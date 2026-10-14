@@ -7,7 +7,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 class SinewixProvider : MainAPI() {
-    override var mainUrl = www.ydfvfdizipanel.ru
+    override var mainUrl = https://www.ydfvfdizipanel.ru
     override var name = "Sinewix"
     override var lang = "tr"
     override val hasMainPage = true
