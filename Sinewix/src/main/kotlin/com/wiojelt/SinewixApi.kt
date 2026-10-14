@@ -2,8 +2,6 @@ package com.wiojelt
 
 import android.util.Base64
 import com.lagradost.cloudstream3.app
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -17,6 +15,7 @@ import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import java.util.concurrent.Semaphore
 
 object SinewixApi {
     const val SITE = "https://ydfvfdizipanel.ru"
@@ -38,7 +37,7 @@ object SinewixApi {
 
     // Ana sayfa ayni anda birden cok satir yukler. Her istek ayri giris yapip
     // birbirinin oturumunu bozuyordu; bu yuzden istekler sirayla yapilir.
-    private val lock = Mutex()
+    private val lock = Semaphore(1)
 
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b)
@@ -140,14 +139,18 @@ object SinewixApi {
         return open(r.text, nonce, ts)
     }
 
-    suspend fun get(path: String): Any? = lock.withLock {
-        var res = getOnce(path)
-        if (res == null) {
-            // oturum dusmus olabilir: yeniden giris yapip bir kez daha dene
-            jwt = ""
-            res = getOnce(path)
+    suspend fun get(path: String): Any? {
+        lock.acquire()
+        try {
+            var res = getOnce(path)
+            if (res == null) {
+                jwt = ""
+                res = getOnce(path)
+            }
+            return res
+        } finally {
+            lock.release()
         }
-        res
     }
 
     fun items(o: Any?): List<JSONObject> {
