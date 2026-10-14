@@ -2,6 +2,8 @@ package com.wiojelt
 
 import android.util.Base64
 import com.lagradost.cloudstream3.app
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -33,6 +35,10 @@ object SinewixApi {
     private var session = ""
     private var exp = 0L
     private val device = "uuid_" + UUID.randomUUID().toString()
+
+    // Ana sayfa ayni anda birden cok satir yukler. Her istek ayri giris yapip
+    // birbirinin oturumunu bozuyordu; bu yuzden istekler sirayla yapilir.
+    private val lock = Mutex()
 
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
     private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b)
@@ -115,7 +121,7 @@ object SinewixApi {
         return true
     }
 
-    suspend fun get(path: String): Any? {
+    private suspend fun getOnce(path: String): Any? {
         if (!login()) return null
         val url = when {
             path.startsWith("http") -> path
@@ -132,6 +138,16 @@ object SinewixApi {
         val r = app.get(url, headers = h)
         if (r.code == 401 || r.code == 403) { jwt = ""; return null }
         return open(r.text, nonce, ts)
+    }
+
+    suspend fun get(path: String): Any? = lock.withLock {
+        var res = getOnce(path)
+        if (res == null) {
+            // oturum dusmus olabilir: yeniden giris yapip bir kez daha dene
+            jwt = ""
+            res = getOnce(path)
+        }
+        res
     }
 
     fun items(o: Any?): List<JSONObject> {
