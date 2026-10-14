@@ -1,2 +1,3 @@
-rootProject.name = "Sinewix"
-include("Sinewix")
+rootProject.name = "Kartaloglu-cs"
+
+include("AbiFilm0")
