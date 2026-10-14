@@ -1,4 +1,4 @@
-version = 5
+version = 6
 
 cloudstream {
     description = "Sinewix film ve dizi"
