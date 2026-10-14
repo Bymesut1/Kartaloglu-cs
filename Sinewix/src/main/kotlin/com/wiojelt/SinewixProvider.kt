@@ -12,22 +12,38 @@ class SinewixProvider : MainAPI() {
     override var lang = "tr"
     override val hasMainPage = true
 
-    // data format: "endpoint1,endpoint2,endpoint3||fallbackSearchWord"
+    // data format: "endpoint1,endpoint2||fallbackSearchWord||m veya s"
     // Endpoint'ler sirayla denenir, ilk dolu donen kullanilir.
-    // Hicbiri dolu donmezse fallbackSearchWord ile arama yapilir (arama zaten calisiyor).
+    // Hicbiri dolu donmezse fallbackSearchWord ile arama yapilir ve m=film, s=dizi filtrelenir.
     override val mainPage = mainPageOf(
-        "media/trending,media/popularmovies,media/showcase||man" to "Trend",
-        "movies/latest,media/latestmovies,media/newmovies||love" to "Son Eklenen Filmler",
-        "series/latest,series/recents,series/newepisodes||dead" to "Son Eklenen Diziler",
-        "movies/popular,media/popularmovies,media/mostwatched||war" to "Popüler Filmler",
-        "series/popular,series/trending,series/mostwatched||night" to "Popüler Diziler",
-        "animes/latest,animes/popular,animes/recents||city" to "Animeler"
+        "media/trending,media/popularmovies,media/showcase||man||" to "Trend",
+        "movies/latest,media/latestmovies,media/newmovies||love||m" to "Son Eklenen Filmler",
+        "series/latest,series/recents,series/newepisodes||dead||s" to "Son Eklenen Diziler",
+        "movies/popular,media/popularmovies,media/mostwatched||war||m" to "Popüler Filmler",
+        "series/popular,series/trending,series/mostwatched||night||s" to "Popüler Diziler",
+        "animes/latest,animes/popular,animes/recents||city||s" to "Animeler",
+        "debug||||" to "Debug (bana ekran goruntusu at)"
+    )
+
+    private val debugEndpoints = listOf(
+        "media/trending", "media/popularmovies", "media/showcase", "media/latestmovies",
+        "media/newmovies", "media/mostwatched", "media/recents", "media/latest", "media/all",
+        "movies/latest", "movies/popular", "movies/all",
+        "series/latest", "series/recents", "series/newepisodes", "series/popular",
+        "series/trending", "series/mostwatched", "series/all",
+        "animes/latest", "animes/popular", "animes/recents",
+        "genres/list", "genres/latest", "home", "featured", "media/featured"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (request.data.startsWith("debug")) {
+            val d = newMovieSearchResponse("DEBUG - buna dokun", "$mainUrl/debug", TvType.Movie)
+            return newHomePageResponse(request.name, listOf(d), false)
+        }
         val parts = request.data.split("||")
         val endpoints = parts.getOrNull(0).orEmpty().split(",").map { it.trim() }.filter { it.isNotEmpty() }
         val word = parts.getOrNull(1).orEmpty()
+        val kind = parts.getOrNull(2).orEmpty()
 
         var items: List<SearchResponse> = emptyList()
 
@@ -43,15 +59,23 @@ class SinewixProvider : MainAPI() {
         if (items.isEmpty() && word.isNotBlank()) {
             items = try { search(word) } catch (e: Exception) { emptyList() }
         }
+        if (kind == "m" || kind == "s") {
+            val want = if (kind == "s") TvType.TvSeries else TvType.Movie
+            val filtered = items.filter { it.type == want }
+            if (filtered.isNotEmpty()) items = filtered
+        }
         return newHomePageResponse(request.name, items.distinctBy { it.url }, false)
     }
 
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private fun isSerie(o: JSONObject) =
-        Regex("serie|anime|tv", RegexOption.IGNORE_CASE).containsMatchIn(
-            o.optString("type") + " " + o.optString("media_type")
-        )
+    private fun isSerie(o: JSONObject): Boolean {
+        val t = (o.optString("type") + " " + o.optString("media_type")).lowercase()
+        if (Regex("serie|anime|tv").containsMatchIn(t)) return true
+        if (t.contains("movie")) return false
+        return o.has("seasons") || o.has("number_of_seasons") ||
+            o.optString("first_air_date").let { it.isNotBlank() && it != "null" }
+    }
 
     private fun poster(o: JSONObject): String? =
         listOf("poster_path", "poster", "cover", "image", "backdrop_path").map { o.optString(it) }
@@ -87,6 +111,24 @@ class SinewixProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        if (url.endsWith("/debug")) {
+            val sb = StringBuilder()
+            for (ep in debugEndpoints) {
+                val o = try { SinewixApi.get("/public/api/$ep/${SinewixApi.API_KEY}") } catch (e: Exception) { null }
+                val n = if (o == null) 0 else SinewixApi.items(o).size
+                val kindText = when (o) {
+                    null -> "BOS"
+                    is JSONObject -> "obj[" + o.keys().asSequence().take(5).joinToString(",") + "]"
+                    is JSONArray -> "dizi"
+                    else -> "diger"
+                }
+                sb.append("$ep: $kindText, item=$n\n")
+            }
+            val sr = try { SinewixApi.get("/public/api/search/love/${SinewixApi.API_KEY}") } catch (e: Exception) { null }
+            val first = sr?.let { SinewixApi.items(it).firstOrNull() }
+            sb.append("\nARAMA ORNEK:\n").append(first?.toString()?.take(1200) ?: "yok")
+            return newMovieLoadResponse("DEBUG", url, TvType.Movie, "") { this.plot = sb.toString() }
+        }
         val serie = url.contains("/s/")
         val id = url.substringAfterLast("/")
         val first = if (serie) "series/show" else "media/detail"
