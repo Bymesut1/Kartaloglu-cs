@@ -12,27 +12,28 @@ class SinewixProvider : MainAPI() {
     override var lang = "tr"
     override val hasMainPage = true
 
-    // data format: "endpoint1,endpoint2||fallbackSearchWord||m veya s"
-    // Endpoint'ler sirayla denenir, ilk dolu donen kullanilir.
-    // Hicbiri dolu donmezse fallbackSearchWord ile arama yapilir ve m=film, s=dizi filtrelenir.
+    // data format: "endpoint||tur||yedekAramaKelimesi"
+    // tur: m = film, s = dizi, e = yeni bolumler
+    // Endpoint'ler orijinal Sinewix/EasyPlex uygulamasindaki katalog adresleridir.
     override val mainPage = mainPageOf(
-        "media/trending,media/popularmovies,media/showcase||man||" to "Trend",
-        "movies/latest,media/latestmovies,media/newmovies||love||m" to "Son Eklenen Filmler",
-        "series/latest,series/recents,series/newepisodes||dead||s" to "Son Eklenen Diziler",
-        "movies/popular,media/popularmovies,media/mostwatched||war||m" to "Popüler Filmler",
-        "series/popular,series/trending,series/mostwatched||night||s" to "Popüler Diziler",
-        "animes/latest,animes/popular,animes/recents||city||s" to "Animeler",
+        "genres/latestmovies/all||m||love" to "Son Eklenen Filmler",
+        "genres/latestseries/all||s||dead" to "Son Eklenen Diziler",
+        "media/seriesEpisodesAll||e||" to "Yeni Bölümler",
+        "genres/latestanimes/all||s||city" to "Son Animeler",
+        "genres/mediaLibrary/show/80/movie||m||" to "Suç Filmleri",
+        "genres/mediaLibrary/show/80/serie||s||" to "Suç Dizileri",
+        "genres/mediaLibrary/show/9648/movie||m||" to "Gizem Filmleri",
+        "genres/mediaLibrary/show/9648/serie||s||" to "Gizem Dizileri",
+        "genres/mediaLibrary/show/10769/serie||s||" to "Kore Diziler",
+        "genres/mediaLibrary/show/16/movie||m||" to "Animasyonlar",
         "debug||||" to "Debug (bana ekran goruntusu at)"
     )
 
     private val debugEndpoints = listOf(
-        "media/trending", "media/popularmovies", "media/showcase", "media/latestmovies",
-        "media/newmovies", "media/mostwatched", "media/recents", "media/latest", "media/all",
-        "movies/latest", "movies/popular", "movies/all",
-        "series/latest", "series/recents", "series/newepisodes", "series/popular",
-        "series/trending", "series/mostwatched", "series/all",
-        "animes/latest", "animes/popular", "animes/recents",
-        "genres/list", "genres/latest", "home", "featured", "media/featured"
+        "genres/latestmovies/all", "genres/latestseries/all", "genres/latestanimes/all",
+        "media/seriesEpisodesAll", "genres/mediaLibrary/show/80/movie",
+        "genres/mediaLibrary/show/80/serie", "genres/mediaLibrary/show/9648/movie",
+        "genres/mediaLibrary/show/10769/serie", "genres/mediaLibrary/show/16/movie"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -41,30 +42,40 @@ class SinewixProvider : MainAPI() {
             return newHomePageResponse(request.name, listOf(d), false)
         }
         val parts = request.data.split("||")
-        val endpoints = parts.getOrNull(0).orEmpty().split(",").map { it.trim() }.filter { it.isNotEmpty() }
-        val word = parts.getOrNull(1).orEmpty()
-        val kind = parts.getOrNull(2).orEmpty()
+        val ep = parts.getOrNull(0).orEmpty()
+        val kind = parts.getOrNull(1).orEmpty()
+        val word = parts.getOrNull(2).orEmpty()
 
-        var items: List<SearchResponse> = emptyList()
+        val path = "/public/api/$ep/${SinewixApi.API_KEY}" + if (page > 1) "?page=$page" else ""
+        val all: List<JSONObject> = try {
+            val o = SinewixApi.get(path)
+            if (o == null) emptyList() else SinewixApi.items(o)
+        } catch (e: Exception) {
+            emptyList()
+        }
 
-        for (ep in endpoints) {
-            items = try {
-                val o = SinewixApi.get("/public/api/$ep/${SinewixApi.API_KEY}")
-                if (o == null) emptyList() else toResponses(SinewixApi.items(o))
-            } catch (e: Exception) {
-                emptyList()
+        var out: List<SearchResponse> = when {
+            all.isEmpty() -> emptyList()
+            kind == "e" -> toEpisodeResponses(all)
+            kind == "s" || kind == "m" -> {
+                val wantSerie = kind == "s"
+                val filtered = all.filter { isSerie(it) == wantSerie }
+                if (filtered.isNotEmpty()) toResponses(filtered) else toResponses(all, wantSerie)
             }
-            if (items.isNotEmpty()) break
+            else -> toResponses(all)
         }
-        if (items.isEmpty() && word.isNotBlank()) {
-            items = try { search(word) } catch (e: Exception) { emptyList() }
-        }
-        if (kind == "m" || kind == "s") {
+        var hasNext = out.isNotEmpty()
+
+        // Katalog endpoint'i bos donerse (yalnizca ilk sayfada) aramayla doldur
+        if (out.isEmpty() && page == 1 && word.isNotBlank()) {
+            val s = try { search(word) } catch (e: Exception) { emptyList() }
             val want = if (kind == "s") TvType.TvSeries else TvType.Movie
-            val filtered = items.filter { it.type == want }
-            if (filtered.isNotEmpty()) items = filtered
+            val f = s.filter { it.type == want }
+            out = if (f.isNotEmpty()) f else s
+            hasNext = false
         }
-        return newHomePageResponse(request.name, items.distinctBy { it.url }, false)
+        val result = if (kind == "e") out else out.distinctBy { it.url }
+        return newHomePageResponse(request.name, result, hasNext)
     }
 
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
@@ -78,7 +89,7 @@ class SinewixProvider : MainAPI() {
     }
 
     private fun poster(o: JSONObject): String? =
-        listOf("poster_path", "poster", "cover", "image", "backdrop_path").map { o.optString(it) }
+        listOf("poster_path", "poster", "cover", "image", "backdrop_path", "still_path").map { o.optString(it) }
             .firstOrNull { it.isNotBlank() && it != "null" }
             ?.let { if (it.startsWith("http")) it else if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else "$mainUrl/$it" }
 
@@ -86,12 +97,23 @@ class SinewixProvider : MainAPI() {
         listOf("name", "title", "original_name", "original_title").map { o.optString(it) }
             .firstOrNull { it.isNotBlank() && it != "null" } ?: ""
 
-    private fun toResponses(list: List<JSONObject>): List<SearchResponse> =
+    private fun toResponses(list: List<JSONObject>, forceSerie: Boolean? = null): List<SearchResponse> =
         list.filter { it.optString("id").isNotBlank() && title(it).isNotBlank() }.map { it0 ->
-            val serie = isSerie(it0)
+            val serie = forceSerie ?: isSerie(it0)
             val url = "$mainUrl/${if (serie) "s" else "m"}/${it0.optString("id")}"
             if (serie) newTvSeriesSearchResponse(title(it0), url, TvType.TvSeries) { posterUrl = poster(it0) }
             else newMovieSearchResponse(title(it0), url, TvType.Movie) { posterUrl = poster(it0) }
+        }
+
+    private fun toEpisodeResponses(list: List<JSONObject>): List<SearchResponse> =
+        list.mapNotNull { o ->
+            val sid = o.optString("serie_id").takeIf { it.isNotBlank() && it != "null" } ?: o.optString("id")
+            val t = title(o)
+            if (sid.isBlank() || t.isBlank()) return@mapNotNull null
+            val sn = o.optInt("season_number")
+            val en = o.optInt("episode_number")
+            val label = if (en > 0) "$t S%02dE%02d".format(sn, en) else t
+            newTvSeriesSearchResponse(label, "$mainUrl/s/$sid", TvType.TvSeries) { posterUrl = poster(o) }
         }
 
     override suspend fun search(query: String): List<SearchResponse> {
