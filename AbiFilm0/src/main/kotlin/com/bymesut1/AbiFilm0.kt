@@ -18,26 +18,43 @@ class AbiFilm0 : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/page/" to "Son Eklenenler",
-        "kategoriler" to "Kategoriler"
+        "$mainUrl/yerli-filmler/" to "Yerli Filmler",
+        "$mainUrl/turkce-dublaj-filmler/" to "Türkçe Dublaj Filmler",
+        "$mainUrl/turkce-altyazili-filmler/" to "Türkçe Altyazılı Filmler",
+        "$mainUrl/imdb-en-iyiler/" to "IMDb En İyiler",
+        "$mainUrl/en-cok-izlenen-filmler/" to "En Çok İzlenen Filmler",
+        "$mainUrl/en-cok-begenilen-filmler/" to "En Çok Beğenilen Filmler",
+        "$mainUrl/seri-filmler/" to "Seri Filmler",
+        "turler" to "Film Türleri"
     )
 
+    private val genreNames = listOf(
+        "Aile", "Aksiyon", "Animasyon", "Belgesel", "Bilim Kurgu", "Biyografi", "Dram",
+        "Efsane", "Fantastik", "Gerilim", "Gizem", "Hint", "Komedi", "Korku", "Macera",
+        "Müzik", "Müzikal", "Netflix", "Polisiye", "Politik", "Romantik", "Savaş", "Spor",
+        "Suç", "Tarih", "TV film", "Vahşi Batı", "Vizyondaki"
+    )
+
+    private fun normName(s: String) =
+        s.replace(Regex("""[\s(]*\d+[)\s]*$"""), "").trim()
+            .lowercase(java.util.Locale("tr", "TR"))
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (request.data == "kategoriler") {
+        if (request.data == "turler") {
             if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
 
             val home = app.get(mainUrl, headers = mapOf("User-Agent" to ua)).document
-            val catRegex = Regex(
-                """/(?:film-)?(?:kategori|category|tur|turu|genre)/[^/]+/?$""",
-                RegexOption.IGNORE_CASE
-            )
-            val cats = home.select("a[href]").mapNotNull { a ->
-                val href = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
-                if (!catRegex.containsMatchIn(href.substringBefore("?"))) return@mapNotNull null
-                val title = cleanTitle(a.text())
-                if (title.isBlank()) null else title to href
-            }.distinctBy { it.second }.take(15)
+            val wanted = genreNames.associateBy { normName(it) }
+            val seen = HashSet<String>()
 
-            val lists = cats.amap { (title, href) ->
+            val genres = home.select("a[href]").mapNotNull { a ->
+                val name = wanted[normName(a.text())] ?: return@mapNotNull null
+                val href = fixUrlNull(a.attr("href"))?.substringBefore("#") ?: return@mapNotNull null
+                if (href.isBlank() || href.trimEnd('/') == mainUrl.trimEnd('/')) return@mapNotNull null
+                if (!seen.add(name)) null else name to href
+            }
+
+            val lists = genres.amap { (title, href) ->
                 val items = runCatching {
                     app.get(href, headers = mapOf("User-Agent" to ua)).document
                         .select(".listmovie").mapNotNull { it.toSearchResult() }
@@ -48,9 +65,17 @@ class AbiFilm0 : MainAPI() {
             return newHomePageResponse(lists, false)
         }
 
-        val doc = app.get("${request.data}$page/", headers = mapOf("User-Agent" to ua)).document
-        val items = doc.select(".listmovie").mapNotNull { it.toSearchResult() }
-        return newHomePageResponse(request.name, items)
+        val url = when {
+            request.data == "$mainUrl/page/" -> "${request.data}$page/"
+            page <= 1 -> request.data
+            else -> "${request.data}page/$page/"
+        }
+        val items = runCatching {
+            app.get(url, headers = mapOf("User-Agent" to ua)).document
+                .select(".listmovie").mapNotNull { it.toSearchResult() }
+        }.getOrDefault(emptyList())
+
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     private fun cleanTitle(t: String) =
@@ -174,57 +199,3 @@ class AbiFilm0 : MainAPI() {
                     headers = mapOf("User-Agent" to ua, "Origin" to org),
                     referer = "$org/"
                 ).text
-            }.getOrNull()
-            if (body != null && body.trimStart().startsWith("#EXTM3U")) {
-                chosen = u
-                break
-            }
-        }
-        val url = chosen ?: links.firstOrNull() ?: return false
-
-        val quality = Regex("(2160|1440|1080|720|480|360)").find(url)?.value?.toIntOrNull()
-            ?: Qualities.Unknown.value
-
-        callback(
-            newExtractorLink(
-                source = name,
-                name = name,
-                url = url,
-                type = if (url.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-            ) {
-                this.referer = "$org/"
-                this.quality = quality
-                this.headers = mapOf("User-Agent" to ua, "Origin" to org)
-            }
-        )
-        return true
-    }
-
-    private fun scan(raw: String, org: String, out: MutableSet<String>) {
-        val txt = raw.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
-
-        fun add(u: String) {
-            val full = when {
-                u.startsWith("//") -> "https:$u"
-                u.startsWith("http") -> u
-                u.startsWith("/") -> org + u
-                else -> return
-            }
-            out.add(full)
-        }
-
-        // Öncelik sırası: securedLink > videoSource > hls > file
-        listOf("securedLink", "videoSource", "hls", "file").forEach { key ->
-            Regex(""""$key"\s*:\s*"([^"]+)"""").findAll(txt).forEach { add(it.groupValues[1]) }
-        }
-        Regex("""https?:[^"'\s\\<>]+\.(?:m3u8|mp4)[^"'\s\\<>]*""").findAll(txt)
-            .forEach { add(it.value) }
-        Regex("""https?://[^"'\s<>]+?/m3/[^"'\s\\<>]+""").findAll(txt)
-            .forEach { add(it.value) }
-        Regex("""["'](/m3/[^"'\s\\<>]+)["']""").findAll(txt)
-            .forEach { add(it.groupValues[1]) }
-        Regex("""atob\(["']([A-Za-z0-9+/=]{20,})["']\)""").findAll(txt).forEach {
-            runCatching { scan(String(Base64.decode(it.groupValues[1], Base64.DEFAULT)), org, out) }
-        }
-    }
-}
