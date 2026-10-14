@@ -10,17 +10,8 @@ class SinewixProvider : MainAPI() {
     override var mainUrl = SinewixApi.SITE
     override var name = "Sinewix"
     override var lang = "tr"
-    override val hasMainPage = true
+    override val hasMainPage = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
-
-    override val mainPage = mainPageOf(
-        "a" to "Filmler ve Diziler",
-        "e" to "Keşfet"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return newHomePageResponse(request.name, search(request.data), false)
-    }
 
     private fun isSerie(o: JSONObject) =
         Regex("serie|anime|tv", RegexOption.IGNORE_CASE).containsMatchIn(
