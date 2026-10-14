@@ -3,6 +3,6 @@
   "description": "Sinewix CloudStream eklentisi",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/Bymesut1/Sinewix/builds/plugins.json"
+    "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/plugins.json"
   ]
 }
