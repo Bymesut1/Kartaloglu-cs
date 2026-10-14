@@ -1,0 +1,12 @@
+package com.wiojelt
+
+import android.content.Context
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
+
+@CloudstreamPlugin
+class SinewixPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(SinewixProvider())
+    }
+}
