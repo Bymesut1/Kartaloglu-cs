@@ -7,18 +7,44 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 class SinewixProvider : MainAPI() {
-    override var mainUrl = https://www.ydfvfdizipanel.ru
+    override var mainUrl = "https://www.ydfvfdizipanel.ru"
     override var name = "Sinewix"
     override var lang = "tr"
     override val hasMainPage = true
+
+    // data format: "apiPath||fallbackSearchWord"
+    // 1) apiPath denenir (katalog endpoint'i), bos donerse
+    // 2) fallbackSearchWord ile arama yapilip liste doldurulur (arama zaten calisiyor)
     override val mainPage = mainPageOf(
-        "a" to "Filmler ve Diziler",
-        "e" to "Keşfet"
+        "/public/api/media/trending||man" to "Trend",
+        "/public/api/movies/latest||love" to "Son Eklenen Filmler",
+        "/public/api/series/latest||dead" to "Son Eklenen Diziler",
+        "/public/api/movies/popular||war" to "Popüler Filmler",
+        "/public/api/series/popular||night" to "Popüler Diziler",
+        "/public/api/animes/latest||city" to "Animeler"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return newHomePageResponse(request.name, search(request.data), true)
+        val parts = request.data.split("||")
+        val path = parts.getOrNull(0).orEmpty()
+        val word = parts.getOrNull(1).orEmpty()
+
+        var items: List<SearchResponse> = emptyList()
+
+        if (path.isNotBlank()) {
+            items = try {
+                val o = SinewixApi.get("$path/${SinewixApi.API_KEY}")
+                if (o == null) emptyList() else toResponses(SinewixApi.items(o))
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+        if (items.isEmpty() && word.isNotBlank()) {
+            items = try { search(word) } catch (e: Exception) { emptyList() }
+        }
+        return newHomePageResponse(request.name, items.distinctBy { it.url }, false)
     }
+
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private fun isSerie(o: JSONObject) =
@@ -27,7 +53,7 @@ class SinewixProvider : MainAPI() {
         )
 
     private fun poster(o: JSONObject): String? =
-        listOf("poster_path", "poster", "cover", "image").map { o.optString(it) }
+        listOf("poster_path", "poster", "cover", "image", "backdrop_path").map { o.optString(it) }
             .firstOrNull { it.isNotBlank() && it != "null" }
             ?.let { if (it.startsWith("http")) it else if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else "$mainUrl/$it" }
 
@@ -35,15 +61,18 @@ class SinewixProvider : MainAPI() {
         listOf("name", "title", "original_name", "original_title").map { o.optString(it) }
             .firstOrNull { it.isNotBlank() && it != "null" } ?: ""
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
-        val o = SinewixApi.get("/public/api/search/$q/${SinewixApi.API_KEY}") ?: return emptyList()
-        return SinewixApi.items(o).map { it0 ->
+    private fun toResponses(list: List<JSONObject>): List<SearchResponse> =
+        list.filter { it.optString("id").isNotBlank() && title(it).isNotBlank() }.map { it0 ->
             val serie = isSerie(it0)
             val url = "$mainUrl/${if (serie) "s" else "m"}/${it0.optString("id")}"
             if (serie) newTvSeriesSearchResponse(title(it0), url, TvType.TvSeries) { posterUrl = poster(it0) }
             else newMovieSearchResponse(title(it0), url, TvType.Movie) { posterUrl = poster(it0) }
         }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val q = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
+        val o = SinewixApi.get("/public/api/search/$q/${SinewixApi.API_KEY}") ?: return emptyList()
+        return toResponses(SinewixApi.items(o))
     }
 
     private fun links(videos: JSONArray?): String {
