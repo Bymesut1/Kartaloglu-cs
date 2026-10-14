@@ -12,32 +12,33 @@ class SinewixProvider : MainAPI() {
     override var lang = "tr"
     override val hasMainPage = true
 
-    // data format: "apiPath||fallbackSearchWord"
-    // 1) apiPath denenir (katalog endpoint'i), bos donerse
-    // 2) fallbackSearchWord ile arama yapilip liste doldurulur (arama zaten calisiyor)
+    // data format: "endpoint1,endpoint2,endpoint3||fallbackSearchWord"
+    // Endpoint'ler sirayla denenir, ilk dolu donen kullanilir.
+    // Hicbiri dolu donmezse fallbackSearchWord ile arama yapilir (arama zaten calisiyor).
     override val mainPage = mainPageOf(
-        "/public/api/media/trending||man" to "Trend",
-        "/public/api/movies/latest||love" to "Son Eklenen Filmler",
-        "/public/api/series/latest||dead" to "Son Eklenen Diziler",
-        "/public/api/movies/popular||war" to "Popüler Filmler",
-        "/public/api/series/popular||night" to "Popüler Diziler",
-        "/public/api/animes/latest||city" to "Animeler"
+        "media/trending,media/popularmovies,media/showcase||man" to "Trend",
+        "movies/latest,media/latestmovies,media/newmovies||love" to "Son Eklenen Filmler",
+        "series/latest,series/recents,series/newepisodes||dead" to "Son Eklenen Diziler",
+        "movies/popular,media/popularmovies,media/mostwatched||war" to "Popüler Filmler",
+        "series/popular,series/trending,series/mostwatched||night" to "Popüler Diziler",
+        "animes/latest,animes/popular,animes/recents||city" to "Animeler"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val parts = request.data.split("||")
-        val path = parts.getOrNull(0).orEmpty()
+        val endpoints = parts.getOrNull(0).orEmpty().split(",").map { it.trim() }.filter { it.isNotEmpty() }
         val word = parts.getOrNull(1).orEmpty()
 
         var items: List<SearchResponse> = emptyList()
 
-        if (path.isNotBlank()) {
+        for (ep in endpoints) {
             items = try {
-                val o = SinewixApi.get("$path/${SinewixApi.API_KEY}")
+                val o = SinewixApi.get("/public/api/$ep/${SinewixApi.API_KEY}")
                 if (o == null) emptyList() else toResponses(SinewixApi.items(o))
             } catch (e: Exception) {
                 emptyList()
             }
+            if (items.isNotEmpty()) break
         }
         if (items.isEmpty() && word.isNotBlank()) {
             items = try { search(word) } catch (e: Exception) { emptyList() }
