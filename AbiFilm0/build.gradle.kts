@@ -1,4 +1,4 @@
-version = 5
+version = 4
 
 cloudstream {
     description = "wfilmizle.cam - Türkçe Dublaj / Altyazılı film izle"
