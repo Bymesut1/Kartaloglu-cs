@@ -17,10 +17,37 @@ class AbiFilm0 : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 
     override val mainPage = mainPageOf(
-        "$mainUrl/page/" to "Son Eklenenler"
+        "$mainUrl/page/" to "Son Eklenenler",
+        "kategoriler" to "Kategoriler"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (request.data == "kategoriler") {
+            if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
+
+            val home = app.get(mainUrl, headers = mapOf("User-Agent" to ua)).document
+            val catRegex = Regex(
+                """/(?:film-)?(?:kategori|category|tur|turu|genre)/[^/]+/?$""",
+                RegexOption.IGNORE_CASE
+            )
+            val cats = home.select("a[href]").mapNotNull { a ->
+                val href = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
+                if (!catRegex.containsMatchIn(href.substringBefore("?"))) return@mapNotNull null
+                val title = cleanTitle(a.text())
+                if (title.isBlank()) null else title to href
+            }.distinctBy { it.second }.take(15)
+
+            val lists = cats.amap { (title, href) ->
+                val items = runCatching {
+                    app.get(href, headers = mapOf("User-Agent" to ua)).document
+                        .select(".listmovie").mapNotNull { it.toSearchResult() }
+                }.getOrDefault(emptyList())
+                if (items.isEmpty()) null else HomePageList(title, items)
+            }.filterNotNull()
+
+            return newHomePageResponse(lists, false)
+        }
+
         val doc = app.get("${request.data}$page/", headers = mapOf("User-Agent" to ua)).document
         val items = doc.select(".listmovie").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, items)
@@ -134,7 +161,27 @@ class AbiFilm0 : MainAPI() {
             if (txt != null) scan(txt, org, links)
         }
 
-        val url = links.firstOrNull() ?: return false
+        // Geçerli (#EXTM3U ile başlayan) ilk linki seç
+        var chosen: String? = null
+        for (u in links.take(5)) {
+            if (u.contains(".mp4", true)) {
+                chosen = u
+                break
+            }
+            val body = runCatching {
+                app.get(
+                    u,
+                    headers = mapOf("User-Agent" to ua, "Origin" to org),
+                    referer = "$org/"
+                ).text
+            }.getOrNull()
+            if (body != null && body.trimStart().startsWith("#EXTM3U")) {
+                chosen = u
+                break
+            }
+        }
+        val url = chosen ?: links.firstOrNull() ?: return false
+
         val quality = Regex("(2160|1440|1080|720|480|360)").find(url)?.value?.toIntOrNull()
             ?: Qualities.Unknown.value
 
@@ -166,8 +213,10 @@ class AbiFilm0 : MainAPI() {
             out.add(full)
         }
 
-        Regex(""""(?:securedLink|videoSource|hls|file)"\s*:\s*"([^"]+)"""").findAll(txt)
-            .forEach { add(it.groupValues[1]) }
+        // Öncelik sırası: securedLink > videoSource > hls > file
+        listOf("securedLink", "videoSource", "hls", "file").forEach { key ->
+            Regex(""""$key"\s*:\s*"([^"]+)"""").findAll(txt).forEach { add(it.groupValues[1]) }
+        }
         Regex("""https?:[^"'\s\\<>]+\.(?:m3u8|mp4)[^"'\s\\<>]*""").findAll(txt)
             .forEach { add(it.value) }
         Regex("""https?://[^"'\s<>]+?/m3/[^"'\s\\<>]+""").findAll(txt)
