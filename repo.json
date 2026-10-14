@@ -1,7 +1,7 @@
 {
   "name": "Sinewix",
   "description": "Sinewix CloudStream eklentisi",
-  "manifestVersion": 1,
+  "manifestVersion": 2,
   "pluginLists": [
     "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/plugins.json"
   ]
