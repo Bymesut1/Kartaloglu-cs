@@ -1,164 +1,136 @@
 package com.wiojelt
 
-import android.util.Base64
-import com.lagradost.cloudstream3.app
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import java.net.URLEncoder
-import java.security.MessageDigest
-import java.security.SecureRandom
-import java.util.UUID
-import javax.crypto.Cipher
-import javax.crypto.Mac
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
-object SinewixApi {
-    const val SITE = "https://ydfvfdizipanel.ru"
-    const val API_KEY = "9iQNC5HQwPlaFuJDkhncJ5XTJ8feGXOJatAA"
-    private const val PKG = "com.wxsmash.game"
-    private const val APP_ID = "sinewix-mobile"
-    private const val APP_VER = "2.5.3"
-    private const val HASH256 = "f4d4bc98a3fc4600e7f2c2bab7533f1f03d8a70ff03c256bb11dc57050536bd0"
-    private const val CERT_HEX = "308202c3308201aca003020102021430030f5763077759b8be9be1c54b2d35c249457a300a06082a8648ce3d0403023053310b3009060355040613025452310f300d060355040813065475726b657931"
-    private const val SIGN_KEY = "4962QZiZZqWbQlC0k0pdIvojy-STtR8NTq7oQCxMGBF2kwsVX2DBxgK72BovMy4U"
-    private const val RESP_KEY = "H1KKG-JCt1RqHQawNxw7xujy2-vevYuyBqX3Aei1EAdi9VwDnmRL-3Oz2xxvy1VU"
-    const val API_UA = "EasyPlex (Android 14; SM-A546B; Samsung Galaxy A54 5G; tr)"
-    const val WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+class SinewixProvider : MainAPI() {
+    override var mainUrl = SinewixApi.SITE
+    override var name = "Sinewix"
+    override var lang = "tr"
+    override val hasMainPage = true
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private var jwt = ""
-    private var session = ""
-    private var exp = 0L
-    private val device = "uuid_" + UUID.randomUUID().toString()
+    override val mainPage = mainPageOf(
+        "a" to "Filmler ve Diziler",
+        "e" to "Keşfet"
+    )
 
-    // Ana sayfa ayni anda birden cok satir yukler. Her istek ayri giris yapip
-    // birbirinin oturumunu bozuyordu; bu yuzden istekler sirayla yapilir.
-    private val lock = Mutex()
-
-    private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
-    private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b)
-    private fun hmac(key: ByteArray, msg: ByteArray): ByteArray {
-        val m = Mac.getInstance("HmacSHA256")
-        m.init(SecretKeySpec(key, "HmacSHA256"))
-        return m.doFinal(msg)
-    }
-    private fun rnd(): String {
-        val b = ByteArray(24).also { SecureRandom().nextBytes(it) }
-        return Base64.encodeToString(b, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-    }
-    fun b64(s: String): ByteArray =
-        Base64.decode(s.replace('-', '+').replace('_', '/'), Base64.DEFAULT)
-
-    private fun sign(method: String, path: String, ts: String, nonce: String, body: String): String {
-        val canon = "$method\n$path\n$ts\n$nonce\n" + sha256(body.toByteArray()).hex()
-        return hmac(SIGN_KEY.toByteArray(), canon.toByteArray()).hex()
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        return newHomePageResponse(request.name, search(request.data), false)
     }
 
-    private fun headers(ts: String, nonce: String, sig: String): MutableMap<String, String> =
-        mutableMapOf(
-            "Accept" to "application/json", "packagename" to PKG, "User-Agent" to API_UA,
-            "X-App-Id" to APP_ID, "X-Platform" to "android", "X-Device-Id" to device,
-            "signature" to CERT_HEX, "hash256" to HASH256, "X-Encrypt-Response" to "1",
-            "X-Timestamp" to ts, "X-Nonce" to nonce, "X-Signature" to "sha256=$sig"
+    private fun isSerie(o: JSONObject) =
+        Regex("serie|anime|tv", RegexOption.IGNORE_CASE).containsMatchIn(
+            o.optString("type") + " " + o.optString("media_type")
         )
 
-    private fun decrypt(env: JSONObject, nonce: String, ts: String): String? {
-        val iv = b64(env.optString("iv")); val tag = b64(env.optString("tag"))
-        val aad = b64(env.optString("aad")); val ct = b64(env.optString("ciphertext"))
-        val skip = setOf("iv", "tag", "aad", "ciphertext")
-        val extra = env.keys().asSequence().filter { it !in skip }
-            .mapNotNull { env.opt(it) as? String }.toList()
-        val ids = (listOf(session, device, "") + extra).distinct()
-        val pairs = mutableListOf(nonce to ts, ts to nonce)
-        extra.forEach { pairs += it to ts; pairs += nonce to it; pairs += ts to it }
-        for (id in ids) for (p in pairs) {
-            val key = hmac(RESP_KEY.toByteArray(), "easyplex-response-v1|$id|${p.first}|${p.second}".toByteArray())
-            try {
-                val c = Cipher.getInstance("AES/GCM/NoPadding")
-                c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(tag.size * 8, iv))
-                if (aad.isNotEmpty()) c.updateAAD(aad)
-                return String(c.doFinal(ct + tag), Charsets.UTF_8)
-            } catch (_: Exception) { }
+    private fun poster(o: JSONObject): String? =
+        listOf("poster_path", "poster", "cover", "image").map { o.optString(it) }
+            .firstOrNull { it.isNotBlank() && it != "null" }
+            ?.let { if (it.startsWith("http")) it else if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else "$mainUrl/$it" }
+
+    private fun title(o: JSONObject) =
+        listOf("name", "title", "original_name", "original_title").map { o.optString(it) }
+            .firstOrNull { it.isNotBlank() && it != "null" } ?: ""
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val q = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
+        val o = SinewixApi.get("/public/api/search/$q/${SinewixApi.API_KEY}") ?: return emptyList()
+        return SinewixApi.items(o).map { it0 ->
+            val serie = isSerie(it0)
+            val url = "$mainUrl/${if (serie) "s" else "m"}/${it0.optString("id")}"
+            if (serie) newTvSeriesSearchResponse(title(it0), url, TvType.TvSeries) { posterUrl = poster(it0) }
+            else newMovieSearchResponse(title(it0), url, TvType.Movie) { posterUrl = poster(it0) }
         }
-        return null
     }
 
-    private fun open(text: String, nonce: String, ts: String): Any? {
-        if (text.isBlank()) return null
-        val v = try { JSONTokener(text).nextValue() } catch (_: Exception) { return null }
-        if (v is JSONObject && v.optBoolean("encrypted") && v.has("ciphertext")) {
-            val d = decrypt(v, nonce, ts) ?: return null
-            return try { JSONTokener(d).nextValue() } catch (_: Exception) { null }
+    private fun links(videos: JSONArray?): String {
+        val out = mutableListOf<String>()
+        if (videos != null) for (i in 0 until videos.length()) {
+            val v = videos.opt(i)
+            val raw = if (v is JSONObject) v.optString("link") else v?.toString() ?: ""
+            raw.split("|||").map { it.trim() }.filter { it.isNotEmpty() && it != "null" }.forEach { out += it }
         }
-        return v
+        return out.distinct().joinToString("\n")
     }
 
-    private suspend fun login(): Boolean {
-        if (jwt.isNotEmpty() && System.currentTimeMillis() < exp) return true
-        val ts = (System.currentTimeMillis() / 1000).toString()
-        val nonce = rnd()
-        val body = listOf(
-            "signature" to HASH256, "package_name" to PKG, "device_id" to device,
-            "nonce" to rnd(), "timestamp" to ts, "app_version" to APP_VER,
-            "app_id" to APP_ID, "platform" to "android"
-        ).joinToString("&") { URLEncoder.encode(it.first, "UTF-8") + "=" + URLEncoder.encode(it.second, "UTF-8") }
-        val h = headers(ts, nonce, sign("POST", "/api/tokens/mobile/generate", ts, nonce, body))
-        val r = app.post(
-            "$SITE/public/api/tokens/mobile/generate", headers = h,
-            requestBody = body.toRequestBody("application/x-www-form-urlencoded".toMediaType())
-        )
-        val o = open(r.text, nonce, ts) as? JSONObject ?: return false
-        val tok = o.optString("access_token")
-        if (tok.isEmpty()) return false
-        jwt = tok
-        session = o.optString("session_id")
-        exp = System.currentTimeMillis() + maxOf(60, o.optInt("expires_in", 600) - 30) * 1000L
-        return true
+    override suspend fun load(url: String): LoadResponse? {
+        val serie = url.contains("/s/")
+        val id = url.substringAfterLast("/")
+        val first = if (serie) "series/show" else "media/detail"
+        val second = if (serie) "media/detail" else "series/show"
+        var d = SinewixApi.get("/public/api/$first/$id/${SinewixApi.API_KEY}") as? JSONObject
+        if (d == null || !(d.has("videos") || d.has("seasons") || d.has("name") || d.has("title")))
+            d = SinewixApi.get("/public/api/$second/$id/${SinewixApi.API_KEY}") as? JSONObject
+        d ?: return null
+        val name = title(d)
+        val plot = d.optString("overview").takeIf { it.isNotBlank() && it != "null" }
+        val year = d.optString("release_date", d.optString("first_air_date")).take(4).toIntOrNull()
+        return if (d.has("seasons")) {
+            val eps = mutableListOf<Episode>()
+            val seasons = d.optJSONArray("seasons") ?: JSONArray()
+            for (i in 0 until seasons.length()) {
+                val s = seasons.getJSONObject(i)
+                val sn = s.optInt("season_number")
+                val el = s.optJSONArray("episodes") ?: continue
+                for (j in 0 until el.length()) {
+                    val e = el.getJSONObject(j)
+                    eps += newEpisode(links(e.optJSONArray("videos"))) {
+                        this.season = sn
+                        this.episode = e.optInt("episode_number")
+                        this.name = e.optString("name").takeIf { it.isNotBlank() && it != "null" }
+                    }
+                }
+            }
+            newTvSeriesLoadResponse(name, url, TvType.TvSeries, eps) {
+                posterUrl = poster(d); this.plot = plot; this.year = year
+            }
+        } else {
+            var data = links(d.optJSONArray("videos"))
+            d.optString("direct_link").takeIf { it.isNotBlank() && it != "null" }?.let { data += "\n$it" }
+            newMovieLoadResponse(name, url, TvType.Movie, data.trim()) {
+                posterUrl = poster(d); this.plot = plot; this.year = year
+            }
+        }
     }
 
-    private suspend fun getOnce(path: String): Any? {
-        if (!login()) return null
-        val url = when {
-            path.startsWith("http") -> path
-            path.startsWith("/public/api/") -> SITE + path
-            else -> SITE + "/public/api/" + path.trimStart('/')
-        }
-        val i = url.substringBefore("?").indexOf("/api/")
-        val apiPath = if (i >= 0) url.substringBefore("?").substring(i) else url
-        val ts = (System.currentTimeMillis() / 1000).toString()
-        val nonce = rnd()
-        val h = headers(ts, nonce, sign("GET", apiPath, ts, nonce, ""))
-        if (session.isNotEmpty()) h["X-Session-Id"] = session
-        h["Authorization"] = "Bearer $jwt"
-        val r = app.get(url, headers = h)
-        if (r.code == 401 || r.code == 403) { jwt = ""; return null }
-        return open(r.text, nonce, ts)
-    }
+    private fun quality(s: String) =
+        Regex("(2160|1440|1080|720|480|360)").find(s)?.value?.toIntOrNull() ?: Qualities.Unknown.value
 
-    suspend fun get(path: String): Any? = lock.withLock {
-        var res = getOnce(path)
-        if (res == null) {
-            // oturum dusmus olabilir: yeniden giris yapip bir kez daha dene
-            jwt = ""
-            res = getOnce(path)
+    override suspend fun loadLinks(
+        data: String, isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var ok = false
+        val ua = mapOf("User-Agent" to SinewixApi.WEB_UA)
+        for (u in data.split("\n").map { it.trim() }.filter { it.isNotEmpty() }.take(8)) {
+            var direct: String? = null
+            var type = ExtractorLinkType.VIDEO
+            if (u.contains("mediafire.com", true)) {
+                val html = app.get(u, headers = ua).text
+                direct = Regex("""href=["'](https://download[^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(html)?.groupValues?.get(1)?.replace("&amp;", "&")
+                    ?: Regex("""data-scrambled-url=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                        ?.let { String(SinewixApi.b64(it)) }
+            } else if (u.contains("drive.google.com")) {
+                val g = Regex("""/file/d/([^/?#]+)""").find(u)?.groupValues?.get(1)
+                    ?: Regex("""[?&]id=([^&#]+)""").find(u)?.groupValues?.get(1)
+                if (g != null) direct = "https://drive.usercontent.google.com/download?id=$g&export=download&confirm=t"
+            } else if (Regex("""\.m3u8(\?|$)""", RegexOption.IGNORE_CASE).containsMatchIn(u)) {
+                direct = u; type = ExtractorLinkType.M3U8
+            } else if (Regex("""\.(mp4|mkv|webm)(\?|$)""", RegexOption.IGNORE_CASE).containsMatchIn(u)) {
+                direct = u
+            }
+            if (direct == null) continue
+            callback(newExtractorLink(name, name, direct, type) {
+                this.quality = quality(u)
+                this.headers = ua
+            })
+            ok = true
         }
-        res
-    }
-
-    fun items(o: Any?): List<JSONObject> {
-        val out = mutableListOf<JSONObject>()
-        fun take(a: JSONArray) {
-            for (i in 0 until a.length()) a.optJSONObject(i)?.takeIf { it.has("id") }?.let { out += it }
-        }
-        when (o) {
-            is JSONArray -> take(o)
-            is JSONObject -> o.keys().forEach { k -> (o.opt(k) as? JSONArray)?.let { take(it) } }
-        }
-        return out
+        return ok
     }
 }
