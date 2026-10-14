@@ -1,8 +1,0 @@
-{
-  "name": "Sinewix",
-  "description": "Sinewix film ve dizi",
-  "manifestVersion": 1,
-  "pluginLists": [
-    "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/plugins.json"
-  ]
-}
