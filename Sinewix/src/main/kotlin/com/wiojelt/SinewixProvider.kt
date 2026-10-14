@@ -2,180 +2,74 @@ package com.wiojelt
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 
 class SinewixProvider : MainAPI() {
-    override var mainUrl = "https://api.themoviedb.org/3"
+    override var mainUrl = "https://www.ydfvfdizipanel.ru"
     override var name = "Sinewix"
     override var lang = "tr"
     override val hasMainPage = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
-    private val imgBase = "https://image.tmdb.org/t/p"
-
-    // Kataloglar tamamen TMDB'den gelir. data = TMDB endpoint'i (+ sorgu parametreleri)
+    // data format: "endpoint1,endpoint2||fallbackSearchWord||m veya s"
+    // Endpoint'ler sirayla denenir, ilk dolu donen kullanilir.
+    // Hicbiri dolu donmezse fallbackSearchWord ile arama yapilir ve m=film, s=dizi filtrelenir.
     override val mainPage = mainPageOf(
-        "/trending/all/week" to "Trend",
-        "/movie/now_playing?region=TR" to "Vizyondaki Filmler",
-        "/tv/on_the_air" to "Yayındaki Diziler",
-        "/movie/popular" to "Popüler Filmler",
-        "/tv/popular" to "Popüler Diziler",
-        "/movie/top_rated" to "En Çok Oy Alan Filmler",
-        "/tv/top_rated" to "En Çok Oy Alan Diziler",
-        "/discover/tv?with_genres=16&with_original_language=ja&sort_by=popularity.desc" to "Animeler"
+        "media/trending,media/popularmovies,media/showcase||man||" to "Trend",
+        "movies/latest,media/latestmovies,media/newmovies||love||m" to "Son Eklenen Filmler",
+        "series/latest,series/recents,series/newepisodes||dead||s" to "Son Eklenen Diziler",
+        "movies/popular,media/popularmovies,media/mostwatched||war||m" to "Popüler Filmler",
+        "series/popular,series/trending,series/mostwatched||night||s" to "Popüler Diziler",
+        "animes/latest,animes/popular,animes/recents||city||s" to "Animeler",
+        "debug||||" to "Debug (bana ekran goruntusu at)"
     )
 
-    // ---------------------------------------------------------------- TMDB yardımcıları
-
-    private fun JSONObject.str(key: String): String? =
-        optString(key).takeIf { it.isNotBlank() && it != "null" }
-
-    private fun img(path: String?, size: String = "w500"): String? =
-        path?.takeIf { it.isNotBlank() && it != "null" }?.let { "$imgBase/$size$it" }
-
-    private suspend fun tmdb(path: String, extra: String = "", lang: String = "tr-TR"): JSONObject? =
-        try {
-            val sep = if (path.contains("?")) "&" else "?"
-            JSONObject(app.get("$mainUrl$path${sep}api_key=$tmdbKey&language=$lang$extra").text)
-        } catch (e: Exception) {
-            null
-        }
-
-    private fun toResponse(o: JSONObject): SearchResponse? {
-        val mt = o.optString("media_type")
-        if (mt == "person") return null
-        val isTv = mt == "tv" || (mt.isBlank() && o.has("name") && !o.has("title"))
-        val id = o.optInt("id")
-        val title = o.str(if (isTv) "name" else "title") ?: return null
-        if (id == 0) return null
-        val poster = img(o.str("poster_path"))
-        return if (isTv) newTvSeriesSearchResponse(title, "$mainUrl/tv/$id", TvType.TvSeries) { posterUrl = poster }
-        else newMovieSearchResponse(title, "$mainUrl/movie/$id", TvType.Movie) { posterUrl = poster }
-    }
-
-    private fun parseResults(o: JSONObject?): List<SearchResponse> {
-        val arr = o?.optJSONArray("results") ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { toResponse(arr.getJSONObject(it)) }
-    }
-
-    // ---------------------------------------------------------------- Ana sayfa / arama
+    private val debugEndpoints = listOf(
+        "media/trending", "media/popularmovies", "media/showcase", "media/latestmovies",
+        "media/newmovies", "media/mostwatched", "media/recents", "media/latest", "media/all",
+        "movies/latest", "movies/popular", "movies/all",
+        "series/latest", "series/recents", "series/newepisodes", "series/popular",
+        "series/trending", "series/mostwatched", "series/all",
+        "animes/latest", "animes/popular", "animes/recents",
+        "genres/list", "genres/latest", "home", "featured", "media/featured"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val o = tmdb(request.data, "&page=$page")
-        val items = parseResults(o).distinctBy { it.url }
-        val totalPages = o?.optInt("total_pages") ?: 1
-        return newHomePageResponse(request.name, items, page < totalPages)
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8")
-        return parseResults(tmdb("/search/multi", "&include_adult=false&query=$q"))
-    }
-
-    // ---------------------------------------------------------------- Detay
-
-    private fun streamData(tv: Boolean, id: String, title: String, orig: String?, year: Int?, s: Int = 0, e: Int = 0) =
-        JSONObject()
-            .put("tv", tv).put("id", id).put("t", title).put("o", orig ?: "")
-            .put("y", year ?: 0).put("s", s).put("e", e).toString()
-
-    override suspend fun load(url: String): LoadResponse? {
-        val isTv = url.contains("/tv/")
-        val id = url.substringAfterLast("/")
-        val path = if (isTv) "/tv/$id" else "/movie/$id"
-
-        val d = tmdb(path, "&append_to_response=credits,videos,recommendations&include_video_language=tr,en,null")
-            ?: return null
-
-        val title = d.str(if (isTv) "name" else "title") ?: return null
-        val orig = d.str(if (isTv) "original_name" else "original_title")
-        val plot = d.str("overview") ?: tmdb(path, "", "en-US")?.str("overview")
-        val year = (d.str(if (isTv) "first_air_date" else "release_date"))?.take(4)?.toIntOrNull()
-        val poster = img(d.str("poster_path"))
-        val backdrop = img(d.str("backdrop_path"), "w1280")
-
-        val genreArr = d.optJSONArray("genres") ?: JSONArray()
-        val genres = (0 until genreArr.length()).map { genreArr.getJSONObject(it) }
-        val tags = genres.mapNotNull { it.str("name") }
-        val isAnime = isTv && d.str("original_language") == "ja" && genres.any { it.optInt("id") == 16 }
-
-        val castArr = d.optJSONObject("credits")?.optJSONArray("cast") ?: JSONArray()
-        val actors = (0 until minOf(castArr.length(), 15)).mapNotNull {
-            val c = castArr.getJSONObject(it)
-            c.str("name")?.let { n -> Actor(n, img(c.str("profile_path"), "w185")) }
+        if (request.data.startsWith("debug")) {
+            val d = newMovieSearchResponse("DEBUG - buna dokun", "$mainUrl/debug", TvType.Movie)
+            return newHomePageResponse(request.name, listOf(d), false)
         }
+        val parts = request.data.split("||")
+        val endpoints = parts.getOrNull(0).orEmpty().split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        val word = parts.getOrNull(1).orEmpty()
+        val kind = parts.getOrNull(2).orEmpty()
 
-        val vidArr = d.optJSONObject("videos")?.optJSONArray("results") ?: JSONArray()
-        val trailerKey = (0 until vidArr.length()).map { vidArr.getJSONObject(it) }
-            .firstOrNull { it.optString("site") == "YouTube" && it.optString("type") == "Trailer" }
-            ?.str("key")
+        var items: List<SearchResponse> = emptyList()
 
-        val recs = parseResults(d.optJSONObject("recommendations"))
-
-        return if (isTv) {
-            val seasonArr = d.optJSONArray("seasons") ?: JSONArray()
-            val seasonNums = (0 until seasonArr.length())
-                .map { seasonArr.getJSONObject(it).optInt("season_number") }
-                .filter { it > 0 }
-
-            val seasonData = coroutineScope {
-                seasonNums.map { sn -> async { sn to tmdb("$path/season/$sn") } }.awaitAll()
+        for (ep in endpoints) {
+            items = try {
+                val o = SinewixApi.get("/public/api/$ep/${SinewixApi.API_KEY}")
+                if (o == null) emptyList() else toResponses(SinewixApi.items(o))
+            } catch (e: Exception) {
+                emptyList()
             }
-
-            val eps = mutableListOf<Episode>()
-            for ((sn, sd) in seasonData) {
-                val el = sd?.optJSONArray("episodes") ?: continue
-                for (j in 0 until el.length()) {
-                    val e = el.getJSONObject(j)
-                    val en = e.optInt("episode_number")
-                    eps += newEpisode(streamData(true, id, title, orig, year, sn, en)) {
-                        this.name = e.str("name") ?: "Bölüm $en"
-                        this.season = sn
-                        this.episode = en
-                        this.posterUrl = img(e.str("still_path"), "w300")
-                        this.description = e.str("overview")
-                        this.runTime = e.optInt("runtime").takeIf { it > 0 }
-                        addDate(e.str("air_date"))
-                    }
-                }
-            }
-
-            newTvSeriesLoadResponse(title, url, if (isAnime) TvType.Anime else TvType.TvSeries, eps) {
-                this.posterUrl = poster
-                this.backgroundPosterUrl = backdrop
-                this.plot = plot
-                this.year = year
-                this.tags = tags
-                this.recommendations = recs
-                addActors(actors)
-                addTrailer(trailerKey?.let { "https://www.youtube.com/watch?v=$it" })
-            }
-        } else {
-            newMovieLoadResponse(title, url, TvType.Movie, streamData(false, id, title, orig, year)) {
-                this.posterUrl = poster
-                this.backgroundPosterUrl = backdrop
-                this.plot = plot
-                this.year = year
-                this.tags = tags
-                this.duration = d.optInt("runtime").takeIf { it > 0 }
-                this.recommendations = recs
-                addActors(actors)
-                addTrailer(trailerKey?.let { "https://www.youtube.com/watch?v=$it" })
-            }
+            if (items.isNotEmpty()) break
         }
+        if (items.isEmpty() && word.isNotBlank()) {
+            items = try { search(word) } catch (e: Exception) { emptyList() }
+        }
+        if (kind == "m" || kind == "s") {
+            val want = if (kind == "s") TvType.TvSeries else TvType.Movie
+            val filtered = items.filter { it.type == want }
+            if (filtered.isNotEmpty()) items = filtered
+        }
+        return newHomePageResponse(request.name, items.distinctBy { it.url }, false)
     }
 
-    // ---------------------------------------------------------------- Yayın kaynağı (Sinewix paneli)
-    // TMDB sadece katalog/görsel verir, video linki vermez. Linkler için eski panelde
-    // TMDB id'si veya başlık+yıl ile eşleşen kaydı bulup oradaki linkler kullanılır.
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private fun panelIsSerie(o: JSONObject): Boolean {
+    private fun isSerie(o: JSONObject): Boolean {
         val t = (o.optString("type") + " " + o.optString("media_type")).lowercase()
         if (Regex("serie|anime|tv").containsMatchIn(t)) return true
         if (t.contains("movie")) return false
@@ -183,46 +77,95 @@ class SinewixProvider : MainAPI() {
             o.optString("first_air_date").let { it.isNotBlank() && it != "null" }
     }
 
-    private fun panelTitles(o: JSONObject) =
-        listOf("name", "title", "original_name", "original_title").mapNotNull { o.str(it) }
+    private fun poster(o: JSONObject): String? =
+        listOf("poster_path", "poster", "cover", "image", "backdrop_path").map { o.optString(it) }
+            .firstOrNull { it.isNotBlank() && it != "null" }
+            ?.let { if (it.startsWith("http")) it else if (it.startsWith("/")) "https://image.tmdb.org/t/p/w500$it" else "$mainUrl/$it" }
 
-    private fun norm(s: String) = s.lowercase().replace(Regex("[^\\p{L}\\p{Nd}]"), "")
+    private fun title(o: JSONObject) =
+        listOf("name", "title", "original_name", "original_title").map { o.optString(it) }
+            .firstOrNull { it.isNotBlank() && it != "null" } ?: ""
 
-    private fun panelYear(o: JSONObject) =
-        (o.str("release_date") ?: o.str("first_air_date"))?.take(4)?.toIntOrNull()
-
-    private suspend fun findPanelId(titles: List<String>, year: Int?, tv: Boolean, tmdbId: String): String? {
-        for (t in titles.filter { it.isNotBlank() }.distinct()) {
-            val q = URLEncoder.encode(t, "UTF-8").replace("+", "%20")
-            val o = (try { SinewixApi.get("/public/api/search/$q/${SinewixApi.API_KEY}") } catch (e: Exception) { null })
-                ?: continue
-            val cands = SinewixApi.items(o).filter { panelIsSerie(it) == tv && it.optString("id").isNotBlank() }
-            cands.firstOrNull { it.str("tmdb_id") == tmdbId }?.let { return it.optString("id") }
-            val nt = norm(t)
-            val named = cands.filter { c -> panelTitles(c).any { norm(it) == nt } }
-            val pick = named.firstOrNull { year != null && panelYear(it) == year } ?: named.firstOrNull()
-            if (pick != null) return pick.optString("id")
+    private fun toResponses(list: List<JSONObject>): List<SearchResponse> =
+        list.filter { it.optString("id").isNotBlank() && title(it).isNotBlank() }.map { it0 ->
+            val serie = isSerie(it0)
+            val url = "$mainUrl/${if (serie) "s" else "m"}/${it0.optString("id")}"
+            if (serie) newTvSeriesSearchResponse(title(it0), url, TvType.TvSeries) { posterUrl = poster(it0) }
+            else newMovieSearchResponse(title(it0), url, TvType.Movie) { posterUrl = poster(it0) }
         }
-        return null
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val q = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
+        val o = SinewixApi.get("/public/api/search/$q/${SinewixApi.API_KEY}") ?: return emptyList()
+        return toResponses(SinewixApi.items(o))
     }
 
-    private fun links(videos: JSONArray?): List<String> {
+    private fun links(videos: JSONArray?): String {
         val out = mutableListOf<String>()
         if (videos != null) for (i in 0 until videos.length()) {
             val v = videos.opt(i)
             val raw = if (v is JSONObject) v.optString("link") else v?.toString() ?: ""
             raw.split("|||").map { it.trim() }.filter { it.isNotEmpty() && it != "null" }.forEach { out += it }
         }
-        return out.distinct()
+        return out.distinct().joinToString("\n")
     }
 
-    private suspend fun panelDetail(id: String, tv: Boolean): JSONObject? {
-        val first = if (tv) "series/show" else "media/detail"
-        val second = if (tv) "media/detail" else "series/show"
-        var d = (try { SinewixApi.get("/public/api/$first/$id/${SinewixApi.API_KEY}") } catch (e: Exception) { null }) as? JSONObject
+    override suspend fun load(url: String): LoadResponse? {
+        if (url.endsWith("/debug")) {
+            val sb = StringBuilder()
+            for (ep in debugEndpoints) {
+                val o = try { SinewixApi.get("/public/api/$ep/${SinewixApi.API_KEY}") } catch (e: Exception) { null }
+                val n = if (o == null) 0 else SinewixApi.items(o).size
+                val kindText = when (o) {
+                    null -> "BOS"
+                    is JSONObject -> "obj[" + o.keys().asSequence().take(5).joinToString(",") + "]"
+                    is JSONArray -> "dizi"
+                    else -> "diger"
+                }
+                sb.append("$ep: $kindText, item=$n\n")
+            }
+            val sr = try { SinewixApi.get("/public/api/search/love/${SinewixApi.API_KEY}") } catch (e: Exception) { null }
+            val first = sr?.let { SinewixApi.items(it).firstOrNull() }
+            sb.append("\nARAMA ORNEK:\n").append(first?.toString()?.take(1200) ?: "yok")
+            return newMovieLoadResponse("DEBUG", url, TvType.Movie, "") { this.plot = sb.toString() }
+        }
+        val serie = url.contains("/s/")
+        val id = url.substringAfterLast("/")
+        val first = if (serie) "series/show" else "media/detail"
+        val second = if (serie) "media/detail" else "series/show"
+        var d = SinewixApi.get("/public/api/$first/$id/${SinewixApi.API_KEY}") as? JSONObject
         if (d == null || !(d.has("videos") || d.has("seasons") || d.has("name") || d.has("title")))
-            d = (try { SinewixApi.get("/public/api/$second/$id/${SinewixApi.API_KEY}") } catch (e: Exception) { null }) as? JSONObject
-        return d
+            d = SinewixApi.get("/public/api/$second/$id/${SinewixApi.API_KEY}") as? JSONObject
+        d ?: return null
+        val name = title(d)
+        val plot = d.optString("overview").takeIf { it.isNotBlank() && it != "null" }
+        val year = d.optString("release_date", d.optString("first_air_date")).take(4).toIntOrNull()
+        return if (d.has("seasons")) {
+            val eps = mutableListOf<Episode>()
+            val seasons = d.optJSONArray("seasons") ?: JSONArray()
+            for (i in 0 until seasons.length()) {
+                val s = seasons.getJSONObject(i)
+                val sn = s.optInt("season_number")
+                val el = s.optJSONArray("episodes") ?: continue
+                for (j in 0 until el.length()) {
+                    val e = el.getJSONObject(j)
+                    eps += newEpisode(links(e.optJSONArray("videos"))) {
+                        this.season = sn
+                        this.episode = e.optInt("episode_number")
+                        this.name = e.optString("name").takeIf { it.isNotBlank() && it != "null" }
+                    }
+                }
+            }
+            newTvSeriesLoadResponse(name, url, TvType.TvSeries, eps) {
+                posterUrl = poster(d); this.plot = plot; this.year = year
+            }
+        } else {
+            var data = links(d.optJSONArray("videos"))
+            d.optString("direct_link").takeIf { it.isNotBlank() && it != "null" }?.let { data += "\n$it" }
+            newMovieLoadResponse(name, url, TvType.Movie, data.trim()) {
+                posterUrl = poster(d); this.plot = plot; this.year = year
+            }
+        }
     }
 
     private fun quality(s: String) =
@@ -232,36 +175,9 @@ class SinewixProvider : MainAPI() {
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val j = try { JSONObject(data) } catch (e: Exception) { return false }
-        val tv = j.optBoolean("tv")
-        val tmdbId = j.optString("id")
-        val year = j.optInt("y").takeIf { it > 0 }
-
-        val pid = findPanelId(listOf(j.optString("t"), j.optString("o")), year, tv, tmdbId) ?: return false
-        val d = panelDetail(pid, tv) ?: return false
-
-        val found = mutableListOf<String>()
-        if (tv) {
-            val sn = j.optInt("s")
-            val en = j.optInt("e")
-            val seasons = d.optJSONArray("seasons") ?: JSONArray()
-            for (i in 0 until seasons.length()) {
-                val s = seasons.getJSONObject(i)
-                if (s.optInt("season_number") != sn) continue
-                val el = s.optJSONArray("episodes") ?: continue
-                for (k in 0 until el.length()) {
-                    val e = el.getJSONObject(k)
-                    if (e.optInt("episode_number") == en) found += links(e.optJSONArray("videos"))
-                }
-            }
-        } else {
-            found += links(d.optJSONArray("videos"))
-            d.str("direct_link")?.let { found += it }
-        }
-
         var ok = false
         val ua = mapOf("User-Agent" to SinewixApi.WEB_UA)
-        for (u in found.distinct().take(8)) {
+        for (u in data.split("\n").map { it.trim() }.filter { it.isNotEmpty() }.take(8)) {
             var direct: String? = null
             var type = ExtractorLinkType.VIDEO
             if (u.contains("mediafire.com", true)) {
