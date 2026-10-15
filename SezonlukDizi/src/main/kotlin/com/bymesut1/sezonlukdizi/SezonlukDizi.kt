@@ -1,6 +1,7 @@
 package com.bymesut1.sezonlukdizi
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
@@ -31,8 +32,9 @@ class SezonlukDizi : MainAPI() {
     private val dbg = ArrayList<String>()
 
     private fun note(s: String) {
+        Log.d("SZD", s)
         synchronized(dbg) {
-            if (dbg.size < 40) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
+            if (dbg.size < 80) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
         }
     }
 
@@ -302,9 +304,10 @@ class SezonlukDizi : MainAPI() {
                     referer = page,
                     data = mapOf("bid" to bid, "dil" to dil)
                 )
-            }.getOrNull() ?: continue
+            }.onFailure { note("alt n=$n dil=$dil EX ${it.message}") }.getOrNull() ?: continue
             if (r.code == 404) continue
             val t = r.text
+            note("alt n=$n dil=$dil k=${r.code} ${t.take(60)}")
             val alts = parseAlts(t)
             if (alts.isNotEmpty() || Regex("""["']status["']""").containsMatchIn(t)) {
                 note("alt dil=$dil no=$n kayit=${alts.size}")
@@ -324,7 +327,7 @@ class SezonlukDizi : MainAPI() {
                     referer = page,
                     data = mapOf("id" to id)
                 )
-            }.getOrNull() ?: continue
+            }.onFailure { note("emb n=$n EX ${it.message}") }.getOrNull() ?: continue
             if (r.code == 404) continue
             val t = r.text.replace("\\/", "/").replace("\\\"", "\"")
             val src = Regex("""<iframe[^>]+?(?:data-src|src)=["']([^"']+)["']""", ic)
@@ -350,7 +353,7 @@ class SezonlukDizi : MainAPI() {
         val host = hostOf(url)
         val id = Regex("""/(?:e|d|v)/([A-Za-z0-9]+)""").find(url)?.groupValues?.get(1)
             ?: url.substringBefore("?").trimEnd('/').substringAfterLast("/")
-        val txt = runCatching {
+        val resp = runCatching {
             app.get(
                 "https://$host/api/videos/$id/embed/playback",
                 headers = mapOf(
@@ -359,11 +362,13 @@ class SezonlukDizi : MainAPI() {
                     "Referer" to url,
                     "Origin" to "https://$host"
                 )
-            ).text
-        }.getOrNull() ?: run {
+            )
+        }.onFailure { note("byse api EX ${it.message}") }.getOrNull() ?: run {
             note("byse api yok")
             return emptyList()
         }
+        val txt = resp.text
+        note("byse api k=${resp.code} len=${txt.length} ${txt.take(40)}")
 
         return runCatching {
             val pb = JSONObject(txt).getJSONObject("playback")
@@ -416,6 +421,8 @@ class SezonlukDizi : MainAPI() {
         if (!own) {
             val got = mutableListOf<ExtractorLink>()
             runCatching { loadExtractor(u, page, subtitleCallback) { got.add(it) } }
+                .onFailure { note("ext EX $host ${it.message}") }
+            note("ext $host got=${got.size}")
             for (l in got) {
                 callback(
                     newExtractorLink(tag, tag, l.url, l.type) {
@@ -511,7 +518,7 @@ class SezonlukDizi : MainAPI() {
         note("bid=$bid")
         if (bid.isBlank()) {
             if (debugMode) {
-                callback(newExtractorLink(name, "DEBUG: bid yok", "https://debug.invalid/", ExtractorLinkType.VIDEO))
+                callback(newExtractorLink(name, "DEBUG: bid yok", "https://debug.invalid/0", ExtractorLinkType.VIDEO))
                 return true
             }
             return false
@@ -543,9 +550,9 @@ class SezonlukDizi : MainAPI() {
         }
 
         if (!ok && debugMode) {
-            val items = synchronized(dbg) { dbg.take(25).toList() }
+            val items = synchronized(dbg) { dbg.take(60).toList() }
             items.forEachIndexed { i, s ->
-                callback(newExtractorLink(name, "DEBUG ${i + 1}: $s", "https://debug.invalid/", ExtractorLinkType.VIDEO))
+                callback(newExtractorLink(name, "DEBUG ${i + 1}: $s", "https://debug.invalid/${i + 1}", ExtractorLinkType.VIDEO))
             }
             return items.isNotEmpty()
         }
