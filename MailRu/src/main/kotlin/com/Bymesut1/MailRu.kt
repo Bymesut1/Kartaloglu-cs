@@ -24,7 +24,6 @@ class MailRu : MainAPI() {
     )
 
     private val minSeconds  = 300
-    private val homePages   = 3
     private val searchPages = 6
 
     override val mainPage = mainPageOf(
@@ -173,15 +172,50 @@ class MailRu : MainAPI() {
 
     private fun keep(x: ListItem) = x.dur == 0 || x.dur >= minSeconds
 
-    // ---------------- Ana sayfa / arama ----------------
+    // ---------------- Ana sayfa (hesabın tüm videoları, sayfa sayfa) ----------------
+
+    private val pageUrls = ConcurrentHashMap<String, String>()
+
+    private data class PageResult(val items: List<ListItem>, val next: String?)
+
+    private suspend fun fetchPage(url: String): PageResult {
+        val html = try {
+            app.get(url, headers = pageHeaders()).text
+        } catch (e: Exception) {
+            return PageResult(emptyList(), null)
+        }
+        val href = reMore.find(html)?.groupValues?.get(1)
+        return PageResult(parseItems(html), href?.let { absolutize(decodeHtml(it)) })
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val items = fetchAccount(request.name, homePages)
-            .filter(::keep)
-            .distinctBy { it.path }
-            .map { it.toSearch() }
-        return newHomePageResponse(request.name, items, hasNext = false)
+        val acc = request.name
+        var url: String? = if (page <= 1) request.data else pageUrls["$acc:$page"]
+
+        if (url == null && page > 1) {
+            // ara sayfaların adresi bilinmiyorsa baştan yürü
+            var u: String? = request.data
+            for (p in 1 until page) {
+                val cur = u ?: break
+                u = fetchPage(cur).next
+                if (u != null) pageUrls["$acc:${p + 1}"] = u
+            }
+            url = u
+        }
+        if (url == null) return newHomePageResponse(request.name, emptyList(), hasNext = false)
+
+        var res = fetchPage(url)
+        if (res.items.isEmpty() && page <= 1) {
+            // mobil liste boşsa masaüstü listeyi dene
+            res = fetchPage("$mainUrl/mail/$acc/video/_myvideo")
+        }
+        res.next?.let { pageUrls["$acc:${page + 1}"] = it }
+
+        val list = res.items.distinctBy { it.path }.map { it.toSearch() }
+        return newHomePageResponse(request.name, list, hasNext = res.next != null)
     }
+
+    // ---------------- Arama ----------------
 
     private var accountCache: List<ListItem>? = null
 
