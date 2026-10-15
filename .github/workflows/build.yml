@@ -30,7 +30,6 @@ jobs:
         run: |
           mkdir out
           cp AbiFilm0/build/*.cs3 out/
-          cp SezonlukDizi/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
