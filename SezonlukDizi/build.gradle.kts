@@ -1,20 +1,18 @@
-version = 8
+version = 9
 
 cloudstream {
-    description = "sezonlukdizi.cc - Türkçe Dublaj / Altyazılı dizi izle"
-    authors = listOf("Bymesut1")
+    authors     = listOf("keyiflerolsun","JustRelaxable")
+    language    = "tr"
+    description = "Güncel ve eski dizileri en iyi görüntü kalitesiyle bulabileceğiniz yabancı dizi izleme siteniz."
 
-    // 0: Down, 1: Ok, 2: Slow, 3: Beta only
-    status = 1
-
+    /**
+     * Status int as the following:
+     * 0: Down
+     * 1: Ok
+     * 2: Slow
+     * 3: Beta only
+    **/
+    status  = 1 // will be 3 if unspecified
     tvTypes = listOf("TvSeries")
-
-    requiresResources = false
-    language = "tr"
-
-    iconUrl = "https://www.google.com/s2/favicons?domain=sezonlukdizi.cc&sz=%size%"
-}
-
-android {
-    namespace = "com.bymesut1.sezonlukdizi"
+    iconUrl = "https://www.google.com/s2/favicons?domain=sezonlukdizi6.com&sz=%size%"
 }
