@@ -24,7 +24,8 @@ class MailRu : MainAPI() {
     )
 
     private val minSeconds  = 300
-    private val searchPages = 6
+    private val searchPages = 10   // hesap listesi en fazla kaç sayfa (sayfa = 20 video) taransın; liste bitince kendiliğinden durur
+    private val pageSize    = 20
 
     override val mainPage = mainPageOf(
         *accounts.map { "$mobileUrl/mail/$it/video/" to it }.toTypedArray()
@@ -139,10 +140,32 @@ class MailRu : MainAPI() {
         return all
     }
 
+    private fun accountPageUrl(acc: String, offset: Int): String =
+        "$mobileUrl/mail/$acc/video/_myvideo?&offset=$offset&sameFromAjax=1"
+
+    private suspend fun fetchPage(url: String): List<ListItem> {
+        val html = try {
+            app.get(url, headers = pageHeaders()).text
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        return parseItems(html)
+    }
+
+    // hesabın videoları: 1. sayfa + offset=20, 40, ... (liste bitince ya da tekrar edince durur)
     private suspend fun fetchAccount(acc: String, pages: Int): List<ListItem> {
-        val m = fetchList("$mobileUrl/mail/$acc/video/", pages)
-        if (m.isNotEmpty()) return m
-        return fetchList("$mainUrl/mail/$acc/video/_myvideo", pages)
+        var first = fetchPage("$mobileUrl/mail/$acc/video/")
+        if (first.isEmpty()) first = fetchPage("$mainUrl/mail/$acc/video/_myvideo")
+        val all = first.toMutableList()
+        var p = 1
+        while (p < pages && first.isNotEmpty()) {
+            val more = fetchPage(accountPageUrl(acc, p * pageSize))
+            if (more.isEmpty()) break
+            if (more.all { m -> all.any { it.path == m.path } }) break
+            all += more
+            p++
+        }
+        return all
     }
 
     // "tt.57556.Örümcek Adam.tr" -> "Örümcek Adam tr"
@@ -174,45 +197,23 @@ class MailRu : MainAPI() {
 
     // ---------------- Ana sayfa (hesabın tüm videoları, sayfa sayfa) ----------------
 
-    private val pageUrls = ConcurrentHashMap<String, String>()
-
-    private data class PageResult(val items: List<ListItem>, val next: String?)
-
-    private suspend fun fetchPage(url: String): PageResult {
-        val html = try {
-            app.get(url, headers = pageHeaders()).text
-        } catch (e: Exception) {
-            return PageResult(emptyList(), null)
-        }
-        val href = reMore.find(html)?.groupValues?.get(1)
-        return PageResult(parseItems(html), href?.let { absolutize(decodeHtml(it)) })
-    }
+    private val seenHome = ConcurrentHashMap<String, MutableSet<String>>()
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val acc = request.name
-        var url: String? = if (page <= 1) request.data else pageUrls["$acc:$page"]
 
-        if (url == null && page > 1) {
-            // ara sayfaların adresi bilinmiyorsa baştan yürü
-            var u: String? = request.data
-            for (p in 1 until page) {
-                val cur = u ?: break
-                u = fetchPage(cur).next
-                if (u != null) pageUrls["$acc:${p + 1}"] = u
-            }
-            url = u
-        }
-        if (url == null) return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        var items = if (page <= 1) fetchPage(request.data)
+        else fetchPage(accountPageUrl(acc, (page - 1) * pageSize))
+        if (items.isEmpty() && page <= 1) items = fetchPage("$mainUrl/mail/$acc/video/_myvideo")
 
-        var res = fetchPage(url)
-        if (res.items.isEmpty() && page <= 1) {
-            // mobil liste boşsa masaüstü listeyi dene
-            res = fetchPage("$mainUrl/mail/$acc/video/_myvideo")
-        }
-        res.next?.let { pageUrls["$acc:${page + 1}"] = it }
+        // aynı sayfa tekrar gelirse listeyi bitir
+        val seen: MutableSet<String> =
+            if (page <= 1) ConcurrentHashMap.newKeySet<String>().also { seenHome[acc] = it }
+            else seenHome.getOrPut(acc) { ConcurrentHashMap.newKeySet<String>() }
+        val fresh = items.filter { seen.add(it.path) }
 
-        val list = res.items.distinctBy { it.path }.map { it.toSearch() }
-        return newHomePageResponse(request.name, list, hasNext = res.next != null)
+        val list = fresh.map { it.toSearch() }
+        return newHomePageResponse(request.name, list, hasNext = fresh.isNotEmpty() && page < 50)
     }
 
     // ---------------- Arama ----------------
