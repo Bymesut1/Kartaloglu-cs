@@ -52,18 +52,34 @@ class SezonlukDizi : MainAPI() {
     private fun Document.toCards(): List<SearchResponse> {
         val map = LinkedHashMap<String, Pair<String, String?>>()
         for (a in select("a[href]")) {
-            val href = a.attr("href")
+            val href: String = a.attr("href")
             if (!slugRe.containsMatchIn(href)) continue
             val url = fixUrl(href.substringBefore("#").substringBefore("?"))
-            val img = a.selectFirst("img")
-            val t = listOf(img?.attr("alt"), a.attr("title"), a.text())
-                .firstOrNull { !it.isNullOrBlank() }?.trim()
-            val p = img?.let { im ->
-                listOf("data-src", "data-original", "src").map { k -> im.attr(k) }
-                    .firstOrNull { s -> s.isNotBlank() && !s.startsWith("data:") }
+
+            val altText: String = a.selectFirst("img")?.attr("alt") ?: ""
+            val titleAttr: String = a.attr("title")
+            val innerText: String = a.text()
+            var t = ""
+            for (c in listOf(altText, titleAttr, innerText)) {
+                if (c.isNotBlank()) {
+                    t = c.trim()
+                    break
+                }
             }
+
+            var p: String? = null
+            for (k in listOf("data-src", "data-original", "src")) {
+                val v: String = a.selectFirst("img")?.attr(k) ?: ""
+                if (v.isNotBlank() && !v.startsWith("data:")) {
+                    p = v
+                    break
+                }
+            }
+
             val old = map[url]
-            map[url] = Pair(old?.first?.takeIf { it.isNotBlank() } ?: t ?: "", old?.second ?: p)
+            val bestTitle = if (old != null && old.first.isNotBlank()) old.first else t
+            val bestPoster = old?.second ?: p
+            map[url] = Pair(bestTitle, bestPoster)
         }
         return map.map { (url, v) ->
             val slug = slugRe.find(url)?.groupValues?.get(1) ?: ""
@@ -108,14 +124,18 @@ class SezonlukDizi : MainAPI() {
         val epRe = Regex("""(\d+)-sezon-(\d+)-bolum\.html""", ic)
         data class Ep(val url: String, val s: Int, val e: Int, val label: String?)
 
-        val all = doc.select("a[href]").mapNotNull { a ->
-            val href = a.attr("href")
-            val m = epRe.find(href) ?: return@mapNotNull null
-            Ep(
-                fixUrl(href.substringBefore("#").substringBefore("?")),
-                m.groupValues[1].toInt(),
-                m.groupValues[2].toInt(),
-                a.text().trim().takeIf { it.isNotBlank() && it.length < 80 }
+        val all = ArrayList<Ep>()
+        for (a in doc.select("a[href]")) {
+            val href: String = a.attr("href")
+            val m = epRe.find(href) ?: continue
+            val txt: String = a.text().trim()
+            all.add(
+                Ep(
+                    fixUrl(href.substringBefore("#").substringBefore("?")),
+                    m.groupValues[1].toInt(),
+                    m.groupValues[2].toInt(),
+                    if (txt.isNotBlank() && txt.length < 80) txt else null
+                )
             )
         }
         val mine = all.filter { slug.isNotBlank() && it.url.contains("/$slug/") }
@@ -324,8 +344,9 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/")
-        val bid = res.document.selectFirst("#dilsec")?.attr("data-id")?.takeIf { it.isNotBlank() }
-            ?: return false
+        val bidRaw: String = res.document.selectFirst("#dilsec")?.attr("data-id") ?: ""
+        if (bidRaw.isBlank()) return false
+        val bid = bidRaw
 
         val found = ajaxPathsIn(res.text)
         val cands = altCandidates(found)
