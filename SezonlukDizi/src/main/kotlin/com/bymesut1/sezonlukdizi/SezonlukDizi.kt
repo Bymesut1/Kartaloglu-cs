@@ -18,9 +18,55 @@ class SezonlukDizi : MainAPI() {
     private val ic = RegexOption.IGNORE_CASE
     private val slugRe = Regex("""/diziler/([a-z0-9\-]+)\.html""")
 
+    // true: link çıkmazsa kaynak listesinde "DEBUG ..." satırları gösterir
+    private val debugMode = true
+    private val dbg = ArrayList<String>()
+
+    private fun note(s: String) {
+        synchronized(dbg) {
+            if (dbg.size < 40) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
+        }
+    }
+
+    private fun snip(s: String, n: Int = 50) = s.replace(Regex("\\s+"), " ").take(n)
+
+    private val turler = listOf(
+        "mini" to "Mini Dizi",
+        "animasyon" to "Animasyon",
+        "aile" to "Aile",
+        "aksiyon" to "Aksiyon",
+        "belgesel" to "Belgesel",
+        "bilimkurgu" to "Bilim Kurgu",
+        "biyografik" to "Biyografi",
+        "dram" to "Dram",
+        "fantastik" to "Fantastik",
+        "gerilim" to "Gerilim",
+        "gizem" to "Gizem",
+        "korku" to "Korku",
+        "komedi" to "Komedi",
+        "macera" to "Macera",
+        "muzikal" to "Müzikal",
+        "suc" to "Suç",
+        "romantik" to "Romantik",
+        "savas" to "Savaş",
+        "tarihi" to "Tarihi",
+        "western" to "Western"
+    )
+
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Ana Sayfa",
-        "$mainUrl/diziler.asp" to "Tüm Diziler"
+        *(
+            listOf(
+                "$mainUrl/" to "Ana Sayfa",
+                "$mainUrl/diziler.asp" to "Tüm Diziler",
+                "$mainUrl/trend" to "Trend",
+                "$mainUrl/diziler.asp?kat=1" to "Yabancı Diziler",
+                "$mainUrl/diziler.asp?kat=2" to "Yerli Diziler",
+                "$mainUrl/diziler.asp?kat=3" to "Asya Dizileri",
+                "$mainUrl/diziler.asp?kat=4" to "Animasyonlar",
+                "$mainUrl/diziler.asp?kat=5" to "Animeler",
+                "$mainUrl/diziler.asp?kat=6" to "Belgeseller"
+            ) + turler.map { "$mainUrl/diziler.asp?tur=${it.first}" to it.second }
+            ).toTypedArray()
     )
 
     // ---------------- Yardımcılar ----------------
@@ -48,6 +94,12 @@ class SezonlukDizi : MainAPI() {
 
     private fun titleFromSlug(slug: String) =
         slug.split('-').joinToString(" ") { w -> w.replaceFirstChar { it.uppercase() } }
+
+    private fun findM3u8(text: String): String? {
+        val t = text.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+        return Regex("""["'](https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)["']""", ic).find(t)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)""", ic).find(t)?.groupValues?.get(1)
+    }
 
     private fun Document.toCards(): List<SearchResponse> {
         val map = LinkedHashMap<String, Pair<String, String?>>()
@@ -94,7 +146,7 @@ class SezonlukDizi : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
-        val doc = app.get(request.data, headers = mapOf("User-Agent" to ua)).document
+        val doc = app.get(request.data, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/").document
         return newHomePageResponse(request.name, doc.toCards(), false)
     }
 
@@ -109,8 +161,57 @@ class SezonlukDizi : MainAPI() {
 
     // ---------------- Dizi sayfası ----------------
 
+    private data class Ep(val url: String, val s: Int, val e: Int, val label: String?)
+
+    private fun epName(raw: String): String? {
+        var t = raw.replace(Regex("<[^>]+>"), " ").replace("&nbsp;", " ")
+            .replace(Regex("\\s+"), " ").trim()
+        t = t.replace(Regex("""\d+\.\s*Sezon\s*\d+\.\s*Bölüm""", ic), " ")
+        t = t.replace(Regex("""^\s*\d+\.?\s*(\d+[.,]\d+)?\s*"""), "")
+        t = t.replace(Regex("\\s+"), " ").trim()
+        return if (t.isNotBlank() && t.length < 90) t else null
+    }
+
+    private fun epUrl(href: String, slug: String): String = when {
+        href.startsWith("http") -> href
+        href.startsWith("//") -> "https:$href"
+        href.startsWith("/") -> mainUrl + href
+        else -> "$mainUrl/$slug/$href"
+    }
+
+    private fun collectEps(raw: String, slug: String, map: MutableMap<String, Ep>) {
+        val t = raw.replace("\\/", "/").replace("&amp;", "&")
+
+        val reA = Regex(
+            """<a[^>]+href=["']([^"']*?(\d+)-sezon-(\d+)-bolum\.html)["'][^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        for (m in reA.findAll(t)) {
+            val url = epUrl(m.groupValues[1], slug)
+            if (slug.isNotBlank() && !url.contains("/$slug/")) continue
+            val s = m.groupValues[2].toInt()
+            val e = m.groupValues[3].toInt()
+            val key = "$s-$e"
+            if (!map.containsKey(key)) map[key] = Ep(url, s, e, epName(m.groupValues[4]))
+        }
+
+        val reB = Regex("""["']([^"']*?(\d+)-sezon-(\d+)-bolum\.html)["']""", ic)
+        for (m in reB.findAll(t)) {
+            val url = epUrl(m.groupValues[1], slug)
+            if (slug.isNotBlank() && !url.contains("/$slug/")) continue
+            val s = m.groupValues[2].toInt()
+            val e = m.groupValues[3].toInt()
+            val key = "$s-$e"
+            if (!map.containsKey(key)) map[key] = Ep(url, s, e, null)
+        }
+    }
+
+    private fun findDid(html: String): String? =
+        Regex("""\bdid\s*[=:]\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
+
     override suspend fun load(url: String): LoadResponse? {
-        val doc = app.get(url, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/").document
+        val res = app.get(url, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/")
+        val doc = res.document
         val slug = slugRe.find(url)?.groupValues?.get(1) ?: ""
         val title = cleanTitle(
             doc.selectFirst("meta[property=og:title]")?.attr("content")
@@ -121,26 +222,37 @@ class SezonlukDizi : MainAPI() {
         val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
             ?: doc.selectFirst("meta[name=description]")?.attr("content")
 
-        val epRe = Regex("""(\d+)-sezon-(\d+)-bolum\.html""", ic)
-        data class Ep(val url: String, val s: Int, val e: Int, val label: String?)
+        val epMap = LinkedHashMap<String, Ep>()
+        collectEps(res.text, slug, epMap)
 
-        val all = ArrayList<Ep>()
-        for (a in doc.select("a[href]")) {
-            val href: String = a.attr("href")
-            val m = epRe.find(href) ?: continue
-            val txt: String = a.text().trim()
-            all.add(
-                Ep(
-                    fixUrl(href.substringBefore("#").substringBefore("?")),
-                    m.groupValues[1].toInt(),
-                    m.groupValues[2].toInt(),
-                    if (txt.isNotBlank() && txt.length < 80) txt else null
-                )
-            )
+        // Dizi id'sini (did) bul: önce dizi sayfasında, yoksa bir bölüm sayfasında
+        var did: String? = findDid(res.text)
+        if (did == null && slug.isNotBlank()) {
+            val first = epMap.values.firstOrNull()?.url ?: "$mainUrl/$slug/1-sezon-1-bolum.html"
+            val t = runCatching {
+                app.get(first, headers = mapOf("User-Agent" to ua), referer = url).text
+            }.getOrNull()
+            if (t != null) did = findDid(t)
         }
-        val mine = all.filter { slug.isNotBlank() && it.url.contains("/$slug/") }
-        val episodes = (if (mine.isNotEmpty()) mine else all)
-            .distinctBy { it.s to it.e }
+
+        // Tüm sezonların bölümlerini sitenin kendi ajax adresinden çek
+        if (did != null) {
+            for (sno in 1..40) {
+                val before = epMap.size
+                val t = runCatching {
+                    app.post(
+                        "$mainUrl/ajax/dataIzleBolumler.asp",
+                        headers = ajaxHeaders(url),
+                        referer = url,
+                        data = mapOf("did" to did, "sno" to sno.toString())
+                    ).text
+                }.getOrNull() ?: ""
+                collectEps(t, slug, epMap)
+                if (sno > 1 && (t.isBlank() || epMap.size == before)) break
+            }
+        }
+
+        val episodes = epMap.values
             .sortedWith(compareBy({ it.s }, { it.e }))
             .map { ep ->
                 newEpisode(ep.url) {
@@ -204,6 +316,7 @@ class SezonlukDizi : MainAPI() {
 
     private suspend fun probeAlt(bid: String, dil: Int, page: String, cands: List<String>): AltRes {
         var okPath: String? = null
+        var n404 = 0
         for (path in cands) {
             val r = runCatching {
                 app.post(
@@ -212,12 +325,21 @@ class SezonlukDizi : MainAPI() {
                     referer = page,
                     data = mapOf("bid" to bid, "dil" to dil.toString())
                 )
-            }.getOrNull() ?: continue
-            if (r.code == 404) continue
+            }.getOrNull()
+            if (r == null) {
+                note("alt$dil ${path.removePrefix("/ajax/")} istek hatasi")
+                continue
+            }
+            if (r.code == 404) {
+                n404++
+                continue
+            }
             if (okPath == null) okPath = path
             val alts = parseAlts(r.text)
+            note("alt$dil ${path.removePrefix("/ajax/")} ${r.code} n=${alts.size} ${snip(r.text, 40)}")
             if (alts.isNotEmpty()) return AltRes(path, alts)
         }
+        if (n404 > 0) note("alt$dil 404 x$n404")
         return AltRes(okPath, emptyList())
     }
 
@@ -246,6 +368,7 @@ class SezonlukDizi : MainAPI() {
             }.getOrNull() ?: continue
             if (r.code == 404) continue
             val frames = iframesOf(r.text)
+            note("emb ${path.removePrefix("/ajax/")} ${r.code} fr=${frames.size} ${snip(frames.firstOrNull() ?: r.text, 45)}")
             frames.firstOrNull { !isCaptcha(it) }?.let { return it }
             if (cap == null) cap = frames.firstOrNull { isCaptcha(it) }
         }
@@ -274,6 +397,7 @@ class SezonlukDizi : MainAPI() {
         depth: Int = 0
     ): List<ExtractorLink> {
         val u = absUrl(embed)
+        note("res ${hostOf(u)} d$depth")
 
         if (Regex("""\.m3u8(\?|$)""", ic).containsMatchIn(u)) return listOf(mk(u, label, ExtractorLinkType.M3U8, page))
         if (Regex("""\.(mp4|mkv|webm)(\?|$)""", ic).containsMatchIn(u)) return listOf(mk(u, label, ExtractorLinkType.VIDEO, page))
@@ -292,12 +416,28 @@ class SezonlukDizi : MainAPI() {
             val cand = Regex("""https?://[^"'\s<>\\)]+""").findAll(txt.replace("\\/", "/"))
                 .map { it.value }
                 .firstOrNull { Regex("pixeldrain|vidmoly|filemoon|bysejikuar|bysezoxexe|bysekoze", ic).containsMatchIn(hostOf(it)) }
+            if (cand == null) note("captcha: hosterlink yok")
             return if (cand != null && depth < 3) resolveEmbed(cand, page, label, subs, depth + 1) else emptyList()
+        }
+
+        // Vidmoly: kendi çözücümüz (sayfadan m3u8'i çıkarır)
+        if (Regex("vidmoly", ic).containsMatchIn(hostOf(u))) {
+            val txt = runCatching {
+                app.get(u, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/").text
+            }.getOrNull()
+            if (txt != null) {
+                val m3 = findM3u8(txt) ?: runCatching { findM3u8(getAndUnpack(txt)) }.getOrNull()
+                if (m3 != null) return listOf(mk(m3, label, ExtractorLinkType.M3U8, "https://${hostOf(u)}/"))
+                note("vidmoly: m3u8 yok ${snip(txt, 40)}")
+            } else {
+                note("vidmoly: sayfa alinamadi")
+            }
         }
 
         // CloudStream'in hazır çıkarıcıları (VidMoly, Filemoon vb.)
         val got = mutableListOf<ExtractorLink>()
         runCatching { loadExtractor(u, page, subs) { got.add(it) } }
+        note("extractor ${hostOf(u)} -> ${got.size}")
         if (got.isNotEmpty()) return got.map { relabel(it, label) }
 
         // Genel çözüm: sayfada m3u8 / mp4 ara
@@ -306,9 +446,9 @@ class SezonlukDizi : MainAPI() {
         }.getOrNull() ?: return emptyList()
         val hay = listOf(text, runCatching { getAndUnpack(text) }.getOrDefault(""))
         for (h in hay) {
-            val t = h.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
-            val m3 = Regex("""["'](https?:[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*)["']""", ic).find(t)?.groupValues?.get(1)
+            val m3 = findM3u8(h)
             if (m3 != null) return listOf(mk(m3, label, ExtractorLinkType.M3U8, "https://${hostOf(u)}/"))
+            val t = h.replace("\\/", "/").replace("&amp;", "&")
             val mp = Regex("""["'](https?:[^"'\s<>\\]+\.(?:mp4|mkv|webm)[^"'\s<>\\]*)["']""", ic).find(t)?.groupValues?.get(1)
             if (mp != null) return listOf(mk(mp, label, ExtractorLinkType.VIDEO, "https://${hostOf(u)}/"))
         }
@@ -321,6 +461,7 @@ class SezonlukDizi : MainAPI() {
                 if (n.startsWith("http") && n != u) return resolveEmbed(n, page, label, subs, depth + 1)
             }
         }
+        note("desteklenmeyen ${hostOf(u)}")
         return emptyList()
     }
 
@@ -332,7 +473,11 @@ class SezonlukDizi : MainAPI() {
         label: String,
         subs: (SubtitleFile) -> Unit
     ): List<ExtractorLink> {
-        val iu = embedFetch(alt.first, altPath, page, found) ?: return emptyList()
+        val iu = embedFetch(alt.first, altPath, page, found)
+        if (iu == null) {
+            note("embed yok id=${alt.first}")
+            return emptyList()
+        }
         val tag = if (alt.second.isBlank()) label else "$label • ${alt.second}"
         return resolveEmbed(iu, page, tag, subs)
     }
@@ -343,12 +488,22 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        synchronized(dbg) { dbg.clear() }
+
         val res = app.get(data, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/")
         val bidRaw: String = res.document.selectFirst("#dilsec")?.attr("data-id") ?: ""
-        if (bidRaw.isBlank()) return false
+        note("sayfa ${res.code} len=${res.text.length} bid=$bidRaw")
+        if (bidRaw.isBlank()) {
+            if (debugMode) {
+                callback(newExtractorLink(name, "DEBUG: bid yok (sayfa ${res.code})", "https://debug.invalid/", ExtractorLinkType.VIDEO))
+                return true
+            }
+            return false
+        }
         val bid = bidRaw
 
         val found = ajaxPathsIn(res.text)
+        note("ajax yollari: ${found.size}")
         val cands = altCandidates(found)
 
         var ok = false
@@ -366,6 +521,14 @@ class SezonlukDizi : MainAPI() {
                 callback(it)
                 ok = true
             }
+        }
+
+        if (!ok && debugMode) {
+            val items = synchronized(dbg) { dbg.take(14).toList() }
+            items.forEachIndexed { i, s ->
+                callback(newExtractorLink(name, "DEBUG ${i + 1}: $s", "https://debug.invalid/", ExtractorLinkType.VIDEO))
+            }
+            return items.isNotEmpty()
         }
         return ok
     }
