@@ -1,4 +1,4 @@
-version = 5
+version = 6
 
 cloudstream {
     description = "sezonlukdizi.cc - Türkçe Dublaj / Altyazılı dizi izle"
