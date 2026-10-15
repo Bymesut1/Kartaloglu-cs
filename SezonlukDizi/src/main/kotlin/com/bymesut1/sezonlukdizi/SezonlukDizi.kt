@@ -2,6 +2,7 @@ package com.bymesut1.sezonlukdizi
 
 import android.util.Base64
 import android.util.Log
+import kotlinx.coroutines.delay
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
@@ -30,6 +31,7 @@ class SezonlukDizi : MainAPI() {
     // true: link çıkmazsa kaynak listesinde "DEBUG ..." satırları gösterir
     private val debugMode = true
     private val dbg = ArrayList<String>()
+    private var captchaDumped = false
 
     private fun note(s: String) {
         Log.d("SZD", s)
@@ -318,17 +320,32 @@ class SezonlukDizi : MainAPI() {
         return null
     }
 
+    // Cloudflare 429 (rate limit) gelirse bekleyip tekrar dene
+    private suspend fun postRetry(url: String, page: String, data: Map<String, String>, tag: String) = run {
+        var resp = runCatching {
+            app.post(url, headers = ajaxHeaders(page), referer = page, data = data)
+        }.onFailure { note("$tag EX ${it.message}") }.getOrNull()
+        var i = 0
+        while (resp != null && resp.code == 429 && i < 2) {
+            i++
+            note("$tag 429 bekle $i")
+            delay(3000L * i)
+            resp = runCatching {
+                app.post(url, headers = ajaxHeaders(page), referer = page, data = data)
+            }.getOrNull()
+        }
+        resp
+    }
+
     private suspend fun fetchIframe(id: String, nums: List<String>, page: String): Pair<String, String>? {
+        delay(800) // istekleri yavaşlat: Cloudflare 429 engeli
         for (n in nums) {
-            val r = runCatching {
-                app.post(
-                    "$mainUrl/ajax/dataEmbed$n.asp",
-                    headers = ajaxHeaders(page),
-                    referer = page,
-                    data = mapOf("id" to id)
-                )
-            }.onFailure { note("emb n=$n EX ${it.message}") }.getOrNull() ?: continue
+            val r = postRetry("$mainUrl/ajax/dataEmbed$n.asp", page, mapOf("id" to id), "emb n=$n") ?: continue
             if (r.code == 404) continue
+            if (r.code == 429) {
+                note("emb 429 vazgec id=$id")
+                return null
+            }
             val t = r.text.replace("\\/", "/").replace("\\\"", "\"")
             val src = Regex("""<iframe[^>]+?(?:data-src|src)=["']([^"']+)["']""", ic)
                 .find(t)?.groupValues?.get(1)
@@ -353,22 +370,48 @@ class SezonlukDizi : MainAPI() {
         val host = hostOf(url)
         val id = Regex("""/(?:e|d|v)/([A-Za-z0-9]+)""").find(url)?.groupValues?.get(1)
             ?: url.substringBefore("?").trimEnd('/').substringAfterLast("/")
-        val resp = runCatching {
-            app.get(
-                "https://$host/api/videos/$id/embed/playback",
+        // Byse: asıl player başka bir alan adında (embed_frame_url). Playback API orada.
+        var apiHost = host
+        var frameUrl = url
+        runCatching {
+            val d = app.get(
+                "https://$host/api/videos/$id/embed/details",
                 headers = mapOf(
                     "User-Agent" to ua,
-                    "Accept" to "application/json",
+                    "Accept" to "*/*",
                     "Referer" to url,
-                    "Origin" to "https://$host"
+                    "X-Embed-Parent" to url,
+                    "Origin" to mainUrl
                 )
-            )
-        }.onFailure { note("byse api EX ${it.message}") }.getOrNull() ?: run {
-            note("byse api yok")
-            return emptyList()
+            ).text
+            note("byse det ${d.take(90)}")
+            Regex(""""embed_frame_url"\s*:\s*"([^"]+)"""").find(d)?.groupValues?.get(1)
+                ?.replace("\\/", "/")?.let { f ->
+                    frameUrl = f
+                    apiHost = hostOf(f)
+                }
+        }.onFailure { note("byse det EX ${it.message}") }
+        note("byse api host=$apiHost")
+
+        var txt = ""
+        for (org in listOf("https://$apiHost", mainUrl)) {
+            val resp = runCatching {
+                app.get(
+                    "https://$apiHost/api/videos/$id/embed/playback",
+                    headers = mapOf(
+                        "User-Agent" to ua,
+                        "Accept" to "application/json",
+                        "Referer" to frameUrl,
+                        "X-Embed-Parent" to url,
+                        "Origin" to org
+                    )
+                )
+            }.onFailure { note("byse api EX ${it.message}") }.getOrNull() ?: continue
+            txt = resp.text
+            note("byse api k=${resp.code} len=${txt.length} ${txt.take(40)}")
+            if (txt.contains("playback")) break
         }
-        val txt = resp.text
-        note("byse api k=${resp.code} len=${txt.length} ${txt.take(40)}")
+        if (txt.isBlank()) return emptyList()
 
         return runCatching {
             val pb = JSONObject(txt).getJSONObject("playback")
@@ -463,6 +506,17 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
+        if (own && u.contains("recaptcha", true)) {
+            if (!captchaDumped) {
+                captchaDumped = true
+                val cp = runCatching { app.get(u, headers = baseHeaders, referer = page).text }.getOrNull()
+                Log.d("SZD", "CAPTCHA URL $u")
+                Log.d("SZD", "CAPTCHA BODY $cp")
+            }
+            note("captcha atlandi ${u.substringAfter("//").take(95)}")
+            return false
+        }
+
         val txt = runCatching { app.get(u, headers = baseHeaders, referer = page).text }.getOrNull()
         if (txt == null) {
             note("get fail $host")
@@ -512,6 +566,7 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         synchronized(dbg) { dbg.clear() }
+        captchaDumped = false
 
         val document = app.get(data, headers = baseHeaders, referer = "$mainUrl/").document
         val bid: String = document.selectFirst("div#dilsec")?.attr("data-id") ?: ""
@@ -543,7 +598,7 @@ class SezonlukDizi : MainAPI() {
                 }
                 embNums = listOf(fr.first)
                 val iframe = fr.second
-                note("iframe ${hostOf(iframe)}")
+                note("iframe ${iframe.substringAfter("//")}")
 
                 if (resolve(iframe, data, tag, 0, subtitleCallback, callback)) ok = true
             }
