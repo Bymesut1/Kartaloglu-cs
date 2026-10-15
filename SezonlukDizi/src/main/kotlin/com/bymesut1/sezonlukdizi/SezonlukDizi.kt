@@ -1,10 +1,16 @@
 package com.bymesut1.sezonlukdizi
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class SezonlukDizi : MainAPI() {
     override var mainUrl = "https://sezonlukdizi.cc"
@@ -26,7 +32,7 @@ class SezonlukDizi : MainAPI() {
 
     private fun note(s: String) {
         synchronized(dbg) {
-            if (dbg.size < 30) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
+            if (dbg.size < 40) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
         }
     }
 
@@ -74,6 +80,15 @@ class SezonlukDizi : MainAPI() {
         return when {
             x.startsWith("//") -> "https:$x"
             x.startsWith("/") -> mainUrl + x
+            else -> x
+        }
+    }
+
+    private fun absFrom(x0: String, base: String): String {
+        val x = x0.trim().replace("&amp;", "&")
+        return when {
+            x.startsWith("//") -> "https:$x"
+            x.startsWith("/") -> "https://${hostOf(base)}$x"
             else -> x
         }
     }
@@ -313,7 +328,11 @@ class SezonlukDizi : MainAPI() {
             if (r.code == 404) continue
             val t = r.text.replace("\\/", "/").replace("\\\"", "\"")
             val src = Regex("""<iframe[^>]+?(?:data-src|src)=["']([^"']+)["']""", ic)
-                .find(t)?.groupValues?.get(1) ?: continue
+                .find(t)?.groupValues?.get(1)
+            if (src == null) {
+                note("emb n=$n k=${r.code} ${t.take(60)}")
+                continue
+            }
             return n to absUrl(src)
         }
         return null
@@ -326,30 +345,157 @@ class SezonlukDizi : MainAPI() {
             this.headers = mapOf("User-Agent" to ua)
         }
 
-    // CloudStream'in hazır çıkarıcısı (VidMoly, Pixeldrain, Filemoon...) çözemezse buraya düşer
-    private suspend fun fallbackLinks(u: String, page: String, label: String): List<ExtractorLink> {
-        if (Regex("""\.m3u8(\?|$)""", ic).containsMatchIn(u)) return listOf(mk(u, label, ExtractorLinkType.M3U8, page))
-        if (Regex("""\.(mp4|mkv|webm)(\?|$)""", ic).containsMatchIn(u)) return listOf(mk(u, label, ExtractorLinkType.VIDEO, page))
+    // Byse / Filemoon klonu: şifreli playback API'sini çöz
+    private suspend fun byseLinks(url: String, label: String): List<ExtractorLink> {
+        val host = hostOf(url)
+        val id = Regex("""/(?:e|d|v)/([A-Za-z0-9]+)""").find(url)?.groupValues?.get(1)
+            ?: url.substringBefore("?").trimEnd('/').substringAfterLast("/")
+        val txt = runCatching {
+            app.get(
+                "https://$host/api/videos/$id/embed/playback",
+                headers = mapOf(
+                    "User-Agent" to ua,
+                    "Accept" to "application/json",
+                    "Referer" to url,
+                    "Origin" to "https://$host"
+                )
+            ).text
+        }.getOrNull() ?: run {
+            note("byse api yok")
+            return emptyList()
+        }
 
-        Regex("""pixeldrain\.[a-z]+/(?:u|api/file)/([A-Za-z0-9]+)""", ic).find(u)?.let {
-            return listOf(
-                mk("https://pixeldrain.com/api/file/${it.groupValues[1]}", label, ExtractorLinkType.VIDEO, "https://pixeldrain.com/")
+        return runCatching {
+            val pb = JSONObject(txt).getJSONObject("playback")
+            fun b64(s: String) = Base64.decode(s, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+            val iv = b64(pb.getString("iv"))
+            val payload = b64(pb.getString("payload"))
+            val kp = pb.getJSONArray("key_parts")
+            val bos = ByteArrayOutputStream()
+            for (i in 0 until kp.length()) bos.write(b64(kp.getString(i)))
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(bos.toByteArray(), "AES"),
+                GCMParameterSpec(128, iv)
             )
+            val plain = String(cipher.doFinal(payload), Charsets.UTF_8)
+            val arr = JSONObject(plain).getJSONArray("sources")
+            val out = ArrayList<ExtractorLink>()
+            for (i in 0 until arr.length()) {
+                val s = arr.getJSONObject(i)
+                val u = s.optString("url")
+                if (u.isBlank()) continue
+                val type = if (u.contains(".m3u8", true) || s.optString("mime_type").contains("mpegurl", true))
+                    ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                out.add(mk(u, label, type, "https://$host/"))
+            }
+            note("byse ok ${out.size}")
+            out
+        }.getOrElse {
+            note("byse hata ${it.message} | ${txt.take(50)}")
+            emptyList()
+        }
+    }
+
+    // iframe'i özyinelemeli çöz: hazır çıkarıcı -> Byse -> doğrudan link -> sayfa içi m3u8/mp4 -> iç içe iframe'ler
+    private suspend fun resolve(
+        u: String,
+        page: String,
+        tag: String,
+        depth: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (depth > 3) return false
+        val host = hostOf(u)
+        val ownHost = hostOf(mainUrl)
+        val own = host == ownHost || host.endsWith(".$ownHost")
+        var ok = false
+
+        if (!own) {
+            val got = mutableListOf<ExtractorLink>()
+            runCatching { loadExtractor(u, page, subtitleCallback) { got.add(it) } }
+            for (l in got) {
+                callback(
+                    newExtractorLink(tag, tag, l.url, l.type) {
+                        this.referer = l.referer
+                        this.quality = l.quality
+                        this.headers = l.headers
+                    }
+                )
+                ok = true
+            }
+            if (ok) return true
+
+            if (host.contains("byse")) {
+                for (l in byseLinks(u, tag)) {
+                    callback(l)
+                    ok = true
+                }
+                if (ok) return true
+            }
+            if (Regex("""\.m3u8(\?|$)""", ic).containsMatchIn(u)) {
+                callback(mk(u, tag, ExtractorLinkType.M3U8, page))
+                return true
+            }
+            if (Regex("""\.(mp4|mkv|webm)(\?|$)""", ic).containsMatchIn(u)) {
+                callback(mk(u, tag, ExtractorLinkType.VIDEO, page))
+                return true
+            }
+            Regex("""pixeldrain\.[a-z]+/(?:u|api/file)/([A-Za-z0-9]+)""", ic).find(u)?.let {
+                callback(
+                    mk(
+                        "https://pixeldrain.com/api/file/${it.groupValues[1]}",
+                        tag,
+                        ExtractorLinkType.VIDEO,
+                        "https://pixeldrain.com/"
+                    )
+                )
+                return true
+            }
         }
 
-        val text = runCatching {
-            app.get(u, headers = baseHeaders, referer = "$mainUrl/").text
-        }.getOrNull() ?: return emptyList()
+        val txt = runCatching { app.get(u, headers = baseHeaders, referer = page).text }.getOrNull()
+        if (txt == null) {
+            note("get fail $host")
+            return false
+        }
+        val html = txt.replace("\\/", "/").replace("&amp;", "&")
+        val unpacked = runCatching { getAndUnpack(html) }.getOrDefault("")
 
-        for (h in listOf(text, runCatching { getAndUnpack(text) }.getOrDefault(""))) {
+        for (h in listOf(html, unpacked)) {
             val m3 = findM3u8(h)
-            if (m3 != null) return listOf(mk(m3, label, ExtractorLinkType.M3U8, "https://${hostOf(u)}/"))
-            val t = h.replace("\\/", "/").replace("&amp;", "&")
+            if (m3 != null) {
+                callback(mk(m3, tag, ExtractorLinkType.M3U8, "https://$host/"))
+                return true
+            }
             val mp = Regex("""["'](https?:[^"'\s<>\\]+\.(?:mp4|mkv|webm)[^"'\s<>\\]*)["']""", ic)
-                .find(t)?.groupValues?.get(1)
-            if (mp != null) return listOf(mk(mp, label, ExtractorLinkType.VIDEO, "https://${hostOf(u)}/"))
+                .find(h)?.groupValues?.get(1)
+            if (mp != null) {
+                callback(mk(mp, tag, ExtractorLinkType.VIDEO, "https://$host/"))
+                return true
+            }
         }
-        return emptyList()
+
+        val nested = LinkedHashSet<String>()
+        for (m in Regex("""<iframe[^>]+?(?:data-src|src)=["']([^"']+)["']""", ic).findAll(html)) {
+            val a = absFrom(m.groupValues[1], u)
+            if (a.startsWith("http") && a != u) nested.add(a)
+        }
+        for (m in Regex(
+            """["'](https?://[^"'\s<>\\]*(?:byse|vidmoly|filemoon|pixeldrain|dood|streamtape|mixdrop|voe|ok\.ru|mail\.ru|uqload|sibnet)[^"'\s<>\\]*)["']""",
+            ic
+        ).findAll(html)) {
+            if (m.groupValues[1] != u) nested.add(m.groupValues[1])
+        }
+        note("pg ${host}${u.substringAfter(host).take(25)} len=${txt.length} n=${nested.size}")
+        if (nested.isEmpty()) note("body: ${html.take(80)}")
+
+        for (n in nested) {
+            if (resolve(n, u, tag, depth + 1, subtitleCallback, callback)) ok = true
+        }
+        return ok
     }
 
     override suspend fun loadLinks(
@@ -392,33 +538,12 @@ class SezonlukDizi : MainAPI() {
                 val iframe = fr.second
                 note("iframe ${hostOf(iframe)}")
 
-                val got = mutableListOf<ExtractorLink>()
-                runCatching { loadExtractor(iframe, "$mainUrl/", subtitleCallback) { got.add(it) } }
-
-                if (got.isNotEmpty()) {
-                    for (l in got) {
-                        callback(
-                            newExtractorLink(tag, tag, l.url, l.type) {
-                                this.referer = l.referer
-                                this.quality = l.quality
-                                this.headers = l.headers
-                            }
-                        )
-                        ok = true
-                    }
-                } else {
-                    val fb = fallbackLinks(iframe, data, tag)
-                    note("fallback ${hostOf(iframe)} -> ${fb.size}")
-                    for (l in fb) {
-                        callback(l)
-                        ok = true
-                    }
-                }
+                if (resolve(iframe, data, tag, 0, subtitleCallback, callback)) ok = true
             }
         }
 
         if (!ok && debugMode) {
-            val items = synchronized(dbg) { dbg.take(18).toList() }
+            val items = synchronized(dbg) { dbg.take(25).toList() }
             items.forEachIndexed { i, s ->
                 callback(newExtractorLink(name, "DEBUG ${i + 1}: $s", "https://debug.invalid/", ExtractorLinkType.VIDEO))
             }
