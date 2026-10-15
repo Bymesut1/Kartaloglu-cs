@@ -2,7 +2,6 @@ package com.bymesut1.sezonlukdizi
 
 import android.util.Base64
 import android.util.Log
-import kotlinx.coroutines.delay
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
@@ -32,6 +31,10 @@ class SezonlukDizi : MainAPI() {
     private val debugMode = true
     private val dbg = ArrayList<String>()
     private var captchaDumped = false
+
+    private fun pause(ms: Long) {
+        try { Thread.sleep(ms) } catch (_: InterruptedException) { }
+    }
 
     private fun note(s: String) {
         Log.d("SZD", s)
@@ -329,7 +332,7 @@ class SezonlukDizi : MainAPI() {
         while (resp != null && resp.code == 429 && i < 2) {
             i++
             note("$tag 429 bekle $i")
-            delay(3000L * i)
+            pause(3000L * i)
             resp = runCatching {
                 app.post(url, headers = ajaxHeaders(page), referer = page, data = data)
             }.getOrNull()
@@ -338,7 +341,7 @@ class SezonlukDizi : MainAPI() {
     }
 
     private suspend fun fetchIframe(id: String, nums: List<String>, page: String): Pair<String, String>? {
-        delay(800) // istekleri yavaşlat: Cloudflare 429 engeli
+        pause(800) // istekleri yavaşlat: Cloudflare 429 engeli
         for (n in nums) {
             val r = postRetry("$mainUrl/ajax/dataEmbed$n.asp", page, mapOf("id" to id), "emb n=$n") ?: continue
             if (r.code == 404) continue
