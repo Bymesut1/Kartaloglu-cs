@@ -24,7 +24,7 @@ class SezonlukDizi : MainAPI() {
 
     private fun note(s: String) {
         synchronized(dbg) {
-            if (dbg.size < 40) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
+            if (dbg.size < 60) dbg.add(s.replace(Regex("\\s+"), " ").take(110))
         }
     }
 
@@ -273,26 +273,57 @@ class SezonlukDizi : MainAPI() {
     private data class AltRes(val path: String?, val alts: List<Pair<String, String>>)
 
     private fun ajaxPathsIn(text: String): List<String> =
-        Regex("""["'`(=]\s*(/?ajax/[A-Za-z0-9_\-]+(?:\.[A-Za-z]{2,5})?)""", ic)
+        Regex("""(/?ajax/[A-Za-z0-9_\-]+(?:\.[A-Za-z]{2,5})?)""", ic)
             .findAll(text).map {
                 var p = it.groupValues[1]
                 if (!p.startsWith("/")) p = "/$p"
                 p
             }.distinct().toList()
 
+    // Sayfadaki ve sitenin .js dosyalarındaki ajax adreslerini bul
+    private suspend fun discoverAjax(html: String): List<String> {
+        var found = ajaxPathsIn(html)
+        val myHost = hostOf(mainUrl)
+        val srcs = Regex("""<script[^>]+src=["']([^"']+)["']""", ic).findAll(html)
+            .map { absUrl(it.groupValues[1]) }
+            .filter { hostOf(it) == myHost && Regex("""\.js(\?|$)""", ic).containsMatchIn(it) }
+            .distinct().take(6).toList()
+        note("js dosyasi ${srcs.size}")
+        for (s in srcs) {
+            val t = runCatching {
+                app.get(s, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/").text
+            }.getOrNull()
+            if (t == null) {
+                note("js alinamadi ${snip(s.substringAfterLast('/'), 30)}")
+                continue
+            }
+            val p = ajaxPathsIn(t)
+            note("js ${snip(s.substringAfterLast('/'), 22)} len=${t.length} ajax=${p.size}")
+            found = found + p
+        }
+        return found.distinct()
+    }
+
     private fun withExt(p: String): List<String> =
         if (Regex("""\.[A-Za-z]{2,5}$""").containsMatchIn(p)) listOf(p) else listOf(p, "$p.asp")
 
+    private fun isEmbedPath(p: String) = p.contains("embed", true)
+    private fun isOtherPath(p: String) = p.contains("bolumler", true) || p.contains("izlendi", true)
+
     private fun altCandidates(found: List<String>): List<String> {
-        val fromPage = found.filter { it.contains("alternatif", true) }.flatMap { withExt(it) }
-        val guess = listOf("3", "4", "5", "2", "6", "7", "8", "").map { "/ajax/dataAlternatif$it.asp" }
-        return (fromPage + guess).distinct()
+        val named = found.filter { it.contains("alternatif", true) }.flatMap { withExt(it) }
+        val others = found.filter { !isEmbedPath(it) && !isOtherPath(it) && !it.contains("alternatif", true) }
+            .flatMap { withExt(it) }
+        val guess = listOf("3", "4", "5", "2", "6", "7", "8", "1", "9", "").map { "/ajax/dataAlternatif$it.asp" }
+        return (named + guess + others).distinct()
     }
 
     private fun embedCandidates(altPath: String?, found: List<String>): List<String> {
-        val fromPage = found.filter { it.contains("embed", true) }.flatMap { withExt(it) }
+        val named = found.filter { isEmbedPath(it) }.flatMap { withExt(it) }
         val derived = if (altPath != null) listOf(altPath.replace(Regex("alternatif", ic), "Embed")) else emptyList()
-        return (fromPage + derived + listOf("/ajax/dataEmbed.asp")).distinct()
+        val others = found.filter { !isEmbedPath(it) && !isOtherPath(it) && it != altPath && !it.contains("alternatif", true) }
+            .flatMap { withExt(it) }
+        return (named + derived + listOf("/ajax/dataEmbed.asp") + others).distinct()
     }
 
     private fun ajaxHeaders(referer: String) = mapOf(
@@ -502,8 +533,9 @@ class SezonlukDizi : MainAPI() {
         }
         val bid = bidRaw
 
-        val found = ajaxPathsIn(res.text)
+        val found = discoverAjax(res.text)
         note("ajax yollari: ${found.size}")
+        found.take(10).forEach { note("ajax $it") }
         val cands = altCandidates(found)
 
         var ok = false
@@ -524,7 +556,7 @@ class SezonlukDizi : MainAPI() {
         }
 
         if (!ok && debugMode) {
-            val items = synchronized(dbg) { dbg.take(14).toList() }
+            val items = synchronized(dbg) { dbg.take(22).toList() }
             items.forEachIndexed { i, s ->
                 callback(newExtractorLink(name, "DEBUG ${i + 1}: $s", "https://debug.invalid/", ExtractorLinkType.VIDEO))
             }
