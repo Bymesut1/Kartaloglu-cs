@@ -2,9 +2,14 @@
 
 package com.bymesut1.sezonlukdizi
 
+import android.util.Log
+import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Document
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class SezonlukDizi : MainAPI() {
     override var mainUrl              = "https://sezonlukdizi.cc"
@@ -68,7 +73,6 @@ class SezonlukDizi : MainAPI() {
             )
         }
 
-
         val episodesReq = app.get("${mainUrl}/bolumler/${endpoint}").document
         val episodes    = mutableListOf<Episode>()
         for (sezon in episodesReq.select("table.unstackable")) {
@@ -85,7 +89,6 @@ class SezonlukDizi : MainAPI() {
                 })
             }
         }
-
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
@@ -142,7 +145,6 @@ class SezonlukDizi : MainAPI() {
                                 url = link.url,
                                 type = link.type
                             ) {
-                                // İsteğinize uygun olarak Quality, Headers'dan önce geliyor.
                                 this.quality = link.quality
                                 this.headers = link.headers
                             }
@@ -179,16 +181,15 @@ class SezonlukDizi : MainAPI() {
                 loadExtractor(iframe, "${mainUrl}/", subtitleCallback) { link ->
                     CoroutineScope(Dispatchers.IO).launch {
                         callback.invoke(
-                    newExtractorLink(
-                        source = "Dublaj - ${veri.baslik}",
-                        name = "Dublaj - ${veri.baslik}",
-                        url = link.url,
-                        type = link.type
-                    ) {
-                        // Quality, Headers'dan önce
-                        this.quality = link.quality
-                        this.headers = link.headers
-                    }
+                            newExtractorLink(
+                                source = "Dublaj - ${veri.baslik}",
+                                name = "Dublaj - ${veri.baslik}",
+                                url = link.url,
+                                type = link.type
+                            ) {
+                                this.quality = link.quality
+                                this.headers = link.headers
+                            }
                         )
                     }
                 }
@@ -198,13 +199,28 @@ class SezonlukDizi : MainAPI() {
         return true
     }
 
-    //Helper function for getting the number (probably some kind of version?) after the dataAlternatif and dataEmbed
-    private suspend fun getAspData() : AspData{
+    private suspend fun getAspData() : AspData {
         val websiteCustomJavascript = app.get("${this.mainUrl}/js/site.min.js")
         val dataAlternatifAsp = Regex("""dataAlternatif(.*?).asp""").find(websiteCustomJavascript.text)?.groupValues?.get(1)
             .toString()
         val dataEmbedAsp = Regex("""dataEmbed(.*?).asp""").find(websiteCustomJavascript.text)?.groupValues?.get(1)
             .toString()
-        return AspData(dataAlternatifAsp,dataEmbedAsp)
+        return AspData(dataAlternatifAsp, dataEmbedAsp)
     }
 }
+
+// --- EKSİK OLAN VERİ SINIFLARI (DATA CLASSES) ---
+data class Kaynak(
+    val status: String?,
+    val data: List<KaynakVeri>?
+)
+
+data class KaynakVeri(
+    val id: Int?,
+    val baslik: String?
+)
+
+data class AspData(
+    val alternatif: String,
+    val embed: String
+)
