@@ -9,7 +9,10 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Semaphore
@@ -50,16 +53,29 @@ class SezonlukDizi : MainAPI() {
     private fun Element.toSearchResult(): SearchResponse? {
         val title     = this.selectFirst("div.description")?.text()?.trim() ?: return null
         val href      = fixUrlNull(this.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img")?.attr("data-src"))
+        val posterUrl = fixUrlNull(
+            this.selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: this.selectFirst("img")?.attr("src")
+        )
 
         return newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = posterUrl }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q        = java.net.URLEncoder.encode(query, "UTF-8")
-        val document = app.get("${mainUrl}/diziler.asp?adi=$q").document
+        val url      = "${mainUrl}/diziler.asp?adi=$q"
+        val document = app.get(url).document
 
-        return document.select("div.afis a").mapNotNull { it.toSearchResult() }
+        val results = document.select("div.afis a, a.column[href*='/diziler/']")
+            .mapNotNull { it.toSearchResult() }
+            .distinctBy { it.url }
+
+        if (results.isEmpty() && debugMode) {
+            // Boşsa nedenini görelim
+            val info = "DEBUG arama 0 sonuc | html=${document.html().length} | a=${document.select("a").size} | afis=${document.select("div.afis").size}"
+            return listOf(newTvSeriesSearchResponse(info, mainUrl, TvType.TvSeries))
+        }
+        return results
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
@@ -117,6 +133,9 @@ class SezonlukDizi : MainAPI() {
     //  3) Extractor'un döndürdüğü url / type / headers / referer AYNEN kullanılıyor.
     //  Olmazsa: WebView ile gerçek m3u8 isteği yakalanıyor ve #EXTM3U ile doğrulanıyor.
 
+    // WebView yedeği şimdilik kapalı (takılmanın sebebi mi diye elemek için)
+    private val useWebView = false
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -125,107 +144,132 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
         val anyFound = AtomicBoolean(false)
-        Log.d("SZD", "data » $data")
 
-        val document = app.get(data).document
-        val aspData  = getAspData()
-        val bid      = document.selectFirst("div#dilsec")?.attr("data-id")
-        dbg.add("asp alt=${aspData.alternatif} emb=${aspData.embed} bid=$bid")
+        // Debug satırını anında ekrana düşürür (sonu beklemeden ilerlemeyi görelim)
+        suspend fun d(msg: String) {
+            dbg.add(msg)
+            if (debugMode) {
+                callback(
+                    newExtractorLink(name, "DEBUG $msg", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+        }
 
-        if (bid != null) {
-            // En fazla 40 sn bekle, sonra ne bulduysak onunla dön (sonsuz dönmeyi engeller)
-            withTimeoutOrNull(40_000L) {
+        d("basladi ${data.takeLast(40)}")
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val job = scope.launch {
+            try {
+                val document = withTimeoutOrNull(15_000L) { app.get(data).document }
+                if (document == null) { d("bolum sayfasi zaman asimi"); return@launch }
+                d("bolum sayfasi ok")
+
+                val aspData = withTimeoutOrNull(15_000L) { getAspData() }
+                if (aspData == null) { d("site.min.js zaman asimi"); return@launch }
+
+                val bid = document.selectFirst("div#dilsec")?.attr("data-id")
+                d("asp alt=${aspData.alternatif} emb=${aspData.embed} bid=$bid")
+                if (bid == null) return@launch
+
                 val sem   = Semaphore(6)
                 val wvSem = Semaphore(2)
-                coroutineScope {
-                    for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
-                        launch {
-                            val raw = try {
+
+                for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
+                    launch {
+                        val raw = try {
+                            withTimeoutOrNull(15_000L) {
                                 app.post(
                                     "${mainUrl}/ajax/dataAlternatif${aspData.alternatif}.asp",
                                     headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
                                     data    = mapOf("bid" to bid, "dil" to dil)
                                 ).text
-                            } catch (e: Exception) {
-                                dbg.add("ALT hata $etiket ${e.message?.take(50)}"); return@launch
                             }
-                            dbg.add("RAW $etiket ${raw.take(120).replace(Regex("\\s+"), " ")}")
-                            val resp = tryParseJson<Kaynak>(raw)
-                            if (resp == null || resp.status != "success") {
-                                dbg.add("$etiket yok (${resp?.status})"); return@launch
-                            }
-                            val list = resp.data
-                            if (list == null) { dbg.add("$etiket data null"); return@launch }
-                            dbg.add("$etiket kaynak ${list.size}")
+                        } catch (e: Exception) {
+                            d("ALT hata $etiket ${e.message?.take(50)}"); return@launch
+                        }
+                        if (raw == null) { d("ALT zaman asimi $etiket"); return@launch }
+                        d("RAW $etiket ${raw.take(120).replace(Regex("\\s+"), " ")}")
 
-                            for (veri in list) {
-                                launch {
-                                    sem.withPermit {
-                                        val label = "$etiket - ${veri.baslik}"
-                                        val embedDoc = try {
+                        val resp = tryParseJson<Kaynak>(raw)
+                        if (resp == null || resp.status != "success") {
+                            d("$etiket yok (${resp?.status})"); return@launch
+                        }
+                        val list = resp.data
+                        if (list == null) { d("$etiket data null"); return@launch }
+                        d("$etiket kaynak ${list.size}")
+
+                        for (veri in list) {
+                            launch {
+                                sem.withPermit {
+                                    val label = "$etiket - ${veri.baslik}"
+                                    val embedDoc = try {
+                                        withTimeoutOrNull(15_000L) {
                                             app.post(
                                                 "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
                                                 headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
                                                 data    = mapOf("id" to "${veri.id}")
                                             ).document
-                                        } catch (e: Exception) {
-                                            dbg.add("EMB hata $label ${e.message?.take(50)}"); return@withPermit
                                         }
-                                        val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
-                                        if (iframe == null) { dbg.add("$label iframe yok"); return@withPermit }
+                                    } catch (e: Exception) {
+                                        d("EMB hata $label ${e.message?.take(50)}"); return@withPermit
+                                    }
+                                    if (embedDoc == null) { d("EMB zaman asimi $label"); return@withPermit }
 
-                                        val got = ConcurrentLinkedQueue<ExtractorLink>()
-                                        try {
+                                    val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
+                                    if (iframe == null) { d("$label iframe yok"); return@withPermit }
+
+                                    val got = ConcurrentLinkedQueue<ExtractorLink>()
+                                    try {
+                                        withTimeoutOrNull(20_000L) {
                                             loadExtractor(iframe, "${mainUrl}/", subtitleCallback) { got.add(it) }
-                                        } catch (e: Exception) {
-                                            dbg.add("LE hata $label ${e.message?.take(50)}")
                                         }
-                                        dbg.add("LE $label ${got.size} ${iframe.take(60)}")
+                                    } catch (e: Exception) {
+                                        d("LE hata $label ${e.message?.take(50)}")
+                                    }
+                                    d("LE $label ${got.size} ${iframe.take(60)}")
 
-                                        if (got.isNotEmpty()) {
-                                            for (link in got) {
-                                                callback(
-                                                    newExtractorLink(
-                                                        source = label,
-                                                        name   = label,
-                                                        url    = link.url,
-                                                        type   = link.type
-                                                    ) {
-                                                        this.referer = link.referer
-                                                        this.quality = link.quality
-                                                        this.headers = link.headers
-                                                    }
-                                                )
-                                                anyFound.set(true)
-                                            }
-                                        } else {
-                                            val wv = wvSem.withPermit {
-                                                try { webViewLink(iframe, data, label, dbg) } catch (e: Exception) {
-                                                    dbg.add("WV hata $label ${e.message?.take(50)}"); null
+                                    if (got.isNotEmpty()) {
+                                        for (link in got) {
+                                            callback(
+                                                newExtractorLink(
+                                                    source = label,
+                                                    name   = label,
+                                                    url    = link.url,
+                                                    type   = link.type
+                                                ) {
+                                                    this.referer = link.referer
+                                                    this.quality = link.quality
+                                                    this.headers = link.headers
                                                 }
-                                            }
-                                            if (wv != null) { callback(wv); anyFound.set(true) }
+                                            )
+                                            anyFound.set(true)
                                         }
+                                    } else if (useWebView) {
+                                        val wv = wvSem.withPermit {
+                                            try { webViewLink(iframe, data, label, dbg) } catch (e: Exception) {
+                                                d("WV hata $label ${e.message?.take(50)}"); null
+                                            }
+                                        }
+                                        if (wv != null) { callback(wv); anyFound.set(true) }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            } ?: dbg.add("ZAMAN ASIMI 40sn")
+            } catch (e: Exception) {
+                d("GENEL HATA ${e.javaClass.simpleName} ${e.message?.take(60)}")
+            }
         }
 
-        if (debugMode) {
-            dbg.toList().take(40).forEach {
-                callback(
-                    newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-            return true
-        }
-        return anyFound.get()
+        // En fazla 35 sn bekle; sonra ne varsa onunla dön (sonsuz dönmesin)
+        val finished = withTimeoutOrNull(35_000L) { job.join(); true }
+        if (finished == null) d("ZAMAN ASIMI 35sn")
+        scope.cancel()
+
+        return if (debugMode) true else anyFound.get()
     }
 
     // ---------------- WebView yedeği + doğrulama ----------------
