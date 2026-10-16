@@ -66,6 +66,7 @@ class SezonlukDizi : MainAPI() {
         val url      = "${mainUrl}/diziler.asp?adi=$q"
         val document = app.get(url).document
 
+        Log.d("SZD", "ARAMA url=$url len=${document.html().length} govde=${document.body().text().take(300)}")
         val results = document.select("div.afis a, a.column[href*='/diziler/']")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -152,10 +153,11 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
         val anyFound = AtomicBoolean(false)
+        val captchaLogged = AtomicBoolean(false)
 
         // Debug satırları listeye eklenir, en sonda topluca gösterilir
         // (anında göstermek oynatıcının ilk sahte linki seçip hata vermesine yol açıyordu)
-        suspend fun d(msg: String) { dbg.add(msg) }
+        suspend fun d(msg: String) { dbg.add(msg); Log.d("SZD", msg) }
 
         d("basladi ${data.takeLast(40)}")
 
@@ -204,21 +206,29 @@ class SezonlukDizi : MainAPI() {
                             launch {
                                 sem.withPermit {
                                     val label = "$etiket - ${veri.baslik}"
-                                    val embedDoc = try {
+                                    val embedResp = try {
                                         withTimeoutOrNull(15_000L) {
                                             app.post(
                                                 "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
                                                 headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
                                                 data    = mapOf("id" to "${veri.id}")
-                                            ).document
+                                            )
                                         }
                                     } catch (e: Exception) {
                                         d("EMB hata $label ${e.message?.take(50)}"); return@withPermit
                                     }
-                                    if (embedDoc == null) { d("EMB zaman asimi $label"); return@withPermit }
+                                    if (embedResp == null) { d("EMB zaman asimi $label"); return@withPermit }
+                                    val embedDoc = embedResp.document
+                                    Log.d("SZD", "EMBRAW $label ${embedResp.text.take(500).replace(Regex("\\s+"), " ")}")
 
                                     val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
                                     if (iframe == null) { d("$label iframe yok"); return@withPermit }
+                                    if (iframe.contains("reCAPTCHA", true) && captchaLogged.compareAndSet(false, true)) {
+                                        try {
+                                            val cp = withTimeoutOrNull(15_000L) { app.get(iframe, referer = data) }
+                                            Log.d("SZD", "CAPTCHA SAYFA code=${cp?.code} ${cp?.text?.take(800)?.replace(Regex("\\s+"), " ")}")
+                                        } catch (e: Exception) { Log.d("SZD", "CAPTCHA SAYFA hata ${e.message}") }
+                                    }
 
                                     val got = ConcurrentLinkedQueue<ExtractorLink>()
                                     try {
@@ -334,6 +344,15 @@ class SezonlukDizi : MainAPI() {
         val js  = app.get("${this.mainUrl}/js/site.min.js").text
         val alt = Regex("""dataAlternatif(.*?).asp""").find(js)?.groupValues?.get(1) ?: ""
         val emb = Regex("""dataEmbed(.*?).asp""").find(js)?.groupValues?.get(1) ?: ""
+        // Teşhis: sitenin tüm ajax uçları ve captcha / embed çevresindeki kod logcat'e yazılır
+        try {
+            val eps = Regex("""/ajax/\w+\.asp""").findAll(js).map { it.value }.distinct().toList()
+            Log.d("SZD", "AJAX UCLARI $eps")
+            for (key in listOf("reCAPTCHADATA", "dataEmbed", "g-recaptcha", "grecaptcha")) {
+                val i = js.indexOf(key)
+                if (i >= 0) Log.d("SZD", "JS[$key] " + js.substring(maxOf(0, i - 350), minOf(js.length, i + 450)).replace(Regex("\\s+"), " "))
+            }
+        } catch (e: Exception) { Log.d("SZD", "JS teshis hata ${e.message}") }
         return AspData(alt, emb)
     }
 }
