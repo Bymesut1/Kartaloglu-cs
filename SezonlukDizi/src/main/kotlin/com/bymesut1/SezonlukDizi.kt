@@ -9,7 +9,9 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import com.fasterxml.jackson.annotation.JsonProperty
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -71,6 +73,11 @@ class SezonlukDizi : MainAPI() {
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
+        if (results.isEmpty()) {
+            val viaAjax = try { ajaxSearch(query) } catch (e: Exception) { Log.d("SZD", "ajaxSearch hata ${e.message}"); emptyList() }
+            if (viaAjax.isNotEmpty()) return viaAjax
+        }
+
         if (results.isEmpty() && debugMode) {
             // Boşsa nedenini görelim: her bilgi ayrı, kısa bir kart
             val infos = listOf(
@@ -85,6 +92,69 @@ class SezonlukDizi : MainAPI() {
             }
         }
         return results
+    }
+
+    private val xhr = mapOf("X-Requested-With" to "XMLHttpRequest")
+
+    private fun jsonCollect(node: Any?, out: MutableList<SearchResponse>) {
+        when (node) {
+            is org.json.JSONObject -> {
+                val title = listOf("title", "baslik", "name", "ad", "adi")
+                    .firstNotNullOfOrNull { k -> node.optString(k).takeIf { it.isNotBlank() } }
+                val link  = listOf("url", "link", "href")
+                    .firstNotNullOfOrNull { k -> node.optString(k).takeIf { it.isNotBlank() } }
+                if (title != null && link != null) {
+                    val img = listOf("image", "img", "poster", "resim")
+                        .firstNotNullOfOrNull { k -> node.optString(k).takeIf { it.isNotBlank() } }
+                    out.add(newTvSeriesSearchResponse(title, fixUrl(link), TvType.TvSeries) { this.posterUrl = fixUrlNull(img) })
+                }
+                val keys = node.keys()
+                while (keys.hasNext()) jsonCollect(node.opt(keys.next()), out)
+            }
+            is org.json.JSONArray -> for (i in 0 until node.length()) jsonCollect(node.opt(i), out)
+        }
+    }
+
+    // Sitenin kendi canlı arama ucu (/ajax/arama.asp). Parametre adı bilinmediği için birkaç biçim denenir.
+    private suspend fun ajaxSearch(query: String): List<SearchResponse> {
+        val q = java.net.URLEncoder.encode(query, "UTF-8")
+        try {
+            val js = app.get("${mainUrl}/js/site.min.js").text
+            val i  = js.indexOf("arama.asp")
+            if (i >= 0) Log.d("SZD", "JS[arama] " + js.substring(maxOf(0, i - 300), minOf(js.length, i + 400)).replace(Regex("\\s+"), " "))
+        } catch (e: Exception) { }
+
+        val names = listOf("GET q", "POST q", "POST dizi", "POST adi")
+        for ((idx, name) in names.withIndex()) {
+            val txt = try {
+                when (idx) {
+                    0 -> app.get("${mainUrl}/ajax/arama.asp?q=$q", headers = xhr, referer = mainUrl).text
+                    1 -> app.post("${mainUrl}/ajax/arama.asp", headers = xhr, data = mapOf("q" to query)).text
+                    2 -> app.post("${mainUrl}/ajax/arama.asp", headers = xhr, data = mapOf("dizi" to query)).text
+                    else -> app.post("${mainUrl}/ajax/arama.asp", headers = xhr, data = mapOf("adi" to query)).text
+                }
+            } catch (e: Exception) { Log.d("SZD", "ARAMA AJAX $name hata ${e.message}"); continue }
+            Log.d("SZD", "ARAMA AJAX $name -> ${txt.take(300).replace(Regex("\\s+"), " ")}")
+            val out = mutableListOf<SearchResponse>()
+            val t = txt.trim()
+            try {
+                if (t.startsWith("{")) jsonCollect(org.json.JSONObject(t), out)
+                else if (t.startsWith("[")) jsonCollect(org.json.JSONArray(t), out)
+                else {
+                    org.jsoup.Jsoup.parse(t).select("a[href]").forEach { a ->
+                        val title = a.text().trim().ifBlank { a.selectFirst("img")?.attr("alt") ?: "" }
+                        val href  = fixUrlNull(a.attr("href"))
+                        if (title.isNotBlank() && href != null) {
+                            out.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                                this.posterUrl = fixUrlNull(a.selectFirst("img")?.attr("src"))
+                            })
+                        }
+                    }
+                }
+            } catch (e: Exception) { Log.d("SZD", "ARAMA AJAX $name parse hata ${e.message}") }
+            if (out.isNotEmpty()) return out.distinctBy { it.url }
+        }
+        return emptyList()
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
@@ -153,7 +223,6 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
         val anyFound = AtomicBoolean(false)
-        val captchaLogged = AtomicBoolean(false)
 
         // Debug satırları listeye eklenir, en sonda topluca gösterilir
         // (anında göstermek oynatıcının ilk sahte linki seçip hata vermesine yol açıyordu)
@@ -175,7 +244,8 @@ class SezonlukDizi : MainAPI() {
                 d("asp alt=${aspData.alternatif} emb=${aspData.embed} bid=$bid")
                 if (bid == null) return@launch
 
-                val sem   = Semaphore(6)
+                val sem      = Semaphore(6)
+                val embedSem = Semaphore(1)   // dataEmbed istekleri tek tek (Cloudflare 1015 hız sınırı)
                 val wvSem = Semaphore(2)
 
                 for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
@@ -207,12 +277,26 @@ class SezonlukDizi : MainAPI() {
                                 sem.withPermit {
                                     val label = "$etiket - ${veri.baslik}"
                                     val embedResp = try {
-                                        withTimeoutOrNull(15_000L) {
-                                            app.post(
-                                                "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
-                                                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                                                data    = mapOf("id" to "${veri.id}")
-                                            )
+                                        embedSem.withPermit {
+                                            var r = withTimeoutOrNull(15_000L) {
+                                                app.post(
+                                                    "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
+                                                    headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                                                    data    = mapOf("id" to "${veri.id}")
+                                                )
+                                            }
+                                            if (r != null && r.text.contains("1015")) {
+                                                delay(3_000L)
+                                                r = withTimeoutOrNull(15_000L) {
+                                                    app.post(
+                                                        "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
+                                                        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                                                        data    = mapOf("id" to "${veri.id}")
+                                                    )
+                                                }
+                                            }
+                                            delay(700L)
+                                            r
                                         }
                                     } catch (e: Exception) {
                                         d("EMB hata $label ${e.message?.take(50)}"); return@withPermit
@@ -223,11 +307,8 @@ class SezonlukDizi : MainAPI() {
 
                                     val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
                                     if (iframe == null) { d("$label iframe yok"); return@withPermit }
-                                    if (iframe.contains("reCAPTCHA", true) && captchaLogged.compareAndSet(false, true)) {
-                                        try {
-                                            val cp = withTimeoutOrNull(15_000L) { app.get(iframe, referer = data) }
-                                            Log.d("SZD", "CAPTCHA SAYFA code=${cp?.code} ${cp?.text?.take(800)?.replace(Regex("\\s+"), " ")}")
-                                        } catch (e: Exception) { Log.d("SZD", "CAPTCHA SAYFA hata ${e.message}") }
+                                    if (iframe.contains("reCAPTCHA", true)) {
+                                        d("$label CAPTCHA (Turnstile) - atlandi"); return@withPermit
                                     }
 
                                     val got = ConcurrentLinkedQueue<ExtractorLink>()
@@ -237,6 +318,15 @@ class SezonlukDizi : MainAPI() {
                                         }
                                     } catch (e: Exception) {
                                         d("LE hata $label ${e.message?.take(50)}")
+                                    }
+                                    if (got.isEmpty() && iframe.contains("byse", true)) {
+                                        try {
+                                            withTimeoutOrNull(25_000L) {
+                                                ByseExtractor().getUrl(iframe, "${mainUrl}/", subtitleCallback) { got.add(it) }
+                                            }
+                                        } catch (e: Exception) {
+                                            d("BYSE hata $label ${e.message?.take(60)}")
+                                        }
                                     }
                                     d("LE $label ${got.size} ${iframe.take(60)}")
 
@@ -354,5 +444,98 @@ class SezonlukDizi : MainAPI() {
             }
         } catch (e: Exception) { Log.d("SZD", "JS teshis hata ${e.message}") }
         return AspData(alt, emb)
+    }
+}
+
+
+// ---- Yeni Filemoon ("Byse") alan adları için elle yazılmış çözücü ----
+data class ByseDetails(@JsonProperty("embed_frame_url") val embedFrameUrl: String?)
+data class ByseRoot(@JsonProperty("playback") val playback: ByseEnc?)
+data class ByseEnc(
+    @JsonProperty("iv")        val iv: String?,
+    @JsonProperty("payload")   val payload: String?,
+    @JsonProperty("key_parts") val keyParts: List<String>?
+)
+data class ByseSources(@JsonProperty("sources") val sources: List<ByseSrc>?)
+data class ByseSrc(
+    @JsonProperty("url")       val url: String?,
+    @JsonProperty("mime_type") val mimeType: String?
+)
+
+class ByseExtractor : ExtractorApi() {
+    override var name = "Filemoon"
+    override var mainUrl = "https://bysejikuar.com"
+    override val requiresReferer = false
+
+    private val ua =
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
+
+    private fun b64(s: String): ByteArray =
+        android.util.Base64.decode(s, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP)
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val host = Regex("^https?://[^/]+").find(url)?.value ?: return
+        val code = url.substringAfterLast("/").substringBefore("?")
+        var frameHost = host
+        var frameUrl  = url
+
+        try {
+            val dTxt = app.get(
+                "$host/api/videos/$code/embed/details",
+                headers = mapOf("Referer" to url, "User-Agent" to ua)
+            ).text
+            Log.d("SZD", "BYSE details ${dTxt.take(300)}")
+            val frame = tryParseJson<ByseDetails>(dTxt)?.embedFrameUrl
+            if (!frame.isNullOrBlank()) {
+                frameUrl  = frame
+                frameHost = Regex("^https?://[^/]+").find(frame)?.value ?: host
+            }
+        } catch (e: Exception) { Log.d("SZD", "BYSE details hata ${e.message}") }
+
+        val pTxt = app.get(
+            "$frameHost/api/videos/$code/embed/playback",
+            headers = mapOf(
+                "Referer" to frameUrl,
+                "X-Embed-Parent" to url,
+                "Accept" to "*/*",
+                "User-Agent" to ua
+            )
+        ).text
+        Log.d("SZD", "BYSE playback ${pTxt.take(300)}")
+        val pb = tryParseJson<ByseRoot>(pTxt)?.playback ?: return
+
+        val iv      = b64(pb.iv ?: return)
+        val payload = b64(pb.payload ?: return)
+        val key     = pb.keyParts?.map { b64(it) }?.fold(ByteArray(0)) { acc, x -> acc + x } ?: return
+
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            javax.crypto.Cipher.DECRYPT_MODE,
+            javax.crypto.spec.SecretKeySpec(key, "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv)
+        )
+        val json = String(cipher.doFinal(payload), Charsets.UTF_8)
+        Log.d("SZD", "BYSE cozuldu ${json.take(300)}")
+
+        val srcs = tryParseJson<ByseSources>(json)?.sources ?: return
+        for (src in srcs) {
+            val link = src.url?.takeIf { it.isNotBlank() } ?: continue
+            val isM3u8 = link.contains(".m3u8") || (src.mimeType?.contains("mpegurl", true) == true)
+            callback(
+                newExtractorLink(
+                    name, name, link,
+                    if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "$frameHost/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to ua, "Referer" to "$frameHost/")
+                }
+            )
+        }
     }
 }
