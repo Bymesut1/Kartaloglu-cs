@@ -1,40 +1,18 @@
-// use an integer for version numbers
 version = 8
 
-android {
-    namespace = "com.bymesut1.sezonlukdizi"
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-}
-
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile> {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
-    }
-}
-
-dependencies {
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
-    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.1")
-}
-
 cloudstream {
-    language    = "tr"
-    description = "SezonlukDizi - Türkçe dizi izle"
     authors     = listOf("bymesut1")
+    language    = "tr"
+    description = "Güncel ve eski dizileri en iyi görüntü kalitesiyle bulabileceğiniz yabancı dizi izleme siteniz."
 
     /**
      * Status int as the following:
      * 0: Down
      * 1: Ok
      * 2: Slow
-     * 3: Beta-only
+     * 3: Beta only
     **/
-    status  = 1
+    status  = 1 // will be 3 if unspecified
     tvTypes = listOf("TvSeries")
-
-    iconUrl = "https://www.google.com/s2/favicons?domain=sezonlukdizi.cc&sz=%size%"
+    iconUrl = "https://www.google.com/s2/favicons?domain=sezonlukdizi6.com&sz=%size%"
 }
