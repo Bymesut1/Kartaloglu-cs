@@ -2,6 +2,7 @@ package com.bymesut1
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
@@ -194,11 +195,22 @@ class AbiFilm3 : MainAPI() {
 
             for ((label, embed) in parts) {
                 dbg.add("E $label ${embed.take(70)}")
-                val found = try { resolveEmbed(embed, data, dbg) } catch (e: Exception) {
+                val origin = originOf(embed)
+
+                // 1) Statik çözüm
+                var found = try { resolveEmbed(embed, data, dbg) } catch (e: Exception) {
                     dbg.add("EM hata ${e.message?.take(60)}"); null
                 }
+                // 2) Gerçekten çalışıyor mu? (#EXTM3U + farklı header kombinasyonları)
+                if (found != null) found = verifyFound(found, origin, dbg, label)
+                // 3) Olmadıysa WebView ile gerçek istekleri yakala (JS sandbox yerine)
+                if (found == null) {
+                    found = try { webViewFind(embed, data, origin, dbg, label) } catch (e: Exception) {
+                        dbg.add("WV hata $label ${e.message?.take(60)}"); null
+                    }
+                }
+
                 if (found != null) {
-                    val origin = originOf(embed)
                     callback(
                         newExtractorLink(
                             name,
@@ -213,14 +225,16 @@ class AbiFilm3 : MainAPI() {
                     )
                     any = true
                 } else {
-                    try {
-                        if (loadExtractor(embed, data, subtitleCallback, callback)) any = true
-                    } catch (_: Exception) {}
+                    val ok = try {
+                        loadExtractor(embed, data, subtitleCallback, callback)
+                    } catch (_: Exception) { false }
+                    dbg.add("$label COZULEMEDI, loadExtractor=$ok")
+                    if (ok) any = true
                 }
             }
         }
 
-        if (!any && debugMode) {
+        if (debugMode) {
             dbg.take(40).forEach {
                 callback(
                     newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
@@ -231,6 +245,45 @@ class AbiFilm3 : MainAPI() {
             return true
         }
         return any
+    }
+
+
+    // ---------------- Akış doğrulama + WebView yedeği ----------------
+
+    private suspend fun verifyFound(f: Found, origin: String, dbg: MutableList<String>, label: String): Found? {
+        if (!f.hls) return f
+        val variants = listOf(
+            f.headers,
+            mapOf("User-Agent" to androidUA, "Referer" to "$origin/", "Origin" to origin),
+            mapOf("User-Agent" to androidUA, "Referer" to "$mainUrl/", "Origin" to mainUrl),
+            mapOf("User-Agent" to androidUA)
+        )
+        for ((i, h) in variants.withIndex()) {
+            val r = try { app.get(f.url, headers = h) } catch (e: Exception) {
+                dbg.add("V $label h$i hata ${e.message?.take(40)}"); null
+            } ?: continue
+            dbg.add("V $label h$i ${r.code} ${r.text.take(30).replace(Regex("\\s+"), " ")}")
+            if (r.code == 200 && r.text.trimStart().startsWith("#EXTM3U")) return f.copy(headers = h)
+        }
+        return null
+    }
+
+    private suspend fun webViewFind(
+        embed: String, pageUrl: String, origin: String, dbg: MutableList<String>, label: String
+    ): Found? {
+        val resp = app.get(
+            embed,
+            referer = pageUrl,
+            headers = mapOf("User-Agent" to androidUA),
+            interceptor = WebViewResolver(
+                Regex("""\.m3u8|\.mp4(\?|$)|master\.txt|/hls/""", RegexOption.IGNORE_CASE)
+            )
+        )
+        val u = resp.url
+        dbg.add("WV $label ${u.take(90)}")
+        if (u == embed || badExt.containsMatchIn(u)) return null
+        val cand = Found(u, !isMp4(u), mapOf("User-Agent" to androidUA, "Referer" to "$origin/", "Origin" to origin))
+        return verifyFound(cand, origin, dbg, label) ?: cand
     }
 
     private val skipHosts = Regex(
@@ -292,7 +345,7 @@ class AbiFilm3 : MainAPI() {
             val texts = unpackAll(html)
             val r = extractEmbed(html, origin, texts)
             if (r != null) {
-                return Found(r.first, r.second, mapOf("User-Agent" to ua, "Referer" to "$origin/"))
+                return Found(r.first, r.second, mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin))
             }
             dbg.add(
                 "EM len=${html.length} script=${Regex("<script", RegexOption.IGNORE_CASE).findAll(html).count()} " +
