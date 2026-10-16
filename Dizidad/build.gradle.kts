@@ -1,5 +1,9 @@
 version = 1
 
+android {
+    namespace = "com.Bymesut1.dizidad"
+}
+
 cloudstream {
     description = "Dizidad - dizi ve film (Türkçe dublaj / altyazılı)"
     authors = listOf("Bymesut1")
