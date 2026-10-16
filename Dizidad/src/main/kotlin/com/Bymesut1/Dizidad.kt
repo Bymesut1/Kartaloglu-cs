@@ -3,6 +3,7 @@ package com.Bymesut1
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class Dizidad : MainAPI() {
@@ -76,19 +77,25 @@ class Dizidad : MainAPI() {
 
     // ---------------- Liste / kart ayrıştırma ----------------
 
+    private fun posterOf(img: Element?): String? {
+        if (img == null) return null
+        for (k in listOf("data-src", "data-lazy-src", "data-original", "src")) {
+            val v: String = img.attr(k)
+            if (v.isNotBlank() && !v.startsWith("data:")) return fixUrl(v)
+        }
+        return null
+    }
+
     private fun parseCards(doc: Document): List<SearchResponse> {
         val map = LinkedHashMap<String, Pair<String, String?>>()
         for (a in doc.select("a[href]")) {
-            val href = fixUrl(a.attr("href")).substringBefore("#")
+            val href: String = fixUrl(a.attr("href")).substringBefore("#")
             if (!reItem.matches(href) || reEpisode.containsMatchIn(href)) continue
 
-            val img = a.selectFirst("img")
-            val title = a.attr("title").ifBlank { img?.attr("alt").orEmpty() }.ifBlank { a.text() }.trim()
-            val poster = img?.let { i ->
-                listOf("data-src", "data-lazy-src", "data-original", "src")
-                    .map { i.attr(it) }
-                    .firstOrNull { it.isNotBlank() && !it.startsWith("data:") }
-            }?.let { fixUrl(it) }
+            val img: Element? = a.selectFirst("img")
+            val alt: String = img?.attr("alt").orEmpty()
+            val title: String = a.attr("title").ifBlank { alt }.ifBlank { a.text() }.trim()
+            val poster: String? = posterOf(img)
 
             val prev = map[href]
             map[href] = title.ifBlank { prev?.first.orEmpty() } to (poster ?: prev?.second)
@@ -134,16 +141,23 @@ class Dizidad : MainAPI() {
     // ---------------- Dizi / film sayfası ----------------
 
     override suspend fun load(url: String): LoadResponse? {
-        val doc = app.get(url, headers = pageHeaders()).document
-        fun meta(p: String) =
-            doc.selectFirst("meta[property=$p]")?.attr("content")?.takeIf { it.isNotBlank() }
+        val doc: Document = app.get(url, headers = pageHeaders()).document
 
-        val title  = cleanTitle(meta("og:title") ?: doc.selectFirst("h1")?.text() ?: doc.title())
+        fun meta(p: String): String? {
+            val el: Element? = doc.selectFirst("meta[property=$p]")
+            val c: String = el?.attr("content").orEmpty()
+            return c.ifBlank { null }
+        }
+
+        val h1: Element? = doc.selectFirst("h1")
+        val h1Text: String? = h1?.text()
+
+        val title  = cleanTitle(meta("og:title") ?: h1Text ?: doc.title())
         val poster = meta("og:image")?.let { fixUrl(it) }
         val plot   = meta("og:description")
 
         val all = doc.select("a[href]").mapNotNull { a ->
-            val href = fixUrl(a.attr("href")).substringBefore("#")
+            val href: String = fixUrl(a.attr("href")).substringBefore("#")
             if (!href.contains("dizidad.com", true)) return@mapNotNull null
             val m = reEpisode.find(href) ?: return@mapNotNull null
             Triple(href, m.groupValues[1].toInt(), m.groupValues[2].toInt())
