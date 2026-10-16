@@ -71,9 +71,17 @@ class SezonlukDizi : MainAPI() {
             .distinctBy { it.url }
 
         if (results.isEmpty() && debugMode) {
-            // Boşsa nedenini görelim
-            val info = "DEBUG arama 0 sonuc | html=${document.html().length} | a=${document.select("a").size} | afis=${document.select("div.afis").size}"
-            return listOf(newTvSeriesSearchResponse(info, mainUrl, TvType.TvSeries))
+            // Boşsa nedenini görelim: her bilgi ayrı, kısa bir kart
+            val infos = listOf(
+                "DEBUG html=${document.html().length}",
+                "DEBUG a=${document.select("a").size} afis=${document.select("div.afis").size}",
+                "DEBUG baslik: ${document.title().take(40)}",
+                "DEBUG govde: ${document.body().text().take(70)}",
+                "DEBUG url: ${url.takeLast(40)}"
+            )
+            return infos.mapIndexed { i, t ->
+                newTvSeriesSearchResponse(t, "$mainUrl/?debug=$i", TvType.TvSeries)
+            }
         }
         return results
     }
