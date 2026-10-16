@@ -1,18 +1,22 @@
+// ! Bu araç @bymesut1 tarafından | @KekikAkademi için yazılmıştır.
+
 package com.bymesut1
 
 import com.fasterxml.jackson.annotation.JsonProperty
 
+
 data class Kaynak(
-    @JsonProperty("status") val status: String?,
-    @JsonProperty("data")   val data: List<KaynakVeri>?
+    @JsonProperty("status") val status: String,
+    @JsonProperty("data") val data: List<Veri>,
 )
 
-data class KaynakVeri(
-    @JsonProperty("id")     val id: String?,
-    @JsonProperty("baslik") val baslik: String?
+data class Veri(
+    @JsonProperty("baslik") val baslik: String,
+    @JsonProperty("id") val id: Int,
+    @JsonProperty("kalite") val kalite: Int,
 )
 
 data class AspData(
-    val alternatif: String,
-    val embed: String
+    val alternatif : String,
+    val embed : String
 )
