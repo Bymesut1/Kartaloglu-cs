@@ -18,6 +18,7 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile> {
 
 dependencies {
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
 }
 
 cloudstream {
