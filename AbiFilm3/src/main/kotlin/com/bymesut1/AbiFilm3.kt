@@ -1,11 +1,15 @@
 package com.bymesut1
 
 import android.util.Base64
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class AbiFilm3 : MainAPI() {
     override var mainUrl = "https://filmmakinesi.to"
@@ -124,6 +128,56 @@ class AbiFilm3 : MainAPI() {
     private fun cleanTitle(t: String): String =
         t.replace(Regex("\\s*izle\\s*(\\(\\d{4}\\))?\\s*$", RegexOption.IGNORE_CASE), "").trim()
 
+
+    // ---------------- TMDB ----------------
+
+    // https://www.themoviedb.org/settings/api adresinden ücretsiz anahtar al
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+
+    data class TmdbSearch(@JsonProperty("results") val results: List<TmdbShow>? = null)
+    data class TmdbShow(@JsonProperty("id") val id: Int? = null)
+    data class TmdbSeason(@JsonProperty("episodes") val episodes: List<TmdbEp>? = null)
+    data class TmdbEp(
+        @JsonProperty("episode_number") val episodeNumber: Int? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("overview") val overview: String? = null,
+        @JsonProperty("still_path") val stillPath: String? = null,
+        @JsonProperty("air_date") val airDate: String? = null,
+        @JsonProperty("runtime") val runtime: Int? = null
+    )
+
+    private suspend fun tmdbFindId(title: String, year: Int?): Int? {
+        if (tmdbKey.startsWith("BURAYA")) return null
+        val q = URLEncoder.encode(title, "UTF-8")
+        suspend fun search(withYear: Boolean): Int? = try {
+            val y = if (withYear && year != null) "&first_air_date_year=$year" else ""
+            app.get("https://api.themoviedb.org/3/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q$y")
+                .parsedSafe<TmdbSearch>()?.results?.firstOrNull()?.id
+        } catch (e: Exception) { null }
+        return search(true) ?: search(false)
+    }
+
+    private suspend fun tmdbSeason(id: Int, season: Int): Map<Int, TmdbEp> {
+        suspend fun fetch(lang: String): List<TmdbEp> = try {
+            app.get("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$tmdbKey&language=$lang")
+                .parsedSafe<TmdbSeason>()?.episodes ?: emptyList()
+        } catch (e: Exception) { emptyList() }
+
+        val tr = fetch("tr-TR")
+        // Türkçe açıklama/görsel yoksa İngilizceden tamamla
+        val en = if (tr.any { it.overview.isNullOrBlank() || it.stillPath == null }) fetch("en-US") else emptyList()
+        val enMap = en.associateBy { it.episodeNumber }
+        return tr.mapNotNull { t ->
+            val n = t.episodeNumber ?: return@mapNotNull null
+            val f = enMap[n]
+            n to t.copy(
+                overview = t.overview?.takeIf { it.isNotBlank() } ?: f?.overview,
+                stillPath = t.stillPath ?: f?.stillPath,
+                name = t.name?.takeIf { it.isNotBlank() } ?: f?.name
+            )
+        }.toMap()
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val doc = app.get(url, headers = pageHeaders).document
         val html = doc.html()
@@ -141,20 +195,41 @@ class AbiFilm3 : MainAPI() {
 
         if (url.contains("/dizi/")) {
             val seen = HashSet<String>()
-            val episodes = ArrayList<Episode>()
+            val found = ArrayList<Triple<String, Int, Int>>() // url, sezon, bölüm
             Regex("href=\"([^\"]*?/sezon-(\\d+)/bolum-(\\d+)/?)\"")
                 .findAll(html).forEach { m ->
-                    val epUrl = fixUrl(m.groupValues[1])
                     val s = m.groupValues[2].toInt()
                     val e = m.groupValues[3].toInt()
-                    if (seen.add("$s-$e")) {
-                        episodes.add(newEpisode(epUrl) {
-                            this.season = s
-                            this.episode = e
-                            this.name = "$s. Sezon $e. Bölüm"
-                        })
-                    }
+                    if (seen.add("$s-$e")) found.add(Triple(fixUrl(m.groupValues[1]), s, e))
                 }
+
+            // TMDB'den resmi bölüm bilgileri (isim, açıklama, görsel, yayın tarihi)
+            val tmdbId = tmdbFindId(title, year)
+            val seasonCache = HashMap<Int, Map<Int, TmdbEp>>()
+            val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+            val episodes = ArrayList<Episode>()
+            for ((epUrl, s, e) in found) {
+                val info = if (tmdbId != null)
+                    seasonCache.getOrPut(s) { tmdbSeason(tmdbId, s) }[e]
+                else null
+
+                // Yayın tarihi bugünden sonraysa listeye ekleme; yayın günü kendiliğinden düşer
+                val air = info?.airDate
+                if (!air.isNullOrBlank() && air > today) continue
+
+                episodes.add(newEpisode(epUrl) {
+                    this.season = s
+                    this.episode = e
+                    this.name = info?.name?.takeIf { it.isNotBlank() } ?: "$s. Sezon $e. Bölüm"
+                    this.description = info?.overview?.takeIf { it.isNotBlank() }
+                    this.posterUrl = info?.stillPath?.let { "https://image.tmdb.org/t/p/w500$it" }
+                    this.runTime = info?.runtime
+                    this.date = air?.let {
+                        try { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(it)?.time } catch (_: Exception) { null }
+                    }
+                })
+            }
             episodes.sortWith(compareBy({ it.season }, { it.episode }))
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
