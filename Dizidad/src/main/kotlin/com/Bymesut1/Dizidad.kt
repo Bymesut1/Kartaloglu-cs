@@ -128,7 +128,7 @@ class Dizidad : MainAPI() {
     private fun typeOf(u: String): ExtractorLinkType? = when {
         u.contains(".m3u8", true) -> ExtractorLinkType.M3U8
         u.contains(".mpd", true)  -> ExtractorLinkType.DASH
-        u.contains(".mp4", true)  -> ExtractorLinkType.VIDEO
+        u.contains(".mp4", true) || u.contains(".m4s", true) -> ExtractorLinkType.VIDEO
         else -> null
     }
 
@@ -277,21 +277,39 @@ class Dizidad : MainAPI() {
         if (url.contains("/diziler/")) {
             val base = url.trimEnd('/').substringAfterLast('/').substringBefore("-izle")
 
-            val all: List<EpRef> = doc.select("a[href]").mapNotNull { a ->
+            fun collect(d: Document): List<EpRef> = d.select("a[href]").mapNotNull { a ->
                 val href: String = fixUrl(a.attr("href")).substringBefore("#")
                 if (!href.contains("dizidad.com", true) || href.contains("/diziler/")) return@mapNotNull null
                 val slug = href.trimEnd('/').substringAfterLast('/')
+                if (base.isNotBlank() && !slug.startsWith("$base-", true)) return@mapNotNull null
                 val m = reEpAny.find(slug) ?: return@mapNotNull null
                 val ep = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
                 val sg = m.groupValues[1]
                 EpRef(href, sg.toIntOrNull() ?: 1, ep, sg.isNotEmpty())
             }.distinctBy { it.href }
 
-            // başka dizilerin bölümleri (yan menü vb.) karışmasın
-            val own = if (base.isNotBlank()) {
-                all.filter { it.href.trimEnd('/').substringAfterLast('/').startsWith("$base-", true) }
-            } else emptyList()
-            val list = if (own.isNotEmpty()) own else all
+            var all: List<EpRef> = collect(doc)
+
+            // Bölüm sayfasındaki "Dizinin Diğer Bölümleri" listesi tüm bölümleri verir (özellikle Kore/Hint dizileri).
+            // Seri sayfasında bölüm yoksa ilk bölüm adresini tahmin et.
+            val seeds = ArrayList<String>()
+            all.lastOrNull()?.let { seeds.add(it.href) }
+            if (base.isNotBlank()) {
+                seeds.add("$mainUrl/$base-1-sezon-1-bolum-izle/")
+                seeds.add("$mainUrl/$base-1-bolum-izle/")
+            }
+            for (seed in seeds.distinct()) {
+                try {
+                    val extra = collect(app.get(seed, headers = pageHeaders(url)).document)
+                    if (extra.isNotEmpty()) {
+                        all = (all + extra).distinctBy { it.href }
+                        break
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            val list = all
 
             if (list.isNotEmpty()) {
                 val hasSeason = list.any { it.hasSeason }
@@ -301,7 +319,7 @@ class Dizidad : MainAPI() {
 
                 val episodes = grouped.map { (key, refs) ->
                     newEpisode(refs.joinToString("|") { it.href }) {
-                        this.name    = "${key.second}. Bölüm"
+                        this.name    = null
                         this.season  = if (hasSeason) key.first else null
                         this.episode = key.second
                     }
@@ -384,6 +402,99 @@ class Dizidad : MainAPI() {
         )
     }
 
+    private fun absUrl(base: String, ref: String): String = when {
+        ref.startsWith("http", true) -> ref
+        ref.startsWith("//")         -> "https:$ref"
+        ref.startsWith("/")          -> originOf(base) + ref
+        else -> base.substringBefore("?").substringBeforeLast("/") + "/" + ref
+    }
+
+    // Playlist + ilk parça (segment) gerçekten açılıyor mu? Açılan başlık setini döndürür.
+    private suspend fun probeHls(
+        url: String,
+        variants: List<Map<String, String>>,
+        dbg: MutableList<String>
+    ): Map<String, String>? {
+        for ((i, h) in variants.withIndex()) {
+            try {
+                val t = app.get(url, headers = h).text
+                if (!t.trim().startsWith("#EXTM3U")) {
+                    dbg.add("HLS#$i liste -> ${t.trim().take(30)}")
+                    continue
+                }
+                var plUrl = url
+                var plText = t
+                if (t.contains("#EXT-X-STREAM-INF")) {
+                    val v = t.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: continue
+                    plUrl = absUrl(url, v)
+                    plText = app.get(plUrl, headers = h).text
+                    if (!plText.trim().startsWith("#EXTM3U")) {
+                        dbg.add("HLS#$i alt liste -> ${plText.trim().take(30)}")
+                        continue
+                    }
+                }
+                val mapUri = Regex("""#EXT-X-MAP:[^\n]*URI="([^"]+)"""").find(plText)?.groupValues?.get(1)
+                val seg = plText.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                val first = seg ?: mapUri ?: return h
+                val code = app.get(absUrl(plUrl, first), headers = h + ("Range" to "bytes=0-1")).code
+                dbg.add("HLS#$i parça $code ${absUrl(plUrl, first).removePrefix("https://").take(50)}")
+                if (code in 200..299) return h
+            } catch (e: Exception) {
+                dbg.add("HLS#$i ERR ${e.message?.take(50)}")
+            }
+        }
+        return null
+    }
+
+    private fun variantsFor(l: ExtractorLink, page: String): List<Map<String, String>> {
+        val own = LinkedHashMap<String, String>()
+        own.putAll(l.headers)
+        if (l.referer.isNotBlank()) own["Referer"] = l.referer
+        if (!own.containsKey("User-Agent")) own["User-Agent"] = ua
+        return listOf(
+            own as Map<String, String>,
+            mapOf("User-Agent" to ua),
+            hdrFor(page, false),
+            hdrFor(page, true),
+            hdrFor(originOf(l.url) + "/", false)
+        ).distinct()
+    }
+
+    // true = akış doğrulandı (ya da HLS değil); orijinal çalışıyorsa aynen verilir, değilse çalışan başlıklarla
+    private suspend fun emitValidated(
+        l: ExtractorLink,
+        page: String,
+        seen: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit,
+        dbg: MutableList<String>
+    ): Boolean {
+        if (!seen.add(l.url)) return true
+        val isHls = l.type == ExtractorLinkType.M3U8 || l.url.contains(".m3u8", true) || l.url.contains("/m3/")
+        if (!isHls) {
+            callback.invoke(l)
+            return true
+        }
+        val vs = variantsFor(l, page)
+        val ok = probeHls(l.url, vs, dbg)
+        if (ok == null) {
+            dbg.add("HLS doğrulanamadı: ${l.url.removePrefix("https://").take(60)}")
+            callback.invoke(l)
+            return false
+        }
+        if (ok == vs.first()) {
+            callback.invoke(l)
+            return true
+        }
+        callback.invoke(
+            newExtractorLink(source = l.source, name = l.name, url = l.url, type = ExtractorLinkType.M3U8) {
+                this.referer = ok["Referer"] ?: ""
+                this.quality = l.quality
+                this.headers = ok
+            }
+        )
+        return true
+    }
+
     // playlist hangi başlık kombinasyonuyla açılıyor? (security error çözümü: Referer / Origin / Cookie denemeleri)
     private suspend fun probePlaylist(
         link: String,
@@ -456,16 +567,17 @@ class Dizidad : MainAPI() {
         val endpoints = listOf("$base/player/index.php", "$origin/player/index.php", "$dirPrefix/player/index.php").distinct()
 
         var apiText = ""
-        suspend fun callApi(r: String): List<String> {
+        suspend fun callApi(postRef: String, r: String): List<String> {
             for (ep in endpoints) {
                 val text = try {
                     app.post(
                         "$ep?data=${URLEncoder.encode(id, "UTF-8")}&do=getVideo",
                         headers = mapOf(
                             "User-Agent"       to ua,
-                            "Referer"          to embedUrl,
+                            "Referer"          to postRef,
                             "Origin"           to originOf(ep),
                             "X-Requested-With" to "XMLHttpRequest",
+                            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
                             "Accept"           to "application/json, text/javascript, */*; q=0.01"
                         ),
                         cookies = cookies,
@@ -474,13 +586,15 @@ class Dizidad : MainAPI() {
                 } catch (e: Exception) {
                     "ERR ${e.message}"
                 }
-                dbg.add("POST ${ep.removePrefix("https://").take(40)} r=${r.length} -> ${text.trim().take(70)}")
+                dbg.add("POST ${ep.removePrefix("https://").take(40)} ref=${postRef.removePrefix("https://").take(25)} r=${r.length} -> ${text.trim().take(70)}")
                 apiText += " " + text
 
-                val sec = Regex("\"(?:securedLink|secured_link)\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
-                val vs  = Regex("\"(?:videoSource|video_source)\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
-                val found = (listOf(sec, vs).map { unesc(it) } + findMedia(text))
-                    .map { if (it.startsWith("/")) originOf(ep) + it else it }
+                val keyed = listOf("securedLink", "secured_link", "videoSource", "video_source", "hls", "file").mapNotNull { k ->
+                    Regex("\"$k\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+                }
+                val m3tok = Regex("""https?://[^"'\s<>\\]+?/m3/[^"'\s<>\\]+""").findAll(unesc(text)).map { it.value }.toList()
+                val found = (keyed.map { unesc(it) } + m3tok + findMedia(text))
+                    .map { if (it.startsWith("//")) "https:$it" else if (it.startsWith("/")) originOf(ep) + it else it }
                     .filter { it.startsWith("http", true) }
                     .distinct()
                 if (found.isNotEmpty()) return found
@@ -488,22 +602,30 @@ class Dizidad : MainAPI() {
             return emptyList()
         }
 
-        var links: List<String> = emptyList()
-        for (r in listOf(pageUrl, "")) {
-            links = callApi(r)
-            if (links.isNotEmpty()) break
-        }
-
+        // token, POST'taki Referer / r değerine bağlı olabilir: hepsini sırayla dene, playlist açılanı al
+        val combos = listOf(
+            embedUrl to "$mainUrl/",
+            pageUrl to pageUrl,
+            pageUrl to "",
+            embedUrl to pageUrl,
+            "$mainUrl/" to "$mainUrl/",
+            embedUrl to ""
+        )
         var result = 0
-        if (links.isNotEmpty()) {
+        var weak: String? = null
+        for ((postRef, r) in combos) {
+            val links = callApi(postRef, r)
+            if (links.isEmpty()) continue
             val refs = listOf(
+                "$origin/" to true,
+                postRef to false,
+                postRef to true,
                 embedUrl to false,
                 embedUrl to true,
                 "$base/" to true,
                 pageUrl to true,
                 "$mainUrl/" to true
-            )
-            var weak: String? = null
+            ).distinct()
             for (link in links) {
                 if (link.contains(".mp4", true)) {
                     emit(link, embedUrl, label, ExtractorLinkType.VIDEO, withCookie(hdrFor(embedUrl, true)), callback)
@@ -518,11 +640,12 @@ class Dizidad : MainAPI() {
                     weak = link
                 }
             }
-            if (result == 0 && weak != null) {
-                emit(weak, embedUrl, label, ExtractorLinkType.M3U8, withCookie(hdrFor(embedUrl, true)), callback)
-                dbg.add("playlist doğrulanamadı: ${weak.removePrefix("https://").take(60)}")
-                result = 1
-            }
+            if (result == 2) break
+        }
+        if (result == 0 && weak != null) {
+            emit(weak, embedUrl, label, ExtractorLinkType.M3U8, withCookie(hdrFor(embedUrl, true)), callback)
+            dbg.add("playlist doğrulanamadı: ${weak.removePrefix("https://").take(60)}")
+            result = 1
         }
         if (result == 2) return 2
 
@@ -549,6 +672,10 @@ class Dizidad : MainAPI() {
         val embeds = extractEmbeds(html)
         dbg.add("sayfa ${page.substringAfter(".com/").take(40)} embed=${embeds.size}")
 
+        val out = ArrayList<ExtractorLink>()
+        val collect: (ExtractorLink) -> Unit = { out.add(it) }
+        val seen = HashSet<String>()
+
         for (e in embeds) {
             try {
                 val ids = youtubeIds(e)
@@ -556,11 +683,23 @@ class Dizidad : MainAPI() {
                     for (id in ids) playYoutube(id, page, subtitleCallback) { l -> yt.add(l) }
                     continue
                 }
-                if (loadExtractor(e, page, subtitleCallback, callback)) {
-                    strong = true
-                    continue
+                var good = false
+
+                // 1) CloudStream'in hazır çözücüsü (PeaceMakerst vb.) - çalışıyorsa aynen kullanılır
+                val n0 = out.size
+                try {
+                    loadExtractor(e, page, subtitleCallback, collect)
+                } catch (_: Exception) {
                 }
-                if (resolvePlayer(e, page, label, subtitleCallback, callback, yt, dbg) == 2) strong = true
+                for (l in out.drop(n0)) if (emitValidated(l, page, seen, callback, dbg)) good = true
+
+                // 2) çalışmadıysa kendi çözücümüz (farklı Referer/Origin/Cookie + POST denemeleri)
+                if (!good) {
+                    val n1 = out.size
+                    resolvePlayer(e, page, label, subtitleCallback, collect, yt, dbg)
+                    for (l in out.drop(n1)) if (emitValidated(l, page, seen, callback, dbg)) good = true
+                }
+                if (good) strong = true
             } catch (ex: Exception) {
                 dbg.add("HATA ${e.removePrefix("https://").take(35)} ${ex.message?.take(60)}")
             }
