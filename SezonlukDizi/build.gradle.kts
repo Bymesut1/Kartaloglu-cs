@@ -1,6 +1,10 @@
 // use an integer for version numbers
 version = 1
 
+android {
+    namespace = "com.bymesut1.sezonlukdizi"
+}
+
 cloudstream {
     language    = "tr"
     description = "SezonlukDizi - Türkçe dizi izle"
