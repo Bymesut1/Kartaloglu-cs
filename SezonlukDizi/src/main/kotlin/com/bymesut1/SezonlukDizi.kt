@@ -8,6 +8,12 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 class SezonlukDizi : MainAPI() {
     override var mainUrl        = "https://sezonlukdizi.cc"
@@ -50,7 +56,8 @@ class SezonlukDizi : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("${mainUrl}/diziler.asp?adi=${query}").document
+        val q        = java.net.URLEncoder.encode(query, "UTF-8")
+        val document = app.get("${mainUrl}/diziler.asp?adi=$q").document
 
         return document.select("div.afis a").mapNotNull { it.toSearchResult() }
     }
@@ -116,8 +123,8 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val dbg = ArrayList<String>()
-        var any = false
+        val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
+        val anyFound = AtomicBoolean(false)
         Log.d("SZD", "data » $data")
 
         val document = app.get(data).document
@@ -126,77 +133,90 @@ class SezonlukDizi : MainAPI() {
         dbg.add("asp alt=${aspData.alternatif} emb=${aspData.embed} bid=$bid")
 
         if (bid != null) {
-            for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
-                val raw = try {
-                    app.post(
-                        "${mainUrl}/ajax/dataAlternatif${aspData.alternatif}.asp",
-                        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                        data    = mapOf("bid" to bid, "dil" to dil)
-                    ).text
-                } catch (e: Exception) {
-                    dbg.add("ALT hata $etiket ${e.message?.take(50)}"); continue
-                }
-                dbg.add("RAW $etiket ${raw.take(120).replace(Regex("\\s+"), " ")}")
-                val resp = tryParseJson<Kaynak>(raw)
-                if (resp == null || resp.status != "success") {
-                    dbg.add("$etiket yok (${resp?.status})"); continue
-                }
-                val list = resp.data ?: run { dbg.add("$etiket data null"); null } ?: continue
-                dbg.add("$etiket kaynak ${list.size}")
+            // En fazla 40 sn bekle, sonra ne bulduysak onunla dön (sonsuz dönmeyi engeller)
+            withTimeoutOrNull(40_000L) {
+                val sem   = Semaphore(6)
+                val wvSem = Semaphore(2)
+                coroutineScope {
+                    for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
+                        launch {
+                            val raw = try {
+                                app.post(
+                                    "${mainUrl}/ajax/dataAlternatif${aspData.alternatif}.asp",
+                                    headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                                    data    = mapOf("bid" to bid, "dil" to dil)
+                                ).text
+                            } catch (e: Exception) {
+                                dbg.add("ALT hata $etiket ${e.message?.take(50)}"); return@launch
+                            }
+                            dbg.add("RAW $etiket ${raw.take(120).replace(Regex("\\s+"), " ")}")
+                            val resp = tryParseJson<Kaynak>(raw)
+                            if (resp == null || resp.status != "success") {
+                                dbg.add("$etiket yok (${resp?.status})"); return@launch
+                            }
+                            val list = resp.data
+                            if (list == null) { dbg.add("$etiket data null"); return@launch }
+                            dbg.add("$etiket kaynak ${list.size}")
 
-                for (veri in list) {
-                    val label = "$etiket - ${veri.baslik}"
+                            for (veri in list) {
+                                launch {
+                                    sem.withPermit {
+                                        val label = "$etiket - ${veri.baslik}"
+                                        val embedDoc = try {
+                                            app.post(
+                                                "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
+                                                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                                                data    = mapOf("id" to "${veri.id}")
+                                            ).document
+                                        } catch (e: Exception) {
+                                            dbg.add("EMB hata $label ${e.message?.take(50)}"); return@withPermit
+                                        }
+                                        val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
+                                        if (iframe == null) { dbg.add("$label iframe yok"); return@withPermit }
 
-                    val embedDoc = try {
-                        app.post(
-                            "${mainUrl}/ajax/dataEmbed${aspData.embed}.asp",
-                            headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                            data    = mapOf("id" to "${veri.id}")
-                        ).document
-                    } catch (e: Exception) {
-                        dbg.add("EMB hata $label ${e.message?.take(50)}"); continue
-                    }
-                    val iframe = fixUrlNull(embedDoc.selectFirst("iframe")?.attr("src"))
-                    if (iframe == null) { dbg.add("$label iframe yok"); continue }
+                                        val got = ConcurrentLinkedQueue<ExtractorLink>()
+                                        try {
+                                            loadExtractor(iframe, "${mainUrl}/", subtitleCallback) { got.add(it) }
+                                        } catch (e: Exception) {
+                                            dbg.add("LE hata $label ${e.message?.take(50)}")
+                                        }
+                                        dbg.add("LE $label ${got.size} ${iframe.take(60)}")
 
-                    // 1) Hazır extractor
-                    val got = ConcurrentLinkedQueue<ExtractorLink>()
-                    try {
-                        loadExtractor(iframe, "${mainUrl}/", subtitleCallback) { got.add(it) }
-                    } catch (e: Exception) {
-                        dbg.add("LE hata $label ${e.message?.take(50)}")
-                    }
-                    dbg.add("LE $label ${got.size} ${iframe.take(60)}")
-
-                    if (got.isNotEmpty()) {
-                        for (link in got) {
-                            callback(
-                                newExtractorLink(
-                                    source = label,
-                                    name   = label,
-                                    url    = link.url,
-                                    type   = link.type
-                                ) {
-                                    this.referer = link.referer
-                                    this.quality = link.quality
-                                    this.headers = link.headers
+                                        if (got.isNotEmpty()) {
+                                            for (link in got) {
+                                                callback(
+                                                    newExtractorLink(
+                                                        source = label,
+                                                        name   = label,
+                                                        url    = link.url,
+                                                        type   = link.type
+                                                    ) {
+                                                        this.referer = link.referer
+                                                        this.quality = link.quality
+                                                        this.headers = link.headers
+                                                    }
+                                                )
+                                                anyFound.set(true)
+                                            }
+                                        } else {
+                                            val wv = wvSem.withPermit {
+                                                try { webViewLink(iframe, data, label, dbg) } catch (e: Exception) {
+                                                    dbg.add("WV hata $label ${e.message?.take(50)}"); null
+                                                }
+                                            }
+                                            if (wv != null) { callback(wv); anyFound.set(true) }
+                                        }
+                                    }
                                 }
-                            )
-                            any = true
+                            }
                         }
-                    } else {
-                        // 2) WebView yedeği
-                        val wv = try { webViewLink(iframe, data, label, dbg) } catch (e: Exception) {
-                            dbg.add("WV hata $label ${e.message?.take(50)}"); null
-                        }
-                        if (wv != null) { callback(wv); any = true }
                     }
                 }
-            }
+            } ?: dbg.add("ZAMAN ASIMI 40sn")
         }
 
         if (debugMode) {
-            dbg.take(40).forEach {
+            dbg.toList().take(40).forEach {
                 callback(
                     newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
                         this.quality = Qualities.Unknown.value
@@ -205,7 +225,7 @@ class SezonlukDizi : MainAPI() {
             }
             return true
         }
-        return any
+        return anyFound.get()
     }
 
     // ---------------- WebView yedeği + doğrulama ----------------
