@@ -301,9 +301,6 @@ class AbiFilm3 : MainAPI() {
             addPart(f.attr("data-src").ifBlank { f.attr("src") }, "Kaynak")
         }
 
-        Regex("""https?:\\?/\\?/[^"'\s<>\\]*closeload[^"'\s<>\\]*""", RegexOption.IGNORE_CASE)
-            .findAll(html).forEach { addPart(it.value, "CloseLoad") }
-
         return map.map { it.value to it.key }
     }
 
