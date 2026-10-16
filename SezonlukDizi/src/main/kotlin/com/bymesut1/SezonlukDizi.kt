@@ -145,17 +145,9 @@ class SezonlukDizi : MainAPI() {
         val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
         val anyFound = AtomicBoolean(false)
 
-        // Debug satırını anında ekrana düşürür (sonu beklemeden ilerlemeyi görelim)
-        suspend fun d(msg: String) {
-            dbg.add(msg)
-            if (debugMode) {
-                callback(
-                    newExtractorLink(name, "DEBUG $msg", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-        }
+        // Debug satırları listeye eklenir, en sonda topluca gösterilir
+        // (anında göstermek oynatıcının ilk sahte linki seçip hata vermesine yol açıyordu)
+        suspend fun d(msg: String) { dbg.add(msg) }
 
         d("basladi ${data.takeLast(40)}")
 
@@ -269,7 +261,17 @@ class SezonlukDizi : MainAPI() {
         if (finished == null) d("ZAMAN ASIMI 35sn")
         scope.cancel()
 
-        return if (debugMode) true else anyFound.get()
+        if (debugMode) {
+            dbg.toList().take(40).forEach {
+                callback(
+                    newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+            return true
+        }
+        return anyFound.get()
     }
 
     // ---------------- WebView yedeği + doğrulama ----------------
