@@ -16,7 +16,7 @@ class Dizidad : MainAPI() {
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
 
     // Kaynak listesinde "DEBUG" satırları çıkması için true. Her şey çalışınca false yap.
-    private val DEBUG = true
+    private val DEBUG = false
 
     // Bölüm kategorileri kaldırıldı: bölümler artık dizinin içinde listeleniyor.
     override val mainPage = mainPageOf(
@@ -276,19 +276,25 @@ class Dizidad : MainAPI() {
 
         if (url.contains("/diziler/")) {
             val base = url.trimEnd('/').substringAfterLast('/').substringBefore("-izle")
+                .removeSuffix("-turkce-dublaj").removeSuffix("-dublaj").removeSuffix("-turkce-altyazili")
 
-            fun collect(d: Document): List<EpRef> = d.select("a[href]").mapNotNull { a ->
+            fun collect(d: Document, strict: Boolean = true): List<EpRef> = d.select("a[href]").mapNotNull { a ->
                 val href: String = fixUrl(a.attr("href")).substringBefore("#")
                 if (!href.contains("dizidad.com", true) || href.contains("/diziler/")) return@mapNotNull null
                 val slug = href.trimEnd('/').substringAfterLast('/')
-                if (base.isNotBlank() && !slug.startsWith("$base-", true)) return@mapNotNull null
+                if (strict && base.isNotBlank() && !slug.startsWith("$base-", true)) return@mapNotNull null
                 val m = reEpAny.find(slug) ?: return@mapNotNull null
                 val ep = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
                 val sg = m.groupValues[1]
                 EpRef(href, sg.toIntOrNull() ?: 1, ep, sg.isNotEmpty())
             }.distinctBy { it.href }
 
-            var all: List<EpRef> = collect(doc)
+            fun collectAny(d: Document): List<EpRef> {
+                val strict = collect(d)
+                return if (strict.isNotEmpty()) strict else collect(d, false)
+            }
+
+            var all: List<EpRef> = collectAny(doc)
 
             // Bölüm sayfasındaki "Dizinin Diğer Bölümleri" listesi tüm bölümleri verir (özellikle Kore/Hint dizileri).
             // Seri sayfasında bölüm yoksa ilk bölüm adresini tahmin et.
@@ -297,10 +303,12 @@ class Dizidad : MainAPI() {
             if (base.isNotBlank()) {
                 seeds.add("$mainUrl/$base-1-sezon-1-bolum-izle/")
                 seeds.add("$mainUrl/$base-1-bolum-izle/")
+                seeds.add("$mainUrl/$base-1-sezon-1-bolum-turkce-dublaj-izle/")
+                seeds.add("$mainUrl/$base-1-bolum-turkce-dublaj-izle/")
             }
             for (seed in seeds.distinct()) {
                 try {
-                    val extra = collect(app.get(seed, headers = pageHeaders(url)).document)
+                    val extra = collectAny(app.get(seed, headers = pageHeaders(url)).document)
                     if (extra.isNotEmpty()) {
                         all = (all + extra).distinctBy { it.href }
                         break
