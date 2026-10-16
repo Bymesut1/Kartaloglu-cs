@@ -5,6 +5,10 @@ android {
     namespace = "com.bymesut1.sezonlukdizi"
 }
 
+dependencies {
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+}
+
 cloudstream {
     language    = "tr"
     description = "SezonlukDizi - Türkçe dizi izle"
