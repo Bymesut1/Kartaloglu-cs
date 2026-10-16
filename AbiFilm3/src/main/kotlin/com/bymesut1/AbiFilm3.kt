@@ -3,6 +3,7 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 import java.net.URLEncoder
 
 class AbiFilm3 : MainAPI() {
@@ -11,6 +12,9 @@ class AbiFilm3 : MainAPI() {
     override var lang = "tr"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+
+    // Her şey çalışınca false yap
+    private val debugMode = true
 
     private val androidUA =
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
@@ -24,15 +28,52 @@ class AbiFilm3 : MainAPI() {
             "Referer" to "$mainUrl/"
         )
 
-    override val mainPage = mainPageOf("$mainUrl/" to "Ana Sayfa")
+    // ---------------- Kategoriler ----------------
 
-    // ---------------- Ana sayfa / Arama ----------------
+    override val mainPage = mainPageOf(
+        "$mainUrl/filmler-1/" to "Son Filmler",
+        "$mainUrl/yabanci-dizi-izle-1/" to "Diziler",
+        "$mainUrl/ulke/turkiye-fm4/" to "Yerli Filmler",
+        "$mainUrl/film-izle/olmeden-izlenmesi-gerekenler-fm1/" to "Ölmeden İzle",
+        "$mainUrl/seri-filmler-izle-1/" to "Seri Filmler",
+        "$mainUrl/kanal/netflix-fm1/" to "Netflix",
+        "$mainUrl/kanal/disney-fmgj6b/" to "Disney",
+        "$mainUrl/kanal/amazon/" to "PrimeVideo",
+        "$mainUrl/ulke/guney-kore-fm2/" to "Kore Filmleri",
+        "$mainUrl/tur/aksiyon-fmy54y/film/" to "Aksiyon",
+        "$mainUrl/tur/aile-fm2/film/" to "Aile",
+        "$mainUrl/tur/animasyon-fm2/film/" to "Animasyon",
+        "$mainUrl/tur/belgesel/film/" to "Belgesel",
+        "$mainUrl/tur/biyografi/film/" to "Biyografi",
+        "$mainUrl/tur/bilim-kurgu-fmy58w/film/" to "Bilim Kurgu",
+        "$mainUrl/tur/dram-fm1/film/" to "Dram",
+        "$mainUrl/tur/fantastik-fm1/film/" to "Fantastik",
+        "$mainUrl/tur/gerilim-fm1/film/" to "Gerilim",
+        "$mainUrl/tur/gizem/film/" to "Gizem",
+        "$mainUrl/tur/komedi-fm1/film/" to "Komedi",
+        "$mainUrl/tur/korku-fm2/film/" to "Korku",
+        "$mainUrl/tur/macera-fm1/film/" to "Macera",
+        "$mainUrl/tur/muzik/film/" to "Müzik",
+        "$mainUrl/tur/polisiye/film/" to "Polisiye",
+        "$mainUrl/tur/romantik-fm1/film/" to "Romantik",
+        "$mainUrl/tur/savas-fm1/film/" to "Savaş",
+        "$mainUrl/tur/spor/film/" to "Spor",
+        "$mainUrl/tur/tarih-fm1/film/" to "Tarih",
+        "$mainUrl/tur/western-fm1/film/" to "Western"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(request.name, emptyList(), false)
-        val doc = app.get(request.data, headers = pageHeaders).document
-        return newHomePageResponse(request.name, parseCards(doc), false)
+        val base = request.data.trimEnd('/') + "/"
+        val url = if (page <= 1) base else "${base}sayfa/$page/"
+        val list = try {
+            parseCards(app.get(url, headers = pageHeaders).document)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        return newHomePageResponse(request.name, list, list.isNotEmpty())
     }
+
+    // ---------------- Arama ----------------
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
@@ -40,27 +81,40 @@ class AbiFilm3 : MainAPI() {
         return parseCards(doc)
     }
 
-    private fun parseCards(doc: org.jsoup.nodes.Document): List<SearchResponse> {
-        return doc.select("a.item[href*=/film/], a.item[href*=/dizi/]").mapNotNull { el ->
+    private val cardHref = Regex("^(?:https?://[^/]+)?/(film|dizi)/[^/]+/?$")
+
+    private fun parseCards(doc: Document): List<SearchResponse> {
+        val seen = HashSet<String>()
+        return doc.select("a.item").mapNotNull { el ->
+            if (el.hasClass("soon") || el.hasClass("item-ep")) return@mapNotNull null
             val href = el.attr("href")
-            if (href.isBlank()) return@mapNotNull null
+            val m = cardHref.find(href) ?: return@mapNotNull null
+            val url = fixUrl(href)
+            if (!seen.add(url)) return@mapNotNull null
+
             val img = el.selectFirst("img")
-            val title = el.attr("data-title").ifBlank { img?.attr("alt") ?: "" }.trim()
+            val title = el.attr("data-title").ifBlank {
+                el.selectFirst(".item-title")?.text()
+                    ?: el.selectFirst(".title")?.text()
+                    ?: img?.attr("alt") ?: ""
+            }.trim()
             if (title.isBlank()) return@mapNotNull null
-            val poster = fixUrlNull(
-                img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src")
-            )
+
+            var poster = img?.attr("src") ?: ""
+            if (poster.isBlank() || poster.startsWith("data:")) poster = img?.attr("data-src") ?: ""
+            val posterUrl = fixUrlNull(poster.ifBlank { null })
+
             val year = Regex("(19|20)\\d{2}")
                 .find(el.select("div.info span").text())?.value?.toIntOrNull()
-            val url = fixUrl(href)
-            if (href.contains("/dizi/")) {
+
+            if (m.groupValues[1] == "dizi") {
                 newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                    this.posterUrl = poster
+                    this.posterUrl = posterUrl
                     this.year = year
                 }
             } else {
                 newMovieSearchResponse(title, url, TvType.Movie) {
-                    this.posterUrl = poster
+                    this.posterUrl = posterUrl
                     this.year = year
                 }
             }
@@ -69,16 +123,23 @@ class AbiFilm3 : MainAPI() {
 
     // ---------------- Detay sayfası ----------------
 
+    private fun cleanTitle(t: String): String =
+        t.replace(Regex("\\s*izle\\s*(\\(\\d{4}\\))?\\s*$", RegexOption.IGNORE_CASE), "").trim()
+
     override suspend fun load(url: String): LoadResponse? {
         val doc = app.get(url, headers = pageHeaders).document
         val html = doc.html()
-        val title = doc.selectFirst("h1")?.text()?.trim()
+        val rawTitle = doc.selectFirst("h1")?.text()?.trim()
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?: return null
-        val poster = fixUrlNull(doc.selectFirst("meta[property=og:image]")?.attr("content"))
+        val title = cleanTitle(rawTitle).ifBlank { rawTitle }
+        val poster = fixUrlNull(
+            doc.selectFirst("meta[property=og:image]")?.attr("content")
+                ?: doc.selectFirst(".thumbnail-outer img")?.attr("src")
+        )
         val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
-        val year = Regex("(19|20)\\d{2}")
-            .find(doc.select("div.info span").text())?.value?.toIntOrNull()
+        val year = Regex("(19|20)\\d{2}").findAll(url).lastOrNull()?.value?.toIntOrNull()
+            ?: Regex("\\((\\d{4})\\)").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
 
         if (url.contains("/dizi/")) {
             val seen = HashSet<String>()
@@ -119,54 +180,90 @@ class AbiFilm3 : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, headers = pageHeaders).document
+        val dbg = ArrayList<String>()
         var any = false
 
-        for ((label, embed) in extractParts(doc)) {
-            val found = try { resolveEmbed(embed, data) } catch (e: Exception) { null }
-            if (found != null) {
-                val origin = originOf(embed)
+        val res = try { app.get(data, headers = pageHeaders) } catch (e: Exception) {
+            dbg.add("sayfa hata ${e.message?.take(80)}")
+            null
+        }
+        if (res != null) {
+            dbg.add("sayfa ${res.code} len=${res.text.length}")
+            val parts = extractParts(res.document, res.text)
+            dbg.add("kaynak ${parts.size}")
+
+            for ((label, embed) in parts) {
+                dbg.add("E $label ${embed.take(70)}")
+                val found = try { resolveEmbed(embed, data, dbg) } catch (e: Exception) {
+                    dbg.add("EM hata ${e.message?.take(60)}"); null
+                }
+                if (found != null) {
+                    val origin = originOf(embed)
+                    callback(
+                        newExtractorLink(
+                            name,
+                            "$name - $label",
+                            found.url,
+                            if (found.hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "$origin/"
+                            this.quality = Qualities.Unknown.value
+                            this.headers = found.headers
+                        }
+                    )
+                    any = true
+                } else {
+                    try {
+                        if (loadExtractor(embed, data, subtitleCallback, callback)) any = true
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+
+        if (!any && debugMode) {
+            dbg.take(40).forEach {
                 callback(
-                    newExtractorLink(
-                        name,
-                        "$name - $label",
-                        found.url,
-                        if (found.hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "$origin/"
+                    newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
                         this.quality = Qualities.Unknown.value
-                        this.headers = found.headers
                     }
                 )
-                any = true
-            } else {
-                // Kendi çözücümüz bulamazsa CloudStream'in hazır çıkarıcılarını dene
-                try {
-                    if (loadExtractor(embed, data, subtitleCallback, callback)) any = true
-                } catch (_: Exception) {}
             }
+            return true
         }
         return any
     }
 
-    private fun extractParts(doc: org.jsoup.nodes.Document): List<Pair<String, String>> {
-        val map = LinkedHashMap<String, String>()
+    private val skipHosts = Regex(
+        "youtube|youtu\\.be|googletagmanager|google-analytics|cloudflare|facebook|twitter|agl005|cvt-s2|fonts\\.g",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun extractParts(doc: Document, html: String): List<Pair<String, String>> {
+        val map = LinkedHashMap<String, String>() // url -> label
+
+        fun addPart(raw: String, label: String) {
+            val u = raw.trim().replace("&amp;", "&").replace("\\/", "/")
+            if (!u.startsWith("http")) return
+            if (skipHosts.containsMatchIn(u)) return
+            if (label.contains("fragman", true)) return
+            if (!map.containsKey(u)) map[u] = label.ifBlank { "Kaynak" }
+        }
+
         doc.select("a[data-video_url]").forEach { a ->
-            val u = a.attr("data-video_url").trim()
-            val label = a.text().replace(Regex("\\s+"), " ").trim().ifBlank { "Kaynak" }
-            if (Regex("youtube\\.com|youtu\\.be").containsMatchIn(u) ||
-                label.contains("fragman", true)
-            ) return@forEach
-            if (!u.startsWith("http") || map.containsKey(u)) return@forEach
-            map[u] = label
+            addPart(
+                a.attr("data-video_url"),
+                a.text().replace(Regex("\\s+"), " ").trim()
+            )
         }
-        if (map.isEmpty()) {
-            doc.select("iframe[data-src]").forEach { f ->
-                val u = f.attr("data-src").trim()
-                if (!u.startsWith("http") || Regex("youtube|youtu\\.be").containsMatchIn(u)) return@forEach
-                if (!map.containsKey(u)) map[u] = "Kaynak"
-            }
+        Regex("data-video_url=\"([^\"]+)\"").findAll(html).forEach { addPart(it.groupValues[1], "Kaynak") }
+
+        doc.select("iframe[data-src], iframe[src]").forEach { f ->
+            addPart(f.attr("data-src").ifBlank { f.attr("src") }, "Kaynak")
         }
+
+        Regex("""https?:\\?/\\?/[^"'\s<>\\]*closeload[^"'\s<>\\]*""", RegexOption.IGNORE_CASE)
+            .findAll(html).forEach { addPart(it.value, "CloseLoad") }
+
         return map.map { it.value to it.key }
     }
 
@@ -174,7 +271,7 @@ class AbiFilm3 : MainAPI() {
 
     private data class Found(val url: String, val hls: Boolean, val headers: Map<String, String>)
 
-    private suspend fun resolveEmbed(embedUrl: String, pageUrl: String): Found? {
+    private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, dbg: MutableList<String>): Found? {
         val origin = originOf(embedUrl)
         for (ua in listOf(androidUA, desktopUA)) {
             val html = try {
@@ -187,12 +284,20 @@ class AbiFilm3 : MainAPI() {
                         "Referer" to pageUrl
                     )
                 ).text
-            } catch (e: Exception) { "" }
-            if (html.isBlank()) continue
-            val r = extractEmbed(html, origin) ?: continue
-            return Found(
-                r.first, r.second,
-                mapOf("User-Agent" to ua, "Referer" to "$origin/")
+            } catch (e: Exception) {
+                dbg.add("EM hata ${e.message?.take(60)}"); ""
+            }
+            if (html.isBlank()) { dbg.add("EM sayfa bos"); continue }
+
+            val texts = unpackAll(html)
+            val r = extractEmbed(html, origin, texts)
+            if (r != null) {
+                return Found(r.first, r.second, mapOf("User-Agent" to ua, "Referer" to "$origin/"))
+            }
+            dbg.add(
+                "EM len=${html.length} script=${Regex("<script", RegexOption.IGNORE_CASE).findAll(html).count()} " +
+                    "paket=${texts.size - 1} eval=${html.contains("eval(")} ld=${html.contains("contentUrl")} " +
+                    "av=${html.contains("av(")} m3u8=${texts.last().contains("m3u8")}"
             )
         }
         return null
@@ -204,30 +309,28 @@ class AbiFilm3 : MainAPI() {
         """^https?://[^/]*(?:\.shop|pictabox\.[a-z]+|rapidrame\.[a-z]+|cdnimages?\d*\.[a-z]+|cdnimgs?\d*\.[a-z]+|static\d+\.[a-z]+)(?:[/:?]|$)""",
         RegexOption.IGNORE_CASE
     )
+    private val b64Chars = Regex("^[A-Za-z0-9+/=_\\-]+$")
+    private val httpStart = Regex("https?://[A-Za-z0-9]")
 
-    private fun originOf(u: String) =
-        Regex("^https?://[^/]+").find(u)?.value ?: ""
+    private fun originOf(u: String) = Regex("^https?://[^/]+").find(u)?.value ?: ""
 
     private fun isMp4(u: String) =
         Regex("\\.mp4(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(u)
 
-    /** (url, hls?) döndürür */
-    private fun extractEmbed(html: String, origin: String): Pair<String, Boolean>? {
-        // Düz <video src> / <source src>
+    /** (url, hls?) */
+    private fun extractEmbed(html: String, origin: String, texts: List<String>): Pair<String, Boolean>? {
         Regex("<(?:source|video)[^>]*\\ssrc=[\"'](https?://[^\"']+)[\"']", RegexOption.IGNORE_CASE)
             .find(html)?.let {
                 val u = it.groupValues[1].replace("&amp;", "&")
                 if (!badExt.containsMatchIn(u)) return u to !isMp4(u)
             }
 
-        for (t in unpackAll(html)) {
-            // JSON-LD contentUrl
+        for (t in texts) {
             Regex("\"contentUrl\"\\s*:\\s*\"([^\"]+)\"").find(t)?.let {
                 val v = hexUnescape(it.groupValues[1])
                 if (v.startsWith("http") && !badExt.containsMatchIn(v)) return v to !isMp4(v)
             }
 
-            // RapidVid av('...')
             Regex("av\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)").find(t)?.let {
                 try {
                     val d = decodeSecret(it.groupValues[1])
@@ -236,7 +339,6 @@ class AbiFilm3 : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // "file":"..."
             for (m in Regex("\"?file\"?\\s*:\\s*\"([^\"]+)\"").findAll(t)) {
                 val v = hexUnescape(m.groupValues[1])
                 if (v.startsWith("http") && !badExt.containsMatchIn(v)) return v to !isMp4(v)
@@ -244,12 +346,12 @@ class AbiFilm3 : MainAPI() {
 
             findStreamUrl(t)?.let { return it }
 
-            // Göreli m3u8
             Regex("[\"'](/[^\"'\\s]+\\.m3u8[^\"'\\s]*)[\"']").find(hexUnescape(t))?.let {
                 return (origin + it.groupValues[1]) to true
             }
         }
-        return null
+
+        return try { bruteFindStream(texts) } catch (_: Exception) { null }
     }
 
     private fun findStreamUrl(text0: String): Pair<String, Boolean>? {
@@ -270,6 +372,53 @@ class AbiFilm3 : MainAPI() {
         return null
     }
 
+    // ---------------- Yedek (brute-force) çözücü ----------------
+
+    private fun bruteFindStream(texts: List<String>): Pair<String, Boolean>? {
+        val cands = ArrayList<String>()
+        val re = Regex("""["']([A-Za-z0-9+/=_\-]{30,6000})["']""")
+        for (t in texts) for (m in re.findAll(t)) {
+            if (!cands.contains(m.groupValues[1])) cands.add(m.groupValues[1])
+        }
+        cands.sortByDescending { it.length }
+        for (c in cands.take(8)) {
+            val d = tryDecodeString(c)
+            if (d.isNotEmpty()) {
+                findStreamUrl(d)?.let { return it }
+                val u = Regex("""https?://[^\s"'<>\\]+""").find(d)?.value
+                if (u != null && !badExt.containsMatchIn(u)) return u to !isMp4(u)
+            }
+        }
+        return null
+    }
+
+    private fun tryDecodeString(str: String): String {
+        val variants = listOf(str, str.reversed(), rot13(str), rot13(str).reversed())
+        for (v in variants) {
+            val bytes = b64(v)
+            if (bytes.size < 12) continue
+            val plain = latin1(bytes)
+            if (httpStart.containsMatchIn(plain)) return plain
+            val inner0 = latin1(b64(plain))
+            if (httpStart.containsMatchIn(inner0)) return inner0
+
+            for (a in 0..5) for (b in 0..5) for (c in 0..5) {
+                if (a == 0 && b == 0 && c == 0) continue
+                val off = intArrayOf(a, b, c)
+                val n = minOf(bytes.size, 48)
+                val pre = String(ByteArray(n) { i -> (bytes[i] - off[i % 3]).toByte() }, Charsets.ISO_8859_1)
+                if (!httpStart.containsMatchIn(pre) && !b64Chars.matches(pre)) continue
+                val s2 = String(ByteArray(bytes.size) { i -> (bytes[i] - off[i % 3]).toByte() }, Charsets.ISO_8859_1)
+                if (httpStart.containsMatchIn(s2)) return s2
+                if (b64Chars.matches(s2)) {
+                    val s3 = latin1(b64(s2))
+                    if (httpStart.containsMatchIn(s3)) return s3
+                }
+            }
+        }
+        return ""
+    }
+
     // ---------------- Yardımcılar ----------------
 
     private fun b64(s: String): ByteArray {
@@ -280,6 +429,14 @@ class AbiFilm3 : MainAPI() {
     }
 
     private fun latin1(b: ByteArray) = String(b, Charsets.ISO_8859_1)
+
+    private fun rot13(s: String): String = s.map { c ->
+        when (c) {
+            in 'a'..'z' -> 'a' + (c - 'a' + 13) % 26
+            in 'A'..'Z' -> 'A' + (c - 'A' + 13) % 26
+            else -> c
+        }
+    }.joinToString("")
 
     // RapidVid: ters çevir -> b64 -> "K9L" anahtarı ile kaydır -> b64
     private fun decodeSecret(input: String): String {
@@ -301,7 +458,6 @@ class AbiFilm3 : MainAPI() {
             .replace("\\/", "/")
     }
 
-    // eval(function(p,a,c,k,e,d)...) paketlerini aç (en fazla 3 kat)
     private fun unpackAll(text: String): List<String> {
         val list = arrayListOf(text)
         var cur = text
