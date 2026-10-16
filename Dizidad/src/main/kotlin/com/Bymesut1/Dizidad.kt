@@ -15,7 +15,10 @@ class Dizidad : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
 
-    // Ana sayfa satırları. Yavaşlatırsa istemediğin satırı sil.
+    // Kaynak listesinde "DEBUG" satırları çıkması için true. Her şey çalışınca false yap.
+    private val DEBUG = true
+
+    // Bölüm kategorileri kaldırıldı: bölümler artık dizinin içinde listeleniyor.
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Son Eklenenler",
         "$mainUrl/#populer" to "Popüler Diziler",
@@ -37,17 +40,7 @@ class Dizidad : MainAPI() {
         "$mainUrl/yerli-filmler/" to "Yerli Filmler",
         "$mainUrl/turkce-dublaj-filmler/" to "Türkçe Dublajlı Filmler",
         "$mainUrl/turkce-altyazili-filmler/" to "Türkçe Altyazılı Filmler",
-        "$mainUrl/tum-filmler/" to "Tüm Filmler",
-
-        "$mainUrl/turkce-dublaj-bolumler-hd/" to "Dublajlı Bölümler",
-        "$mainUrl/yerli-dizi-bolumleri/" to "Yerli Dizi Bölümleri",
-        "$mainUrl/anime-dizilerin-bolumleri/" to "Anime Bölümler",
-        "$mainUrl/yabanci-dizilerin-son-bolumleri/" to "Yabancı Bölümler",
-        "$mainUrl/kore-dizilerinden-son-bolumler/" to "Kore Dizi Bölümleri",
-        "$mainUrl/hint-dizilerinden-son-bolumler/" to "Hint Dizi Bölümleri",
-        "$mainUrl/pakistan-dizilerinden-son-bolumler/" to "Pakistan Dizi Bölümleri",
-        "$mainUrl/tv-program-bolumleri/" to "Tv Program Bölümleri",
-        "$mainUrl/tum-bolumler/" to "Tüm Bölümler"
+        "$mainUrl/tum-filmler/" to "Tüm Filmler"
     )
 
     private val ua =
@@ -59,15 +52,20 @@ class Dizidad : MainAPI() {
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
     )
 
+    private data class EpRef(val href: String, val season: Int, val episode: Int, val hasSeason: Boolean)
+
     // ---------------- Yardımcılar ----------------
 
     private val reItem = Regex(
         """^https?://(?:www\.)?dizidad\.com/(?:(?:diziler|filmler|film)/[^/?#]+|[a-z0-9-]+-izle[a-z0-9-]*)/?$""",
         RegexOption.IGNORE_CASE
     )
-    private val reEpisode = Regex("""-(\d+)-sezon-(\d+)-bolum""", RegexOption.IGNORE_CASE)
+
+    // "...-1-sezon-5-bolum..." ya da "...-30-bolum..."
+    private val reEpAny = Regex("""-(?:(\d+)-sezon-)?(\d+)-bolum""", RegexOption.IGNORE_CASE)
+
     private val reMedia = Regex(
-        """https?://[^\s"'<>\\)]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\)]*)?""",
+        """https?://[^\s"'<>\\)]+?\.(?:m3u8|mp4|mpd)(?:\?[^\s"'<>\\)]*)?""",
         RegexOption.IGNORE_CASE
     )
     private val reSub = Regex(
@@ -78,8 +76,8 @@ class Dizidad : MainAPI() {
         """(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?v=|v/)|youtu\.be/)([A-Za-z0-9_-]{11})""",
         RegexOption.IGNORE_CASE
     )
+    private val reTwimg = Regex("""https?://video\.twimg\.com/[^\s"'<>\\)]+""", RegexOption.IGNORE_CASE)
 
-    // menü / kategori sayfaları: kart olarak listelenmesin
     private val skipSlugs = setOf(
         "netflix-dizileri-izle", "turkce-dublaj-diziler-hd", "yerli-dizi-izle", "anime-izle",
         "yabanci-dizi-izle", "kore-dizileri-izle-hd", "full-hd-hint-dizileri-izle",
@@ -113,8 +111,10 @@ class Dizidad : MainAPI() {
     }
 
     private fun isJunk(u: String): Boolean =
-        Regex("cloudflareinsights|google|facebook|\\.(js|css|png|jpg|gif|svg|ico|woff2?)(\\?|$)", RegexOption.IGNORE_CASE)
-            .containsMatchIn(u)
+        Regex(
+            "cloudflareinsights|google|facebook|\\.(js|css|png|jpg|gif|svg|ico|woff2?)(\\?|$)|[/._-](ads?|vast|banner|adserver)[/._?=-]",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(u)
 
     private fun findMedia(txt: String): List<String> =
         reMedia.findAll(unesc(txt)).map { it.value }.filter { !isJunk(it) }.distinct().toList()
@@ -124,6 +124,30 @@ class Dizidad : MainAPI() {
 
     private fun youtubeIds(txt: String): List<String> =
         reYoutube.findAll(unesc(txt)).map { it.groupValues[1] }.distinct().toList()
+
+    private fun typeOf(u: String): ExtractorLinkType? = when {
+        u.contains(".m3u8", true) -> ExtractorLinkType.M3U8
+        u.contains(".mpd", true)  -> ExtractorLinkType.DASH
+        u.contains(".mp4", true)  -> ExtractorLinkType.VIDEO
+        else -> null
+    }
+
+    private fun cookieHeader(c: Map<String, String>): String =
+        c.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+    private fun hdrFor(ref: String, withOrigin: Boolean): Map<String, String> {
+        val m = linkedMapOf(
+            "User-Agent"      to ua,
+            "Referer"         to ref,
+            "Accept"          to "*/*",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+        )
+        if (withOrigin) {
+            val o = originOf(ref)
+            if (o.isNotBlank()) m["Origin"] = o
+        }
+        return m
+    }
 
     // ---------------- Liste / kart ayrıştırma ----------------
 
@@ -145,20 +169,36 @@ class Dizidad : MainAPI() {
             if (inContent.isNotEmpty()) inContent else doc.select("a[href]")
         }
 
-        val map = LinkedHashMap<String, Pair<String, String?>>()
+        // href -> (başlık, poster, bölümden türetildi mi)
+        val map = LinkedHashMap<String, Triple<String, String?, Boolean>>()
         for (a in anchors) {
-            val href: String = fixUrl(a.attr("href")).substringBefore("#")
-            if (!reItem.matches(href) || reEpisode.containsMatchIn(href)) continue
+            var href: String = fixUrl(a.attr("href")).substringBefore("#")
+            if (!reItem.matches(href)) continue
             val slug = href.trimEnd('/').substringAfterLast('/')
             if (slug in skipSlugs) continue
 
             val img: Element? = a.selectFirst("img")
             val alt: String = img?.attr("alt").orEmpty()
-            val title: String = a.attr("title").ifBlank { alt }.ifBlank { a.text() }.trim()
+            var title: String = a.attr("title").ifBlank { alt }.ifBlank { a.text() }.trim()
             val poster: String? = posterOf(img)
 
+            // Bölüm kartı ise diziye çevir: "haysiyet-1-bolum-izle" -> /diziler/haysiyet-izle/
+            var derived = false
+            val em = reEpAny.find(slug)
+            if (em != null && !href.contains("/diziler/")) {
+                href = "$mainUrl/diziler/${slug.substring(0, em.range.first)}-izle/"
+                title = title.replace(
+                    Regex("""\s*(\d+\.\s*sezon\s*)?\d+\.?\s*bölüm.*$""", RegexOption.IGNORE_CASE), ""
+                ).trim()
+                derived = true
+            }
+
             val prev = map[href]
-            map[href] = title.ifBlank { prev?.first.orEmpty() } to (poster ?: prev?.second)
+            map[href] = when {
+                prev == null -> Triple(title, poster, derived)
+                derived      -> Triple(prev.first.ifBlank { title }, prev.second ?: poster, prev.third)
+                else         -> Triple(title.ifBlank { prev.first }, poster ?: prev.second, false)
+            }
         }
 
         return map.filter { it.value.first.isNotBlank() }.map { (href, v) ->
@@ -207,10 +247,17 @@ class Dizidad : MainAPI() {
         }
     }
 
-    // ---------------- Dizi / film / bölüm sayfası ----------------
+    // ---------------- Dizi / film sayfası ----------------
 
     override suspend fun load(url: String): LoadResponse? {
         val doc: Document = app.get(url, headers = pageHeaders()).document
+
+        // Bölüm sayfası açıldıysa dizinin sayfasına yönlendir
+        val ownSlug = url.trimEnd('/').substringAfterLast('/')
+        if (!url.contains("/diziler/") && reEpAny.containsMatchIn(ownSlug)) {
+            val sHref: String? = doc.selectFirst("a[rel=category tag]")?.attr("href")?.let { fixUrl(it) }
+            if (sHref != null && sHref.contains("/diziler/") && sHref != url) return load(sHref)
+        }
 
         fun meta(p: String): String? {
             val el: Element? = doc.selectFirst("meta[property=$p]")
@@ -218,40 +265,45 @@ class Dizidad : MainAPI() {
             return c.ifBlank { null }
         }
 
-        val h1: Element? = doc.selectFirst("h1")
-        val h1Text: String? = h1?.text()
-
+        val h1Text: String? = doc.selectFirst("h1")?.text()
         val title  = cleanTitle(meta("og:title") ?: h1Text ?: doc.title())
         val poster = meta("og:image")?.let { fixUrl(it) }
         val plot   = meta("og:description")
 
-        // fragman: sayfadaki YouTube bağlantısı (bölüm sayfalarında değil, çünkü orada asıl video olabilir)
         val trailer: String? = if (!url.contains("-bolum")) {
             youtubeIds(doc.html()).firstOrNull()?.let { "https://www.youtube.com/watch?v=$it" }
         } else null
 
-        val isSeriesPage = url.contains("/diziler/")
+        if (url.contains("/diziler/")) {
+            val base = url.trimEnd('/').substringAfterLast('/').substringBefore("-izle")
 
-        if (isSeriesPage) {
-            val all = doc.select("a[href]").mapNotNull { a ->
+            val all: List<EpRef> = doc.select("a[href]").mapNotNull { a ->
                 val href: String = fixUrl(a.attr("href")).substringBefore("#")
-                if (!href.contains("dizidad.com", true)) return@mapNotNull null
-                val m = reEpisode.find(href) ?: return@mapNotNull null
-                Triple(href, m.groupValues[1].toInt(), m.groupValues[2].toInt())
-            }.distinctBy { it.first }
+                if (!href.contains("dizidad.com", true) || href.contains("/diziler/")) return@mapNotNull null
+                val slug = href.trimEnd('/').substringAfterLast('/')
+                val m = reEpAny.find(slug) ?: return@mapNotNull null
+                val ep = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
+                val sg = m.groupValues[1]
+                EpRef(href, sg.toIntOrNull() ?: 1, ep, sg.isNotEmpty())
+            }.distinctBy { it.href }
 
-            // başka dizilerin (yan menü vb.) bölümleri karışmasın
-            val slug = url.substringAfter("/diziler/", "").trim('/')
-            val own  = if (slug.isNotBlank()) all.filter { it.first.contains(slug, true) } else emptyList()
-            val eps  = (if (own.isNotEmpty()) own else all)
-                .sortedWith(compareBy({ it.second }, { it.third }))
+            // başka dizilerin bölümleri (yan menü vb.) karışmasın
+            val own = if (base.isNotBlank()) {
+                all.filter { it.href.trimEnd('/').substringAfterLast('/').startsWith("$base-", true) }
+            } else emptyList()
+            val list = if (own.isNotEmpty()) own else all
 
-            if (eps.isNotEmpty()) {
-                val episodes = eps.map { (href, s, e) ->
-                    newEpisode(href) {
-                        this.name    = "$s. Sezon $e. Bölüm"
-                        this.season  = s
-                        this.episode = e
+            if (list.isNotEmpty()) {
+                val hasSeason = list.any { it.hasSeason }
+                // aynı sezon/bölümün dublaj + altyazılı sayfaları tek bölümde birleşir
+                val grouped = list.groupBy { Pair(it.season, it.episode) }
+                    .toSortedMap(compareBy<Pair<Int, Int>>({ it.first }, { it.second }))
+
+                val episodes = grouped.map { (key, refs) ->
+                    newEpisode(refs.joinToString("|") { it.href }) {
+                        this.name    = "${key.second}. Bölüm"
+                        this.season  = if (hasSeason) key.first else null
+                        this.episode = key.second
                     }
                 }
                 return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
@@ -262,7 +314,6 @@ class Dizidad : MainAPI() {
             }
         }
 
-        // film ya da tek bölüm sayfası
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot      = plot
@@ -299,123 +350,232 @@ class Dizidad : MainAPI() {
         false
     }
 
+    // YouTube: sadece H264 1080p (yoksa en iyi H264, o da yoksa en iyi kalite). Diğerleri atılır.
+    private fun pickYoutube(list: List<ExtractorLink>): ExtractorLink? {
+        if (list.isEmpty()) return null
+        fun is264(l: ExtractorLink) = l.name.contains("H264", true) || l.name.contains("avc", true)
+        fun is1080(l: ExtractorLink) = l.quality == 1080 || l.name.contains("1080")
+        val h264 = list.filter { is264(it) }
+        return h264.firstOrNull { is1080(it) }
+            ?: h264.maxByOrNull { it.quality }
+            ?: list.firstOrNull { is1080(it) }
+            ?: list.maxByOrNull { it.quality }
+    }
+
     private suspend fun emit(
         url: String,
         referer: String,
         label: String,
-        asM3u8: Boolean,
+        type: ExtractorLinkType?,
+        headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit
     ) {
-        val origin = originOf(referer)
-        val hdrs = mutableMapOf("User-Agent" to ua)
-        if (origin.isNotBlank()) hdrs["Origin"] = origin
         callback.invoke(
             newExtractorLink(
                 source = name,
                 name   = "$name $label",
                 url    = url,
-                type   = if (asM3u8) ExtractorLinkType.M3U8 else null
+                type   = type
             ) {
                 this.referer = referer
                 this.quality = qualityOf(url)
-                this.headers = hdrs
+                this.headers = headers
             }
         )
     }
 
-    // hdplayersystem / hdmomplayer gömülü oynatıcı -> akış
-    private suspend fun resolveHdPlayer(
+    // playlist hangi başlık kombinasyonuyla açılıyor? (security error çözümü: Referer / Origin / Cookie denemeleri)
+    private suspend fun probePlaylist(
+        link: String,
+        refs: List<Pair<String, Boolean>>,
+        cookies: Map<String, String>,
+        dbg: MutableList<String>
+    ): Map<String, String>? {
+        for ((ref, withOrigin) in refs) {
+            val h = hdrFor(ref, withOrigin)
+            val t = try {
+                app.get(link, headers = h, cookies = cookies).text
+            } catch (e: Exception) {
+                "ERR ${e.message}"
+            }
+            dbg.add("GET m3 ref=${ref.removePrefix("https://").take(30)} o=$withOrigin -> ${t.trim().take(40)}")
+            if (t.trim().startsWith("#EXTM3U")) return h
+        }
+        return null
+    }
+
+    // Gömülü oynatıcı (hdplayersystem, peacemakerst vb.) -> akış.
+    // Dönüş: 2 = sağlam akış, 1 = doğrulanamayan akış, 0 = yok
+    private suspend fun resolvePlayer(
         embedUrl: String,
         pageUrl: String,
         label: String,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+        callback: (ExtractorLink) -> Unit,
+        yt: MutableList<ExtractorLink>,
+        dbg: MutableList<String>
+    ): Int {
         val origin = originOf(embedUrl)
-        val id = embedUrl.substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast("/")
+        val clean = embedUrl.substringBefore("?").substringBefore("#")
+        val id = clean.trimEnd('/').substringAfterLast("/")
 
-        val html = app.get(
+        val resp = app.get(
             embedUrl,
             headers = mapOf("User-Agent" to ua, "Referer" to pageUrl, "Origin" to mainUrl)
-        ).text
+        )
+        val html = resp.text
+        val cookies: Map<String, String> = resp.cookies
+        val ck = cookieHeader(cookies)
+        fun withCookie(h: Map<String, String>): Map<String, String> =
+            if (ck.isBlank()) h else h + ("Cookie" to ck)
+
+        dbg.add("embed ${origin.removePrefix("https://")} code=${resp.code} len=${html.length} cookies=${cookies.size}")
 
         findSubs(html).forEachIndexed { i, s ->
             subtitleCallback.invoke(SubtitleFile("Altyazı ${i + 1}", s))
         }
 
-        // sayfada doğrudan medya varsa
+        val tw = reTwimg.findAll(unesc(html)).map { it.value }.distinct().toList()
+        if (tw.isNotEmpty()) dbg.add("twimg x${tw.size}: ${tw.first().removePrefix("https://").take(90)}")
+
+        // 1) sayfada doğrudan medya varsa
+        val hasApi = html.contains("getVideo") || html.contains("player_base_url")
         val direct = findMedia(html)
-        if (direct.isNotEmpty()) {
-            direct.forEach { emit(it, embedUrl, label, false, callback) }
-            return true
+        val m3u8s = direct.filter { it.contains(".m3u8", true) }
+        val pick = if (m3u8s.isNotEmpty()) m3u8s else direct
+        if (pick.isNotEmpty() && (m3u8s.isNotEmpty() || !hasApi)) {
+            for (u in pick) emit(u, embedUrl, label, typeOf(u), withCookie(hdrFor(embedUrl, true)), callback)
+            return 2
         }
 
+        // 2) getVideo POST
         val base = Regex("""player_base_url\s*=\s*["']([^"']+)["']""")
-            .find(html)?.groupValues?.get(1) ?: origin
+            .find(html)?.groupValues?.get(1)?.trimEnd('/') ?: origin
+        val vi = clean.indexOf("/video/")
+        val dirPrefix = if (vi > 0) clean.substring(0, vi) else origin
+        val endpoints = listOf("$base/player/index.php", "$origin/player/index.php", "$dirPrefix/player/index.php").distinct()
 
-        suspend fun attempt(r: String): Boolean {
-            val text = try {
-                app.post(
-                    "$base/player/index.php?data=${URLEncoder.encode(id, "UTF-8")}&do=getVideo",
-                    headers = mapOf(
-                        "User-Agent"       to ua,
-                        "Referer"          to embedUrl,
-                        "Origin"           to base,
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept"           to "application/json, text/javascript, */*; q=0.01"
-                    ),
-                    data = mapOf("hash" to id, "r" to r)
-                ).text
-            } catch (e: Exception) {
-                return false
+        var apiText = ""
+        suspend fun callApi(r: String): List<String> {
+            for (ep in endpoints) {
+                val text = try {
+                    app.post(
+                        "$ep?data=${URLEncoder.encode(id, "UTF-8")}&do=getVideo",
+                        headers = mapOf(
+                            "User-Agent"       to ua,
+                            "Referer"          to embedUrl,
+                            "Origin"           to originOf(ep),
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+                        ),
+                        cookies = cookies,
+                        data = mapOf("hash" to id, "r" to r)
+                    ).text
+                } catch (e: Exception) {
+                    "ERR ${e.message}"
+                }
+                dbg.add("POST ${ep.removePrefix("https://").take(40)} r=${r.length} -> ${text.trim().take(70)}")
+                apiText += " " + text
+
+                val sec = Regex("\"(?:securedLink|secured_link)\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+                val vs  = Regex("\"(?:videoSource|video_source)\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+                val found = (listOf(sec, vs).map { unesc(it) } + findMedia(text))
+                    .map { if (it.startsWith("/")) originOf(ep) + it else it }
+                    .filter { it.startsWith("http", true) }
+                    .distinct()
+                if (found.isNotEmpty()) return found
             }
+            return emptyList()
+        }
 
-            val sec = Regex("\"(?:securedLink|secured_link)\"\\s*:\\s*\"([^\"]+)\"")
-                .find(text)?.groupValues?.get(1)
-            val vs = Regex("\"(?:videoSource|video_source)\"\\s*:\\s*\"([^\"]+)\"")
-                .find(text)?.groupValues?.get(1)
+        var links: List<String> = emptyList()
+        for (r in listOf(pageUrl, "")) {
+            links = callApi(r)
+            if (links.isNotEmpty()) break
+        }
 
-            // önce securedLink, yoksa videoSource
-            val link = listOf(sec, vs).map { unesc(it) }
-                .firstOrNull { it.startsWith("http", true) } ?: return false
-
-            // playlist hangi Referer ile açılıyor
-            var okRef: String? = null
-            if (!link.contains(".mp4", true)) {
-                for (ref in listOf(embedUrl, "$base/", pageUrl)) {
-                    val t = try {
-                        app.get(
-                            link,
-                            headers = mapOf(
-                                "User-Agent" to ua,
-                                "Referer"    to ref,
-                                "Origin"     to originOf(ref)
-                            )
-                        ).text
-                    } catch (e: Exception) {
-                        ""
-                    }
-                    if (t.trim().startsWith("#EXTM3U")) { okRef = ref; break }
+        var result = 0
+        if (links.isNotEmpty()) {
+            val refs = listOf(
+                embedUrl to false,
+                embedUrl to true,
+                "$base/" to true,
+                pageUrl to true,
+                "$mainUrl/" to true
+            )
+            var weak: String? = null
+            for (link in links) {
+                if (link.contains(".mp4", true)) {
+                    emit(link, embedUrl, label, ExtractorLinkType.VIDEO, withCookie(hdrFor(embedUrl, true)), callback)
+                    result = 2
+                    continue
+                }
+                val h = probePlaylist(link, refs, cookies, dbg)
+                if (h != null) {
+                    emit(link, h["Referer"] ?: embedUrl, label, ExtractorLinkType.M3U8, withCookie(h), callback)
+                    result = 2
+                } else if (weak == null) {
+                    weak = link
                 }
             }
+            if (result == 0 && weak != null) {
+                emit(weak, embedUrl, label, ExtractorLinkType.M3U8, withCookie(hdrFor(embedUrl, true)), callback)
+                dbg.add("playlist doğrulanamadı: ${weak.removePrefix("https://").take(60)}")
+                result = 1
+            }
+        }
+        if (result == 2) return 2
 
-            emit(
-                link,
-                okRef ?: embedUrl,
-                label,
-                okRef != null || link.contains(".m3u8", true),
-                callback
-            )
-            return true
+        // 3) oynatıcı sayfasında / cevapta YouTube varsa
+        for (y in (youtubeIds(html) + youtubeIds(apiText)).distinct()) {
+            playYoutube(y, pageUrl, subtitleCallback) { l -> yt.add(l) }
+        }
+        if (yt.isNotEmpty()) return 2
+        return result
+    }
+
+    // Bir bölüm sayfası -> tüm akışlar
+    private suspend fun processPage(
+        page: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        dbg: MutableList<String>
+    ): Boolean {
+        val html = app.get(page, headers = pageHeaders()).text
+        val label = if (page.contains("dublaj", true)) "Türkçe Dublaj" else "Altyazılı"
+        val yt = ArrayList<ExtractorLink>()
+        var strong = false
+
+        val embeds = extractEmbeds(html)
+        dbg.add("sayfa ${page.substringAfter(".com/").take(40)} embed=${embeds.size}")
+
+        for (e in embeds) {
+            try {
+                val ids = youtubeIds(e)
+                if (ids.isNotEmpty()) {
+                    for (id in ids) playYoutube(id, page, subtitleCallback) { l -> yt.add(l) }
+                    continue
+                }
+                if (loadExtractor(e, page, subtitleCallback, callback)) {
+                    strong = true
+                    continue
+                }
+                if (resolvePlayer(e, page, label, subtitleCallback, callback, yt, dbg) == 2) strong = true
+            } catch (ex: Exception) {
+                dbg.add("HATA ${e.removePrefix("https://").take(35)} ${ex.message?.take(60)}")
+            }
         }
 
-        if (attempt(pageUrl) || attempt("")) return true
-
-        // oynatıcı sayfasında YouTube varsa onu dene
-        for (yt in youtubeIds(html)) {
-            if (playYoutube(yt, pageUrl, subtitleCallback, callback)) return true
+        if (yt.isEmpty() && !strong) {
+            for (id in youtubeIds(html)) playYoutube(id, page, subtitleCallback) { l -> yt.add(l) }
         }
-        return false
+
+        val best = pickYoutube(yt)
+        if (best != null) {
+            callback.invoke(best)
+            strong = true
+        }
+        return strong
     }
 
     override suspend fun loadLinks(
@@ -424,47 +584,32 @@ class Dizidad : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, headers = pageHeaders()).text
-        val label = if (data.contains("dublaj", true)) "Türkçe Dublaj" else "Altyazılı"
-
+        val pages = data.split("|").map { it.trim() }.filter { it.startsWith("http") }
+        val dbg = ArrayList<String>()
         var any = false
-        for (e in extractEmbeds(html)) {
-            try {
-                val yt = youtubeIds(e)
-                if (yt.isNotEmpty()) {
-                    // YouTube (yerli diziler / fragmanlar)
-                    for (id in yt) {
-                        if (playYoutube(id, data, subtitleCallback, callback)) any = true
-                    }
-                } else if (Regex("hdplayersystem|hdmomplayer", RegexOption.IGNORE_CASE).containsMatchIn(e)) {
-                    if (resolveHdPlayer(e, data, label, subtitleCallback, callback)) any = true
-                } else {
-                    // CloudStream'in hazır çözücüleri (ok.ru, dailymotion vb.)
-                    if (loadExtractor(e, data, subtitleCallback, callback)) any = true
 
-                    val t = app.get(e, headers = pageHeaders(data)).text
-                    val media = findMedia(t)
-                    if (media.isNotEmpty()) {
-                        findSubs(t).forEachIndexed { i, s ->
-                            subtitleCallback.invoke(SubtitleFile("Altyazı ${i + 1}", s))
-                        }
-                        media.forEach { emit(it, e, label, false, callback) }
-                        any = true
-                    } else {
-                        for (id in youtubeIds(t)) {
-                            if (playYoutube(id, data, subtitleCallback, callback)) any = true
-                        }
-                    }
-                }
-            } catch (_: Exception) {
+        for (p in pages) {
+            try {
+                if (processPage(p, subtitleCallback, callback, dbg)) any = true
+            } catch (e: Exception) {
+                dbg.add("HATA sayfa ${e.message?.take(80)}")
             }
         }
 
-        // hiçbir şey çıkmadıysa sayfanın kendisinde YouTube ara
-        if (!any) {
-            for (id in youtubeIds(html)) {
-                if (playYoutube(id, data, subtitleCallback, callback)) any = true
+        if (DEBUG && !any) {
+            dbg.take(14).forEachIndexed { i, s ->
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name   = "DEBUG ${i + 1}: ${s.take(220)}",
+                        url    = "https://debug.invalid/${i + 1}.mp4"
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
+            return dbg.isNotEmpty()
         }
         return any
     }
