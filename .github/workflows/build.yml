@@ -32,6 +32,7 @@ jobs:
           cp AbiFilm0/build/*.cs3 out/
           cp MailRu/build/*.cs3 out/
           cp Dizidad/build/*.cs3 out/
+          cp AbiFilm3/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
