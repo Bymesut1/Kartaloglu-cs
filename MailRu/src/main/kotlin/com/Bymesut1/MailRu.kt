@@ -24,7 +24,7 @@ class MailRu : MainAPI() {
     )
 
     private val minSeconds  = 300
-    private val searchPages = 6    // hesap listesi en fazla kaç sayfa taransın (1 sayfa = 20 video, 6 sayfa = 120 video)
+    private val searchPages = 10   // hesap listesi en fazla kaç sayfa (sayfa = 20 video) taransın; liste bitince kendiliğinden durur
     private val pageSize    = 20
 
     override val mainPage = mainPageOf(
@@ -230,25 +230,15 @@ class MailRu : MainAPI() {
         return items
     }
 
-    private suspend fun siteSearch(enc: String): List<ListItem> {
-        var found = fetchList("$mobileUrl/video/search?st=search&q=$enc", 2)
-        if (found.isEmpty()) found = fetchList("$mainUrl/video/search?st=search&q=$enc", 1)
-        return found
-    }
-
-    private suspend fun accountMatches(q: String): List<ListItem> =
-        if (q.length >= 3) accountItems().filter { norm(it.title).contains(q) } else emptyList()
-
     override suspend fun search(query: String): List<SearchResponse> {
         val enc = URLEncoder.encode(query, "UTF-8")
-        val q   = norm(query)
+        var found = fetchList("$mobileUrl/video/search?st=search&q=$enc", 2)
+        if (found.isEmpty()) found = fetchList("$mainUrl/video/search?st=search&q=$enc", 1)
 
-        // site araması ve hesap listesi taraması AYNI ANDA çalışır
-        val results = listOf(true, false).amap { isSite ->
-            if (isSite) siteSearch(enc) else accountMatches(q)
-        }
-        val found        = results[0]
-        val fromAccounts = results[1]
+        val q = norm(query)
+        val fromAccounts = if (q.length >= 3) {
+            accountItems().filter { norm(it.title).contains(q) }
+        } else emptyList()
 
         return (found + fromAccounts)
             .distinctBy { it.path }
