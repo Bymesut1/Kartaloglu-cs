@@ -14,9 +14,6 @@ class AbiFilm3 : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Her şey çalışınca false yap
-    private val debugMode = true
-
     private val androidUA =
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
     private val desktopUA =
@@ -234,16 +231,6 @@ class AbiFilm3 : MainAPI() {
             }
         }
 
-        if (debugMode) {
-            dbg.take(40).forEach {
-                callback(
-                    newExtractorLink(name, "DEBUG $it", "https://debug.invalid/", ExtractorLinkType.VIDEO) {
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-            return true
-        }
         return any
     }
 
