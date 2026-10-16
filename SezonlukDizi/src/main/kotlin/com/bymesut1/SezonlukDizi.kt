@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -126,19 +127,21 @@ class SezonlukDizi : MainAPI() {
 
         if (bid != null) {
             for ((dil, etiket) in listOf("1" to "AltYazı", "0" to "Dublaj")) {
-                val resp = try {
+                val raw = try {
                     app.post(
                         "${mainUrl}/ajax/dataAlternatif${aspData.alternatif}.asp",
                         headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
                         data    = mapOf("bid" to bid, "dil" to dil)
-                    ).parsedSafe<Kaynak>()
+                    ).text
                 } catch (e: Exception) {
-                    dbg.add("ALT hata $etiket ${e.message?.take(50)}"); null
+                    dbg.add("ALT hata $etiket ${e.message?.take(50)}"); continue
                 }
+                dbg.add("RAW $etiket ${raw.take(120).replace(Regex("\\s+"), " ")}")
+                val resp = tryParseJson<Kaynak>(raw)
                 if (resp == null || resp.status != "success") {
                     dbg.add("$etiket yok (${resp?.status})"); continue
                 }
-                val list = resp.data ?: continue
+                val list = resp.data ?: run { dbg.add("$etiket data null"); null } ?: continue
                 dbg.add("$etiket kaynak ${list.size}")
 
                 for (veri in list) {
