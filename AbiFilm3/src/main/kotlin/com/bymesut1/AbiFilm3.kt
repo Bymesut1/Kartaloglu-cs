@@ -1,7 +1,6 @@
 package com.bymesut1
 
 import android.util.Base64
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
@@ -134,16 +133,16 @@ class AbiFilm3 : MainAPI() {
     // https://www.themoviedb.org/settings/api adresinden ücretsiz anahtar al
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
 
-    data class TmdbSearch(@JsonProperty("results") val results: List<TmdbShow>? = null)
-    data class TmdbShow(@JsonProperty("id") val id: Int? = null)
-    data class TmdbSeason(@JsonProperty("episodes") val episodes: List<TmdbEp>? = null)
+    data class TmdbSearch(val results: List<TmdbShow>? = null)
+    data class TmdbShow(val id: Int? = null)
+    data class TmdbSeason(val episodes: List<TmdbEp>? = null)
     data class TmdbEp(
-        @JsonProperty("episode_number") val episodeNumber: Int? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("still_path") val stillPath: String? = null,
-        @JsonProperty("air_date") val airDate: String? = null,
-        @JsonProperty("runtime") val runtime: Int? = null
+        val episode_number: Int? = null,
+        val name: String? = null,
+        val overview: String? = null,
+        val still_path: String? = null,
+        val air_date: String? = null,
+        val runtime: Int? = null
     )
 
     private suspend fun tmdbFindId(title: String, year: Int?): Int? {
@@ -165,14 +164,14 @@ class AbiFilm3 : MainAPI() {
 
         val tr = fetch("tr-TR")
         // Türkçe açıklama/görsel yoksa İngilizceden tamamla
-        val en = if (tr.any { it.overview.isNullOrBlank() || it.stillPath == null }) fetch("en-US") else emptyList()
-        val enMap = en.associateBy { it.episodeNumber }
+        val en = if (tr.any { it.overview.isNullOrBlank() || it.still_path == null }) fetch("en-US") else emptyList()
+        val enMap = en.associateBy { it.episode_number }
         return tr.mapNotNull { t ->
-            val n = t.episodeNumber ?: return@mapNotNull null
+            val n = t.episode_number ?: return@mapNotNull null
             val f = enMap[n]
             n to t.copy(
                 overview = t.overview?.takeIf { it.isNotBlank() } ?: f?.overview,
-                stillPath = t.stillPath ?: f?.stillPath,
+                still_path = t.still_path ?: f?.still_path,
                 name = t.name?.takeIf { it.isNotBlank() } ?: f?.name
             )
         }.toMap()
@@ -215,7 +214,7 @@ class AbiFilm3 : MainAPI() {
                 else null
 
                 // Yayın tarihi bugünden sonraysa listeye ekleme; yayın günü kendiliğinden düşer
-                val air = info?.airDate
+                val air = info?.air_date
                 if (!air.isNullOrBlank() && air > today) continue
 
                 episodes.add(newEpisode(epUrl) {
@@ -223,7 +222,7 @@ class AbiFilm3 : MainAPI() {
                     this.episode = e
                     this.name = info?.name?.takeIf { it.isNotBlank() } ?: "$s. Sezon $e. Bölüm"
                     this.description = info?.overview?.takeIf { it.isNotBlank() }
-                    this.posterUrl = info?.stillPath?.let { "https://image.tmdb.org/t/p/w500$it" }
+                    this.posterUrl = info?.still_path?.let { "https://image.tmdb.org/t/p/w500$it" }
                     this.runTime = info?.runtime
                     this.date = air?.let {
                         try { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(it)?.time } catch (_: Exception) { null }
