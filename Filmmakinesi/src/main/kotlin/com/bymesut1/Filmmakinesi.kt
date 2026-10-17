@@ -12,7 +12,7 @@ import java.util.Locale
 
 class AbiFilm3 : MainAPI() {
     override var mainUrl = "https://filmmakinesi.to"
-    override var name = "AbiFilm3"
+    override var name = "Fimmakinesi"
     override var lang = "tr"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
