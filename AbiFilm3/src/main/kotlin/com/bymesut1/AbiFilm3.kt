@@ -135,6 +135,7 @@ class AbiFilm3 : MainAPI() {
 
     data class TmdbSearch(val results: List<TmdbShow>? = null)
     data class TmdbShow(val id: Int? = null)
+    data class TmdbDetail(val overview: String? = null)
     data class TmdbSeason(val episodes: List<TmdbEp>? = null)
     data class TmdbEp(
         val episode_number: Int? = null,
@@ -145,16 +146,25 @@ class AbiFilm3 : MainAPI() {
         val runtime: Int? = null
     )
 
-    private suspend fun tmdbFindId(title: String, year: Int?): Int? {
+    private suspend fun tmdbFindId(title: String, year: Int?, isTv: Boolean = true): Int? {
         if (tmdbKey.startsWith("BURAYA")) return null
         val q = URLEncoder.encode(title, "UTF-8")
+        val kind = if (isTv) "tv" else "movie"
+        val yearParam = if (isTv) "first_air_date_year" else "year"
         suspend fun search(withYear: Boolean): Int? = try {
-            val y = if (withYear && year != null) "&first_air_date_year=$year" else ""
-            app.get("https://api.themoviedb.org/3/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q$y")
+            val y = if (withYear && year != null) "&$yearParam=$year" else ""
+            app.get("https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q$y")
                 .parsedSafe<TmdbSearch>()?.results?.firstOrNull()?.id
         } catch (e: Exception) { null }
         return search(true) ?: search(false)
     }
+
+    // Dizi / film açıklaması: yalnızca Türkçe (TR). Türkçe yoksa null döner.
+    private suspend fun tmdbOverviewTr(id: Int, isTv: Boolean): String? = try {
+        val kind = if (isTv) "tv" else "movie"
+        app.get("https://api.themoviedb.org/3/$kind/$id?api_key=$tmdbKey&language=tr-TR")
+            .parsedSafe<TmdbDetail>()?.overview?.trim()?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) { null }
 
     private suspend fun tmdbSeason(id: Int, season: Int): Map<Int, TmdbEp> {
         suspend fun fetch(lang: String): List<TmdbEp> = try {
@@ -163,14 +173,14 @@ class AbiFilm3 : MainAPI() {
         } catch (e: Exception) { emptyList() }
 
         val tr = fetch("tr-TR")
-        // Türkçe açıklama/görsel yoksa İngilizceden tamamla
-        val en = if (tr.any { it.overview.isNullOrBlank() || it.still_path == null }) fetch("en-US") else emptyList()
+        // Açıklama her zaman Türkçe; İngilizce yalnızca eksik görsel ve isim için kullanılır
+        val en = if (tr.any { it.still_path == null || it.name.isNullOrBlank() }) fetch("en-US") else emptyList()
         val enMap = en.associateBy { it.episode_number }
         return tr.mapNotNull { t ->
             val n = t.episode_number ?: return@mapNotNull null
             val f = enMap[n]
             n to t.copy(
-                overview = t.overview?.takeIf { it.isNotBlank() } ?: f?.overview,
+                overview = t.overview?.takeIf { it.isNotBlank() },
                 still_path = t.still_path ?: f?.still_path,
                 name = t.name?.takeIf { it.isNotBlank() } ?: f?.name
             )
@@ -188,7 +198,7 @@ class AbiFilm3 : MainAPI() {
             doc.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: doc.selectFirst(".thumbnail-outer img")?.attr("src")
         )
-        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+        val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")
         val year = Regex("(19|20)\\d{2}").findAll(url).lastOrNull()?.value?.toIntOrNull()
             ?: Regex("\\((\\d{4})\\)").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
 
@@ -203,7 +213,8 @@ class AbiFilm3 : MainAPI() {
                 }
 
             // TMDB'den resmi bölüm bilgileri (isim, açıklama, görsel, yayın tarihi)
-            val tmdbId = tmdbFindId(title, year)
+            val tmdbId = tmdbFindId(title, year, true)
+            val plot = (if (tmdbId != null) tmdbOverviewTr(tmdbId, true) else null) ?: sitePlot
             val seasonCache = HashMap<Int, Map<Int, TmdbEp>>()
             val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
@@ -237,6 +248,8 @@ class AbiFilm3 : MainAPI() {
             }
         }
 
+        val movieId = tmdbFindId(title, year, false)
+        val plot = (if (movieId != null) tmdbOverviewTr(movieId, false) else null) ?: sitePlot
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot = plot
