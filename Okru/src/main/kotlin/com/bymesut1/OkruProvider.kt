@@ -67,7 +67,8 @@ class OkruProvider : MainAPI() {
     private fun fixPoster(p: String?): String? {
         val s = p?.trim() ?: return null
         if (s.isBlank()) return null
-        return if (s.startsWith("//")) "https:$s" else s
+        val t = s.replace("\\/", "/").replace("&amp;", "&")
+        return if (t.startsWith("//")) "https:$t" else t
     }
 
     private fun card(x: OkItem): SearchResponse =
@@ -81,24 +82,80 @@ class OkruProvider : MainAPI() {
         return Regex("(^|[^a-z0-9])tr([^a-z0-9]|$)|dublaj|turkce|türkçe|\\bdual\\b|\\bizle\\b").containsMatchIn(t)
     }
 
+    private fun fold(s: String): String = s.replace("İ", "i").replace("I", "ı").lowercase()
+        .replace('ı', 'i').replace('ğ', 'g').replace('ü', 'u')
+        .replace('ş', 's').replace('ö', 'o').replace('ç', 'c')
+        .replace(Regex("[^a-z0-9]+"), " ").trim()
+
+    // ---------------- Video bilgisi önbelleği + afiş tamamlama ----------------
+
+    private val metaCache = java.util.concurrent.ConcurrentHashMap<String, OkMeta>()
+
+    private suspend fun metaOf(id: String): OkMeta? {
+        metaCache[id]?.let { return it }
+        val m = fetchMeta(id) ?: return null
+        metaCache[id] = m
+        return m
+    }
+
+    // Afişi / başlığı olmayan kayıtların video sayfasından afişini ve başlığını tamamlar
+    private suspend fun withPosters(list: List<OkItem>): List<OkItem> =
+        list.amap { x ->
+            if (x.poster != null && x.title.isNotBlank()) {
+                x
+            } else {
+                val m = try { metaOf(x.id) } catch (e: Exception) { null }
+                OkItem(
+                    x.id,
+                    x.title.ifBlank { m?.title.orEmpty() },
+                    x.poster ?: m?.poster
+                )
+            }
+        }.filter { it.title.isNotBlank() }
+
     // ---------------- Ana sayfa ----------------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
         val items: List<OkItem> = when (request.data) {
             "secilmis" -> secilmis
-            "hesap" -> hesaplar.flatMap {
-                try { parseProfile(app.get(it, headers = hdr(true)).text) } catch (e: Exception) { emptyList() }
-            }
-            else -> try {
-                parseProps(app.get("$mainUrl/video/showcase", headers = hdr(true)).text)
-            } catch (e: Exception) {
-                emptyList()
-            }
+            "hesap" -> hesaplar.flatMap { profileItems(it) }
+            else -> vitrinItems()
         }
         val seen = HashSet<String>()
-        val list = items.filter { seen.add(it.id) }.map { card(it) }
+        val uniq = items.filter { seen.add(it.id) }.take(36)
+        val list = withPosters(uniq).map { card(it) }
         return newHomePageResponse(request.name, list, false)
+    }
+
+    private suspend fun profileItems(url: String): List<OkItem> {
+        val urls = listOf(url, url.replace("https://ok.ru", "https://m.ok.ru"))
+        for (u in urls) {
+            for (desk in listOf(true, false)) {
+                val html = try { app.get(u, headers = hdr(desk), timeout = 15L).text } catch (e: Exception) { "" }
+                if (html.isBlank()) continue
+                val a = parseProfile(html)
+                if (a.isNotEmpty()) return a
+                val b = parseProps(html)
+                if (b.isNotEmpty()) return b
+                val ids = LinkedHashSet<String>()
+                Regex("/video/(\\d{8,})").findAll(html).forEach { ids.add(it.groupValues[1]) }
+                if (ids.isNotEmpty()) return ids.take(30).map { OkItem(it, "", null) }
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun vitrinItems(): List<OkItem> {
+        val a = try {
+            parseProps(app.get("$mainUrl/video/showcase", headers = hdr(true), timeout = 15L).text)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (a.isNotEmpty()) return a
+        // ok.ru vitrini boşsa arama motorlarından Türkçe film bul
+        val ids = engineSearchIds(listOf("site:ok.ru/video türkçe dublaj film", "ok.ru video tr dublaj film izle"))
+        return ids.take(24).map { OkItem(it, "", null) }
     }
 
     // Profil sayfası: her /video/<numara> için en yakın başlık
@@ -167,13 +224,19 @@ class OkruProvider : MainAPI() {
     // ---------------- Arama (ok.ru + arama motorları) ----------------
 
     private fun engineUrls(q: String): List<String> = listOf(
+        "https://html.duckduckgo.com/html/?q=${enc(q)}",
         "https://www.bing.com/search?q=${enc(q)}&setlang=tr&count=30",
+        "https://search.brave.com/search?q=${enc(q)}",
+        "https://www.mojeek.com/search?q=${enc(q)}",
+        "https://yandex.com.tr/search/?text=${enc(q)}&lr=11508",
+        "https://yandex.com/search/?text=${enc(q)}",
         "https://www.google.com/search?q=${enc(q)}&hl=tr&num=30&gbv=1"
     )
 
     private fun engineHeaders(u: String): Map<String, String> {
         val h = hashMapOf(
             "User-Agent" to uaDesktop,
+            "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
             "Referer" to "https://www.google.com/"
         )
@@ -183,42 +246,73 @@ class OkruProvider : MainAPI() {
 
     private fun engineIds(html0: String): List<String> {
         val html = html0.replace("%252F", "/").replace("%2F", "/").replace("%2f", "/")
-            .replace("%3A", ":").replace("&amp;", "&").replace("\\/", "/")
+            .replace("%3A", ":").replace("%3a", ":").replace("&amp;", "&").replace("\\/", "/")
         val out = LinkedHashSet<String>()
         Regex("ok\\.ru/video(?:embed)?/(\\d{8,})", RegexOption.IGNORE_CASE).findAll(html)
             .forEach { out.add(it.groupValues[1]) }
         return out.toList()
     }
 
+    // Tüm arama motorlarına aynı anda sorar, bulunan ok.ru video numaralarını toplar
+    private suspend fun engineSearchIds(queries: List<String>): List<String> {
+        val urls = queries.flatMap { engineUrls(it) }
+        val pages = urls.amap { u ->
+            try { app.get(u, headers = engineHeaders(u), timeout = 15L).text } catch (e: Exception) { "" }
+        }
+        val out = LinkedHashSet<String>()
+        pages.forEach { p -> engineIds(p).forEach { out.add(it) } }
+        return out.toList()
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
+        val q = query.trim()
+        if (q.isBlank()) return emptyList()
         val items = LinkedHashMap<String, OkItem>()
 
-        try {
-            val h = app.get(
-                "$mainUrl/video/search?st.cmd=anonymVideo&st.m=SEARCH&st.v.sq=${enc(query)}",
-                headers = hdr(true)
-            ).text
-            parseProps(h).forEach { if (!items.containsKey(it.id)) items[it.id] = it }
-        } catch (e: Exception) {
-        }
-
-        val ids = LinkedHashSet<String>()
-        val queries = listOf("$query tr ok.ru", "$query türkçe dublaj ok.ru", "$query izle ok.ru")
-        for (q in queries) {
-            for (u in engineUrls(q)) {
-                val html = try { app.get(u, headers = engineHeaders(u)).text } catch (e: Exception) { "" }
-                engineIds(html).forEach { ids.add(it) }
+        // 1) Elle eklenen filmlerde eşleşme
+        val words = fold(q).split(" ").filter { it.isNotBlank() }
+        if (words.isNotEmpty()) {
+            for (s in secilmis) {
+                val t = fold(s.title)
+                if (words.all { t.contains(it) } && !items.containsKey(s.id)) items[s.id] = s
             }
-            if (ids.size >= 14) break
         }
 
-        // Bulunan numaraların gerçek başlığı video sayfasından doğrulanır
-        for (id in ids.filter { !items.containsKey(it) }.take(12)) {
-            val m = fetchMeta(id) ?: continue
-            if (m.title.isBlank()) continue
+        // 2) ok.ru kendi araması
+        val okIds = LinkedHashSet<String>()
+        val okUrls = listOf(
+            "$mainUrl/video/search?st.cmd=anonymVideo&st.m=SEARCH&st.v.sq=${enc(q)}",
+            "$mainUrl/video/search?st.v.sq=${enc(q)}",
+            "https://m.ok.ru/video/search?st.v.sq=${enc(q)}"
+        )
+        for (u in okUrls) {
+            val h = try { app.get(u, headers = hdr(!u.contains("m.ok.ru")), timeout = 15L).text } catch (e: Exception) { "" }
+            if (h.isBlank()) continue
+            parseProps(h).forEach { if (!items.containsKey(it.id)) items[it.id] = it }
+            Regex("/video/(\\d{8,})").findAll(h).forEach { okIds.add(it.groupValues[1]) }
+            if (items.size >= 10) break
+        }
+
+        // 3) Arama motorları (ok.ru video bağlantıları)
+        val ids = LinkedHashSet<String>()
+        okIds.forEach { ids.add(it) }
+        val queries = listOf(
+            "site:ok.ru/video $q",
+            "$q tr dublaj site:ok.ru",
+            "$q izle ok.ru video"
+        )
+        engineSearchIds(queries).forEach { ids.add(it) }
+
+        // Bulunan numaraların gerçek başlığı + afişi video sayfasından alınır
+        val toCheck = ids.filter { !items.containsKey(it) }.take(16)
+        val metas = toCheck.amap { id -> id to (try { metaOf(id) } catch (e: Exception) { null }) }
+        for ((id, m) in metas) {
+            if (m == null || m.title.isBlank()) continue
             items[id] = OkItem(id, m.title, m.poster)
         }
-        return items.values.sortedByDescending { turkishTag(it.title) }.map { card(it) }
+
+        val sorted = items.values.sortedByDescending { turkishTag(it.title) }.take(40)
+        return withPosters(sorted).map { card(it) }
     }
 
     // ---------------- Video bilgisi ----------------
@@ -259,10 +353,17 @@ class OkruProvider : MainAPI() {
                         .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
                     if (vids.isEmpty() && hls.isBlank() && dash.isBlank()) continue
 
+                    val posterRaw = listOf(
+                        mv.optString("poster"),
+                        mv.optString("bigThumbnail"),
+                        mv.optString("thumbnail"),
+                        md.optString("poster")
+                    ).firstOrNull { it.isNotBlank() }
+
                     return OkMeta(
                         id,
                         mv.optString("title").trim(),
-                        fixPoster(mv.optString("poster")),
+                        fixPoster(posterRaw),
                         mv.optString("duration").toIntOrNull() ?: 0,
                         mv.optString("description"),
                         vids, hls, dash
@@ -279,7 +380,7 @@ class OkruProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val id = idOf(url)
         if (id.isBlank()) return null
-        val m = fetchMeta(id) ?: return null
+        val m = metaOf(id) ?: return null
         val link = "$mainUrl/video/$id"
         val title = m.title.ifBlank { "Video $id" }
         val seed = secilmis.firstOrNull { it.id == id }
@@ -298,6 +399,7 @@ class OkruProvider : MainAPI() {
     ): Boolean {
         val id = idOf(data)
         if (id.isBlank()) return false
+        // Bağlantılar süreli olduğu için burada her zaman taze alınır
         val m = fetchMeta(id) ?: return false
         val h = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Origin" to mainUrl)
         var any = false
