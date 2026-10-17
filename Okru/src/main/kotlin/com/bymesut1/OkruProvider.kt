@@ -8,401 +8,237 @@ import org.json.JSONTokener
 import org.jsoup.parser.Parser
 import java.net.URLEncoder
 
-class OkruProvider : MainAPI() {
+class OKRU : MainAPI() {
     override var mainUrl = "https://ok.ru"
-    override var name = "Okru"
-    override var lang = "tr"
+    override var name = "OKRu"
     override val hasMainPage = true
-    override val supportedTypes = setOf(TvType.Movie)
-
-    private val ua =
-        "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
-    private val uaDesktop =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-    private data class OkItem(val id: String, val title: String, val poster: String?)
-
-    private data class OkMeta(
-        val id: String,
-        val title: String,
-        val poster: String?,
-        val dur: Int,
-        val desc: String,
-        val videos: List<Pair<Int, String>>,
-        val hls: String,
-        val dash: String
-    )
-
-    // Elle eklenen garanti filmler (id = ok.ru video numarası). Buraya yenilerini ekleyebilirsin.
-    private val secilmis = listOf(
-        OkItem("1766021532169", "The Terminator (1984) TR 1080p", null),
-        OkItem("1050987137588", "The Terminator (1984) BluRay TR", null),
-        OkItem("1189269146174", "The Terminator (1984) Filmsarayi", null),
-        OkItem("11402194193016", "Rambo İlk Kan (1982) Beyaz TV", null),
-        OkItem("10001072654964", "İlk Kan (1982)", null),
-        OkItem("357648699796", "Yeşil Dev Hulk (2008) TR Dublaj", null),
-        OkItem("7225761139269", "Yeşil Dev Hulk 2 (2008)", null)
-    )
-
-    // Yükleyen hesaplar (video listesi sayfası)
-    private val hesaplar = listOf("https://ok.ru/profile/590041294398/video")
+    override var lang = "ru"
+    override val hasQuickSearch = false
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
-        "secilmis" to "Seçilmiş Türkçe Filmler",
-        "hesap" to "Yükleyen Hesap Videoları",
-        "vitrin" to "ok.ru Vitrin"
+        "${mainUrl}/video/showcase" to "Videos",
+        "${mainUrl}/video/kino/soviet" to "Soviet",
+        "${mainUrl}/video/kino/drama" to "Drama",
+        "${mainUrl}/video/kino/action" to "Action",
+        "${mainUrl}/video/kino/family" to "Family",
+        "${mainUrl}/video/kino/comedy" to "Comedy Movies",
+        "${mainUrl}/video/serial" to "Series",
     )
-
-    // ---------------- Yardımcılar ----------------
-
-    private fun dec(s: String): String = Parser.unescapeEntities(s, false)
-    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
-
-    private fun hdr(desktop: Boolean = false): Map<String, String> = mapOf(
-        "User-Agent" to (if (desktop) uaDesktop else ua),
-        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8,ru;q=0.5",
-        "Referer" to "$mainUrl/video"
-    )
-
-    private fun fixPoster(p: String?): String? {
-        val s = p?.trim() ?: return null
-        if (s.isBlank()) return null
-        val t = s.replace("\\/", "/").replace("&amp;", "&")
-        return if (t.startsWith("//")) "https:$t" else t
-    }
-
-    private fun card(x: OkItem): SearchResponse =
-        newMovieSearchResponse(x.title, "$mainUrl/video/${x.id}", TvType.Movie) {
-            this.posterUrl = x.poster
-        }
-
-    private fun turkishTag(title: String): Boolean {
-        val t = title.replace("İ", "i").lowercase()
-        if (Regex("altyaz|\\bsub\\b|\\beng\\b|english").containsMatchIn(t)) return false
-        return Regex("(^|[^a-z0-9])tr([^a-z0-9]|$)|dublaj|turkce|türkçe|\\bdual\\b|\\bizle\\b").containsMatchIn(t)
-    }
-
-    private fun fold(s: String): String = s.replace("İ", "i").replace("I", "ı").lowercase()
-        .replace('ı', 'i').replace('ğ', 'g').replace('ü', 'u')
-        .replace('ş', 's').replace('ö', 'o').replace('ç', 'c')
-        .replace(Regex("[^a-z0-9]+"), " ").trim()
-
-    // ---------------- Video bilgisi önbelleği + afiş tamamlama ----------------
-
-    private val metaCache = java.util.concurrent.ConcurrentHashMap<String, OkMeta>()
-
-    private suspend fun metaOf(id: String): OkMeta? {
-        metaCache[id]?.let { return it }
-        val m = fetchMeta(id) ?: return null
-        metaCache[id] = m
-        return m
-    }
-
-    // Afişi / başlığı olmayan kayıtların video sayfasından afişini ve başlığını tamamlar
-    private suspend fun withPosters(list: List<OkItem>): List<OkItem> =
-        list.amap { x ->
-            if (x.poster != null && x.title.isNotBlank()) {
-                x
-            } else {
-                val m = try { metaOf(x.id) } catch (e: Exception) { null }
-                OkItem(
-                    x.id,
-                    x.title.ifBlank { m?.title.orEmpty() },
-                    x.poster ?: m?.poster
-                )
-            }
-        }.filter { it.title.isNotBlank() }
-
-    // ---------------- Ana sayfa ----------------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
-        val items: List<OkItem> = when (request.data) {
-            "secilmis" -> secilmis
-            "hesap" -> hesaplar.flatMap { profileItems(it) }
-            else -> vitrinItems()
-        }
-        val seen = HashSet<String>()
-        val uniq = items.filter { seen.add(it.id) }.take(36)
-        val list = withPosters(uniq).map { card(it) }
-        return newHomePageResponse(request.name, list, false)
-    }
+        val tag = request.data.substringAfterLast("/")
+        val isSerial = request.data.contains("serial")
+        val isShowcase = request.data.contains("showcase")
+        var document = app.get(request.data).document
+        val lastElement = document.selectFirst("[data-module=Loader]")?.attr("data-last-element") ?: if (isShowcase) "18" else "1669805881145"
 
-    private suspend fun profileItems(url: String): List<OkItem> {
-        val urls = listOf(url, url.replace("https://ok.ru", "https://m.ok.ru"))
-        for (u in urls) {
-            for (desk in listOf(true, false)) {
-                val html = try { app.get(u, headers = hdr(desk), timeout = 15L).text } catch (e: Exception) { "" }
-                if (html.isBlank()) continue
-                val a = parseProfile(html)
-                if (a.isNotEmpty()) return a
-                val b = parseProps(html)
-                if (b.isNotEmpty()) return b
-                val ids = LinkedHashSet<String>()
-                Regex("/video/(\\d{8,})").findAll(html).forEach { ids.add(it.groupValues[1]) }
-                if (ids.isNotEmpty()) return ids.take(30).map { OkItem(it, "", null) }
-            }
-        }
-        return emptyList()
-    }
-
-    private suspend fun vitrinItems(): List<OkItem> {
-        val a = try {
-            parseProps(app.get("$mainUrl/video/showcase", headers = hdr(true), timeout = 15L).text)
-        } catch (e: Exception) {
-            emptyList()
-        }
-        if (a.isNotEmpty()) return a
-        // ok.ru vitrini boşsa arama motorlarından Türkçe film bul
-        val ids = engineSearchIds(listOf("site:ok.ru/video türkçe dublaj film", "ok.ru video tr dublaj film izle"))
-        return ids.take(24).map { OkItem(it, "", null) }
-    }
-
-    // Profil sayfası: her /video/<numara> için en yakın başlık
-    private fun parseProfile(html: String): List<OkItem> {
-        val ids = ArrayList<Pair<String, Int>>()
-        val seen = HashSet<String>()
-        Regex("/video/(\\d{8,})").findAll(html).forEach {
-            if (seen.add(it.groupValues[1])) ids.add(it.groupValues[1] to it.range.first)
-        }
-        val skip = Regex("^(görüntüle|izle|video|videolar|kapat|logo|ok|oynat)$", RegexOption.IGNORE_CASE)
-        val titles = ArrayList<Pair<Int, String>>()
-        Regex("(?:alt|title|aria-label)=\"([^\"]{2,200})\"").findAll(html).forEach { m ->
-            val t = dec(m.groupValues[1]).trim()
-            if (t.isBlank() || t == "#" || t.startsWith("http") || skip.matches(t)) return@forEach
-            titles.add(m.range.first to t)
-        }
-        return ids.mapNotNull { (id, at) ->
-            val best = titles.minByOrNull { kotlin.math.abs(it.first - at) + (if (it.first > at) 1 else 0) }
-            if (best == null || kotlin.math.abs(best.first - at) > 900) null else OkItem(id, best.second, null)
-        }
-    }
-
-    // data-props / data-options JSON bloklarındaki film kayıtları (vitrin, arama)
-    private fun parseProps(html: String): List<OkItem> {
-        val out = ArrayList<OkItem>()
-        val seen = HashSet<String>()
-        fun add(o: JSONObject) {
-            val id = o.optString("id")
-            val title = dec(o.optString("title").ifBlank { o.optString("name") }).trim()
-            if (id.isBlank() || title.isBlank() || !seen.add(id)) return
-            val poster = listOf("thumbnailUrl", "thumbnail", "poster", "imageUrl")
-                .map { o.optString(it) }.firstOrNull { it.isNotBlank() }
-            out.add(OkItem(id, title, fixPoster(poster)))
-        }
-        fun walk(o: Any?, depth: Int) {
-            if (o == null || depth > 9) return
-            if (o is JSONArray) {
-                for (i in 0 until o.length()) walk(o.opt(i), depth + 1)
-                return
-            }
-            if (o !is JSONObject) return
-            val mv = o.optJSONObject("movie")
-            if (mv != null && mv.optString("id").isNotBlank()) {
-                add(mv)
-            } else if (Regex("^\\d{8,}$").matches(o.optString("id")) &&
-                (o.has("title") || o.has("name")) &&
-                (o.has("duration") || o.has("thumbnail") || o.has("poster") || o.has("imageUrl"))
-            ) {
-                add(o)
-            }
-            val keys = o.keys()
-            while (keys.hasNext()) {
-                val v = o.opt(keys.next())
-                if (v is JSONObject || v is JSONArray) walk(v, depth + 1)
-            }
-        }
-        Regex("data-(?:props|options|module|state)=\"([^\"]+)\"").findAll(html).forEach { m ->
-            try {
-                walk(JSONTokener(dec(m.groupValues[1])).nextValue(), 0)
-            } catch (e: Exception) {
-            }
-        }
-        return out
-    }
-
-    // ---------------- Arama (ok.ru + arama motorları) ----------------
-
-    private fun engineUrls(q: String): List<String> = listOf(
-        "https://html.duckduckgo.com/html/?q=${enc(q)}",
-        "https://www.bing.com/search?q=${enc(q)}&setlang=tr&count=30",
-        "https://search.brave.com/search?q=${enc(q)}",
-        "https://www.mojeek.com/search?q=${enc(q)}",
-        "https://yandex.com.tr/search/?text=${enc(q)}&lr=11508",
-        "https://yandex.com/search/?text=${enc(q)}",
-        "https://www.google.com/search?q=${enc(q)}&hl=tr&num=30&gbv=1"
-    )
-
-    private fun engineHeaders(u: String): Map<String, String> {
-        val h = hashMapOf(
-            "User-Agent" to uaDesktop,
-            "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
-            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
-            "Referer" to "https://www.google.com/"
-        )
-        if (u.contains("google.")) h["Cookie"] = "CONSENT=YES+cb; SOCS=CAI"
-        return h
-    }
-
-    private fun engineIds(html0: String): List<String> {
-        val html = html0.replace("%252F", "/").replace("%2F", "/").replace("%2f", "/")
-            .replace("%3A", ":").replace("%3a", ":").replace("&amp;", "&").replace("\\/", "/")
-        val out = LinkedHashSet<String>()
-        Regex("ok\\.ru/video(?:embed)?/(\\d{8,})", RegexOption.IGNORE_CASE).findAll(html)
-            .forEach { out.add(it.groupValues[1]) }
-        return out.toList()
-    }
-
-    // Tüm arama motorlarına aynı anda sorar, bulunan ok.ru video numaralarını toplar
-    private suspend fun engineSearchIds(queries: List<String>): List<String> {
-        val urls = queries.flatMap { engineUrls(it) }
-        val pages = urls.amap { u ->
-            try { app.get(u, headers = engineHeaders(u), timeout = 15L).text } catch (e: Exception) { "" }
-        }
-        val out = LinkedHashSet<String>()
-        pages.forEach { p -> engineIds(p).forEach { out.add(it) } }
-        return out.toList()
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = query.trim()
-        if (q.isBlank()) return emptyList()
-        val items = LinkedHashMap<String, OkItem>()
-
-        // 1) Elle eklenen filmlerde eşleşme
-        val words = fold(q).split(" ").filter { it.isNotBlank() }
-        if (words.isNotEmpty()) {
-            for (s in secilmis) {
-                val t = fold(s.title)
-                if (words.all { t.contains(it) } && !items.containsKey(s.id)) items[s.id] = s
-            }
-        }
-
-        // 2) ok.ru kendi araması
-        val okIds = LinkedHashSet<String>()
-        val okUrls = listOf(
-            "$mainUrl/video/search?st.cmd=anonymVideo&st.m=SEARCH&st.v.sq=${enc(q)}",
-            "$mainUrl/video/search?st.v.sq=${enc(q)}",
-            "https://m.ok.ru/video/search?st.v.sq=${enc(q)}"
-        )
-        for (u in okUrls) {
-            val h = try { app.get(u, headers = hdr(!u.contains("m.ok.ru")), timeout = 15L).text } catch (e: Exception) { "" }
-            if (h.isBlank()) continue
-            parseProps(h).forEach { if (!items.containsKey(it.id)) items[it.id] = it }
-            Regex("/video/(\\d{8,})").findAll(h).forEach { okIds.add(it.groupValues[1]) }
-            if (items.size >= 10) break
-        }
-
-        // 3) Arama motorları (ok.ru video bağlantıları)
-        val ids = LinkedHashSet<String>()
-        okIds.forEach { ids.add(it) }
-        val queries = listOf(
-            "site:ok.ru/video $q",
-            "$q tr dublaj site:ok.ru",
-            "$q izle ok.ru video"
-        )
-        engineSearchIds(queries).forEach { ids.add(it) }
-
-        // Bulunan numaraların gerçek başlığı + afişi video sayfasından alınır
-        val toCheck = ids.filter { !items.containsKey(it) }.take(16)
-        val metas = toCheck.amap { id -> id to (try { metaOf(id) } catch (e: Exception) { null }) }
-        for ((id, m) in metas) {
-            if (m == null || m.title.isBlank()) continue
-            items[id] = OkItem(id, m.title, m.poster)
-        }
-
-        val sorted = items.values.sortedByDescending { turkishTag(it.title) }.take(40)
-
-        // ok.ru arama sayfasındaki küçük resimler çoğu zaman açılmıyor: afişi her zaman video sayfasından al
-        val seedIds = secilmis.map { it.id }.toSet()
-        val fixed = sorted.amap { x ->
-            val m = try { metaOf(x.id) } catch (e: Exception) { null }
-            if (m == null) {
-                x
+        if (page > 1) {
+            val postUrl = if (isShowcase) {
+                "$mainUrl/video/showcase?st.cmd=anonymVideo&st.m=SHOWCASE&st.ft=showcase&st.furl=%2Fvideo%2Fshowcase&cmd=VideoUniversalContentBlock"
             } else {
-                OkItem(
-                    x.id,
-                    if (seedIds.contains(x.id)) x.title else m.title.ifBlank { x.title },
-                    m.poster ?: x.poster
+                val ft = if (isSerial) "serial" else request.data.substringBeforeLast("/").substringAfterLast("/")
+                "$mainUrl${request.data.substringBeforeLast("/")}?st.cmd=anonymVideo&st.fltag=$tag&st.m=ALBUMS_CATALOG&st.ft=$ft&st.furl=${request.data}&cmd=VideoUniversalContentBlock"
+            }
+
+            val response = app.post(
+                postUrl,
+                data = mapOf(
+                    "fetch" to "false",
+                    "st.page" to page.toString(),
+                    "st.lastelem" to lastElement,
+                    "gwt.requested" to "9579ea2eT1774883610506"
+                ),
+                headers = mapOf(
+                    "ok-screen" to "anonymVideo",
+                    "X-Requested-With" to "XMLHttpRequest"
                 )
-            }
+            )
+            document = response.document
         }
-        return fixed.filter { it.title.isNotBlank() }.map { card(it) }
-    }
 
-    // ---------------- Video bilgisi ----------------
+        val resultsList = mutableListOf<SearchResponse>()
 
-    private val kalite = mapOf(
-        "ultra" to 2160, "quad" to 1440, "full" to 1080, "hd" to 720,
-        "sd" to 480, "low" to 360, "lowest" to 240, "mobile" to 144
-    )
-
-    private suspend fun fetchMeta(id: String): OkMeta? {
-        for (path in listOf("/videoembed/", "/video/")) {
-            val doc = try {
-                app.get(mainUrl + path + id, headers = hdr(path == "/video/")).document
-            } catch (e: Exception) {
-                continue
-            }
-            for (el in doc.select("[data-options]")) {
-                val raw = el.attr("data-options")
-                if (!raw.contains("flashvars")) continue
-                try {
-                    val opts = JSONObject(raw)
-                    val fv = opts.optJSONObject("flashvars") ?: continue
-                    val md = fv.optJSONObject("metadata") ?: JSONObject(fv.optString("metadata", "{}"))
-                    val mv = md.optJSONObject("movie") ?: JSONObject()
-
-                    val vids = ArrayList<Pair<Int, String>>()
-                    val arr = md.optJSONArray("videos")
-                    if (arr != null) {
-                        for (i in 0 until arr.length()) {
-                            val v = arr.optJSONObject(i) ?: continue
-                            val u = v.optString("url")
-                            if (u.isNotBlank()) vids.add((kalite[v.optString("name")] ?: 0) to u)
-                        }
-                    }
-                    val hls = listOf("hlsManifestUrl", "hlsMasterPlaylistUrl", "ondemandHls")
-                        .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
-                    val dash = listOf("ondemandDash", "dashManifestUrl", "ondemandDashUrl", "dashUrl")
-                        .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
-                    if (vids.isEmpty() && hls.isBlank() && dash.isBlank()) continue
-
-                    val posterRaw = listOf(
-                        mv.optString("poster"),
-                        mv.optString("bigThumbnail"),
-                        mv.optString("thumbnail"),
-                        md.optString("poster")
-                    ).firstOrNull { it.isNotBlank() }
-
-                    return OkMeta(
-                        id,
-                        mv.optString("title").trim(),
-                        fixPoster(posterRaw),
-                        mv.optString("duration").toIntOrNull() ?: 0,
-                        mv.optString("description"),
-                        vids, hls, dash
-                    )
-                } catch (e: Exception) {
+        if (isSerial) {
+            document.select("video-channels-vitrine-slider").forEach { slider ->
+                val props = slider.attr("data-props")
+                val regex = Regex("""\{"id":"(.*?)".*?"href":"(.*?)","name":"(.*?)","imageUrl":"(.*?)"""")
+                regex.findAll(props).forEach { match ->
+                    val href = fixUrl(match.groupValues[2].replace("\\u0026", "&"))
+                    val name = match.groupValues[3]
+                    val poster = match.groupValues[4].replace("\\u0026", "&")
+                    resultsList.add(newTvSeriesSearchResponse(name, href, TvType.TvSeries) {
+                        this.posterUrl = poster
+                    })
                 }
             }
+        } else {
+            document.select("div.ugrid_i").forEach { item ->
+                val card = item.selectFirst("div.video-card") ?: return@forEach
+                val titleElement = card.selectFirst("a.video-card_n")
+                val linkElement = card.selectFirst("a.video-card_lk")
+                val imgElement = card.selectFirst("img.video-card_img")
+
+                val name = titleElement?.text() ?: return@forEach
+                val href = fixUrl(linkElement?.attr("href") ?: return@forEach)
+                val poster = imgElement?.attr("src") ?: ""
+
+                resultsList.add(newMovieSearchResponse(name, href, TvType.Movie) {
+                    this.posterUrl = poster
+                })
+            }
         }
-        return null
+
+        val finalResults = resultsList.distinctBy { it.url }
+
+        return newHomePageResponse(
+            list = HomePageList(
+                name = request.name,
+                list = finalResults,
+                isHorizontalImages = true
+            ),
+            hasNext = finalResults.isNotEmpty()
+        )
     }
 
-    private fun idOf(url: String): String = Regex("(\\d{8,})").find(url)?.groupValues?.get(1) ?: ""
+    override suspend fun search(query: String, page: Int): SearchResponseList {
+        var searchdata: SearchData? = null
+
+        if (page == 1) {
+            val response = app.post("$mainUrl/video/search?st.cmd=video&st.psft=showcase&st.m=SEARCH&st.ft=search&st.fuvh=on&st.furl=%2Fvideo%2Fshowcase&cmd=VideoContentBlock", data = mapOf("st.v.sq" to query, "gwt.requested" to "9579ea2eT1774883610506")).document
+            val jsonstr = response.selectFirst("video-search-result")?.attr("data-props")
+            if (!jsonstr.isNullOrEmpty()) searchdata = AppUtils.parseJson<SearchData>(jsonstr)
+        } else {
+            val offset = (page - 1) * 30
+            val reqbodystring = """{"id": $page,"parameters": {"displayMode": "Movie","videosOffset": $offset,"channelsOffset": 0,"searchQuery": "$query","currentStateId": "video","durationType": "ANY","hd": false}}"""
+            val jsonstr = app.post("$mainUrl/web-api/v2/video/fetchSearchResult", headers = mapOf("Accept" to "application/json, text/javascript, */*; q=0.01", "ok-screen" to "anonymVideo", "x-client-flags" to "ms:0;dcss:0;mpv2:1;dz:0"), requestBody = reqbodystring.toRequestBody("text/plain;charset=UTF-8".toMediaTypeOrNull())).text
+            if (jsonstr.isNotEmpty()) searchdata = AppUtils.parseJson<ApiSearchResponse>(jsonstr).result
+        }
+
+        val results = searchdata?.videos?.list?.mapNotNull { item ->
+            val title = item.movie?.title ?: item.name ?: return@mapNotNull null
+            val id = item.movie?.id ?: return@mapNotNull null
+            val poster = item.movie.thumbnail?.big ?: item.movie?.thumbnail?.small ?: item.imageUrl
+            newMovieSearchResponse(title, "$mainUrl/video/$id", TvType.Movie) {
+                this.posterUrl = fixUrlNull(poster) }
+        } ?: emptyList()
+
+        return newSearchResponseList(results, hasNext = searchdata?.videos?.hasMore == true)
+    }
+
+    override suspend fun quickSearch(query: String): List<SearchResponse>? = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
-        val id = idOf(url)
-        if (id.isBlank()) return null
-        val m = metaOf(id) ?: return null
-        val link = "$mainUrl/video/$id"
-        val title = m.title.ifBlank { "Video $id" }
-        val seed = secilmis.firstOrNull { it.id == id }
-        return newMovieLoadResponse(seed?.title ?: title, link, TvType.Movie, link) {
-            this.posterUrl = m.poster
-            this.plot = m.desc.ifBlank { null }
-            this.duration = if (m.dur > 0) m.dur / 60 else null
+        val idmatch = Regex("""video/(\d+)""").find(url)
+        val curl = idmatch?.let { "$mainUrl/video/${it.groupValues[1]}" } ?: url.split("?").first()
+        val doc = app.get(url).document
+        val album = url.contains("/video/c")
+
+        val title = (if (album) {
+            doc.selectFirst("h3.album-info_name")?.text() ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
+        } else {
+            doc.selectFirst("meta[property=og:title]")?.attr("content")
+        }) ?: doc.selectFirst("title")?.text() ?: return null
+
+        val author = doc.selectFirst("meta[property=ya:ovs:login]")?.attr("content")
+        val recs = doc.select("li.recommendations_block_reco-content_item").mapNotNull { it.toOkruRecommendation() }.distinctBy { it.url }
+
+        return if (album) SerieLoad(url, curl, title, author, recs, doc)
+        else Filmvideo(curl, title, author, recs, doc)
+    }
+
+    private suspend fun SerieLoad(url: String, curl: String, title: String, author: String?, recs: List<SearchResponse>, doc: Document): LoadResponse? {
+        val aid = url.substringAfter("/video/c").substringBefore("?").split("/").firstOrNull()
+        val eps = mutableListOf<Episode>()
+        var page = 1
+        var hasnext = true
+        var lelem = doc.selectFirst(".loader-container")?.attr("data-last-element")
+
+        val felems = doc.select("div.ugrid_i.js-seen-item-movie")
+        val poster = felems.firstOrNull()?.selectFirst("img.video-card_img")?.attr("src")
+
+        eps.addAll(felems.mapNotNull { it.toOkruEpisode(withdescription = true) })
+
+        while (hasnext && !aid.isNullOrEmpty() && !lelem.isNullOrEmpty()) {
+            page++
+            val pres = app.post(
+                "$mainUrl/video/c$aid?st.cmd=anonymVideo&st.m=ALBUM&st.ft=album&st.aid=c$aid&cmd=VideoAlbumBlock",
+                data = mapOf("fetch" to "false", "st.page" to page.toString(), "st.lastelem" to lelem),
+                headers = mapOf("Referer" to url, "X-Requested-With" to "XMLHttpRequest")
+            )
+            val pdoc = pres.document
+            val items = pdoc.select("div.ugrid_i.js-seen-item-movie")
+
+            if (items.isEmpty()) {
+                hasnext = false
+            } else {
+                eps.addAll(items.mapNotNull { it.toOkruEpisode(withdescription = false) })
+                lelem = pres.headers["lastelem"] ?: pdoc.selectFirst(".loader-container")?.attr("data-last-element")
+                if (pres.headers["fetchedall"] == "true") hasnext = false
+            }
+            if (page > 15) hasnext = false
+        }
+
+        val feps = eps.distinctBy { it.data }.reversed()
+        if (feps.isEmpty()) return null
+
+        return if (feps.size == 1) {
+            newMovieLoadResponse(title, curl, TvType.Movie, feps.first().data) {
+                this.posterUrl = fixUrlNull(poster)
+                this.recommendations = recs
+                author?.let { this.tags = listOf(it) }
+            }
+        } else {
+            newTvSeriesLoadResponse(title, curl, TvType.TvSeries, feps) {
+                this.posterUrl = fixUrlNull(poster)
+                this.recommendations = recs
+                this.showStatus = ShowStatus.Completed
+                author?.let { this.tags = listOf(it) }
+            }
+        }
+    }
+
+    private suspend fun Filmvideo(curl: String, title: String, author: String?, recs: List<SearchResponse>, doc: Document): LoadResponse {
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val eurl = doc.selectFirst("meta[property=og:video:secure_url]")?.attr("content")
+            ?: doc.selectFirst("meta[property=og:video:url]")?.attr("content")
+            ?: curl.replace("/video/", "/videoembed/")
+        val duration = doc.selectFirst("meta[property=video:duration]")?.attr("content")?.toIntOrNull()?.div(60)
+
+        return newMovieLoadResponse(title, curl, TvType.Movie, eurl) {
+            this.posterUrl = fixUrlNull(poster)
+            this.duration = duration
+            this.recommendations = recs
+            author?.let { this.tags = listOf(it) }
+        }
+    }
+
+    private fun Element.toOkruRecommendation(): SearchResponse? {
+        val rraw = this.selectFirst("a.recommendations_block_card-phot-link")?.attr("href")?.let { fixUrl(it) }
+        val rid = rraw?.let { Regex("""video/(\d+)""").find(it)?.groupValues?.get(1) }
+        val rurl = rid?.let { "$mainUrl/video/$it" } ?: rraw ?: return null
+        val rtitle = this.selectFirst("div.recommendations_block_card-title")?.text()
+            ?: this.selectFirst("img.recommendations_block_card-photo-img")?.attr("alt")
+            ?: return null
+        val rposter = this.selectFirst("img.recommendations_block_card-photo-img")?.attr("src")
+
+        return newMovieSearchResponse(rtitle, rurl, TvType.Movie) {
+            this.posterUrl = rposter
+        }
+    }
+
+    private fun Element.toOkruEpisode(withdescription: Boolean): Episode? {
+        val id = this.selectFirst("div.video-card")?.attr("data-id") ?: return null
+        val name = this.selectFirst("a.video-card_n")?.text()
+        val poster = this.selectFirst("img.video-card_img")?.attr("src")
+        val description = if (withdescription) this.selectFirst("div.video-card_duration")?.text() else null
+
+        return newEpisode(
+            "$mainUrl/video/$id"
+        ) {
+            this.name = name
+            this.posterUrl = poster
+            this.description = description
         }
     }
 
@@ -412,46 +248,29 @@ class OkruProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val id = idOf(data)
-        if (id.isBlank()) return false
-        // Bağlantılar süreli olduğu için burada her zaman taze alınır
-        val m = fetchMeta(id) ?: return false
-        val h = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Origin" to mainUrl)
-        var any = false
+        val cleanData = data.trim()
+        Log.d(this.name, cleanData)
 
-        for ((q, u0) in m.videos.sortedByDescending { it.first }) {
-            var u = u0.replace("\\/", "/")
-            if (u.startsWith("//")) u = "https:$u"
-            if (!u.startsWith("http")) continue
-            callback(
-                newExtractorLink(name, "$name ${if (q > 0) "${q}p" else "Video"}", u, ExtractorLinkType.VIDEO) {
-                    this.referer = "$mainUrl/"
-                    this.quality = if (q > 0) q else Qualities.Unknown.value
-                    this.headers = h
-                }
-            )
-            any = true
+        if (cleanData.contains("ok.ru") || cleanData.contains("odnoklassniki.ru")) {
+            var isFound = false
+            OkRuExtractor().getUrl(cleanData, mainUrl, subtitleCallback) {
+                isFound = true
+                callback(it)
+            }
+            return isFound
         }
-        if (m.hls.isNotBlank()) {
-            callback(
-                newExtractorLink(name, "$name HLS", m.hls, ExtractorLinkType.M3U8) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = h
-                }
-            )
-            any = true
+
+        var isFound = false
+        loadExtractor(cleanData, mainUrl, subtitleCallback) {
+            isFound = true
+            callback(it)
         }
-        if (m.dash.isNotBlank()) {
-            callback(
-                newExtractorLink(name, "$name DASH", m.dash, ExtractorLinkType.DASH) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = h
-                }
-            )
-            any = true
-        }
-        return any
+        return isFound
     }
-}
+
+data class SearchItem(val name: String? = null, val imageUrl: String? = null, val movie: SearchMovie? = null)
+data class SearchMovie(val id: String? = null, val title: String? = null, val thumbnail: SearchThumbnail? = null)
+data class SearchThumbnail(val small: String? = null, val big: String? = null)
+data class ApiSearchResponse(val result: SearchData? = null)
+data class SearchData(val videos: SearchVideos? = null)
+data class SearchVideos(val list: List<SearchItem>? = null, val hasMore: Boolean? = null)
