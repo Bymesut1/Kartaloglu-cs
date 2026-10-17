@@ -362,20 +362,26 @@ class Dizidad : MainAPI() {
             if (list.isNotEmpty()) {
                 val tmdbId = tmdbFindId(title, true)
                 val plot = (if (tmdbId != null) tmdbOverviewTr(tmdbId, true) else null) ?: sitePlot
-                val seasonCache = HashMap<Int, Map<Int, String>>()
                 val hasSeason = list.any { it.hasSeason }
                 // aynı sezon/bölümün dublaj + altyazılı sayfaları tek bölümde birleşir
                 val grouped = list.groupBy { Pair(it.season, it.episode) }
                     .toSortedMap(compareBy<Pair<Int, Int>>({ it.first }, { it.second }))
 
+                // Bölüm açıklamaları newEpisode bloğunun DIŞINDA önceden çekilir (suspend çağrı burada olmalı)
+                val seasonOverviews = HashMap<Int, Map<Int, String>>()
+                if (tmdbId != null) {
+                    for (sn in grouped.keys.map { it.first }.distinct()) {
+                        seasonOverviews[sn] = tmdbSeasonOverviews(tmdbId, sn)
+                    }
+                }
+
                 val episodes = grouped.map { (key, refs) ->
+                    val epOverview: String? = seasonOverviews[key.first]?.get(key.second)
                     newEpisode(refs.joinToString("|") { it.href }) {
                         this.name    = null
                         this.season  = if (hasSeason) key.first else null
                         this.episode = key.second
-                        this.description = if (tmdbId != null)
-                            seasonCache.getOrPut(key.first) { tmdbSeasonOverviews(tmdbId, key.first) }[key.second]
-                        else null
+                        this.description = epOverview
                     }
                 }
                 return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
