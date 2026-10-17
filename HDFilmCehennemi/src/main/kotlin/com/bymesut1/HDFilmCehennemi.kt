@@ -14,7 +14,14 @@ import java.text.Normalizer
 import java.util.Collections
 import kotlin.math.abs
 
-private data class SiteItem(val url: String, val title: String, val year: Int, val type: String, val poster: String? = null)
+private data class SiteItem(
+    val url: String,
+    val title: String,
+    val year: Int,
+    val type: String,
+    val poster: String? = null,
+    val isPoster: Boolean = false
+)
 private data class Alt(val id: String, val name: String, val lang: String)
 private data class Player(val name: String, val lang: String, val id: String?, val embed: String?)
 private data class EmbedResult(val urls: List<String>, val subs: List<SubItem>, val strict: Set<String>, val base: String)
@@ -42,10 +49,35 @@ class HDFilmCehennemi : MainAPI() {
     private var good: Pair<String, Boolean>? = null   // çalışan adres + UA biçimi
     private val IC = RegexOption.IGNORE_CASE
 
-    // ---------------- Ana sayfa (SİTEDEN) ----------------
+    // ---------------- Ana sayfa (SİTEDEN: kategoriler + afişler) ----------------
     override val mainPage = mainPageOf(
-        "/" to "Ana Sayfa",
-        "/dizi/" to "Diziler"
+        "/" to "Yeni Eklenenler",
+        "/category/tavsiye-filmler-izle2/" to "Tavsiye Filmler",
+        "/imdb-7-puan-uzeri-filmler-2/" to "IMDb 7+ Filmler",
+        "/en-cok-yorumlananlar-2/" to "En Çok Yorumlananlar",
+        "/en-cok-begenilen-filmleri-izle-4/" to "En Çok Beğenilenler",
+        "/category/film-izle-2/" to "Filmler",
+        "/yabancidiziizle-5/" to "Diziler",
+        "/dil/turkce-dublajli-film-izleyin-6/" to "Türkçe Dublaj",
+        "/dil/turkce-altyazili-filmleri-izleme-sitesi-3/" to "Türkçe Altyazılı",
+        "/tur/aksiyon-filmleri-izleyin-8/" to "Aksiyon",
+        "/tur/korku-filmlerini-izle-9/" to "Korku",
+        "/tur/komedi-filmlerini-izleyin-2/" to "Komedi",
+        "/tur/bilim-kurgu-filmlerini-izleyin-5/" to "Bilim Kurgu",
+        "/tur/gerilim-filmlerini-izle-4/" to "Gerilim",
+        "/tur/dram-filmlerini-izle-2/" to "Dram",
+        "/tur/animasyon-filmlerini-izleyin-5/" to "Animasyon",
+        "/tur/macera-filmlerini-izleyin-5/" to "Macera",
+        "/tur/romantik-filmleri-izle-3/" to "Romantik",
+        "/tur/fantastik-filmlerini-izleyin-4/" to "Fantastik",
+        "/tur/suc-filmleri-izle-3/" to "Suç",
+        "/tur/savas-filmleri-izle-5/" to "Savaş",
+        "/tur/belgesel-filmlerini-izle-2/" to "Belgesel",
+        "/ulke/turkiye-4/" to "Türk Filmleri",
+        "/ulke/guney-kore-1/" to "Kore Filmleri",
+        "/category/marvel-yapimlarini-izle-5/" to "Marvel",
+        "/category/dc-yapimlarini-izle-1/" to "DC",
+        "/serifilmlerim-4/" to "Seri Filmler"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -56,12 +88,13 @@ class HDFilmCehennemi : MainAPI() {
         } catch (e: Exception) {
             ""
         }
-        val items = parseCatalog(html, true).map { toSearchResponse(it) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty() && path != "/")
+        val items = parseCatalog(html, false).map { toSearchResponse(it) }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     // Sitede olan film / dizi sayfası mı? (menü, kategori vb. değil)
     private fun isContentItem(it: SiteItem): Boolean {
+        if (it.isPoster) return true
         val p = pathOf(it.url).substringBefore("?").substringBefore("#")
         if (p.contains("/sezon-") || p.contains("/bolum-")) return false
         if (Regex("^/dizi/[^/]+/?$").containsMatchIn(p)) return true
@@ -318,7 +351,11 @@ class HDFilmCehennemi : MainAPI() {
     private fun parseResults(src: String): List<SiteItem> {
         val out = ArrayList<SiteItem>()
         val seen = HashSet<String>()
-        Jsoup.parse(src).select("a[href]").forEach { a ->
+        val doc = Jsoup.parse(src)
+        // Afiş kartları varsa yalnızca onları al (menü / yan bağlantılar karışmasın)
+        val posters = doc.select("a.poster:not(.poster-slider)")
+        val anchors = if (posters.isNotEmpty()) posters else doc.select("a[href]")
+        anchors.forEach { a ->
             val href = a.attr("href")
             if (href.isBlank() || href.startsWith("#") || href.startsWith("javascript:")) return@forEach
             var title = a.selectFirst("[class*=poster-title], [class*=title]")?.text().orEmpty()
@@ -326,7 +363,8 @@ class HDFilmCehennemi : MainAPI() {
             if (title.isBlank()) title = a.selectFirst("img[alt]")?.attr("alt").orEmpty()
             if (title.isBlank()) title = a.text()
             title = title.trim()
-            val year = a.selectFirst("[class*=year]")?.text()
+            val yearEl = a.selectFirst("[class*=year]") ?: a.selectFirst(".poster-meta span")
+            val year = yearEl?.text()
                 ?.let { Regex("""\d{4}""").find(it)?.value }?.toIntOrNull() ?: 0
             val type = a.selectFirst("[class*=type]")?.text().orEmpty().trim()
             val url = toSite(href)
@@ -343,7 +381,7 @@ class HDFilmCehennemi : MainAPI() {
             }
             val poster: String? = posterRaw?.let { toSite(it) }
             if (title.isBlank() || !seen.add(url)) return@forEach
-            out.add(SiteItem(url, title, year, type, poster))
+            out.add(SiteItem(url, title, year, type, poster, a.hasClass("poster")))
         }
         return out
     }
@@ -595,7 +633,7 @@ class HDFilmCehennemi : MainAPI() {
         if (Regex("""\.mp4(\?|$)""", IC).containsMatchIn(u)) return Verified(true, sets[0])
         for (h in sets) {
             val r: NiceResponse? = try {
-                app.get(u, headers = h, timeout = 6L)
+                app.get(u, headers = h, timeout = 8L)
             } catch (e: Exception) {
                 null
             }
@@ -671,17 +709,35 @@ class HDFilmCehennemi : MainAPI() {
                 }
                 val sets = streamHeaderSets(res.base)
 
-                // Altyazılar
+                // Altyazılar (oynatıcı sayfasından)
                 res.subs
                     .filter { s ->
-                        s.lang in subLangs && !Regex("forced|zorunlu", IC).containsMatchIn(s.label + " " + s.url)
+                        (s.lang in subLangs || s.lang == "xx") &&
+                            !Regex("forced|zorunlu", IC).containsMatchIn(s.label + " " + s.url)
                     }
                     .forEach { s ->
                         if (seenSub.add(s.url)) {
-                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { s.lang }
+                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { "Altyazı" }
                             subtitleCallback.invoke(SubtitleFile(nameS, s.url))
                         }
                     }
+
+                // Rapid: sayfada altyazı bulunamadıysa akış adresinden türet
+                if (res.subs.none { it.lang == "tr" }) {
+                    for (su0 in res.urls) {
+                        val mm = Regex("""/hls\d?/\d+/(\d+)/([A-Za-z0-9]+)_""").find(su0) ?: continue
+                        val su = siteBase() + "/srt/" + mm.groupValues[1] + "/" + mm.groupValues[2] + "_Turkish.vtt/"
+                        val chk: NiceResponse? = try {
+                            app.get(su, headers = embedHeaders(pageUrl), timeout = 6L)
+                        } catch (e: Exception) {
+                            null
+                        }
+                        if (chk != null && chk.code == 200 && chk.text.trimStart().startsWith("WEBVTT") && seenSub.add(su)) {
+                            subtitleCallback.invoke(SubtitleFile("Türkçe", su))
+                        }
+                        break
+                    }
+                }
 
                 // Akışlar
                 val cands = res.urls
@@ -699,8 +755,10 @@ class HDFilmCehennemi : MainAPI() {
                 }
                 var okList = verified.filter { it.second.ok }
                 if (okList.isEmpty()) {
+                    // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
                     val st = verified.filter { res.strict.contains(it.first) }
-                    if (st.isNotEmpty()) okList = st.take(1)
+                    val pick = if (st.isNotEmpty()) st.take(1) else verified.take(1)
+                    okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
                 }
 
                 val nm = when {
@@ -716,7 +774,7 @@ class HDFilmCehennemi : MainAPI() {
                     if (!seenUrl.add(u)) return@forEachIndexed
                     val label = "$lg $nm" + (if (i > 0) " #${i + 1}" else "")
                     val linkType = when {
-                        u.contains(".mp4", true) -> ExtractorLinkType.VIDEO
+                        u.contains(".mp4", true) && !u.contains("master", true) -> ExtractorLinkType.VIDEO
                         u.contains(".m3u8", true) || u.contains("master", true) || u.contains("/hls", true) -> ExtractorLinkType.M3U8
                         else -> ExtractorLinkType.VIDEO
                     }
@@ -976,6 +1034,82 @@ object Decoder {
         return out
     }
 
+    // ---------- dc_xxx([...]) ve av("...") özel çözücüler (Close / Rapid) ----------
+    private val dcRe = Regex("""dc_\w+\(\s*\[([^\]]*)\]\s*\)""")
+    private val partRe = Regex("""["']([^"']*)["']""")
+    private val avRe = Regex("""\bav\(\s*["']([A-Za-z0-9+/=_-]{16,})["']\s*\)""")
+
+    private fun safeB64(s: String): String? = try {
+        String(Base64.decode(s, Base64.DEFAULT), Charsets.ISO_8859_1)
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun rot13(s: String): String {
+        val sb = StringBuilder()
+        for (ch in s) {
+            if (ch in 'a'..'z') sb.append('a' + (ch - 'a' + 13) % 26)
+            else if (ch in 'A'..'Z') sb.append('A' + (ch - 'A' + 13) % 26)
+            else sb.append(ch)
+        }
+        return sb.toString()
+    }
+
+    // Bilinen dönüşümlerin olası kombinasyonlarını dener, http ile başlayan sonucu döndürür
+    private fun dcDecode(joined: String): String? {
+        for (r13 in listOf(false, true)) {
+            for (rev in listOf(false, true)) {
+                for (shift in listOf(true, false)) {
+                    var s = joined
+                    if (r13) s = rot13(s)
+                    if (rev) s = s.reversed()
+                    val d = safeB64(s) ?: continue
+                    var o = d
+                    if (shift) {
+                        val sb = StringBuilder()
+                        for (i in d.indices) {
+                            val k = (399756995L % (i + 5)).toInt() + 3
+                            val code = (((d[i].code - k) % 256) + 256) % 256
+                            sb.append(code.toChar())
+                        }
+                        o = sb.toString()
+                    }
+                    for (cand in listOf(o, o.reversed())) {
+                        if (cand.startsWith("http", true)) return cand
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun avDecode(input: String): String? {
+        val first = safeB64(input.reversed()) ?: return null
+        val key = "K9L"
+        val sb = StringBuilder()
+        for (i in first.indices) {
+            val off = key[i % key.length].code % 5 + 1
+            sb.append((first[i].code - off).toChar())
+        }
+        val second = safeB64(sb.toString()) ?: return null
+        return if (second.startsWith("http", true)) second else null
+    }
+
+    private fun dcAv(src: String): List<String> {
+        val out = ArrayList<String>()
+        for (m in dcRe.findAll(src).take(10)) {
+            val joined = partRe.findAll(m.groupValues[1]).joinToString("") { it.groupValues[1] }
+            if (joined.length < 16) continue
+            val d = dcDecode(joined)
+            if (d != null) out.add(d)
+        }
+        for (m in avRe.findAll(src).take(10)) {
+            val d = avDecode(m.groupValues[1])
+            if (d != null) out.add(d)
+        }
+        return out
+    }
+
     // ---------- Tüm çözülmüş metinleri topla ----------
     fun collectBlobs(html: String): List<String> {
         val out = LinkedHashSet<String>()
@@ -989,6 +1123,7 @@ object Decoder {
                 if (!out.add(u)) continue
                 next.addAll(unpack(u))
                 next.addAll(b64(u))
+                next.addAll(dcAv(u))
             }
             queue = next
             round++
@@ -1066,13 +1201,13 @@ object Decoder {
             val code = langAttr.find(tag)?.groupValues?.get(1).orEmpty()
             out.add(SubItem(url, label, langOf(label, code, url)))
         }
-        // Genel tarama: {"file":..,"label":..} / {label,..,file} / kind: captions
+        // Genel tarama: {"file":..,"label":..} / {file:..,label:..} / kind: captions
         val objRe = Regex("""\{[^{}]{0,600}\}""")
-        val urlKey = Regex("""["'](?:file|src|url)["']\s*:\s*["']([^"']+)["']""", IC)
-        val lblKey = Regex("""["'](?:label|name|title)["']\s*:\s*["']([^"']*)["']""", IC)
-        val codeKey = Regex("""["'](?:srclang|language|lang)["']\s*:\s*["']([^"']*)["']""", IC)
+        val urlKey = Regex("""["']?\b(?:file|src|url)\b["']?\s*:\s*["']([^"']+)["']""", IC)
+        val lblKey = Regex("""["']?\b(?:label|name|title)\b["']?\s*:\s*["']([^"']*)["']""", IC)
+        val codeKey = Regex("""["']?\b(?:srclang|language|lang)\b["']?\s*:\s*["']([^"']*)["']""", IC)
         val hint = Regex("""captions|subtitles|srclang|\.vtt|\.srt""", IC)
-        val subUrl = Regex("""\.(?:vtt|srt|ass)(?:\?|#|$)|/subs?/|subtitle|caption""", IC)
+        val subUrl = Regex("""\.(?:vtt|srt|ass)(?:[/?#]|$)|/srt/|/vtt/|/subs?/|subtitle|caption""", IC)
         for (m in objRe.findAll(blob)) {
             val o = m.value
             if (!hint.containsMatchIn(o)) continue
@@ -1082,6 +1217,14 @@ object Decoder {
             val code = codeKey.find(o)?.groupValues?.get(1).orEmpty()
             val url = absUrl(u, origin)
             out.add(SubItem(url, label, langOf(label, code, url)))
+        }
+        // Son çare: metindeki herhangi bir .vtt / .srt adresi
+        if (out.isEmpty()) {
+            val anyRe = Regex("""["'(]((?:https?:)?/[^"'\s<>()]+?\.(?:vtt|srt)(?:[/?#][^"'\s<>()]*)?)["')]""", IC)
+            for (m in anyRe.findAll(blob)) {
+                val url = absUrl(m.groupValues[1], origin)
+                out.add(SubItem(url, "", langOf("", "", url)))
+            }
         }
         return out
     }
