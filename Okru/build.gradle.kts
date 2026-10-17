@@ -1,4 +1,4 @@
-version = 3
+version = 4
 
 android {
     namespace = "com.bymesut1.okru"
