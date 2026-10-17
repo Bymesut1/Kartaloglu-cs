@@ -7,6 +7,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.parser.Parser
 import java.net.URLEncoder
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
 class OkruProvider : MainAPI() {
@@ -113,7 +114,7 @@ class OkruProvider : MainAPI() {
             val r = app.get(
                 u,
                 headers = mapOf("User-Agent" to uaDesktop, "Referer" to "$mainUrl/", "Accept" to "image/*,*/*;q=0.8"),
-                timeout = 10L
+                timeout = 5L
             )
             val ct = r.headers["Content-Type"].orEmpty()
             r.isSuccessful && (ct.isEmpty() || ct.startsWith("image", true))
@@ -147,16 +148,17 @@ class OkruProvider : MainAPI() {
     private suspend fun withPosters(list: List<OkItem>, metaTitle: Boolean = false): List<OkItem> {
         val seedIds = secilmis.map { it.id }.toSet()
         return list.amap { x ->
-            val m = try { metaOf(x.id) } catch (e: Exception) { null }
-            val title = when {
-                metaTitle && !seedIds.contains(x.id) && m != null && m.title.isNotBlank() -> m.title
-                else -> x.title.ifBlank { m?.title.orEmpty() }
+            val done = withTimeoutOrNull(8000L) {
+                val m = try { metaOf(x.id) } catch (e: Exception) { null }
+                val title = when {
+                    metaTitle && !seedIds.contains(x.id) && m != null && m.title.isNotBlank() -> m.title
+                    else -> x.title.ifBlank { m?.title.orEmpty() }
+                }
+                if (title.isBlank()) x
+                else OkItem(x.id, title, bestPoster(x.id, title, listOf(m?.poster, x.poster)))
             }
-            if (title.isBlank()) {
-                x
-            } else {
-                OkItem(x.id, title, bestPoster(x.id, title, listOf(m?.poster, x.poster)))
-            }
+            // Süre dolduysa: sayfadan gelen başlık/resimle, resim yoksa düz afişle göster
+            done ?: (if (x.title.isBlank()) x else OkItem(x.id, x.title, x.poster ?: placeholder(x.title)))
         }.filter { it.title.isNotBlank() }
     }
 
@@ -273,23 +275,25 @@ class OkruProvider : MainAPI() {
 
     // Döner: (arama sayfasındaki kayıtlar, sayfada geçen video numaraları)
     private suspend fun okSearch(q: String): Pair<List<OkItem>, List<String>> {
-        val items = LinkedHashMap<String, OkItem>()
-        val ids = LinkedHashSet<String>()
         val urls = listOf(
             "$mainUrl/video/search?st.cmd=anonymVideo&st.m=SEARCH&st.v.sq=${enc(q)}",
             "$mainUrl/video/search?st.v.sq=${enc(q)}",
             "https://m.ok.ru/video/search?st.v.sq=${enc(q)}"
         )
-        for (u in urls) {
-            val h = try {
-                app.get(u, headers = hdr(!u.contains("m.ok.ru")), timeout = 15L).text
+        // üç adres aynı anda sorulur, hangisi önce doluysa o kullanılır (sıralı bekleme yok)
+        val pages = urls.amap { u ->
+            try {
+                app.get(u, headers = hdr(!u.contains("m.ok.ru")), timeout = 8L).text
             } catch (e: Exception) {
                 ""
             }
+        }
+        val items = LinkedHashMap<String, OkItem>()
+        val ids = LinkedHashSet<String>()
+        for (h in pages) {
             if (h.isBlank()) continue
             parseProps(h).forEach { if (!items.containsKey(it.id)) items[it.id] = it }
             Regex("/video/(\\d{8,})").findAll(h).forEach { ids.add(it.groupValues[1]) }
-            if (items.size >= 10) break
         }
         return items.values.toList() to ids.toList()
     }
@@ -312,15 +316,17 @@ class OkruProvider : MainAPI() {
         val (found, pageIds) = okSearch(q)
         found.forEach { if (!items.containsKey(it.id)) items[it.id] = it }
 
-        // 3) Arama sayfasında geçen ama kaydı çıkarılamayan numaraların başlığı video sayfasından
-        val extra = pageIds.filter { !items.containsKey(it) }.take(16)
-        val metas = extra.amap { id -> id to (try { metaOf(id) } catch (e: Exception) { null }) }
-        for ((id, m) in metas) {
-            if (m == null || m.title.isBlank()) continue
-            items[id] = OkItem(id, m.title, m.poster)
+        // 3) Sadece arama sayfasından hiç kayıt çıkmadıysa: sayfada geçen numaralara bak (en çok 8)
+        if (items.isEmpty()) {
+            val extra = pageIds.take(8)
+            val metas = extra.amap { id -> id to (try { metaOf(id) } catch (e: Exception) { null }) }
+            for ((id, m) in metas) {
+                if (m == null || m.title.isBlank()) continue
+                items[id] = OkItem(id, m.title, m.poster)
+            }
         }
 
-        val sorted = items.values.sortedByDescending { turkishTag(it.title) }.take(40)
+        val sorted = items.values.sortedByDescending { turkishTag(it.title) }.take(24)
         return withPosters(sorted, metaTitle = true).map { card(it) }
     }
 
@@ -334,7 +340,7 @@ class OkruProvider : MainAPI() {
     private suspend fun fetchMeta(id: String): OkMeta? {
         for (path in listOf("/videoembed/", "/video/")) {
             val doc = try {
-                app.get(mainUrl + path + id, headers = hdr(path == "/video/")).document
+                app.get(mainUrl + path + id, headers = hdr(path == "/video/"), timeout = 8L).document
             } catch (e: Exception) {
                 continue
             }
