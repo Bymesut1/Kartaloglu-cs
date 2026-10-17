@@ -105,6 +105,12 @@ class Dizidad : MainAPI() {
         .trim()
         .ifBlank { "Video" }
 
+    // Dizi başlığındaki "Türkçe Dublaj / Altyazılı" eklerini kaldırır (tek kart + tek sayfa için)
+    private fun cleanSeriesTitle(t: String): String = t
+        .replace(Regex("\\s*\\[?\\s*(türkçe\\s*)?(dublaj|altyazılı)\\s*\\]?\\s*$", RegexOption.IGNORE_CASE), "")
+        .trim()
+        .ifBlank { t }
+
     private fun qualityOf(u: String): Int {
         val m = Regex("(2160|1440|1080|720|480|360)").find(u)?.groupValues?.get(1)?.toIntOrNull()
         return m ?: Qualities.Unknown.value
@@ -193,6 +199,16 @@ class Dizidad : MainAPI() {
                 derived = true
             }
 
+            // "dizi-adi-3-sezon-izle" gibi sezon sayfalarını da diziye çevir (film gibi görünmesin)
+            if (!derived && !href.contains("/diziler/") && !slug.contains("-bolum", true)) {
+                val sm = Regex("^(.+?)-\\d+-sezon(?:-[a-z0-9-]*)?$", RegexOption.IGNORE_CASE).find(slug)
+                if (sm != null) {
+                    href = "$mainUrl/diziler/${sm.groupValues[1]}-izle/"
+                    title = title.replace(Regex("""\s*\d+\.?\s*sezon.*$""", RegexOption.IGNORE_CASE), "").trim()
+                    derived = true
+                }
+            }
+
             val prev = map[href]
             map[href] = when {
                 prev == null -> Triple(title, poster, derived)
@@ -201,15 +217,28 @@ class Dizidad : MainAPI() {
             }
         }
 
-        return map.filter { it.value.first.isNotBlank() }.map { (href, v) ->
+        val items = map.filter { it.value.first.isNotBlank() }.entries.toList()
+
+        // Aynı dizinin dublaj / altyazılı kartları tek kart olsun (dublajlı olan tercih edilir)
+        val bestForKey = HashMap<String, String>()
+        for ((href, v) in items) {
+            if (!href.contains("/diziler/")) continue
+            val key = cleanSeriesTitle(cleanTitle(v.first)).lowercase()
+            val cur = bestForKey[key]
+            if (cur == null || (!cur.contains("dublaj", true) && href.contains("dublaj", true))) bestForKey[key] = href
+        }
+
+        return items.mapNotNull { (href, v) ->
             val raw = v.first
             var title = cleanTitle(raw)
-            val dub = raw.contains("dublaj", true) || href.contains("dublaj", true)
-            if (dub && !title.contains("dublaj", true)) title += " [Dublaj]"
             val poster = v.second
             if (href.contains("/diziler/")) {
+                title = cleanSeriesTitle(title)
+                if (bestForKey[title.lowercase()] != href) return@mapNotNull null
                 newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
             } else {
+                val dub = raw.contains("dublaj", true) || href.contains("dublaj", true)
+                if (dub && !title.contains("dublaj", true)) title += " [Dublaj]"
                 newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
             }
         }
@@ -253,41 +282,89 @@ class Dizidad : MainAPI() {
 
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
 
+    data class TmdbShow(
+        val id: Int? = null,
+        val name: String? = null,
+        val original_name: String? = null,
+        val title: String? = null,
+        val original_title: String? = null
+    )
     data class TmdbSearch(val results: List<TmdbShow>? = null)
-    data class TmdbShow(val id: Int? = null)
-    data class TmdbDetail(val overview: String? = null)
+    data class TmdbDetail(
+        val overview: String? = null,
+        val poster_path: String? = null,
+        val backdrop_path: String? = null
+    )
+    data class TmdbEp(
+        val episode_number: Int? = null,
+        val name: String? = null,
+        val overview: String? = null,
+        val still_path: String? = null,
+        val air_date: String? = null,
+        val runtime: Int? = null
+    )
     data class TmdbSeason(val episodes: List<TmdbEp>? = null)
-    data class TmdbEp(val episode_number: Int? = null, val overview: String? = null)
 
     private fun tmdbTitle(t: String): String = t
         .replace(Regex("\\s*(türkçe\\s*)?(dublaj|altyazılı)\\b.*$", RegexOption.IGNORE_CASE), "")
         .trim()
         .ifBlank { t }
 
+    private fun norm(s: String?): String =
+        (s ?: "").lowercase().replace(Regex("[^\\p{L}\\p{N}]"), "")
+
+    // Başlığa tam uyan sonucu tercih eder, yoksa ilk sonucu alır
     private suspend fun tmdbFindId(title: String, isTv: Boolean): Int? = try {
-        val q = URLEncoder.encode(tmdbTitle(title), "UTF-8")
+        val clean = tmdbTitle(title)
+        val q = URLEncoder.encode(clean, "UTF-8")
         val kind = if (isTv) "tv" else "movie"
-        app.get("https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q")
-            .parsedSafe<TmdbSearch>()?.results?.firstOrNull()?.id
+        val results = app.get("https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q")
+            .parsedSafe<TmdbSearch>()?.results.orEmpty()
+        val want = norm(clean)
+        val exact = results.firstOrNull {
+            norm(it.name) == want || norm(it.original_name) == want ||
+                norm(it.title) == want || norm(it.original_title) == want
+        }
+        (exact ?: results.firstOrNull())?.id
+    } catch (e: Exception) { null }
+
+    private suspend fun tmdbDetailTr(id: Int, isTv: Boolean): TmdbDetail? = try {
+        val kind = if (isTv) "tv" else "movie"
+        app.get("https://api.themoviedb.org/3/$kind/$id?api_key=$tmdbKey&language=tr-TR")
+            .parsedSafe<TmdbDetail>()
     } catch (e: Exception) { null }
 
     // Dizi / film açıklaması: yalnızca Türkçe (tr-TR). Yoksa null.
-    private suspend fun tmdbOverviewTr(id: Int, isTv: Boolean): String? = try {
-        val kind = if (isTv) "tv" else "movie"
-        app.get("https://api.themoviedb.org/3/$kind/$id?api_key=$tmdbKey&language=tr-TR")
-            .parsedSafe<TmdbDetail>()?.overview?.trim()?.takeIf { it.isNotBlank() }
-    } catch (e: Exception) { null }
+    private suspend fun tmdbOverviewTr(id: Int, isTv: Boolean): String? =
+        tmdbDetailTr(id, isTv)?.overview?.trim()?.takeIf { it.isNotBlank() }
 
-    // Bölüm açıklamaları (yalnızca Türkçe)
-    private suspend fun tmdbSeasonOverviews(id: Int, season: Int): Map<Int, String> = try {
-        app.get("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$tmdbKey&language=tr-TR")
-            .parsedSafe<TmdbSeason>()?.episodes.orEmpty()
-            .mapNotNull { e ->
-                val n = e.episode_number ?: return@mapNotNull null
-                val o = e.overview?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                n to o
-            }.toMap()
-    } catch (e: Exception) { emptyMap() }
+    // Bir sezonun tüm bölüm bilgileri: ad, açıklama (yalnızca Türkçe), görsel, süre, tarih
+    private suspend fun tmdbSeasonEps(id: Int, season: Int): Map<Int, TmdbEp> {
+        suspend fun fetch(lang: String): List<TmdbEp> {
+            for (attempt in 1..2) {
+                try {
+                    val r = app.get("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$tmdbKey&language=$lang")
+                        .parsedSafe<TmdbSeason>()?.episodes
+                    if (r != null) return r
+                } catch (e: Exception) {
+                }
+            }
+            return emptyList()
+        }
+        val tr = fetch("tr-TR")
+        // Açıklama her zaman Türkçe; İngilizce yalnızca eksik görsel ve bölüm adı için
+        val en = if (tr.any { it.still_path == null || it.name.isNullOrBlank() }) fetch("en-US") else emptyList()
+        val enMap = en.associateBy { it.episode_number }
+        return tr.mapNotNull { t ->
+            val n = t.episode_number ?: return@mapNotNull null
+            val f = enMap[n]
+            n to t.copy(
+                overview = t.overview?.takeIf { it.isNotBlank() },
+                still_path = t.still_path ?: f?.still_path,
+                name = t.name?.takeIf { it.isNotBlank() } ?: f?.name
+            )
+        }.toMap()
+    }
 
     override suspend fun load(url: String): LoadResponse? {
         val doc: Document = app.get(url, headers = pageHeaders()).document
@@ -318,16 +395,35 @@ class Dizidad : MainAPI() {
             val base = url.trimEnd('/').substringAfterLast('/').substringBefore("-izle")
                 .removeSuffix("-turkce-dublaj").removeSuffix("-dublaj").removeSuffix("-turkce-altyazili")
 
-            fun collect(d: Document, strict: Boolean = true): List<EpRef> = d.select("a[href]").mapNotNull { a ->
-                val href: String = fixUrl(a.attr("href")).substringBefore("#")
-                if (!href.contains("dizidad.com", true) || href.contains("/diziler/")) return@mapNotNull null
-                val slug = href.trimEnd('/').substringAfterLast('/')
-                if (strict && base.isNotBlank() && !slug.startsWith("$base-", true)) return@mapNotNull null
-                val m = reEpAny.find(slug) ?: return@mapNotNull null
-                val ep = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
-                val sg = m.groupValues[1]
-                EpRef(href, sg.toIntOrNull() ?: 1, ep, sg.isNotEmpty())
-            }.distinctBy { it.href }
+            fun slugOf(h: String): String = h.trimEnd('/').substringAfterLast('/')
+
+            // Yalnızca bu dizinin bölümleri sayılır (spin-off ve başka diziler karışmaz)
+            val epStrict: Regex? = if (base.isNotBlank())
+                Regex("^" + Regex.escape(base) + "-(?:(?:turkce-)?(?:dublaj|altyazili)-)?(?:(\\d+)-sezon-)?(\\d+)-bolum", RegexOption.IGNORE_CASE)
+            else null
+
+            fun collect(d: Document, strict: Boolean = true): List<EpRef> {
+                val rows = ArrayList<Pair<String, MatchResult>>()
+                for (a in d.select("a[href]")) {
+                    val href: String = fixUrl(a.attr("href")).substringBefore("#")
+                    if (!href.contains("dizidad.com", true) || href.contains("/diziler/")) continue
+                    val slug = slugOf(href)
+                    val m = (if (strict && epStrict != null) epStrict.find(slug) else reEpAny.find(slug)) ?: continue
+                    rows.add(Pair(href, m))
+                }
+                var use: List<Pair<String, MatchResult>> = rows
+                if (!strict) {
+                    // Başka dizilerin bölümleri karışmasın: en çok görülen dizi önekini seç
+                    val top = rows.groupBy { slugOf(it.first).substring(0, it.second.range.first) }
+                        .maxByOrNull { it.value.size }?.key
+                    use = rows.filter { slugOf(it.first).substring(0, it.second.range.first) == top }
+                }
+                return use.mapNotNull { (href, m) ->
+                    val ep = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
+                    val sg = m.groupValues[1]
+                    EpRef(href, sg.toIntOrNull() ?: 1, ep, sg.isNotEmpty())
+                }.distinctBy { it.href }
+            }
 
             fun collectAny(d: Document): List<EpRef> {
                 val strict = collect(d)
@@ -357,35 +453,63 @@ class Dizidad : MainAPI() {
                 }
             }
 
+            // Aynı dizinin dublaj / altyazılı sayfalarındaki bölümleri de birleştir
+            if (base.isNotBlank()) {
+                val sibs = listOf("$base-izle", "$base-turkce-dublaj-izle", "$base-dublaj-izle", "$base-turkce-altyazili-izle")
+                    .map { "$mainUrl/diziler/$it/" }
+                    .filter { !it.trimEnd('/').equals(url.trimEnd('/'), true) }
+                for (sUrl in sibs) {
+                    try {
+                        val extra = collectAny(app.get(sUrl, headers = pageHeaders(url)).document)
+                        if (extra.isNotEmpty()) all = (all + extra).distinctBy { it.href }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+
             val list = all
 
             if (list.isNotEmpty()) {
-                val tmdbId = tmdbFindId(title, true)
-                val plot = (if (tmdbId != null) tmdbOverviewTr(tmdbId, true) else null) ?: sitePlot
+                val seriesTitle = cleanSeriesTitle(title)
+                val tmdbId = tmdbFindId(seriesTitle, true)
+                val detail = if (tmdbId != null) tmdbDetailTr(tmdbId, true) else null
+                val plot = detail?.overview?.trim()?.takeIf { it.isNotBlank() } ?: sitePlot
+                val tmdbPoster = detail?.poster_path?.let { "https://image.tmdb.org/t/p/w500$it" }
+                val tmdbBackdrop = detail?.backdrop_path?.let { "https://image.tmdb.org/t/p/w1280$it" }
+
                 val hasSeason = list.any { it.hasSeason }
                 // aynı sezon/bölümün dublaj + altyazılı sayfaları tek bölümde birleşir
                 val grouped = list.groupBy { Pair(it.season, it.episode) }
                     .toSortedMap(compareBy<Pair<Int, Int>>({ it.first }, { it.second }))
 
-                // Bölüm açıklamaları newEpisode bloğunun DIŞINDA önceden çekilir (suspend çağrı burada olmalı)
-                val seasonOverviews = HashMap<Int, Map<Int, String>>()
+                // TMDB bölüm bilgileri newEpisode bloğunun DIŞINDA önceden çekilir (suspend çağrı burada olmalı)
+                val seasonInfo = HashMap<Int, Map<Int, TmdbEp>>()
                 if (tmdbId != null) {
                     for (sn in grouped.keys.map { it.first }.distinct()) {
-                        seasonOverviews[sn] = tmdbSeasonOverviews(tmdbId, sn)
+                        seasonInfo[sn] = tmdbSeasonEps(tmdbId, sn)
                     }
                 }
 
                 val episodes = grouped.map { (key, refs) ->
-                    val epOverview: String? = seasonOverviews[key.first]?.get(key.second)
+                    val info = seasonInfo[key.first]?.get(key.second)
+                    val epDate: Long? = info?.air_date?.takeIf { it.isNotBlank() }?.let {
+                        try {
+                            java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).parse(it)?.time
+                        } catch (_: Exception) { null }
+                    }
                     newEpisode(refs.joinToString("|") { it.href }) {
-                        this.name    = null
+                        this.name    = info?.name?.takeIf { it.isNotBlank() }
                         this.season  = if (hasSeason) key.first else null
                         this.episode = key.second
-                        this.description = epOverview
+                        this.description = info?.overview?.takeIf { it.isNotBlank() }
+                        this.posterUrl = info?.still_path?.let { "https://image.tmdb.org/t/p/w500$it" }
+                        this.runTime = info?.runtime
+                        this.date = epDate
                     }
                 }
-                return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                    this.posterUrl = poster
+                return newTvSeriesLoadResponse(seriesTitle, url, TvType.TvSeries, episodes) {
+                    this.posterUrl = tmdbPoster ?: poster
+                    this.backgroundPosterUrl = tmdbBackdrop
                     this.plot      = plot
                     addTrailer(trailer)
                 }
