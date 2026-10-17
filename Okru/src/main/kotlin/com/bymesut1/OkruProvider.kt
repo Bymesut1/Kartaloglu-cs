@@ -312,7 +312,22 @@ class OkruProvider : MainAPI() {
         }
 
         val sorted = items.values.sortedByDescending { turkishTag(it.title) }.take(40)
-        return withPosters(sorted).map { card(it) }
+
+        // ok.ru arama sayfasındaki küçük resimler çoğu zaman açılmıyor: afişi her zaman video sayfasından al
+        val seedIds = secilmis.map { it.id }.toSet()
+        val fixed = sorted.amap { x ->
+            val m = try { metaOf(x.id) } catch (e: Exception) { null }
+            if (m == null) {
+                x
+            } else {
+                OkItem(
+                    x.id,
+                    if (seedIds.contains(x.id)) x.title else m.title.ifBlank { x.title },
+                    m.poster ?: x.poster
+                )
+            }
+        }
+        return fixed.filter { it.title.isNotBlank() }.map { card(it) }
     }
 
     // ---------------- Video bilgisi ----------------
