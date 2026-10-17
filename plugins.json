@@ -1,0 +1,146 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=cizgimax.online&sz=%size%",
+        "fileHash": "sha256-34d13990ba0247d657155282f079e121c91dffefba5ff780cd2bb2c490804d05",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 52049,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Cartoon",
+            "Movie"
+        ],
+        "version": 2,
+        "internalName": "CizgiMax",
+        "description": "\u00c7izgiMax - T\u00fcrk\u00e7e dublajl\u0131 \u00e7izgi film ve anime. TMDB T\u00fcrk\u00e7e bilgiler, b\u00f6l\u00fcm a\u00e7\u0131klamalar\u0131 ve g\u00f6rselleri.",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/CizgiMax.cs3",
+        "name": "CizgiMax"
+    },
+    {
+        "fileHash": "sha256-93d0c6b18befc4e0085ad10d7a25753b5f84ea8c8f6ca0c54d1aaf4dd977dcc1",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 72128,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Movie"
+        ],
+        "version": 7,
+        "internalName": "Dizidad",
+        "description": "Dizidad - dizi ve film (T\u00fcrk\u00e7e dublaj / altyaz\u0131l\u0131)",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/Dizidad.cs3",
+        "name": "Dizidad"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=filmdozu.com&sz=%size%",
+        "fileHash": "sha256-c43afeaecb1bc92c27ca6d19f148643a1b36e5079f132a1d6917d147387ab210",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 33688,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 2,
+        "internalName": "FilmDozu",
+        "description": "FilmDozu - T\u00fcrk\u00e7e dublaj ve altyaz\u0131l\u0131 film izle (TMDB T\u00fcrk\u00e7e bilgili)",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/FilmDozu.cs3",
+        "name": "FilmDozu"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=filmmakinesi.to&sz=%size%",
+        "fileHash": "sha256-271bc218f5e73325c5cf82f58fd569e677c2fc1e10cca3d22dd73f4c5a82ab02",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 42743,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 8,
+        "internalName": "Filmmakinesi",
+        "description": "filmmakinesi.to - Film ve Dizi izle",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/Filmmakinesi.cs3",
+        "name": "Filmmakinesi"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=hdfilmcehennemi.nl&sz=%size%",
+        "fileHash": "sha256-f31b9843b5347771691b90719ba94bfee75978d374ff96ba9e2cc1922d5570dd",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 76431,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "version": 3,
+        "internalName": "HDFilmCehennemi",
+        "description": "HDFilmCehennemi - TMDB tabanl\u0131 film ve dizi eklentisi",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/HDFilmCehennemi.cs3",
+        "name": "HDFilmCehennemi"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=my.mail.ru&sz=%size%",
+        "fileHash": "sha256-bb0749a7a38d7bd8fc37845c26cd74cfabf85bea737cedc0c8858244f90ad2d9",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 30476,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 4,
+        "internalName": "MailRu",
+        "description": "my.mail.ru kullan\u0131c\u0131 y\u00fcklemeleri: T\u00fcrk\u00e7e dublajl\u0131 filmler",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/MailRu.cs3",
+        "name": "MailRu"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=wfilmizle.cam&sz=%size%",
+        "fileHash": "sha256-3a2b3d911e268baa66c42ebcf2bfcabef4ad6e42279d834b0bf4302230b93438",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Bymesut1/Kartaloglu-cs",
+        "fileSize": 26687,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "Bymesut1"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 7,
+        "internalName": "Wfilmizle",
+        "description": "wfilmizle.cam - T\u00fcrk\u00e7e Dublaj / Altyaz\u0131l\u0131 film izle",
+        "url": "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/Wfilmizle.cs3",
+        "name": "Wfilmizle"
+    }
+]
