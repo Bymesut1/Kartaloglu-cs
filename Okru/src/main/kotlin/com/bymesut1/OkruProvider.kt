@@ -2,9 +2,6 @@ package com.bymesut1
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -117,9 +114,9 @@ class OkruProvider : MainAPI() {
 
     private val metaCache = ConcurrentHashMap<String, OkMeta>()
 
-    private suspend fun metaOf(id: String): OkMeta? {
+    private suspend fun metaOf(id: String, fast: Boolean = false): OkMeta? {
         metaCache[id]?.let { return it }
-        val m = fetchMeta(id) ?: return null
+        val m = fetchMeta(id, fast) ?: return null
         metaCache[id] = m
         return m
     }
@@ -215,7 +212,6 @@ class OkruProvider : MainAPI() {
     // true: Yandex HER aramada ok.ru ile aynı anda çalışır, bulduklarını LİSTENİN BAŞINA koyar.
     // false: sadece ok.ru'da yeterli eşleşme yoksa yedek olarak çalışır.
     private val yandexHerZaman = true
-    private val yandexBekleSn = 5L          // Yandex'i en fazla kaç saniye bekle
     private val yandexEsik = 3              // (yedek modunda) eşleşen sonuç bundan azsa Yandex'e bakılır
     private val yandexMaxVideo = 8      // Yandex'ten en fazla kaç video numarası değerlendirilsin
 
@@ -277,61 +273,61 @@ class OkruProvider : MainAPI() {
 
         // ok.ru'dan paralel doğrulama: oynatılamayan/silinmiş videolar elenir
         return todo.amap { id ->
-            val m = try { metaOf(id) } catch (e: Exception) { null }
+            val m = try { metaOf(id, true) } catch (e: Exception) { null }
             if (m == null || m.title.isBlank()) null else OkItem(id, m.title, m.poster)
         }.filterNotNull()
     }
+
+    private suspend fun safeYandex(q: String, have: Set<String>): List<OkItem> =
+        try { yandexItems(q, have) } catch (e: Exception) { emptyList() }
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.isBlank()) return newSearchResponseList(emptyList(), false)
 
-        return coroutineScope {
-            // Yandex, ok.ru aramasıyla AYNI ANDA başlar (sıralı bekleme yok)
-            val yandexJob = if (page == 1 && yandexHerZaman) {
-                async {
-                    withTimeoutOrNull(yandexBekleSn * 1000L) {
-                        try { yandexItems(q, emptySet()) } catch (e: Exception) { emptyList() }
-                    } ?: emptyList()
-                }
-            } else null
+        val own = LinkedHashMap<String, OkItem>()   // elle eklenen eşleşmeler
+        val items = LinkedHashMap<String, OkItem>() // ok.ru sonuçları
 
-            val own = LinkedHashMap<String, OkItem>()   // elle eklenen eşleşmeler
-            val items = LinkedHashMap<String, OkItem>() // ok.ru sonuçları
-
-            if (page == 1) {
-                val words = fold(q).split(" ").filter { it.isNotBlank() }
-                if (words.isNotEmpty()) {
-                    for (s in secilmis) {
-                        val t = fold(s.title)
-                        if (words.all { t.contains(it) }) own[s.id] = s
-                    }
+        if (page == 1) {
+            val words = fold(q).split(" ").filter { it.isNotBlank() }
+            if (words.isNotEmpty()) {
+                for (s in secilmis) {
+                    val t = fold(s.title)
+                    if (words.all { t.contains(it) }) own[s.id] = s
                 }
             }
-
-            val data = searchData(q, page)
-            var found = data?.toItems().orEmpty()
-            if (found.isEmpty() && page == 1) found = fallbackSearch(q)
-            found.forEach { if (!items.containsKey(it.id) && !own.containsKey(it.id)) items[it.id] = it }
-
-            var yandex: List<OkItem> = yandexJob?.await().orEmpty()
-
-            // Yedek modu: ok.ru'da isimle eşleşme azsa Yandex'e sonradan bak
-            if (page == 1 && !yandexHerZaman && eslesenSayisi(q, own.values + items.values) < yandexEsik) {
-                yandex = withTimeoutOrNull(yandexBekleSn * 1000L) {
-                    try { yandexItems(q, items.keys) } catch (e: Exception) { emptyList() }
-                } ?: emptyList()
-            }
-
-            // Sıra: elle eklenenler -> Yandex bulduklarını -> ok.ru (Türkçe etiketliler önde)
-            val ordered = LinkedHashMap<String, OkItem>()
-            own.values.forEach { ordered[it.id] = it }
-            yandex.forEach { if (!ordered.containsKey(it.id)) ordered[it.id] = it }
-            items.values.sortedByDescending { turkishTag(it.title) }
-                .forEach { if (!ordered.containsKey(it.id)) ordered[it.id] = it }
-
-            newSearchResponseList(ordered.values.map { card(it) }, data?.videos?.hasMore == true)
         }
+
+        // Yandex ve ok.ru aramaları AYNI ANDA çalışır (amap ile paralel). Zaman aşımları isteklerin kendisinde.
+        var yandex: List<OkItem> = emptyList()
+        var data: SearchData? = null
+        listOf(0, 1).amap { i ->
+            if (i == 0) {
+                if (page == 1 && yandexHerZaman) yandex = safeYandex(q, emptySet())
+            } else {
+                data = searchData(q, page)
+            }
+            Unit
+        }
+        val d = data
+
+        var found = d?.toItems().orEmpty()
+        if (found.isEmpty() && page == 1) found = fallbackSearch(q)
+        found.forEach { if (!items.containsKey(it.id) && !own.containsKey(it.id)) items[it.id] = it }
+
+        // Yedek modu: ok.ru'da isimle eşleşme azsa Yandex'e sonradan bak
+        if (page == 1 && !yandexHerZaman && eslesenSayisi(q, own.values + items.values) < yandexEsik) {
+            yandex = safeYandex(q, items.keys)
+        }
+
+        // Sıra: elle eklenenler -> Yandex bulduklarını -> ok.ru (Türkçe etiketliler önde)
+        val ordered = LinkedHashMap<String, OkItem>()
+        own.values.forEach { ordered[it.id] = it }
+        yandex.forEach { if (!ordered.containsKey(it.id)) ordered[it.id] = it }
+        items.values.sortedByDescending { turkishTag(it.title) }
+            .forEach { if (!ordered.containsKey(it.id)) ordered[it.id] = it }
+
+        return newSearchResponseList(ordered.values.map { card(it) }, d?.videos?.hasMore == true)
     }
 
     override suspend fun search(query: String): List<SearchResponse> =
@@ -507,10 +503,12 @@ class OkruProvider : MainAPI() {
         "sd" to 480, "low" to 360, "lowest" to 240, "mobile" to 144
     )
 
-    private suspend fun fetchMeta(id: String): OkMeta? {
-        for (path in listOf("/videoembed/", "/video/")) {
+    private suspend fun fetchMeta(id: String, fast: Boolean = false): OkMeta? {
+        val paths = if (fast) listOf("/videoembed/") else listOf("/videoembed/", "/video/")
+        val to = if (fast) 4L else 8L
+        for (path in paths) {
             val doc = try {
-                app.get(mainUrl + path + id, headers = hdr(path == "/video/"), timeout = 8L).document
+                app.get(mainUrl + path + id, headers = hdr(path == "/video/"), timeout = to).document
             } catch (e: Exception) {
                 continue
             }
