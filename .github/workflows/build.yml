@@ -35,6 +35,7 @@ jobs:
           cp Filmmakinesi/build/*.cs3 out/
           cp FilmDozu/build/*.cs3 out/
           cp CizgiMax/build/*.cs3 out/
+          cp HDFilmCehennemi/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
