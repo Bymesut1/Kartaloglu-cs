@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 
-class AbiFilm0 : MainAPI() {
+class Wfilmizle : MainAPI() {
     override var mainUrl = "https://www.wfilmizle.cam"
     override var name = "Wfilmizle"
     override val hasMainPage = true
