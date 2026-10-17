@@ -7,7 +7,6 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.parser.Parser
 import java.net.URLEncoder
-import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
 class OkruProvider : MainAPI() {
@@ -148,17 +147,16 @@ class OkruProvider : MainAPI() {
     private suspend fun withPosters(list: List<OkItem>, metaTitle: Boolean = false): List<OkItem> {
         val seedIds = secilmis.map { it.id }.toSet()
         return list.amap { x ->
-            val done = withTimeoutOrNull(8000L) {
-                val m = try { metaOf(x.id) } catch (e: Exception) { null }
-                val title = when {
-                    metaTitle && !seedIds.contains(x.id) && m != null && m.title.isNotBlank() -> m.title
-                    else -> x.title.ifBlank { m?.title.orEmpty() }
-                }
-                if (title.isBlank()) x
-                else OkItem(x.id, title, bestPoster(x.id, title, listOf(m?.poster, x.poster)))
+            val m = try { metaOf(x.id) } catch (e: Exception) { null }
+            val title = when {
+                metaTitle && !seedIds.contains(x.id) && m != null && m.title.isNotBlank() -> m.title
+                else -> x.title.ifBlank { m?.title.orEmpty() }
             }
-            // Süre dolduysa: sayfadan gelen başlık/resimle, resim yoksa düz afişle göster
-            done ?: (if (x.title.isBlank()) x else OkItem(x.id, x.title, x.poster ?: placeholder(x.title)))
+            if (title.isBlank()) {
+                x
+            } else {
+                OkItem(x.id, title, bestPoster(x.id, title, listOf(m?.poster, x.poster)))
+            }
         }.filter { it.title.isNotBlank() }
     }
 
