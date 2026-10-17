@@ -757,7 +757,7 @@ class HDFilmCehennemi : MainAPI() {
                 if (okList.isEmpty()) {
                     // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
                     val st = verified.filter { res.strict.contains(it.first) }
-                    val pick = if (st.isNotEmpty()) st.take(1) else verified.take(1)
+                    val pick = if (st.isNotEmpty()) st.take(1) else emptyList<Pair<String, Verified>>()
                     okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
                 }
 
@@ -952,6 +952,7 @@ data class Cand(val urls: List<String>, val strict: Set<String>)
 // ================= Decoder =================
 object Decoder {
     private val IC = RegexOption.IGNORE_CASE
+    private const val B64CH = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
     // ---------- Metin yardımcıları ----------
     private fun fold(s: String): String {
@@ -977,17 +978,20 @@ object Decoder {
         return t.replace("&amp;", "&")
     }
 
-    // ---------- p.a.c.k.e.r çözücü ----------
+    // ---------- p.a.c.k.e.r çözücü (tek ve çift tırnaklı) ----------
     private val packedRe = Regex(
         """\}\('((?:[^'\\]|\\.)*)',\s*(\d+),\s*(\d+),\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)""",
         RegexOption.DOT_MATCHES_ALL
     )
+    private val packedRe2 = Regex(
+        """\}\("((?:[^"\\]|\\.)*)",\s*(\d+),\s*(\d+),\s*"((?:[^"\\]|\\.)*)"\.split\("\|"\)""",
+        RegexOption.DOT_MATCHES_ALL
+    )
 
-    private fun unpack(src: String): List<String> {
-        val out = ArrayList<String>()
-        for (m in packedRe.findAll(src)) {
+    private fun unpackWith(re: Regex, q: String, src: String, out: MutableList<String>) {
+        for (m in re.findAll(src)) {
             try {
-                val payload = m.groupValues[1].replace("\\'", "'").replace("\\\\", "\\")
+                val payload = m.groupValues[1].replace("\\" + q, q).replace("\\\\", "\\")
                 val radix = m.groupValues[2].toInt()
                 val count = m.groupValues[3].toInt()
                 val dict = m.groupValues[4].split("|")
@@ -1007,6 +1011,12 @@ object Decoder {
             } catch (e: Exception) {
             }
         }
+    }
+
+    private fun unpack(src: String): List<String> {
+        val out = ArrayList<String>()
+        unpackWith(packedRe, "'", src, out)
+        unpackWith(packedRe2, "\"", src, out)
         return out
     }
 
@@ -1034,15 +1044,27 @@ object Decoder {
         return out
     }
 
-    // ---------- dc_xxx([...]) ve av("...") özel çözücüler (Close / Rapid) ----------
-    private val dcRe = Regex("""dc_\w+\(\s*\[([^\]]*)\]\s*\)""")
-    private val partRe = Regex("""["']([^"']*)["']""")
-    private val avRe = Regex("""\bav\(\s*["']([A-Za-z0-9+/=_-]{16,})["']\s*\)""")
-
-    private fun safeB64(s: String): String? = try {
-        String(Base64.decode(s, Base64.DEFAULT), Charsets.ISO_8859_1)
-    } catch (e: Exception) {
-        null
+    // Hoşgörülü base64 çözücü (URL-safe ve bozuk karakterleri atar), bayt dizisini Latin-1 metin olarak verir
+    private fun b64d(s0: String): String {
+        val s = StringBuilder()
+        for (ch in s0) {
+            val c = if (ch == '-') '+' else if (ch == '_') '/' else ch
+            if (B64CH.indexOf(c) >= 0) s.append(c)
+        }
+        if (s.length < 8) return ""
+        val o = StringBuilder()
+        var buf = 0
+        var bits = 0
+        for (ch in s) {
+            buf = (buf shl 6) or B64CH.indexOf(ch)
+            bits += 6
+            if (bits >= 8) {
+                bits -= 8
+                o.append(((buf shr bits) and 255).toChar())
+                buf = buf and ((1 shl bits) - 1)
+            }
+        }
+        return o.toString()
     }
 
     private fun rot13(s: String): String {
@@ -1055,54 +1077,107 @@ object Decoder {
         return sb.toString()
     }
 
-    // Bilinen dönüşümlerin olası kombinasyonlarını dener, http ile başlayan sonucu döndürür
-    private fun dcDecode(joined: String): String? {
-        for (r13 in listOf(false, true)) {
-            for (rev in listOf(false, true)) {
-                for (shift in listOf(true, false)) {
-                    var s = joined
-                    if (r13) s = rot13(s)
-                    if (rev) s = s.reversed()
-                    val d = safeB64(s) ?: continue
-                    var o = d
-                    if (shift) {
-                        val sb = StringBuilder()
-                        for (i in d.indices) {
-                            val k = (399756995L % (i + 5)).toInt() + 3
-                            val code = (((d[i].code - k) % 256) + 256) % 256
-                            sb.append(code.toChar())
-                        }
-                        o = sb.toString()
-                    }
-                    for (cand in listOf(o, o.reversed())) {
-                        if (cand.startsWith("http", true)) return cand
-                    }
+    private fun unmix(s: String, salt: Long): String {
+        val sb = StringBuilder()
+        for (i in s.indices) {
+            val k = (salt % (i + 5)).toInt()
+            sb.append((((s[i].code - k) % 256 + 256) % 256).toChar())
+        }
+        return sb.toString()
+    }
+
+    // ---------- Close: dc_xxx(["parça","parça",...]) ----------
+    private val dcRe = Regex("""dc_\w+\s*\(\s*\[([^\]]*)\]\s*\)""")
+    private val partRe = Regex("\"((?:[^\"\\\\]|\\\\.)*)\"|'((?:[^'\\\\]|\\\\.)*)'")
+    private val saltRe = Regex("""(\d{6,12})\s*%\s*\(\s*\w+\s*\+\s*\d+\s*\)""")
+    private val httpRe = Regex("""https?://""")
+
+    // Bilinen dönüşümlerin tüm kombinasyonları denenir (ters çevir / rot13 / base64 / konuma bağlı kaydırma)
+    private fun dcDecode(blob: String): List<String> {
+        val out = ArrayList<String>()
+        val salts = ArrayList<Long>()
+        val found = saltRe.find(blob)?.groupValues?.get(1)?.toLongOrNull()
+        if (found != null) salts.add(found)
+        if (!salts.contains(399756995L)) salts.add(399756995L)
+        for (m in dcRe.findAll(blob).take(10)) {
+            val sb = StringBuilder()
+            for (pm in partRe.findAll(m.groupValues[1])) {
+                sb.append(if (pm.groupValues[1].isNotEmpty()) pm.groupValues[1] else pm.groupValues[2])
+            }
+            val s = sb.toString()
+            if (s.length < 8) continue
+            for (p in listOf(s, s.reversed(), rot13(s), rot13(s.reversed()))) {
+                val d = b64d(p)
+                if (d.isEmpty()) continue
+                val cands = ArrayList<String>()
+                cands.add(d)
+                cands.add(d.reversed())
+                for (sl in salts) {
+                    val um = unmix(d, sl)
+                    cands.add(um)
+                    cands.add(um.reversed())
+                    cands.add(unmix(d.reversed(), sl))
+                }
+                for (c in cands) {
+                    if (httpRe.containsMatchIn(c)) out.add(c)
                 }
             }
         }
-        return null
+        return out
     }
 
+    // İç içe base64 (base64 -> ters -> base64 ...): bağlantı çıkana kadar en çok 3 kat
+    private val mediaHintRe = Regex("""https?://|\.m3u8|\.mp4""")
+    private val b64OnlyRe = Regex("""^[A-Za-z0-9+/=_-]+$""")
+    private val wsRe = Regex("""\s+""")
+
+    private fun deepB64(s: String, depth: Int, out: MutableList<String>) {
+        if (depth > 3 || out.size > 40) return
+        for (p in listOf(s, s.reversed())) {
+            val d = b64d(p)
+            if (d.isEmpty()) continue
+            for (c in listOf(d, d.reversed())) {
+                if (mediaHintRe.containsMatchIn(c)) {
+                    out.add(c)
+                    continue
+                }
+                val t = c.replace(wsRe, "")
+                if (t.length >= 24 && b64OnlyRe.matches(t)) deepB64(t, depth + 1, out)
+            }
+        }
+    }
+
+    private val longStrRe = Regex("""["'`]([A-Za-z0-9+/=_-]{40,})["'`]""")
+
+    private fun b64Strings(src: String): List<String> {
+        val out = ArrayList<String>()
+        val seen = HashSet<String>()
+        for (m in longStrRe.findAll(src)) {
+            if (out.size >= 40) break
+            if (seen.add(m.groupValues[1])) deepB64(m.groupValues[1], 0, out)
+        }
+        return out
+    }
+
+    // ---------- Rapid: av("...") ----------
+    private val avRe = Regex("""\bav\(\s*["']([A-Za-z0-9+/=_-]{16,})["']\s*\)""")
+
     private fun avDecode(input: String): String? {
-        val first = safeB64(input.reversed()) ?: return null
+        val first = b64d(input.reversed())
+        if (first.isEmpty()) return null
         val key = "K9L"
         val sb = StringBuilder()
         for (i in first.indices) {
             val off = key[i % key.length].code % 5 + 1
             sb.append((first[i].code - off).toChar())
         }
-        val second = safeB64(sb.toString()) ?: return null
+        val second = b64d(sb.toString())
         return if (second.startsWith("http", true)) second else null
     }
 
     private fun dcAv(src: String): List<String> {
         val out = ArrayList<String>()
-        for (m in dcRe.findAll(src).take(10)) {
-            val joined = partRe.findAll(m.groupValues[1]).joinToString("") { it.groupValues[1] }
-            if (joined.length < 16) continue
-            val d = dcDecode(joined)
-            if (d != null) out.add(d)
-        }
+        out.addAll(dcDecode(src))
         for (m in avRe.findAll(src).take(10)) {
             val d = avDecode(m.groupValues[1])
             if (d != null) out.add(d)
@@ -1124,6 +1199,7 @@ object Decoder {
                 next.addAll(unpack(u))
                 next.addAll(b64(u))
                 next.addAll(dcAv(u))
+                next.addAll(b64Strings(u))
             }
             queue = next
             round++
@@ -1133,38 +1209,60 @@ object Decoder {
 
     // ---------- Akış adayları ----------
     private val urlRe = Regex("""https?://[^\s"'<>\\)]+""")
-    private val streamRe = Regex("""\.m3u8|\.mp4|master\.txt|/hls\d?/""", IC)
-    private val badRe = Regex("""\.(?:vtt|srt|jpg|jpeg|png|gif|webp|css|js|svg|ico|woff2?)(?:\?|#|\z)""", IC)
-    private val fileRe = Regex("""(?:file|src|source|video_location)["']?\s*[:=]\s*["'](https?://[^"']+)["']""", IC)
+    private val streamRe = Regex("""\.m3u8|\.mp4|sublist|/hls\d?/|/(?:master|playlist|index)[^/"']*\.txt""", IC)
+    private val badRe = Regex("""\.(?:vtt|srt|jpe?g|png|gif|webp|css|js|svg|ico|woff2?)(?:\?|#|/?\z)""", IC)
+    private val junkRe = Regex(
+        """cloudflareinsights|cloudflare\.com|googletagmanager|google-analytics|googlesyndication|gstatic|googleapis|doubleclick|facebook\.|twitter\.|jquery|cdnjs|jsdelivr|unpkg|bootstrapcdn|histats|yandex|adsterra|popads|beacon\.min\.js|/cdn-cgi/""",
+        IC
+    )
+    private val keyedRe = Regex(
+        """["']?(?:file|file_link|contentUrl|source|src|hls|stream|stream_url|video_url|url|m3u8|playlist)["']?\s*[:=]\s*["'](https?://[^"'\s\\]+)["']""",
+        IC
+    )
+    private val keyedBadRe = Regex("""\.(?:vtt|srt|jpe?g|png|webp|gif|css|js|ico|svg|woff2?|html?)(?:\?|$)""", IC)
+    private val subDirRe = Regex("""/(?:srt|sub|subtitle|vtt)/""", IC)
+
+    private fun junkUrl(u: String): Boolean = junkRe.containsMatchIn(u)
+
+    private fun cleanBlob(b: String): String =
+        b.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
 
     fun candFrom(blobs: List<String>): Cand {
         val urls = LinkedHashSet<String>()
         val strict = LinkedHashSet<String>()
         for (b in blobs) {
-            for (m in fileRe.findAll(b)) {
-                val u = m.groupValues[1]
-                if (streamRe.containsMatchIn(u) && !badRe.containsMatchIn(u)) {
+            val t = cleanBlob(b)
+            for (m in urlRe.findAll(t)) {
+                val u = m.value.trimEnd(',', ';', '.', ']', ')')
+                if (streamRe.containsMatchIn(u) && !badRe.containsMatchIn(u) && !junkUrl(u)) {
                     urls.add(u)
                     strict.add(u)
                 }
             }
-            for (m in urlRe.findAll(b)) {
-                val u = m.value.trimEnd(',', ';', '.')
-                if (streamRe.containsMatchIn(u) && !badRe.containsMatchIn(u)) urls.add(u)
+        }
+        // Akış desenine uyan adres yoksa: file:"..." / src="..." gibi anahtarlı adresleri aday yap (doğrulamadan geçerse kullanılır)
+        if (strict.isEmpty()) {
+            for (b in blobs) {
+                val t = cleanBlob(b)
+                for (m in keyedRe.findAll(t)) {
+                    val u = m.groupValues[1]
+                    if (keyedBadRe.containsMatchIn(u) || junkUrl(u) || subDirRe.containsMatchIn(u) || u.contains(".js/")) continue
+                    urls.add(u)
+                }
             }
         }
         return Cand(urls.toList(), strict)
     }
 
     // ---------- Altyazılar ----------
-    private val jsonTrackRe = Regex(
-        """["']file["']\s*:\s*["']([^"']+?\.(?:vtt|srt)[^"']*)["'][^{}]*?["']label["']\s*:\s*["']([^"']*)["']""",
+    private val tagRe = Regex("""<track\b[^>]*>""", IC)
+    private val objRe = Regex("""\{[^{}]{0,600}\}""")
+    private val subExtRe = Regex("""\.(?:vtt|srt|ass|ssa|sub)(?:\?|$)|/(?:srt|sub|subs|subtitle|subtitles|vtt)/""", IC)
+    private val anySubRe = Regex("""["'(]((?:https?://|/)[^"'\s\\)]*?(?:\.vtt|\.srt|/srt/)[^"'\s\\)]*)["')]""", IC)
+    private val otherLangRe = Regex(
+        """fransiz|french|portekiz|portug|ispanyol|spanish|almanca|german|deutsch|italyan|italian|arapca|arabic|rusca|russian|hollanda|dutch|yunan|greek|arnavut|albanian|sirp|serbian|isvec|swedish|japon|korece|korean|cince|chinese|bulgar|rumen|romanian|macar|hungar|lehce|polish|czech|ibran|hebrew|farsca|persian|hintce|hindi|\b(?:fr|fre|pt|por|es|spa|de|ger|it|ita|ar|ara|ru|nl|el|ja|ko|zh)\b""",
         IC
     )
-    private val tagRe = Regex("""<track[^>]+>""", IC)
-    private val srcAttr = Regex("""src\s*=\s*["']([^"']+)["']""", IC)
-    private val labelAttr = Regex("""label\s*=\s*["']([^"']*)["']""", IC)
-    private val langAttr = Regex("""srclang\s*=\s*["']([^"']*)["']""", IC)
 
     private fun absUrl(u: String, origin: String): String = when {
         u.startsWith("http", true) -> u
@@ -1177,54 +1275,67 @@ object Decoder {
         val c = code.lowercase()
         if (c.startsWith("tr")) return "tr"
         if (c.startsWith("en")) return "en"
-        val f = fold(label + " " + url)
+        val path = url.replace(Regex("^https?://[^/]+", IC), "")
+        val f = fold("$label $path")
         return when {
             Regex("turk|turkce|\\btr\\b|/tr[._/-]").containsMatchIn(f) -> "tr"
             Regex("ingiliz|english|\\ben\\b|\\beng\\b|/en[._/-]").containsMatchIn(f) -> "en"
-            else -> if (c.isNotBlank()) c.take(2) else "xx"
+            otherLangRe.containsMatchIn(f) -> "other"
+            c.isNotBlank() -> c.take(2)
+            else -> "xx"
         }
     }
 
+    // <track src label srclang>, {file:"..", label:"..", kind:"captions"} (tırnaklı / tırnaksız anahtar) ve yalın .vtt/.srt adresleri
+    private fun attrOf(tag: String, name: String): String {
+        val re = Regex("[\\s{,\"']" + name + "[\"']?\\s*[=:]\\s*(?:\"((?:[^\"\\\\]|\\\\.)*)\"|'((?:[^'\\\\]|\\\\.)*)')", IC)
+        val m = re.find(tag) ?: return ""
+        return if (m.groupValues[1].isNotEmpty()) m.groupValues[1] else m.groupValues[2]
+    }
+
     fun extractSubs(blob: String, origin: String): List<SubItem> {
+        val t = blob.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&").replace("&quot;", "\"")
         val out = ArrayList<SubItem>()
-        for (m in jsonTrackRe.findAll(blob)) {
-            val url = absUrl(m.groupValues[1], origin)
-            val label = m.groupValues[2]
-            out.add(SubItem(url, label, langOf(label, "", url)))
+        val seen = HashSet<String>()
+
+        fun push(url0: String, label0: String, kind: String, srclang: String) {
+            val label = unesc(label0).trim()
+            var url = unesc(url0).replace("\\", "")
+            if (url.isBlank()) return
+            if (Regex("thumb|sprite|storyboard", IC).containsMatchIn(url) || Regex("thumbnails", IC).containsMatchIn(kind)) return
+            if (Regex("""\.(?:jpe?g|png|webp|gif|css|js|m3u8|mp4)(?:\?|$)""", IC).containsMatchIn(url)) return
+            url = absUrl(url, origin)
+            if (junkUrl(url) || !seen.add(url)) return
+            out.add(SubItem(url, label, langOf(label, srclang, url)))
         }
-        for (m in tagRe.findAll(blob)) {
-            val tag = m.value
-            val src = srcAttr.find(tag)?.groupValues?.get(1) ?: continue
-            if (!Regex("""\.(?:vtt|srt)""", IC).containsMatchIn(src)) continue
-            val url = absUrl(src, origin)
-            val label = labelAttr.find(tag)?.groupValues?.get(1).orEmpty()
-            val code = langAttr.find(tag)?.groupValues?.get(1).orEmpty()
-            out.add(SubItem(url, label, langOf(label, code, url)))
+
+        for (m in tagRe.findAll(t)) {
+            val tag = " " + m.value
+            val kd = attrOf(tag, "kind")
+            if (Regex("metadata|chapters|descriptions", IC).containsMatchIn(kd)) continue
+            var src = attrOf(tag, "src")
+            if (src.isBlank()) src = attrOf(tag, "file")
+            push(src, attrOf(tag, "label"), kd, attrOf(tag, "srclang"))
         }
-        // Genel tarama: {"file":..,"label":..} / {file:..,label:..} / kind: captions
-        val objRe = Regex("""\{[^{}]{0,600}\}""")
-        val urlKey = Regex("""["']?\b(?:file|src|url)\b["']?\s*:\s*["']([^"']+)["']""", IC)
-        val lblKey = Regex("""["']?\b(?:label|name|title)\b["']?\s*:\s*["']([^"']*)["']""", IC)
-        val codeKey = Regex("""["']?\b(?:srclang|language|lang)\b["']?\s*:\s*["']([^"']*)["']""", IC)
-        val hint = Regex("""captions|subtitles|srclang|\.vtt|\.srt""", IC)
-        val subUrl = Regex("""\.(?:vtt|srt|ass)(?:[/?#]|$)|/srt/|/vtt/|/subs?/|subtitle|caption""", IC)
-        for (m in objRe.findAll(blob)) {
+        for (m in objRe.findAll(t)) {
             val o = m.value
-            if (!hint.containsMatchIn(o)) continue
-            val u = urlKey.find(o)?.groupValues?.get(1)?.replace("\\/", "/") ?: continue
-            if (!subUrl.containsMatchIn(u)) continue
-            val label = lblKey.find(o)?.groupValues?.get(1).orEmpty()
-            val code = codeKey.find(o)?.groupValues?.get(1).orEmpty()
-            val url = absUrl(u, origin)
-            out.add(SubItem(url, label, langOf(label, code, url)))
+            val kind = attrOf(o, "kind")
+            var f = attrOf(o, "file")
+            if (f.isBlank()) f = attrOf(o, "src")
+            if (f.isBlank()) f = attrOf(o, "url")
+            if (f.isBlank()) continue
+            val isSub = subExtRe.containsMatchIn(f) || Regex("captions|subtitles", IC).containsMatchIn(kind)
+            if (!isSub) continue
+            var label = attrOf(o, "label")
+            if (label.isBlank()) label = attrOf(o, "name")
+            if (label.isBlank()) label = attrOf(o, "title")
+            var lg = attrOf(o, "srclang")
+            if (lg.isBlank()) lg = attrOf(o, "lang")
+            if (lg.isBlank()) lg = attrOf(o, "language")
+            push(f, label, kind, lg)
         }
-        // Son çare: metindeki herhangi bir .vtt / .srt adresi
-        if (out.isEmpty()) {
-            val anyRe = Regex("""["'(]((?:https?:)?/[^"'\s<>()]+?\.(?:vtt|srt)(?:[/?#][^"'\s<>()]*)?)["')]""", IC)
-            for (m in anyRe.findAll(blob)) {
-                val url = absUrl(m.groupValues[1], origin)
-                out.add(SubItem(url, "", langOf("", "", url)))
-            }
+        for (m in anySubRe.findAll(t)) {
+            push(m.groupValues[1], "", "", "")
         }
         return out
     }
