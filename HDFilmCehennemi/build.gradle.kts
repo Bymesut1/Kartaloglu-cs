@@ -1,3 +1,4 @@
+// use an integer for version numbers
 version = 1
 
 android {
@@ -6,13 +7,19 @@ android {
 
 cloudstream {
     language = "tr"
-    description = "TMDB (Türkçe) verileriyle HDFilmCehennemi film ve dizi eklentisi"
+    description = "HDFilmCehennemi - TMDB tabanlı film ve dizi eklentisi"
     authors = listOf("Bymesut1")
 
-    // 0: Down, 1: Ok, 2: Slow, 3: Beta
+    /**
+     * Status int as one of the following:
+     * 0: Down
+     * 1: Ok
+     * 2: Slow
+     * 3: Beta-only
+     **/
     status = 1
+
     tvTypes = listOf("Movie", "TvSeries")
-    requiresResources = false
 
     iconUrl = "https://www.google.com/s2/favicons?domain=hdfilmcehennemi.nl&sz=%size%"
 }
