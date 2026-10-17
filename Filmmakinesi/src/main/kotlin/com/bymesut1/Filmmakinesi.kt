@@ -10,7 +10,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class AbiFilm3 : MainAPI() {
+class Filmmakinesi : MainAPI() {
     override var mainUrl = "https://filmmakinesi.to"
     override var name = "Fimmakinesi"
     override var lang = "tr"
