@@ -1,7 +1,7 @@
 rootProject.name = "Kartaloglu-cs"
 
-include("AbiFilm0")
+include("Wfilmizle")
 include("MailRu")
 include("Dizidad")
-include("AbiFilm3")
+include("Filmmakinesi")
 include("FilmDozu")

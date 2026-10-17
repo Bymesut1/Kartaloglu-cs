@@ -5,8 +5,8 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class AbiFilm0Plugin : Plugin() {
+class WfilmizlePlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(AbiFilm0())
+        registerMainAPI(Wfilmizle())
     }
 }
