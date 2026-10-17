@@ -67,9 +67,9 @@ class CizgiMax : MainAPI() {
 
     // "... Türkçe İzle" gibi ekleri temizler (büyük İ harfi dahil)
     private fun cleanTitle(t: String): String = t
-        .replace(Regex("\\s*[|\\-–]\\s*çizgimax.*$", setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)), "")
+        .replace(Regex("\\s*[|\\-–]\\s*çizgimax.*$", RegexOption.IGNORE_CASE), "")
         .replace(Regex("\\s+[İIiı]zle.*$"), "")
-        .replace(Regex("\\s*t[üu]rk[çc]e(\\s+(dublaj|altyaz[ıi]l[ıi]))?\\s*$", setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)), "")
+        .replace(Regex("\\s*t[üu]rk[çc]e(\\s+(dublaj|altyaz[ıi]l[ıi]))?\\s*$", RegexOption.IGNORE_CASE), "")
         .replace(Regex("\\s+"), " ")
         .trim()
 
