@@ -131,6 +131,36 @@ class OkruProvider : MainAPI() {
         OkItem(id, title, poster)
     } ?: emptyList()
 
+    // parseJson (inline, JVM 11) yerine org.json ile elle okuma: JVM 1.8 hedefiyle uyumlu
+    private fun parseSearchData(o: JSONObject?): SearchData? {
+        val v = o?.optJSONObject("videos") ?: return null
+        val arr = v.optJSONArray("list")
+        val list = ArrayList<SearchItem>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val mv = row.optJSONObject("movie")
+                val th = mv?.optJSONObject("thumbnail")
+                val movie = if (mv == null) null else SearchMovie(
+                    id = mv.optString("id").ifBlank { null },
+                    title = mv.optString("title").ifBlank { null },
+                    thumbnail = if (th == null) null else SearchThumbnail(
+                        small = th.optString("small").ifBlank { null },
+                        big = th.optString("big").ifBlank { null }
+                    )
+                )
+                list.add(
+                    SearchItem(
+                        name = row.optString("name").ifBlank { null },
+                        imageUrl = row.optString("imageUrl").ifBlank { null },
+                        movie = movie
+                    )
+                )
+            }
+        }
+        return SearchData(SearchVideos(list, if (v.has("hasMore")) v.optBoolean("hasMore") else null))
+    }
+
     // Tek istek, tek JSON: sayfa 1 = HTML içindeki data-props, sonraki sayfalar = web-api
     private suspend fun searchData(q: String, page: Int): SearchData? {
         return try {
@@ -142,7 +172,7 @@ class OkruProvider : MainAPI() {
                     timeout = 10L
                 ).document
                 val js = doc.selectFirst("video-search-result")?.attr("data-props")
-                if (!js.isNullOrEmpty()) AppUtils.parseJson<SearchData>(js) else null
+                if (!js.isNullOrEmpty()) parseSearchData(JSONObject(js)) else null
             } else {
                 val offset = (page - 1) * 30
                 val body = """{"id": $page,"parameters": {"displayMode": "Movie","videosOffset": $offset,"channelsOffset": 0,"searchQuery": ${JSONObject.quote(q)},"currentStateId": "video","durationType": "ANY","hd": false}}"""
@@ -157,7 +187,7 @@ class OkruProvider : MainAPI() {
                     requestBody = body.toRequestBody("text/plain;charset=UTF-8".toMediaTypeOrNull()),
                     timeout = 10L
                 ).text
-                if (txt.isNotEmpty()) AppUtils.parseJson<ApiSearchResponse>(txt).result else null
+                if (txt.isNotEmpty()) parseSearchData(JSONObject(txt).optJSONObject("result")) else null
             }
         } catch (e: Exception) {
             null
