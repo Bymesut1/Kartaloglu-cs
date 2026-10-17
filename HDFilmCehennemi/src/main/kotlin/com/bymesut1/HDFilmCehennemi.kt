@@ -14,11 +14,11 @@ import java.text.Normalizer
 import java.util.Collections
 import kotlin.math.abs
 
-private data class SiteItem(val url: String, val title: String, val year: Int, val type: String)
+private data class SiteItem(val url: String, val title: String, val year: Int, val type: String, val poster: String? = null)
 private data class Alt(val id: String, val name: String, val lang: String)
 private data class Player(val name: String, val lang: String, val id: String?, val embed: String?)
 private data class EmbedResult(val urls: List<String>, val subs: List<SubItem>, val strict: Set<String>, val base: String)
-private data class Verified(val ok: Boolean, val headers: Map<String, String>)
+private data class Verified(val ok: Boolean, val headers: Map<String, String>, val text: String = "")
 
 class HDFilmCehennemi : MainAPI() {
     override var mainUrl = "https://hdfilmcehennemi.nl"
@@ -35,162 +35,221 @@ class HDFilmCehennemi : MainAPI() {
     private val hosts = listOf("https://hdfilmcehennemi.nl", "https://www.hdfilmcehennemi.nl")
     private val showSubbed = false          // true: "Altyazılı" oynatıcılar da eklensin
     private val maxPlayers = 4              // en fazla kaç oynatıcı (Close, Rapid ...)
-    private val subLangs = listOf("tr")     // İngilizce de istersen: listOf("tr", "en")
+    private val subLangs = listOf("tr", "en")   // gömülü altyazı dilleri
     private val uaMobile = "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
     private val uaDesktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     private var good: Pair<String, Boolean>? = null   // çalışan adres + UA biçimi
     private val IC = RegexOption.IGNORE_CASE
 
-    // ---------------- Ana sayfa (TMDB, Türkçe) ----------------
+    // ---------------- Ana sayfa (SİTEDEN) ----------------
     override val mainPage = mainPageOf(
-        "movie/popular?region=TR" to "Popüler Filmler",
-        "movie/now_playing?region=TR" to "Vizyondaki Filmler",
-        "movie/top_rated" to "En Çok Oy Alan Filmler",
-        "discover/movie?with_original_language=tr&sort_by=popularity.desc" to "Türk Filmleri",
-        "tv/popular" to "Popüler Diziler",
-        "tv/on_the_air" to "Yayındaki Diziler",
-        "discover/tv?with_original_language=tr&sort_by=popularity.desc" to "Türk Dizileri"
+        "/" to "Ana Sayfa",
+        "/dizi/" to "Diziler"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val sep = if (request.data.contains("?")) "&" else "?"
-        val url = "$tmdbApi/${request.data}${sep}api_key=$tmdbKey&language=tr-TR&page=$page"
-        val isTv = request.data.startsWith("tv") || request.data.startsWith("discover/tv")
-        val items = app.get(url).parsedSafe<TmdbList>()?.results.orEmpty()
-            .mapNotNull { it.toSearch(if (isTv) "tv" else "movie") }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        val path = request.data
+        val p = if (page <= 1) path else path.trimEnd('/') + "/page/$page/"
+        val html = try {
+            siteGet(p)?.text.orEmpty()
+        } catch (e: Exception) {
+            ""
+        }
+        val items = parseCatalog(html, true).map { toSearchResponse(it) }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty() && path != "/")
     }
 
-    private suspend fun TmdbItem.toSearch(forced: String? = null): SearchResponse? {
-        val type = forced ?: this.media_type ?: return null
-        if (type != "movie" && type != "tv") return null
-        val tid = this.id ?: return null
-        val ttl = this.title ?: this.name ?: return null
-        val poster = this.poster_path?.let { "$imgBase/w500$it" }
-        val yr = (this.release_date ?: this.first_air_date)?.take(4)?.toIntOrNull()
-        val url = "$tmdbSite/$type/$tid"
-        return if (type == "tv") {
-            newTvSeriesSearchResponse(ttl, url, TvType.TvSeries) {
-                this.posterUrl = poster
+    // Sitede olan film / dizi sayfası mı? (menü, kategori vb. değil)
+    private fun isContentItem(it: SiteItem): Boolean {
+        val p = pathOf(it.url).substringBefore("?").substringBefore("#")
+        if (p.contains("/sezon-") || p.contains("/bolum-")) return false
+        if (Regex("^/dizi/[^/]+/?$").containsMatchIn(p)) return true
+        if (!Regex("^/[^/]+/?$").containsMatchIn(p)) return false
+        val slug = p.trim('/')
+        val blocked = setOf("dizi", "film", "filmler", "diziler", "search", "kategori", "category", "tag", "yil", "imdb")
+        if (slug in blocked) return false
+        return slug.endsWith("-izle") || it.year > 0
+    }
+
+    private fun parseCatalog(src: String, needPoster: Boolean): List<SiteItem> =
+        parseResults(src).filter { isContentItem(it) && (!needPoster || it.poster != null) }
+
+    private fun cleanSiteTitle(t: String): String = t
+        .replace(Regex("""\s+[İIiı]zle\b.*$"""), "")
+        .replace(Regex("""\s*\((?:19|20)\d{2}\)\s*$"""), "")
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+
+    private fun toSearchResponse(item: SiteItem): SearchResponse {
+        val title = cleanSiteTitle(item.title).ifBlank { item.title }
+        val yr = if (item.year != 0) item.year else null
+        return if (isSeriesItem(item)) {
+            newTvSeriesSearchResponse(title, item.url, TvType.TvSeries) {
+                this.posterUrl = item.poster
                 this.year = yr
             }
         } else {
-            newMovieSearchResponse(ttl, url, TvType.Movie) {
-                this.posterUrl = poster
+            newMovieSearchResponse(title, item.url, TvType.Movie) {
+                this.posterUrl = item.poster
                 this.year = yr
             }
         }
     }
 
-    // ---------------- Arama ----------------
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8")
-        val url = "$tmdbApi/search/multi?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=$q"
-        return app.get(url).parsedSafe<TmdbList>()?.results.orEmpty().mapNotNull { it.toSearch() }
-    }
+    // ---------------- Arama (SİTEDEN) ----------------
+    override suspend fun search(query: String): List<SearchResponse> =
+        searchSite(query).filter { isContentItem(it) }.map { toSearchResponse(it) }
 
-    // ---------------- Detay ----------------
+    // ---------------- Detay (SİTEDEN, dizilerde TMDB bölüm bilgisi) ----------------
     override suspend fun load(url: String): LoadResponse? {
-        val m = Regex("""/(movie|tv)/(\d+)""").find(url) ?: return null
-        val type = m.groupValues[1]
-        val id = m.groupValues[2]
-        return if (type == "tv") loadSeries(id) else loadMovie(id)
-    }
+        val path = pathOf(url)
+        val r = siteGet(path) ?: return null
+        val html = r.text
+        val doc = Jsoup.parse(html)
+        val rawTitle = doc.selectFirst("meta[property=og:title]")?.attr("content")?.ifBlank { null }
+            ?: doc.selectFirst("h1")?.text()
+            ?: doc.title()
+        val title = cleanSiteTitle(rawTitle)
+        if (title.isBlank()) return null
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
+        val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
+        val year = Regex("""\((19|20)\d{2}\)""").find(rawTitle)?.value?.trim('(', ')')?.toIntOrNull()
+            ?: doc.selectFirst("[class*=year]")?.text()
+                ?.let { Regex("""(19|20)\d{2}""").find(it)?.value }?.toIntOrNull()
 
-    private suspend fun getDetail(type: String, id: String, language: String): TmdbDetail? {
-        val url = "$tmdbApi/$type/$id?api_key=$tmdbKey&language=$language" +
-            "&append_to_response=external_ids,credits,videos&include_video_language=tr,en,null"
-        return app.get(url).parsedSafe<TmdbDetail>()
-    }
-
-    private fun castOf(d: TmdbDetail): List<ActorData> {
-        return d.credits?.cast.orEmpty().take(15).mapNotNull { c ->
-            val n = c.name ?: return@mapNotNull null
-            ActorData(Actor(n, c.profile_path?.let { "$imgBase/w185$it" }), roleString = c.character)
+        if (!path.startsWith("/dizi/")) {
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = poster
+                this.plot = sitePlot
+                this.year = year
+            }
         }
+        return loadSeriesPage(url, path, html, title, poster, sitePlot, year)
     }
 
-    private fun trailerKey(d: TmdbDetail): String? {
-        val list = d.videos?.results.orEmpty().filter { it.site == "YouTube" }
-        return (list.firstOrNull { it.type == "Trailer" } ?: list.firstOrNull())?.key
-    }
-
-    private suspend fun loadMovie(id: String): LoadResponse? {
-        val d = getDetail("movie", id, "tr-TR") ?: return null
-        val en = getDetail("movie", id, "en-US")
-        val title = d.title ?: d.original_title ?: en?.title ?: return null
-        val plotText = d.overview?.takeIf { it.isNotBlank() } ?: en?.overview
-        val yr = d.release_date?.take(4)?.toIntOrNull()
-        val imdb = d.imdb_id ?: d.external_ids?.imdb_id
-        val titles = listOfNotNull(d.title, en?.title, d.original_title).filter { it.isNotBlank() }.distinct()
-        val data = LinkData(id.toInt(), false, null, null, imdb, yr, titles).encode()
-        val actorList = castOf(d)
-        val tKey = trailerKey(d)
-
-        return newMovieLoadResponse(title, "$tmdbSite/movie/$id", TvType.Movie, data) {
-            this.posterUrl = d.poster_path?.let { "$imgBase/w500$it" }
-            this.backgroundPosterUrl = d.backdrop_path?.let { "$imgBase/original$it" }
-            this.year = yr
-            this.plot = plotText
-            this.tags = d.genres?.mapNotNull { it.name }
-            this.duration = d.runtime
-            this.actors = actorList
-            if (tKey != null) addTrailer("https://www.youtube.com/watch?v=$tKey")
+    private suspend fun loadSeriesPage(
+        url: String, path: String, html: String,
+        title: String, poster: String?, sitePlot: String?, year: Int?
+    ): LoadResponse? {
+        // Sitedeki bölümler
+        val base = Regex.escape(path.trimEnd('/'))
+        val epRe = Regex(
+            """href=\x22(?:https?://[^\x22/]+)?($base/sezon-(\d+)/bolum-(\d+)(?:-[a-z0-9-]+)?/?)\x22""", IC
+        )
+        val found = LinkedHashMap<Pair<Int, Int>, String>()
+        for (m in epRe.findAll(html)) {
+            val sNo = m.groupValues[2].toIntOrNull() ?: continue
+            val eNo = m.groupValues[3].toIntOrNull() ?: continue
+            val k = Pair(sNo, eNo)
+            if (!found.containsKey(k)) found[k] = toSite(m.groupValues[1])
         }
-    }
 
-    private suspend fun loadSeries(id: String): LoadResponse? {
-        val d = getDetail("tv", id, "tr-TR") ?: return null
-        val en = getDetail("tv", id, "en-US")
-        val title = d.name ?: d.original_name ?: en?.name ?: return null
-        val plotText = d.overview?.takeIf { it.isNotBlank() } ?: en?.overview
-        val yr = d.first_air_date?.take(4)?.toIntOrNull()
-        val imdb = d.external_ids?.imdb_id
-        val titles = listOfNotNull(d.name, en?.name, d.original_name).filter { it.isNotBlank() }.distinct()
+        // TMDB: yalnızca bu (sitede olan) dizi için bölüm bilgisi
+        val tmdbId = tmdbFindTv(title, year)
+        val detail = if (tmdbId != null) tmdbTv(tmdbId) else null
 
-        val seasons = d.seasons.orEmpty().filter { (it.season_number ?: 0) > 0 }
-        val seasonList = seasons.amap { s ->
-            app.get("$tmdbApi/tv/$id/season/${s.season_number}?api_key=$tmdbKey&language=tr-TR")
-                .parsedSafe<TmdbSeason>()
-        }.filterNotNull()
+        val seasonNums: List<Int> = if (found.isNotEmpty()) {
+            found.keys.map { it.first }.distinct().sorted()
+        } else {
+            detail?.seasons.orEmpty().mapNotNull { it.season_number }.filter { it > 0 }
+        }
+        val infoBySeason = HashMap<Int, Map<Int, TmdbEpisode>>()
+        if (tmdbId != null) {
+            for (sn in seasonNums) infoBySeason[sn] = tmdbSeasonMap(tmdbId, sn)
+        }
 
-        val episodes = ArrayList<Episode>()
-        seasonList.forEach { sn ->
-            sn.episodes.orEmpty().forEach { ep ->
-                val epNo = ep.episode_number ?: return@forEach
-                val sNo = ep.season_number ?: sn.season_number ?: return@forEach
-                val data = LinkData(id.toInt(), true, sNo, epNo, imdb, yr, titles).encode()
-                val epName = ep.name?.takeIf { it.isNotBlank() } ?: "$epNo. Bölüm"
-                val epPlot = ep.overview?.takeIf { it.isNotBlank() }
-                val epImg = ep.still_path?.let { "$imgBase/w300$it" }
-                episodes.add(
-                    newEpisode(data) {
-                        this.name = epName
-                        this.season = sNo
-                        this.episode = epNo
-                        this.posterUrl = epImg
-                        this.description = epPlot
-                        addDate(ep.air_date)
-                    }
-                )
+        val eps: Map<Pair<Int, Int>, String> = if (found.isNotEmpty()) {
+            found
+        } else {
+            val g = LinkedHashMap<Pair<Int, Int>, String>()
+            for (sn in seasonNums) {
+                for (e in infoBySeason[sn].orEmpty().keys.sorted()) {
+                    g[Pair(sn, e)] = toSite(url.trimEnd('/') + "/sezon-$sn/bolum-$e/")
+                }
+            }
+            g
+        }
+        if (eps.isEmpty()) return null
+
+        val episodes = eps.toSortedMap(compareBy<Pair<Int, Int>>({ it.first }, { it.second })).map { (k, epUrl) ->
+            val info = infoBySeason[k.first]?.get(k.second)
+            newEpisode(epUrl) {
+                this.name = info?.name?.takeIf { it.isNotBlank() }
+                this.season = k.first
+                this.episode = k.second
+                this.posterUrl = info?.still_path?.let { "$imgBase/w300$it" }
+                this.description = info?.overview?.takeIf { it.isNotBlank() }
+                this.runTime = info?.runtime
+                addDate(info?.air_date)
             }
         }
 
-        val actorList = castOf(d)
-        val tKey = trailerKey(d)
-        val sNames = seasons.mapNotNull { s -> s.season_number?.let { SeasonData(it, "$it. Sezon") } }
-
-        return newTvSeriesLoadResponse(title, "$tmdbSite/tv/$id", TvType.TvSeries, episodes) {
-            this.posterUrl = d.poster_path?.let { "$imgBase/w500$it" }
-            this.backgroundPosterUrl = d.backdrop_path?.let { "$imgBase/original$it" }
-            this.year = yr
-            this.plot = plotText
-            this.tags = d.genres?.mapNotNull { it.name }
-            this.actors = actorList
-            this.seasonNames = sNames
-            if (tKey != null) addTrailer("https://www.youtube.com/watch?v=$tKey")
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            this.posterUrl = poster ?: detail?.poster_path?.let { "$imgBase/w500$it" }
+            this.backgroundPosterUrl = detail?.backdrop_path?.let { "$imgBase/original$it" }
+            this.year = year ?: detail?.first_air_date?.take(4)?.toIntOrNull()
+            this.plot = detail?.overview?.trim()?.takeIf { it.isNotBlank() } ?: sitePlot
+            this.seasonNames = seasonNums.map { SeasonData(it, "$it. Sezon") }
         }
+    }
+
+    // ---------------- TMDB (yalnızca sitede olan diziler için) ----------------
+    private suspend fun tmdbFindTv(title: String, year: Int?): Int? {
+        if (tmdbKey.startsWith("BURAYA")) return null
+        val parts = (title.split(Regex("""\s+[-–—]\s+""")) + title).map { it.trim() }.filter { it.length >= 2 }.distinct()
+        for (q0 in parts) {
+            val q = URLEncoder.encode(q0, "UTF-8")
+            val want = Decoder.norm(q0)
+            for (withYear in listOf(true, false)) {
+                if (withYear && year == null) continue
+                try {
+                    val y = if (withYear) "&first_air_date_year=$year" else ""
+                    val res = app.get("$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q$y")
+                        .parsedSafe<TmdbList>()?.results.orEmpty()
+                    val exact = res.firstOrNull {
+                        Decoder.norm(it.name ?: "") == want || Decoder.norm(it.original_name ?: "") == want
+                    }
+                    val id = (exact ?: res.firstOrNull())?.id
+                    if (id != null) return id
+                } catch (e: Exception) {
+                }
+            }
+        }
+        return null
+    }
+
+    private suspend fun tmdbTv(id: Int): TmdbDetail? = try {
+        app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR").parsedSafe<TmdbDetail>()
+    } catch (e: Exception) {
+        null
+    }
+
+    // Bir sezonun bölümleri: Türkçe ad + açıklama; İngilizce yalnızca eksik görsel/ad için
+    private suspend fun tmdbSeasonMap(id: Int, season: Int): Map<Int, TmdbEpisode> {
+        suspend fun fetch(lang: String): List<TmdbEpisode> {
+            for (i in 1..2) {
+                try {
+                    val r = app.get("$tmdbApi/tv/$id/season/$season?api_key=$tmdbKey&language=$lang")
+                        .parsedSafe<TmdbSeason>()?.episodes
+                    if (r != null) return r
+                } catch (e: Exception) {
+                }
+            }
+            return emptyList()
+        }
+        val tr = fetch("tr-TR")
+        val en = if (tr.any { it.still_path == null || it.name.isNullOrBlank() }) fetch("en-US") else emptyList()
+        val enMap = en.associateBy { it.episode_number }
+        return tr.mapNotNull { t ->
+            val n = t.episode_number ?: return@mapNotNull null
+            val f = enMap[n]
+            n to t.copy(
+                overview = t.overview?.takeIf { it.isNotBlank() },
+                still_path = t.still_path ?: f?.still_path,
+                name = t.name?.takeIf { it.isNotBlank() } ?: f?.name
+            )
+        }.toMap()
     }
 
     // ---------------- Site istekleri ----------------
@@ -271,8 +330,13 @@ class HDFilmCehennemi : MainAPI() {
                 ?.let { Regex("""\d{4}""").find(it)?.value }?.toIntOrNull() ?: 0
             val type = a.selectFirst("[class*=type]")?.text().orEmpty().trim()
             val url = toSite(href)
+            val posterRaw = a.selectFirst("img")?.let { im ->
+                listOf("data-src", "data-lazy-src", "src").map { k -> im.attr(k) }
+                    .firstOrNull { v -> v.isNotBlank() && !v.startsWith("data:") }
+            }
+            val poster = posterRaw?.let { toSite(it) }
             if (title.isBlank() || !seen.add(url)) return@forEach
-            out.add(SiteItem(url, title, year, type))
+            out.add(SiteItem(url, title, year, type, poster))
         }
         return out
     }
@@ -469,7 +533,16 @@ class HDFilmCehennemi : MainAPI() {
                 blobs.forEach { b ->
                     Decoder.extractSubs(b, originOf(v)).forEach { s -> if (seenS.add(s.url)) subs.add(s) }
                 }
-                if (c.urls.isNotEmpty()) return EmbedResult(c.urls, subs, c.strict, v)
+                // Close vb.: JSON-LD "contentUrl" doğrudan video adresi olabilir
+                val ld = Regex(""""contentUrl"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+                val allUrls = LinkedHashSet<String>()
+                val allStrict = LinkedHashSet<String>(c.strict)
+                if (ld != null && ld.startsWith("http", true)) {
+                    allUrls.add(ld)
+                    allStrict.add(ld)
+                }
+                allUrls.addAll(c.urls)
+                if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v)
 
                 val inner = Jsoup.parse(html).selectFirst("iframe[data-src], iframe[src]")
                 if (inner != null && depth < 1) {
@@ -488,10 +561,10 @@ class HDFilmCehennemi : MainAPI() {
             val wv = app.get(
                 embedUrl,
                 referer = siteBase() + "/",
-                interceptor = WebViewResolver(Regex("""\.m3u8|master\.txt|/hls\d?/"""))
+                interceptor = WebViewResolver(Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)"""))
             )
             val u = wv.url
-            if (Regex("""\.m3u8|master\.txt|/hls\d?/""").containsMatchIn(u)) {
+            if (Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)""").containsMatchIn(u)) {
                 return EmbedResult(listOf(u), emptyList(), setOf(u), embedUrl)
             }
         } catch (e: Exception) { }
@@ -520,7 +593,7 @@ class HDFilmCehennemi : MainAPI() {
                 null
             }
             if (r != null && (r.code == 200 || r.code == 206) && r.text.trimStart().startsWith("#EXTM3U")) {
-                return Verified(true, h)
+                return Verified(true, h, r.text)
             }
         }
         return Verified(false, sets[0])
@@ -539,8 +612,13 @@ class HDFilmCehennemi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val link = LinkData.decode(data) ?: return false
-        val pageUrl = findPage(link) ?: return false
+        // Artık veri doğrudan sitedeki sayfa adresi (eski biçim de desteklenir)
+        val pageUrl = if (data.startsWith("http", true)) {
+            toSite(data)
+        } else {
+            val link = LinkData.decode(data) ?: return false
+            findPage(link) ?: return false
+        }
         val html = siteGet(pathOf(pageUrl))?.text ?: return false
         val ifr = pageIframe(html)
 
@@ -558,6 +636,7 @@ class HDFilmCehennemi : MainAPI() {
         val seenEmb = Collections.synchronizedSet(HashSet<String>())
         val seenUrl = Collections.synchronizedSet(HashSet<String>())
         val seenSub = Collections.synchronizedSet(HashSet<String>())
+        val gotExt = java.util.concurrent.atomic.AtomicBoolean(false)
 
         jobs.amap { job ->
             try {
@@ -574,7 +653,15 @@ class HDFilmCehennemi : MainAPI() {
                 }
                 if (embedUrl.isBlank() || !seenEmb.add(embedUrl)) return@amap
 
-                val res = resolveEmbed(embedUrl, pageUrl) ?: return@amap
+                val res = resolveEmbed(embedUrl, pageUrl)
+                if (res == null) {
+                    // Yedek: hazır çıkarıcıları dene (ör. Close)
+                    try {
+                        if (loadExtractor(embedUrl, pageUrl, subtitleCallback, callback)) gotExt.set(true)
+                    } catch (e: Exception) {
+                    }
+                    return@amap
+                }
                 val sets = streamHeaderSets(res.base)
 
                 // Altyazılar
@@ -584,7 +671,8 @@ class HDFilmCehennemi : MainAPI() {
                     }
                     .forEach { s ->
                         if (seenSub.add(s.url)) {
-                            subtitleCallback.invoke(SubtitleFile(if (s.lang == "tr") "Türkçe" else "English", s.url))
+                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { s.lang }
+                            subtitleCallback.invoke(SubtitleFile(nameS, s.url))
                         }
                     }
 
@@ -593,6 +681,15 @@ class HDFilmCehennemi : MainAPI() {
                     .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
                     .take(6)
                 val verified = cands.amap { u -> u to verifyUrl(u, sets) }
+
+                // Akışın içine gömülü (HLS) altyazı kanalları
+                verified.forEach { (mu, mv) ->
+                    if (mv.ok) {
+                        embeddedSubs(mv.text, mu).forEach { es ->
+                            if (seenSub.add(es.url)) subtitleCallback.invoke(SubtitleFile(es.label, es.url))
+                        }
+                    }
+                }
                 var okList = verified.filter { it.second.ok }
                 if (okList.isEmpty()) {
                     val st = verified.filter { res.strict.contains(it.first) }
@@ -611,7 +708,11 @@ class HDFilmCehennemi : MainAPI() {
                     val v = pair.second
                     if (!seenUrl.add(u)) return@forEachIndexed
                     val label = "$lg $nm" + (if (i > 0) " #${i + 1}" else "")
-                    val linkType = if (u.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+                    val linkType = when {
+                        u.contains(".mp4", true) -> ExtractorLinkType.VIDEO
+                        u.contains(".m3u8", true) || u.contains("master", true) || u.contains("/hls", true) -> ExtractorLinkType.M3U8
+                        else -> ExtractorLinkType.VIDEO
+                    }
                     callback.invoke(
                         newExtractorLink(
                             source = provider,
@@ -629,7 +730,31 @@ class HDFilmCehennemi : MainAPI() {
                 e.printStackTrace()
             }
         }
-        return seenUrl.isNotEmpty()
+        return seenUrl.isNotEmpty() || gotExt.get()
+    }
+
+    // HLS ana listesindeki #EXT-X-MEDIA:TYPE=SUBTITLES kanalları (doğrudan .vtt/.srt olanlar)
+    private fun embeddedSubs(master: String, base: String): List<SubItem> {
+        val out = ArrayList<SubItem>()
+        if (!master.contains("TYPE=SUBTITLES", true)) return out
+        val dir = base.substringBefore("?").substringBeforeLast('/') + "/"
+        for (line in master.lines()) {
+            if (!line.startsWith("#EXT-X-MEDIA", true) || !line.contains("TYPE=SUBTITLES", true)) continue
+            val uri = Regex("""URI="([^"]+)"""", IC).find(line)?.groupValues?.get(1) ?: continue
+            if (!Regex("""\.(?:vtt|srt)(?:\?|#|$)""", IC).containsMatchIn(uri)) continue
+            val nm = Regex("""NAME="([^"]*)"""", IC).find(line)?.groupValues?.get(1).orEmpty()
+            val lg = Regex("""LANGUAGE="([^"]*)"""", IC).find(line)?.groupValues?.get(1).orEmpty().lowercase()
+            if (Regex("forced|zorunlu", IC).containsMatchIn("$nm $uri")) continue
+            val code = when {
+                lg.startsWith("tr") || Regex("turk|türk", IC).containsMatchIn(nm) -> "tr"
+                lg.startsWith("en") || Regex("english|ingiliz", IC).containsMatchIn(nm) -> "en"
+                else -> lg.take(2)
+            }
+            if (code !in subLangs) continue
+            val full = if (uri.startsWith("http", true)) uri else if (uri.startsWith("//")) "https:$uri" else dir + uri
+            out.add(SubItem(full, if (code == "tr") "Türkçe" else "English", code))
+        }
+        return out
     }
 }
 
@@ -695,7 +820,9 @@ data class TmdbItem(
     val media_type: String? = null,
     val poster_path: String? = null,
     val release_date: String? = null,
-    val first_air_date: String? = null
+    val first_air_date: String? = null,
+    val original_name: String? = null,
+    val original_title: String? = null
 )
 
 data class TmdbGenre(val name: String? = null)
@@ -745,7 +872,8 @@ data class TmdbEpisode(
     val name: String? = null,
     val overview: String? = null,
     val still_path: String? = null,
-    val air_date: String? = null
+    val air_date: String? = null,
+    val runtime: Int? = null
 )
 
 data class TmdbSeason(
@@ -929,6 +1057,23 @@ object Decoder {
             val url = absUrl(src, origin)
             val label = labelAttr.find(tag)?.groupValues?.get(1).orEmpty()
             val code = langAttr.find(tag)?.groupValues?.get(1).orEmpty()
+            out.add(SubItem(url, label, langOf(label, code, url)))
+        }
+        // Genel tarama: {"file":..,"label":..} / {label,..,file} / kind: captions
+        val objRe = Regex("""\{[^{}]{0,600}\}""")
+        val urlKey = Regex("""["'](?:file|src|url)["']\s*:\s*["']([^"']+)["']""", IC)
+        val lblKey = Regex("""["'](?:label|name|title)["']\s*:\s*["']([^"']*)["']""", IC)
+        val codeKey = Regex("""["'](?:srclang|language|lang)["']\s*:\s*["']([^"']*)["']""", IC)
+        val hint = Regex("""captions|subtitles|srclang|\.vtt|\.srt""", IC)
+        val subUrl = Regex("""\.(?:vtt|srt|ass)(?:\?|#|$)|/subs?/|subtitle|caption""", IC)
+        for (m in objRe.findAll(blob)) {
+            val o = m.value
+            if (!hint.containsMatchIn(o)) continue
+            val u = urlKey.find(o)?.groupValues?.get(1)?.replace("\\/", "/") ?: continue
+            if (!subUrl.containsMatchIn(u)) continue
+            val label = lblKey.find(o)?.groupValues?.get(1).orEmpty()
+            val code = codeKey.find(o)?.groupValues?.get(1).orEmpty()
+            val url = absUrl(u, origin)
             out.add(SubItem(url, label, langOf(label, code, url)))
         }
         return out
