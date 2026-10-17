@@ -14,11 +14,38 @@ class CizgiMax : MainAPI() {
     override val hasMainPage    = true
     override var lang           = "tr"
     override val hasQuickSearch = false
-    override val supportedTypes = setOf(TvType.TvSeries)
+    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
+
+    // Sitedeki türler (menüden): adres parçası -> görünen ad
+    private val genres = listOf(
+        "action" to "Action", "adventure" to "Adventure", "aile" to "Aile", "aksiyon" to "Aksiyon",
+        "askeri" to "Askeri", "avangard" to "Avangard", "award-winning" to "Award Winning",
+        "belgesel" to "Belgesel", "bilim-kurgu" to "Bilim Kurgu", "boys-love" to "Boys Love",
+        "comedy" to "Comedy", "dogaustu" to "Doğaüstü", "dram" to "Dram", "drama" to "Drama",
+        "dovus-sanatlari" to "Dövüş Sanatları", "ecchi" to "Ecchi", "fantasy" to "Fantasy",
+        "fantezi" to "Fantezi", "gerilim" to "Gerilim", "girls-love" to "Girls Love", "gizem" to "Gizem",
+        "gurme" to "Gurme", "gunluk-yasam" to "Günlük Yaşam", "harem" to "Harem", "isekai" to "Isekai",
+        "komedi" to "Komedi", "korku" to "Korku", "kovboy" to "Kovboy", "macera" to "Macera",
+        "mecha" to "Mecha", "mitoloji" to "Mitoloji", "mystery" to "Mystery", "muzik" to "Müzik",
+        "okul" to "Okul", "psikolojik" to "Psikolojik", "reenkarnasyon" to "Reenkarnasyon",
+        "romance" to "Romance", "romantik" to "Romantik", "samuray" to "Samuray", "sci-fi" to "Sci-Fi",
+        "seinen" to "Seinen", "shoujo" to "Shoujo", "shounen" to "Shounen", "slice-of-life" to "Slice of Life",
+        "spor" to "Spor", "supernatural" to "Supernatural", "suspense" to "Suspense", "suc" to "Suç",
+        "super-guc" to "Süper Güç", "tarihsel" to "Tarihsel", "vampir" to "Vampir", "cocuk" to "Çocuk",
+        "odullu" to "Ödüllü"
+    )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Son Eklenenler",
-        "$mainUrl/diziler/" to "Tüm Diziler"
+        *(listOf(
+            "$mainUrl/" to "Son Eklenenler",
+            "$mainUrl/yeni-eklenenler/" to "Yeni Eklenenler",
+            "$mainUrl/arsiv/?sort=populer&donem=daily" to "Trendler",
+            "$mainUrl/diziler/cizgi-film/" to "Çizgi Film",
+            "$mainUrl/diziler/anime/" to "Anime",
+            "$mainUrl/diziler/dizi/" to "Dizi",
+            "$mainUrl/film/" to "Film",
+            "$mainUrl/arsiv/" to "İçerik Arşivi"
+        ) + genres.map { "$mainUrl/tur/${it.first}/" to "Tür: ${it.second}" }).toTypedArray()
     )
 
     private val ua =
@@ -33,12 +60,22 @@ class CizgiMax : MainAPI() {
     // ---------------- Yardımcılar ----------------
 
     private val reSeriesPath = Regex("""(?:https?://[^/]+)?/diziler/([^/?#]+)/?$""", RegexOption.IGNORE_CASE)
+    private val reFilmPath = Regex("""(?:https?://[^/]+)?/film/([^/?#]+)/?$""", RegexOption.IGNORE_CASE)
 
+    // Kategori sayfaları dizi gibi görünmesin
+    private val skipSeriesSlugs = setOf("cizgi-film", "anime", "dizi")
+
+    // "... Türkçe İzle" gibi ekleri temizler (büyük İ harfi dahil)
     private fun cleanTitle(t: String): String = t
-        .replace(Regex("\\s*[|\\-–]\\s*çizgimax.*$", RegexOption.IGNORE_CASE), "")
-        .replace(Regex("\\s+izle\\b.*$", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("\\s*[|\\-–]\\s*çizgimax.*$", setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)), "")
+        .replace(Regex("\\s+[İIiı]zle.*$"), "")
+        .replace(Regex("\\s*t[üu]rk[çc]e(\\s+(dublaj|altyaz[ıi]l[ıi]))?\\s*$", setOf(RegexOption.IGNORE_CASE, RegexOption.UNICODE_CASE)), "")
         .replace(Regex("\\s+"), " ")
         .trim()
+
+    private fun yearOf(html: String): Int? =
+        Regex("Yay[ıi]n\\s*Y[ıi]l[ıi][^0-9]{0,60}((?:19|20)\\d{2})", RegexOption.IGNORE_CASE)
+            .find(html)?.groupValues?.get(1)?.toIntOrNull()
 
     private fun posterOf(img: Element?): String? {
         if (img == null) return null
@@ -104,31 +141,42 @@ class CizgiMax : MainAPI() {
 
         fun add(a: Element, container: Element?) {
             val href: String = fixUrl(a.attr("href")).substringBefore("#")
-            val m = reSeriesPath.find(href) ?: return
+            val sm = reSeriesPath.find(href)
+            val fm = if (sm == null) reFilmPath.find(href) else null
+            val m = sm ?: fm ?: return
+            val rawSlug = m.groupValues[1]
+            if (sm != null && rawSlug in skipSeriesSlugs) return
             val img: Element? = (container ?: a).selectFirst("img")
             var title: String = container?.selectFirst(".film-name")?.text().orEmpty()
             if (title.isBlank()) title = a.attr("title")
             if (title.isBlank()) title = img?.attr("alt").orEmpty()
             if (title.isBlank()) title = a.text()
-            if (title.isBlank()) title = m.groupValues[1].removeSuffix("-izle").replace('-', ' ')
+            if (title.isBlank()) title = rawSlug.removeSuffix("-izle").replace('-', ' ')
             title = cleanTitle(title)
             if (title.isBlank() || out.containsKey(href)) return
             val poster: String? = posterOf(img)
-            out[href] = newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
+            out[href] = if (sm != null) {
+                newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
+            } else {
+                newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
+            }
         }
 
         for (item in doc.select("div.film-item")) {
-            val a: Element = item.selectFirst("a[href*=/diziler/]") ?: continue
+            val a: Element = item.selectFirst("a[href*=/diziler/], a[href*=/film/]") ?: continue
             add(a, item)
         }
         if (out.isEmpty()) {
-            for (a in doc.select("a[href*=/diziler/]")) add(a, a.parent())
+            for (a in doc.select("a[href*=/diziler/], a[href*=/film/]")) add(a, a.parent())
         }
         return out.values.toList()
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val base = request.data
+        if (base.contains("?") && page > 1) {
+            return newHomePageResponse(request.name, emptyList<SearchResponse>(), hasNext = false)
+        }
         val url = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
         val list = try {
             parseCards(app.get(url, headers = pageHeaders()).document)
@@ -154,7 +202,9 @@ class CizgiMax : MainAPI() {
     data class TmdbShow(
         val id: Int? = null,
         val name: String? = null,
-        val original_name: String? = null
+        val original_name: String? = null,
+        val title: String? = null,
+        val original_title: String? = null
     )
     data class TmdbSearch(val results: List<TmdbShow>? = null)
     data class TmdbSeasonSum(val season_number: Int? = null, val episode_count: Int? = null)
@@ -177,17 +227,44 @@ class CizgiMax : MainAPI() {
     private fun norm(s: String?): String =
         (s ?: "").lowercase().replace(Regex("[^\\p{L}\\p{N}]"), "")
 
-    private suspend fun tmdbFindId(title: String): Int? = try {
-        val q = URLEncoder.encode(title, "UTF-8")
-        val results = app.get("https://api.themoviedb.org/3/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q")
-            .parsedSafe<TmdbSearch>()?.results.orEmpty()
-        val want = norm(title)
-        val exact = results.firstOrNull { norm(it.name) == want || norm(it.original_name) == want }
-        (exact ?: results.firstOrNull())?.id
-    } catch (e: Exception) { null }
+    // Önce yıl ile, bulunamazsa yılsız arar (tr-TR). Anahtar girilmemişse devre dışı.
+    private suspend fun tmdbFindId(title: String, year: Int?, isTv: Boolean): Int? {
+        if (tmdbKey.startsWith("BURAYA")) return null
+        val kind = if (isTv) "tv" else "movie"
+        val yearParam = if (isTv) "first_air_date_year" else "year"
+        val words = title.split(" ").filter { it.isNotBlank() }
+        val queries = listOf(
+            title,
+            title.substringBefore(":").trim(),
+            if (words.size >= 4) words.take(3).joinToString(" ") else ""
+        ).map { it.trim() }.filter { it.length >= 2 }.distinct()
 
-    private suspend fun tmdbDetailTr(id: Int): TmdbDetail? = try {
-        app.get("https://api.themoviedb.org/3/tv/$id?api_key=$tmdbKey&language=tr-TR")
+        for (q0 in queries) {
+            val q = URLEncoder.encode(q0, "UTF-8")
+            val want = norm(q0)
+            for (withYear in listOf(true, false)) {
+                if (withYear && year == null) continue
+                try {
+                    val y = if (withYear) "&$yearParam=$year" else ""
+                    val results = app.get(
+                        "https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q$y"
+                    ).parsedSafe<TmdbSearch>()?.results.orEmpty()
+                    val exact = results.firstOrNull {
+                        norm(it.name) == want || norm(it.original_name) == want ||
+                            norm(it.title) == want || norm(it.original_title) == want
+                    }
+                    val id = (exact ?: results.firstOrNull())?.id
+                    if (id != null) return id
+                } catch (e: Exception) {
+                }
+            }
+        }
+        return null
+    }
+
+    private suspend fun tmdbDetailTr(id: Int, isTv: Boolean): TmdbDetail? = try {
+        val kind = if (isTv) "tv" else "movie"
+        app.get("https://api.themoviedb.org/3/$kind/$id?api_key=$tmdbKey&language=tr-TR")
             .parsedSafe<TmdbDetail>()
     } catch (e: Exception) { null }
 
@@ -223,7 +300,34 @@ class CizgiMax : MainAPI() {
 
     private data class EpRef(val href: String, val season: Int, val episode: Int)
 
+    // ---------------- Film sayfası ----------------
+
+    private suspend fun loadMovie(url: String): LoadResponse? {
+        val doc = app.get(url, headers = pageHeaders()).document
+        val h1Text: String? = doc.selectFirst("h1")?.text()
+        val ogTitle: String? = doc.selectFirst("meta[property=og:title]")?.attr("content")?.ifBlank { null }
+        val title = cleanTitle(ogTitle ?: h1Text ?: doc.title()).ifBlank { "Film" }
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }?.let { fixUrl(it) }
+        val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
+        val year = yearOf(doc.html())
+
+        val id = tmdbFindId(title, year, false)
+        val detail = if (id != null) tmdbDetailTr(id, false) else null
+        val plot = detail?.overview?.trim()?.takeIf { it.isNotBlank() } ?: sitePlot
+        val tmdbPoster = detail?.poster_path?.let { "https://image.tmdb.org/t/p/w500$it" }
+        val tmdbBackdrop = detail?.backdrop_path?.let { "https://image.tmdb.org/t/p/w1280$it" }
+
+        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+            this.posterUrl           = tmdbPoster ?: poster
+            this.backgroundPosterUrl = tmdbBackdrop
+            this.plot                = plot
+            this.year                = year
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse? {
+        if (reFilmPath.containsMatchIn(url)) return loadMovie(url)
+
         val doc = app.get(url, headers = pageHeaders()).document
 
         fun meta(p: String): String? {
@@ -235,6 +339,7 @@ class CizgiMax : MainAPI() {
         val title = cleanTitle(meta("og:title") ?: h1Text ?: doc.title()).ifBlank { "Dizi" }
         val poster = meta("og:image")?.let { fixUrl(it) }
         val sitePlot = meta("og:description")
+        val year = yearOf(doc.html())
 
         val slug = url.trimEnd('/').substringAfterLast('/').removeSuffix("-izle")
 
@@ -272,8 +377,8 @@ class CizgiMax : MainAPI() {
             }.distinctBy { it.href }
         }
 
-        val tmdbId = tmdbFindId(title)
-        val detail = if (tmdbId != null) tmdbDetailTr(tmdbId) else null
+        val tmdbId = tmdbFindId(title, year, true)
+        val detail = if (tmdbId != null) tmdbDetailTr(tmdbId, true) else null
 
         // 2) Sayfada bölüm bulunamazsa TMDB sezon/bölüm sayısından üret
         val seasonList: List<TmdbSeasonSum> = detail?.seasons.orEmpty()
@@ -304,7 +409,15 @@ class CizgiMax : MainAPI() {
             }
         }
 
-        val episodes = grouped.map { (key, list) ->
+        // Yayın tarihi bugünden sonra olan bölümleri listeye ekleme
+        val today = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+        val aired = grouped.filter { (key, _) ->
+            val d = seasonInfo[key.first]?.get(key.second)?.air_date
+            d.isNullOrBlank() || d <= today
+        }
+        val visible = if (aired.isNotEmpty()) aired else grouped
+
+        val episodes = visible.map { (key, list) ->
             val info = seasonInfo[key.first]?.get(key.second)
             val epDate: Long? = info?.air_date?.takeIf { it.isNotBlank() }?.let {
                 try {
@@ -326,6 +439,7 @@ class CizgiMax : MainAPI() {
             this.posterUrl           = tmdbPoster ?: poster
             this.backgroundPosterUrl = tmdbBackdrop
             this.plot                = plot
+            this.year                = year
         }
     }
 
@@ -480,6 +594,40 @@ class CizgiMax : MainAPI() {
         else  -> "TR"
     }
 
+    // dub / sub / any (etiketten de anlaşılır)
+    private fun langOf(s: Srv): String = when {
+        s.lang == "dub" || s.label.contains("dublaj", true) -> "dub"
+        s.lang == "sub" || s.label.contains("altyaz", true) -> "sub"
+        else -> "any"
+    }
+
+    // "Dublaj - Dzen" -> "Dzen"
+    private fun hostLabel(s: Srv): String {
+        val l = s.label.trim()
+        val h = (if (l.contains("-")) l.substringAfterLast("-") else l).trim()
+        val generic = setOf("dublaj", "altyazi", "altyazı", "tr", "türkçe", "turkce", "oynatıcı", "")
+        return if (h.lowercase() in generic) {
+            hostOf(absUrl(s.src.ifBlank { s.resolveUrl.ifBlank { s.metaUrl } })).ifBlank { "Oynatıcı" }
+        } else h
+    }
+
+    // Link gerçekten açılıyor mu? (engelli / hata veren videoları ele)
+    private suspend fun works(v: Media): Boolean = try {
+        val ref = v.ref.ifBlank { "$mainUrl/" }
+        val r = app.get(
+            v.url,
+            headers = mapOf(
+                "User-Agent" to ua,
+                "Referer"    to ref,
+                "Origin"     to ref.trimEnd('/'),
+                "Range"      to "bytes=0-0"
+            )
+        )
+        r.code in 200..299
+    } catch (e: Exception) {
+        false
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -495,10 +643,20 @@ class CizgiMax : MainAPI() {
 
         var any = false
         val seen = HashSet<String>()
+        val doneKeys = HashSet<String>()
 
-        for (s in parseServers(html)) {
-            if (s.notice.equals("copyright", true)) continue   // telif nedeniyle açılmayan sunucuları atla
-            val label = listOf(langLabel(s.lang), s.label).filter { it.isNotBlank() }.distinct().joinToString(" ")
+        // Sıra: önce Türkçe Dublaj, sonra Türkçe Altyazı, sonra diğerleri
+        val servers = parseServers(html)
+            .filter { !it.notice.equals("copyright", true) }   // telif nedeniyle açılmayanları atla
+            .sortedBy { when (langOf(it)) { "dub" -> 0; "sub" -> 1; else -> 2 } }
+
+        for (s in servers) {
+            val lang = langOf(s)
+            val host = hostLabel(s)
+            val key = lang + "|" + host.lowercase()
+            if (key in doneKeys) continue          // her dil + sunucu için yalnızca bir kaynak
+
+            val label = "${langLabel(lang)} - $host"
 
             val found: List<Media> = try {
                 resolveServer(s, page)
@@ -506,35 +664,51 @@ class CizgiMax : MainAPI() {
                 emptyList()
             }
 
-            if (found.isNotEmpty()) {
-                for (v in found) {
-                    if (!seen.add(v.url)) continue
-                    val ref = v.ref.ifBlank { "$mainUrl/" }
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name   = "$name $label",
-                            url    = v.url,
-                            type   = typeOf(v.url)
-                        ) {
-                            this.referer = ref
-                            this.quality = v.quality
-                            this.headers = mapOf(
-                                "User-Agent" to ua,
-                                "Referer"    to ref,
-                                "Origin"     to ref.trimEnd('/')
-                            )
-                        }
-                    )
-                    any = true
+            // En iyi kaliteden başlayıp çalışan ilk linki seç
+            var chosen: Media? = null
+            for (v in found.sortedByDescending { it.quality }) {
+                if (!seen.add(v.url)) continue
+                if (works(v)) {
+                    chosen = v
+                    break
                 }
-            } else {
-                // Yedek: bilinen oynatıcılar için hazır çıkarıcıları dene
+            }
+
+            if (chosen != null) {
+                val ref = chosen.ref.ifBlank { "$mainUrl/" }
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name   = "$name $label",
+                        url    = chosen.url,
+                        type   = typeOf(chosen.url)
+                    ) {
+                        this.referer = ref
+                        // Eşit kalite: sıra dublaj -> altyazı -> diğerleri bozulmasın
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf(
+                            "User-Agent" to ua,
+                            "Referer"    to ref,
+                            "Origin"     to ref.trimEnd('/')
+                        )
+                    }
+                )
+                doneKeys.add(key)
+                any = true
+            } else if (found.isEmpty()) {
+                // Yedek: bilinen oynatıcılar için hazır çıkarıcıyı dene, ilk linki al
                 val src = absUrl(s.src.ifBlank { s.resolveUrl.ifBlank { s.metaUrl } })
                 if (src.startsWith("http")) {
+                    val captured = ArrayList<ExtractorLink>()
                     try {
-                        if (loadExtractor(src, page, subtitleCallback, callback)) any = true
+                        loadExtractor(src, page, subtitleCallback) { l -> captured.add(l) }
                     } catch (_: Exception) {
+                    }
+                    val first = captured.firstOrNull()
+                    if (first != null) {
+                        callback.invoke(first)
+                        doneKeys.add(key)
+                        any = true
                     }
                 }
             }
