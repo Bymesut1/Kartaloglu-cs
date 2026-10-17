@@ -1,13 +1,13 @@
 version = 1
 
 android {
-    namespace = "com.hdfilmcehennemi"
+    namespace = "com.HDFilmCehennemi"
 }
 
 cloudstream {
     language = "tr"
     description = "TMDB (Türkçe) verileriyle HDFilmCehennemi film ve dizi eklentisi"
-    authors = listOf("Ben")
+    authors = listOf("Bymesut1")
 
     // 0: Down, 1: Ok, 2: Slow, 3: Beta
     status = 1
