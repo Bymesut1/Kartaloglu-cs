@@ -1,6 +1,6 @@
 {
     "name": "Kartaloglu-cs",
-    "description": "Kartaloglu CloudStream eklentisi",
+    "description": "Türkçe CloudStream eklentisi",
     "manifestVersion": 1,
     "pluginLists": [
         "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/builds/plugins.json"
