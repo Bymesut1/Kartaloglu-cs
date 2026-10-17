@@ -249,6 +249,46 @@ class Dizidad : MainAPI() {
 
     // ---------------- Dizi / film sayfası ----------------
 
+    // ---------------- TMDB (Türkçe) ----------------
+
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+
+    data class TmdbSearch(val results: List<TmdbShow>? = null)
+    data class TmdbShow(val id: Int? = null)
+    data class TmdbDetail(val overview: String? = null)
+    data class TmdbSeason(val episodes: List<TmdbEp>? = null)
+    data class TmdbEp(val episode_number: Int? = null, val overview: String? = null)
+
+    private fun tmdbTitle(t: String): String = t
+        .replace(Regex("\\s*(türkçe\\s*)?(dublaj|altyazılı)\\b.*$", RegexOption.IGNORE_CASE), "")
+        .trim()
+        .ifBlank { t }
+
+    private suspend fun tmdbFindId(title: String, isTv: Boolean): Int? = try {
+        val q = URLEncoder.encode(tmdbTitle(title), "UTF-8")
+        val kind = if (isTv) "tv" else "movie"
+        app.get("https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q")
+            .parsedSafe<TmdbSearch>()?.results?.firstOrNull()?.id
+    } catch (e: Exception) { null }
+
+    // Dizi / film açıklaması: yalnızca Türkçe (tr-TR). Yoksa null.
+    private suspend fun tmdbOverviewTr(id: Int, isTv: Boolean): String? = try {
+        val kind = if (isTv) "tv" else "movie"
+        app.get("https://api.themoviedb.org/3/$kind/$id?api_key=$tmdbKey&language=tr-TR")
+            .parsedSafe<TmdbDetail>()?.overview?.trim()?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) { null }
+
+    // Bölüm açıklamaları (yalnızca Türkçe)
+    private suspend fun tmdbSeasonOverviews(id: Int, season: Int): Map<Int, String> = try {
+        app.get("https://api.themoviedb.org/3/tv/$id/season/$season?api_key=$tmdbKey&language=tr-TR")
+            .parsedSafe<TmdbSeason>()?.episodes.orEmpty()
+            .mapNotNull { e ->
+                val n = e.episode_number ?: return@mapNotNull null
+                val o = e.overview?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                n to o
+            }.toMap()
+    } catch (e: Exception) { emptyMap() }
+
     override suspend fun load(url: String): LoadResponse? {
         val doc: Document = app.get(url, headers = pageHeaders()).document
 
@@ -268,7 +308,7 @@ class Dizidad : MainAPI() {
         val h1Text: String? = doc.selectFirst("h1")?.text()
         val title  = cleanTitle(meta("og:title") ?: h1Text ?: doc.title())
         val poster = meta("og:image")?.let { fixUrl(it) }
-        val plot   = meta("og:description")
+        val sitePlot = meta("og:description")
 
         val trailer: String? = if (!url.contains("-bolum")) {
             youtubeIds(doc.html()).firstOrNull()?.let { "https://www.youtube.com/watch?v=$it" }
@@ -320,6 +360,9 @@ class Dizidad : MainAPI() {
             val list = all
 
             if (list.isNotEmpty()) {
+                val tmdbId = tmdbFindId(title, true)
+                val plot = (if (tmdbId != null) tmdbOverviewTr(tmdbId, true) else null) ?: sitePlot
+                val seasonCache = HashMap<Int, Map<Int, String>>()
                 val hasSeason = list.any { it.hasSeason }
                 // aynı sezon/bölümün dublaj + altyazılı sayfaları tek bölümde birleşir
                 val grouped = list.groupBy { Pair(it.season, it.episode) }
@@ -330,6 +373,9 @@ class Dizidad : MainAPI() {
                         this.name    = null
                         this.season  = if (hasSeason) key.first else null
                         this.episode = key.second
+                        this.description = if (tmdbId != null)
+                            seasonCache.getOrPut(key.first) { tmdbSeasonOverviews(tmdbId, key.first) }[key.second]
+                        else null
                     }
                 }
                 return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
@@ -339,6 +385,15 @@ class Dizidad : MainAPI() {
                 }
             }
         }
+
+        // Bölüm sayfalarında yanlış eşleşme olmasın diye film araması yalnızca gerçek film sayfalarında yapılır
+        val plot: String? = if (url.contains("/diziler/")) {
+            val id = tmdbFindId(title, true)
+            (if (id != null) tmdbOverviewTr(id, true) else null) ?: sitePlot
+        } else if (!reEpAny.containsMatchIn(ownSlug)) {
+            val id = tmdbFindId(title, false)
+            (if (id != null) tmdbOverviewTr(id, false) else null) ?: sitePlot
+        } else sitePlot
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
