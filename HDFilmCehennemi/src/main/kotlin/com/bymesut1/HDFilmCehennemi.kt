@@ -107,16 +107,16 @@ class HDFilmCehennemi : MainAPI() {
         val r = siteGet(path) ?: return null
         val html = r.text
         val doc = Jsoup.parse(html)
-        val rawTitle = doc.selectFirst("meta[property=og:title]")?.attr("content")?.ifBlank { null }
-            ?: doc.selectFirst("h1")?.text()
-            ?: doc.title()
-        val title = cleanSiteTitle(rawTitle)
+        val ogTitle: String? = doc.selectFirst("meta[property=og:title]")?.attr("content")?.ifBlank { null }
+        val h1Text: String? = doc.selectFirst("h1")?.text()
+        val rawTitle: String = ogTitle ?: h1Text ?: doc.title()
+        val title: String = cleanSiteTitle(rawTitle)
         if (title.isBlank()) return null
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
-        val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
-        val year = Regex("""\((19|20)\d{2}\)""").find(rawTitle)?.value?.trim('(', ')')?.toIntOrNull()
-            ?: doc.selectFirst("[class*=year]")?.text()
-                ?.let { Regex("""(19|20)\d{2}""").find(it)?.value }?.toIntOrNull()
+        val poster: String? = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
+        val sitePlot: String? = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
+        val yearTxt: String? = doc.selectFirst("[class*=year]")?.text()
+        val year: Int? = Regex("""\((19|20)\d{2}\)""").find(rawTitle)?.value?.trim('(', ')')?.toIntOrNull()
+            ?: yearTxt?.let { Regex("""(19|20)\d{2}""").find(it)?.value }?.toIntOrNull()
 
         if (!path.startsWith("/dizi/")) {
             return newMovieLoadResponse(title, url, TvType.Movie, url) {
@@ -330,11 +330,18 @@ class HDFilmCehennemi : MainAPI() {
                 ?.let { Regex("""\d{4}""").find(it)?.value }?.toIntOrNull() ?: 0
             val type = a.selectFirst("[class*=type]")?.text().orEmpty().trim()
             val url = toSite(href)
-            val posterRaw = a.selectFirst("img")?.let { im ->
-                listOf("data-src", "data-lazy-src", "src").map { k -> im.attr(k) }
-                    .firstOrNull { v -> v.isNotBlank() && !v.startsWith("data:") }
+            val imgEl = a.selectFirst("img")
+            var posterRaw: String? = null
+            if (imgEl != null) {
+                for (k in listOf("data-src", "data-lazy-src", "src")) {
+                    val v: String = imgEl.attr(k)
+                    if (v.isNotBlank() && !v.startsWith("data:")) {
+                        posterRaw = v
+                        break
+                    }
+                }
             }
-            val poster = posterRaw?.let { toSite(it) }
+            val poster: String? = posterRaw?.let { toSite(it) }
             if (title.isBlank() || !seen.add(url)) return@forEach
             out.add(SiteItem(url, title, year, type, poster))
         }
