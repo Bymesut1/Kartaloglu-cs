@@ -106,6 +106,54 @@ class AbiFilm0 : MainAPI() {
         return doc.select(".listmovie").mapNotNull { it.toSearchResult() }
     }
 
+    // ---------------- TMDB (Türkçe) ----------------
+
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+
+    data class TmdbSearch(val results: List<TmdbShow>? = null)
+    data class TmdbShow(
+        val id: Int? = null,
+        val overview: String? = null,
+        val release_date: String? = null
+    )
+    data class TmdbDetail(val overview: String? = null)
+
+    // Site başlığındaki fazlalıkları (dublaj, altyazı, kalite, yıl...) temizler
+    private fun tmdbTitle(t: String): String = t
+        .replace(Regex("\\(\\s*(19|20)\\d{2}\\s*\\)"), " ")
+        .replace(Regex("(?i)\\b(t[üu]rk[çc]e|altyaz[ıi]l[ıi]|dublaj|full\\s*hd|hd|1080p|720p|film(i)?|izle)\\b"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .ifBlank { t }
+
+    // TMDB'den yalnızca Türkçe (tr-TR) açıklama alır; bulunamazsa null döner.
+    private suspend fun tmdbOverviewTr(title: String, year: Int?): String? {
+        val clean = tmdbTitle(title)
+        val queries = LinkedHashSet<String>()
+        queries.add(clean)
+        queries.add(clean.substringBefore(" - ").substringBefore(":").trim())
+        for (q0 in queries.filter { it.isNotBlank() }) {
+            val q = java.net.URLEncoder.encode(q0, "UTF-8")
+            for (withYear in listOf(true, false)) {
+                if (withYear && year == null) continue
+                try {
+                    val y = if (withYear) "&year=$year" else ""
+                    val results = app.get(
+                        "https://api.themoviedb.org/3/search/movie?api_key=$tmdbKey&language=tr-TR&query=$q$y"
+                    ).parsedSafe<TmdbSearch>()?.results.orEmpty().take(5)
+                    val pick = results.firstOrNull() ?: continue
+                    pick.overview?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+                    val id = pick.id ?: continue
+                    app.get("https://api.themoviedb.org/3/movie/$id?api_key=$tmdbKey&language=tr-TR")
+                        .parsedSafe<TmdbDetail>()?.overview?.trim()?.takeIf { it.isNotBlank() }
+                        ?.let { return it }
+                } catch (e: Exception) {
+                }
+            }
+        }
+        return null
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val doc = app.get(url, headers = mapOf("User-Agent" to ua), referer = "$mainUrl/").document
         val title = cleanTitle(
@@ -114,12 +162,13 @@ class AbiFilm0 : MainAPI() {
                 ?: return null
         )
         val poster = fixUrlNull(doc.selectFirst("meta[property=og:image]")?.attr("content"))
-        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+        val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")
             ?: doc.selectFirst("meta[name=description]")?.attr("content")
         val year = Regex("""(19|20)\d{2}""").find(
             doc.selectFirst(".fa-calendar-alt")?.parent()?.text() ?: ""
         )?.value?.toIntOrNull()
         val tags = doc.select("a[rel=category tag], .tur a").map { it.text() }.filter { it.isNotBlank() }
+        val plot = tmdbOverviewTr(title, year) ?: sitePlot
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
