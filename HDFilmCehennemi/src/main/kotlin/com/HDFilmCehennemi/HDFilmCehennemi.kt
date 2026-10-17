@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.nicehttp.NiceResponse
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -539,7 +539,11 @@ class HDFilmCehennemi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val link = tryParseJson<LinkData>(data) ?: return false
+        val link: LinkData = try {
+            mapper.readValue(data, LinkData::class.java)
+        } catch (e: Exception) {
+            null
+        } ?: return false
         val pageUrl = findPage(link) ?: return false
         val html = siteGet(pathOf(pageUrl))?.text ?: return false
         val ifr = pageIframe(html)
