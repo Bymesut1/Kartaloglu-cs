@@ -1,6 +1,8 @@
 package com.bymesut1
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -44,10 +46,10 @@ class FilmDozu : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie)
 
     // TMDB API anahtarını buraya yaz. Boş/varsayılan kalırsa TMDB kapalı, eklenti siteden çalışır.
-    private val tmdbKey = "BURAYA_TMDB_API_KEY"
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
 
     private val tmdbOn: Boolean
-        get() = tmdbKey.isNotBlank() && !tmdbKey.startsWith("000316508321ce461cf81e7c6815eec7")
+        get() = tmdbKey.isNotBlank() && !tmdbKey.startsWith("BURAYA")
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImg = "https://image.tmdb.org/t/p"
     private val tmdbCache = HashMap<String, FdMovie?>()
