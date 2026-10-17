@@ -7,7 +7,7 @@ import org.jsoup.nodes.Element
 
 class AbiFilm0 : MainAPI() {
     override var mainUrl = "https://www.wfilmizle.cam"
-    override var name = "AbiFilm0"
+    override var name = "Wfilmizle"
     override val hasMainPage = true
     override var lang = "tr"
     override val hasDownloadSupport = true
