@@ -49,6 +49,57 @@ class HDFilmCehennemi : MainAPI() {
     private var good: Pair<String, Boolean>? = null   // çalışan adres + UA biçimi
     private val IC = RegexOption.IGNORE_CASE
 
+    // ---------------- Net afiş (arama / geçmiş için) ----------------
+    private val posterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun upscale(u: String?): String? {
+        if (u.isNullOrBlank()) return u
+        var s: String = u
+        s = s.replace(Regex("""/t/p/w(?:92|154|185|300|342)/"""), "/t/p/w500/")
+        s = s.replace(Regex("""-\d{2,3}x\d{2,3}(\.(?:jpe?g|png|webp))""", IC), "$1")
+        s = s.replace(Regex("""([?&](?:w|width))=\d{1,3}(?=&|$)""", IC), "$1=500")
+        return s
+    }
+
+    private suspend fun tmdbPoster(title: String, year: Int?, isTv: Boolean): String? {
+        val key = "$isTv|${Decoder.norm(title)}|${year ?: 0}"
+        posterCache[key]?.let { return it.ifEmpty { null } }
+        var found: String? = null
+        try {
+            val parts = (title.split(Regex("""\s+[-–—]\s+""")) + title)
+                .map { it.trim() }.filter { it.length >= 2 }.distinct()
+            val ep = if (isTv) "tv" else "movie"
+            for (q0 in parts) {
+                val q = URLEncoder.encode(q0, "UTF-8")
+                val yp = if (year != null) (if (isTv) "&first_air_date_year=$year" else "&year=$year") else ""
+                val res = app.get("$tmdbApi/search/$ep?api_key=$tmdbKey&language=tr-TR&query=$q$yp")
+                    .parsedSafe<TmdbList>()?.results.orEmpty().filter { it.poster_path != null }
+                val want = Decoder.norm(q0)
+                fun names(it: TmdbItem) = listOf(it.title, it.name, it.original_title, it.original_name)
+                    .map { n -> Decoder.norm(n ?: "") }.filter { n -> n.isNotEmpty() }
+                val hit = res.firstOrNull { r -> names(r).any { n -> n == want } }
+                    ?: res.firstOrNull { r ->
+                        want.length >= 6 && names(r).any { n -> n.contains(want) || want.contains(n) }
+                    }
+                    ?: (if (year != null) res.firstOrNull() else null)
+                if (hit?.poster_path != null) {
+                    found = "$imgBase/w500${hit.poster_path}"
+                    break
+                }
+            }
+        } catch (e: Exception) {
+        }
+        posterCache[key] = found ?: ""
+        return found
+    }
+
+    private suspend fun toSearchResponseHi(item: SiteItem): SearchResponse {
+        val isTv = isSeriesItem(item)
+        val t = cleanSiteTitle(item.title).ifBlank { item.title }
+        val hi = tmdbPoster(t, if (item.year != 0) item.year else null, isTv) ?: upscale(item.poster)
+        return toSearchResponse(item.copy(poster = hi))
+    }
+
     // ---------------- Ana sayfa (SİTEDEN: kategoriler + afişler) ----------------
     override val mainPage = mainPageOf(
         "/" to "Yeni Eklenenler",
@@ -132,7 +183,7 @@ class HDFilmCehennemi : MainAPI() {
 
     // ---------------- Arama (SİTEDEN) ----------------
     override suspend fun search(query: String): List<SearchResponse> =
-        searchSite(query).filter { isContentItem(it) }.map { toSearchResponse(it) }
+        searchSite(query).filter { isContentItem(it) }.take(30).amap { toSearchResponseHi(it) }
 
     // ---------------- Detay (SİTEDEN, dizilerde TMDB bölüm bilgisi) ----------------
     override suspend fun load(url: String): LoadResponse? {
@@ -145,11 +196,12 @@ class HDFilmCehennemi : MainAPI() {
         val rawTitle: String = ogTitle ?: h1Text ?: doc.title()
         val title: String = cleanSiteTitle(rawTitle)
         if (title.isBlank()) return null
-        val poster: String? = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
+        val sitePoster: String? = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
         val sitePlot: String? = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
         val yearTxt: String? = doc.selectFirst("[class*=year]")?.text()
         val year: Int? = Regex("""\((19|20)\d{2}\)""").find(rawTitle)?.value?.trim('(', ')')?.toIntOrNull()
             ?: yearTxt?.let { Regex("""(19|20)\d{2}""").find(it)?.value }?.toIntOrNull()
+        val poster: String? = tmdbPoster(title, year, path.startsWith("/dizi/")) ?: upscale(sitePoster)
 
         if (!path.startsWith("/dizi/")) {
             return newMovieLoadResponse(title, url, TvType.Movie, url) {
