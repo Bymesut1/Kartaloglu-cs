@@ -11,6 +11,10 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlinx.coroutines.withTimeoutOrNull
 
 class SezonlukDizi : MainAPI() {
     override var mainUrl = "https://sezonlukdizi.cc"
@@ -55,8 +59,31 @@ class SezonlukDizi : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Önce düz istek atılır (hızlı, WebView açmaz). Sadece Cloudflare kontrol sayfası gelirse CloudflareKiller devreye girer.
+    // Eskiden her istek CloudflareKiller'dan geçiyordu; kontrol sayfasında WebView sonsuz bekleyip arama/oynatmayı donduruyordu.
+    private fun isChallenge(code: Int, body: String): Boolean =
+        code == 403 || code == 503 ||
+            body.contains("<title>Just a moment", true) ||
+            body.contains("cf-browser-verification", true) ||
+            body.contains("/cdn-cgi/challenge-platform/h/b/orchestrate", true)
+
     private suspend fun get(url: String, referer: String = "$mainUrl/") =
-        app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
+        try {
+            val r = app.get(url, headers = hdr(), referer = referer, timeout = 15L)
+            if (isChallenge(r.code, r.text)) throw Exception("cf")
+            r
+        } catch (e: Exception) {
+            app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
+        }
+
+    private suspend fun post(url: String, form: Map<String, String>, referer: String, t: Long = 15L) =
+        try {
+            val r = app.post(url, data = form, headers = ajaxHdr(referer), timeout = t)
+            if (isChallenge(r.code, r.text)) throw Exception("cf")
+            r
+        } catch (e: Exception) {
+            app.post(url, data = form, headers = ajaxHdr(referer), interceptor = cf, timeout = t)
+        }
 
     private fun abs(u: String): String = if (u.startsWith("http")) u else fixUrl(u)
 
@@ -168,9 +195,18 @@ class SezonlukDizi : MainAPI() {
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
-        val doc = get("$liste?adi=${encQ(q)}&s=$page").document
-        val list = cards(doc.selectFirst(".afis") ?: doc.body())
-        return newSearchResponseList(list, list.isNotEmpty() && page < maxPage(doc))
+        val sfx = if (page > 1) "&s=$page" else ""
+        // 1. sayfada "&s=" hiç gönderilmez (çalışan eklenti de göndermiyor); olmazsa UTF-8 ile tekrar denenir
+        val urls = listOf(
+            "$liste?adi=${encQ(q)}$sfx",
+            "$liste?adi=${URLEncoder.encode(q, "UTF-8")}$sfx"
+        ).distinct()
+        for (u in urls) {
+            val doc = try { get(u).document } catch (e: Exception) { null } ?: continue
+            val list = cards(doc.selectFirst(".afis") ?: doc.body())
+            if (list.isNotEmpty()) return newSearchResponseList(list, page < maxPage(doc))
+        }
+        return newSearchResponseList(emptyList(), false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
@@ -252,13 +288,7 @@ class SezonlukDizi : MainAPI() {
                 ?: "/ajax/dataIzleBolumler.asp"
 
             suspend fun season(sno: Int): Document? = try {
-                app.post(
-                    mainUrl + endpoint,
-                    data = mapOf("did" to did, "sno" to sno.toString()),
-                    headers = ajaxHdr(seriesUrl),
-                    interceptor = cf,
-                    timeout = 15L
-                ).document
+                post(mainUrl + endpoint, mapOf("did" to did, "sno" to sno.toString()), seriesUrl).document
             } catch (e: Exception) {
                 null
             }
@@ -390,6 +420,87 @@ class SezonlukDizi : MainAPI() {
         )
     }
 
+    // ---- bysejikuar.com (Byse) oynatıcısı: API şifreli (AES-256-GCM) JSON döndürür ----
+    private fun b64u(s: String): ByteArray {
+        var t = s.trim().replace('-', '+').replace('_', '/')
+        while (t.length % 4 != 0) t += "="
+        return android.util.Base64.decode(t, android.util.Base64.DEFAULT)
+    }
+
+    private suspend fun extractBysejikuar(
+        embed: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val origin = originOf(embed)
+        val id = Regex("""/(?:e|d|v|embed)/([A-Za-z0-9_-]+)""").find(embed)?.groupValues?.get(1)
+            ?: embed.substringBefore("?").trimEnd('/').substringAfterLast('/')
+        if (id.isBlank()) return false
+
+        val h = mapOf(
+            "User-Agent" to ua,
+            "Accept" to "application/json, */*",
+            "Referer" to "$origin/e/$id",
+            "Origin" to origin,
+            "X-Embed-Parent" to embed,
+            "X-Embed-Origin" to mainUrl.removePrefix("https://")
+        )
+
+        // playback nesnesi: /api/videos/<id> ya da /api/videos/<id>/embed/playback içinde
+        var pb: JSONObject? = null
+        for (api in listOf("$origin/api/videos/$id", "$origin/api/videos/$id/embed/playback")) {
+            val txt = try { app.get(api, headers = h, timeout = 15L).text } catch (e: Exception) { continue }
+            val root = try { JSONObject(txt) } catch (e: Exception) { continue }
+            pb = root.optJSONObject("playback") ?: root.takeIf { it.has("payload") } ?: continue
+            break
+        }
+        val p = pb ?: return false
+
+        val json = try {
+            val parts = p.optJSONArray("key_parts") ?: return false
+            var key = ByteArray(0)
+            for (i in 0 until parts.length()) key += b64u(parts.getString(i))
+            val iv = b64u(p.getString("iv"))
+            val enc = b64u(p.getString("payload"))
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+            JSONObject(String(cipher.doFinal(enc), Charsets.UTF_8))
+        } catch (e: Exception) {
+            return false
+        }
+
+        val srcs = json.optJSONArray("sources") ?: return false
+        val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+        var ok = false
+        for (i in 0 until srcs.length()) {
+            val o = srcs.optJSONObject(i) ?: continue
+            val url = o.optString("url").replace("\\/", "/")
+            if (!url.startsWith("http")) continue
+            val ql = o.optString("label").ifBlank { o.optString("quality") }
+            val tag = if (ql.isBlank()) label else "$label $ql"
+            val mime = o.optString("mime_type")
+            if (url.contains(".m3u8") || mime.contains("mpegurl", true)) {
+                val links = try {
+                    M3u8Helper.generateM3u8(name, url, "$origin/", headers = headers)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                if (links.isNotEmpty()) links.forEach { callback(relabel(it, tag)) }
+                else emitM3u8(url, tag, embed, callback)
+            } else {
+                callback(
+                    newExtractorLink(name, "$tag - Byse", url, ExtractorLinkType.VIDEO) {
+                        this.referer = "$origin/"
+                        this.quality = o.optInt("height", 0).takeIf { it > 0 } ?: Qualities.Unknown.value
+                        this.headers = headers
+                    }
+                )
+            }
+            ok = true
+        }
+        return ok
+    }
+
     // Bir gömülü oynatıcı adresini çözer. Sırayla:
     // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
     // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
@@ -402,6 +513,16 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         val u = if (embed.startsWith("//")) "https:$embed" else embed
         if (!u.startsWith("http")) return false
+
+        // 0) Byse (bysejikuar.com): CloudStream'de hazır çözücü yok, kendi çözücümüz
+        if (u.contains("byse", ignoreCase = true)) {
+            val okByse = try {
+                withTimeoutOrNull(20_000L) { extractBysejikuar(u, label, callback) }
+            } catch (e: Exception) {
+                null
+            }
+            if (okByse == true) return true
+        }
 
         // 1) hazır çözücüler
         val tmp = ArrayList<ExtractorLink>()
@@ -432,7 +553,7 @@ class SezonlukDizi : MainAPI() {
                 val r = app.get(
                     u,
                     referer = "$mainUrl/",
-                    interceptor = WebViewResolver(Regex("""\.m3u8"""))
+                    interceptor = WebViewResolver(Regex("""\.m3u8"""), timeout = 15_000L)
                 )
                 if (r.url.contains(".m3u8")) {
                     emitM3u8(r.url, label, u, callback)
@@ -472,13 +593,7 @@ class SezonlukDizi : MainAPI() {
                 var alts: List<Pair<String, String>> = emptyList()
                 for (ep in altEndpoints.orEmpty()) {
                     val txt = try {
-                        app.post(
-                            mainUrl + ep,
-                            data = mapOf("bid" to bid, "dil" to dil),
-                            headers = ajaxHdr(data),
-                            interceptor = cf,
-                            timeout = 15L
-                        ).text
+                        post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), data).text
                     } catch (e: Exception) {
                         ""
                     }
@@ -489,13 +604,7 @@ class SezonlukDizi : MainAPI() {
                     var found: String? = null
                     for (ep in embedEndpoints.orEmpty()) {
                         val r = try {
-                            app.post(
-                                mainUrl + ep,
-                                data = mapOf("id" to id),
-                                headers = ajaxHdr(data),
-                                interceptor = cf,
-                                timeout = 15L
-                            ).text
+                            post(mainUrl + ep, mapOf("id" to id), data).text
                         } catch (e: Exception) {
                             ""
                         }
@@ -513,8 +622,11 @@ class SezonlukDizi : MainAPI() {
 
         // Tüm kaynaklar paralel çözülür
         val any = AtomicBoolean(false)
-        targets.amap { (label, embed) ->
-            if (emitEmbed(embed, label, subtitleCallback, callback)) any.set(true)
+        withTimeoutOrNull(60_000L) {
+            targets.amap { (label, embed) ->
+                val r = withTimeoutOrNull(40_000L) { emitEmbed(embed, label, subtitleCallback, callback) }
+                if (r == true) any.set(true)
+            }
         }
         return any.get()
     }
