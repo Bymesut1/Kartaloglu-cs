@@ -473,14 +473,21 @@ class SezonlukDizi : MainAPI() {
             return false
         }
         val parts = (0 until arr.length()).map { b64u(arr.getString(it)) }
-        d("byse version=${p.optInt("version")} parça boyları=${parts.map { it.size }} alanlar=${p.keys().asSequence().toList()}")
+        d("byse version=${p.optInt("version")} parça=${parts.size}")
 
-        // Anahtar adayları: ilk iki parça (çalışan eklenti böyle yapıyor), hepsi, tek tek. Sadece geçerli AES boyları denenir.
+        // Anahtar: 30 parçadan sadece ikisi gerçek anahtar (iki adet 16 baytlık parça, toplam 32 bayt = AES-256).
+        // Loglarda gözlenen: parts[version-1] ve parts[n-version]. Emin olmak için geçerli boy veren tüm ikili
+        // kombinasyonlar denenir; GCM etiketi doğru anahtarı kendiliğinden doğrular.
+        val v = p.optInt("version")
+        val n = parts.size
+        val valid = intArrayOf(16, 24, 32)
         val cands = ArrayList<ByteArray>()
-        if (parts.size >= 2) cands.add(parts[0] + parts[1])
-        cands.add(parts.fold(ByteArray(0)) { x, y -> x + y })
-        parts.forEach { cands.add(it) }
-        val keys = cands.filter { it.size == 16 || it.size == 24 || it.size == 32 }.distinctBy { it.toList() }
+        if (v in 1..n && (n - v) in 0 until n && v - 1 != n - v) cands.add(parts[v - 1] + parts[n - v])
+        for (i in parts.indices) for (j in parts.indices) {
+            if (i != j && (parts[i].size + parts[j].size) in valid) cands.add(parts[i] + parts[j])
+        }
+        parts.forEach { if (it.size in valid) cands.add(it) }
+        val keys = cands.distinctBy { it.toList() }
         if (keys.isEmpty()) {
             d("byse geçerli anahtar boyu yok")
             return false
@@ -496,6 +503,7 @@ class SezonlukDizi : MainAPI() {
         val enc = ivEnc.second
 
         var json: JSONObject? = null
+        var failed = 0
         for (key in keys) {
             try {
                 val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -506,12 +514,12 @@ class SezonlukDizi : MainAPI() {
                     break
                 }
             } catch (e: Exception) {
-                d("byse çözme denemesi (${key.size}B) hata: ${e.javaClass.simpleName}")
+                failed++
             }
         }
         val srcs = json?.optJSONArray("sources")
         if (srcs == null) {
-            d("byse çözülemedi")
+            d("byse çözülemedi, denenen anahtar=${keys.size} hatalı=$failed")
             return false
         }
 
