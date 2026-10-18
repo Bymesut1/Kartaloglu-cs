@@ -37,6 +37,7 @@ jobs:
           cp CizgiMax/build/*.cs3 out/
           cp HDFilmCehennemi/build/*.cs3 out/
           cp Okru/build/*.cs3 out/
+          cp SezonlukDizi/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
