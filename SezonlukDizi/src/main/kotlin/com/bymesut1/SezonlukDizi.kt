@@ -625,7 +625,7 @@ class SezonlukDizi : MainAPI() {
     // İstemezsen false yap; o zaman Vidmoly sadece Byse çalışmazsa yedek olarak denenir.
     private val vidmolyExtra = true
 
-    // Turnstile kapısı: doğrulanmış oturum çerezleri bir süre saklanır, çözülemezse bir süre tekrar denenmez
+    // Turnstile kapısı: doğrulanmış oturum çerezleri bir süre saklanır, çözülemezse kısa bir süre tekrar denenmez
     @Volatile private var gateCookies: Map<String, String> = emptyMap()
     @Volatile private var gateOkUntil = 0L
     @Volatile private var gateFailUntil = 0L
@@ -956,10 +956,19 @@ class SezonlukDizi : MainAPI() {
 
     // Kapı sayfası (/ajax/reCAPTCHADATA.asp) Cloudflare Turnstile yükler; token çözülünce
     // $.post("/ajax/reCAPTCHA.asp", {'cf-turnstile-response': token}) ile oturumu doğrular.
-    // Sayfayı görünmez WebView'de açıp kendi kendine çözmesi için süre tanırız. Oturum çerezleri WebView'e verilir,
-    // WebView'in çerezleri geri alınır. Sonucu çağıran taraf, aynı kaynağı yeniden isteyerek doğrular.
-    private suspend fun solveGate(ref: String) {
-        val gate = "$mainUrl/ajax/reCAPTCHADATA.asp"
+    // Kapı adresi (dataEmbed'in döndürdüğü tam adres) görünmez WebView'de açılır ve kendi kendine çözmesi için süre tanınır.
+    // ÖNEMLİ: useOkhttp = false. WebView kendi ağ yığınını ve çerez yöneticisini kullanır; böylece Turnstile
+    // gerçek tarayıcı gibi çalışır ve doğrulama çerezi WebView'in CookieManager'ına yazılır.
+    // Oturum çerezleri WebView'e verilir, sonra WebView'in çerezleri geri alınır. Sonucu çağıran taraf,
+    // aynı kaynağı yeniden isteyerek doğrular.
+    private suspend fun solveGate(ref: String, gateUrl: String? = null) {
+        val gate = gateUrl?.let { g ->
+            when {
+                g.startsWith("//") -> "https:$g"
+                g.startsWith("/") -> mainUrl + g
+                else -> g
+            }
+        } ?: "$mainUrl/ajax/reCAPTCHADATA.asp"
         val cm = try { android.webkit.CookieManager.getInstance() } catch (e: Throwable) { null }
         try {
             cm?.setAcceptCookie(true)
@@ -968,6 +977,7 @@ class SezonlukDizi : MainAPI() {
         } catch (e: Throwable) {
             d("captcha çerez hata ${e.javaClass.simpleName}")
         }
+        d("captcha kapı=${gate.take(140)}")
         val t0 = System.currentTimeMillis()
         try {
             app.get(
@@ -975,7 +985,12 @@ class SezonlukDizi : MainAPI() {
                 headers = hdr(),
                 referer = ref,
                 cookies = sessionCookies,
-                interceptor = WebViewResolver(Regex("""zz-asla-eslesmez-zz"""), timeout = 15_000L)
+                interceptor = WebViewResolver(
+                    Regex("""zz-asla-eslesmez-zz"""),
+                    userAgent = ua,
+                    useOkhttp = false,
+                    timeout = 18_000L
+                )
             )
         } catch (e: Exception) {
             d("captcha webview ${e.javaClass.simpleName}")
@@ -986,14 +1001,14 @@ class SezonlukDizi : MainAPI() {
                 val kv = c.trim().split("=", limit = 2)
                 if (kv.size == 2 && kv[0].isNotBlank()) sessionCookies = sessionCookies + (kv[0] to kv[1])
             }
-            d("captcha çözüm denendi süre=${System.currentTimeMillis() - t0}ms çerez $before->${sessionCookies.size}")
+            d("captcha çözüm denendi süre=${System.currentTimeMillis() - t0}ms çerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",").take(80)}")
         } catch (e: Throwable) {
             d("captcha çerez geri alma hata ${e.javaClass.simpleName}")
         }
     }
 
     // reCAPTCHA kapısı dönen adresin içinde ya da (oturum çerezleriyle açılan) sayfasında gerçek oynatıcı adresi var mı bakar
-    private suspend fun captchaInner(u: String, ref: String): String? {
+    private suspend fun captchaInner(u: String, ref: String, force: Boolean = false): String? {
         val full = when {
             u.startsWith("//") -> "https:$u"
             u.startsWith("/") -> mainUrl + u
@@ -1005,13 +1020,14 @@ class SezonlukDizi : MainAPI() {
             ?.let { return it }
         // Kapı sayfasını bölüm başına BİR kez açıp yapısını hata ayıklamaya yazar; gerçek oynatıcı adresi
         // sayfada açıkça yazıyorsa (Vidmoly vb.) onu kullanır.
-        if (gateProbed.compareAndSet(false, true)) {
+        if (force || gateProbed.compareAndSet(false, true)) {
             try {
                 val h = app.get(full, headers = hdr(), referer = ref, cookies = sessionCookies, timeout = 10L).text
                 val ajax = Regex("""/ajax/[A-Za-z0-9_]+\.asp""").findAll(h).map { it.value }.distinct().take(6).toList()
                 val key = Regex("""sitekey["']?\s*[:=]\s*["']([^"']+)""").find(h)?.groupValues?.get(1)
                 val post = Regex("""\$\.(?:post|ajax)\([^;]{0,150}""").find(h)?.value?.replace(Regex("""\s+"""), " ")
                 d("captcha sayfa uzunluk=${h.length} ajax=$ajax sitekey=$key post=$post")
+                d("captcha sayfa başı='${h.replace(Regex("""\s+"""), " ").take(110)}'")
                 Regex("""https?://[^\s"'<>\\]*(?:vidmoly|embed-)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
                     .find(h.replace("\\/", "/"))?.value?.let { return it }
             } catch (e: Exception) {
@@ -1134,6 +1150,7 @@ class SezonlukDizi : MainAPI() {
 
         // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
         var gatedSeen = false
+        var lastGateUrl: String? = null
         suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
             val (f, raw) = fetchEmbed(id, ref)
             val tag = "$tagPrefix$dil:$id"
@@ -1145,7 +1162,10 @@ class SezonlukDizi : MainAPI() {
             val cap = f.contains("reCAPTCHA", true)
             val host = if (cap) "CAPTCHA" else (Regex("""^(?:https?:)?//([^/]+)""").find(f)?.groupValues?.get(1)
                 ?: short(f, 25))
-            if (cap) gatedSeen = true
+            if (cap) {
+                gatedSeen = true
+                lastGateUrl = f
+            }
             val ok = emit(dil, f)
             if (cap && !ok) retryQ.add(Triple(dil, id, ref))
             if (ok) {
@@ -1269,7 +1289,7 @@ class SezonlukDizi : MainAPI() {
 
         // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir
         if (gatedSeen && listOf("0", "1").any { it !in got } && System.currentTimeMillis() >= gateFailUntil) {
-            solveGate(refs.values.firstOrNull() ?: data)
+            solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
         }
         for (dil in listOf("0", "1")) {
             if (dil in got) continue
@@ -1284,27 +1304,42 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa kapı çözülmeye çalışılır.
+        // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa:
+        //    (a) kapı adresinin içinde / kapı sayfasında gerçek adres aranır,
+        //    (b) olmazsa kapının tam adresi WebView'de açılıp çözülür (useOkhttp = false), adres yeniden istenir.
         if (vidmolyExtra) {
             for (dil in listOf("0", "1")) {
                 val cand = queues[dil]?.firstOrNull { it.second.contains("vidmoly", true) } ?: continue
                 val ref = refs[dil] ?: data
                 var f = fetchEmbed(cand.first, ref).first
                 if (f != null && f.contains("reCAPTCHA", true)) {
-                    if (System.currentTimeMillis() < gateFailUntil) {
-                        d("vidmoly dil=$dil kapı yakın zamanda çözülemedi, atlandı")
-                        continue
+                    val gateUrl: String = f
+                    d("vidmoly kapı url=${short(gateUrl, 170)}")
+                    // (a) adresin içinde / sayfasında gerçek adres var mı
+                    var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
+                    if (inner.isNullOrBlank()) {
+                        if (System.currentTimeMillis() < gateFailUntil) {
+                            d("vidmoly dil=$dil kapı yakın zamanda çözülemedi, atlandı")
+                            continue
+                        }
+                        // (b) kapıyı WebView'de çöz, adresi yeniden iste
+                        solveGate(ref, gateUrl)
+                        val f2 = fetchEmbed(cand.first, ref).first
+                        d("vidmoly kapı sonrası url=${short(f2, 170)}")
+                        inner = if (f2 != null && !f2.contains("reCAPTCHA", true)) f2
+                        else try { captchaInner(f2 ?: gateUrl, ref, true) } catch (e: Exception) { null }
+                        if (inner.isNullOrBlank()) {
+                            gateFailUntil = System.currentTimeMillis() + 90_000L
+                            d("vidmoly dil=$dil kapı çözülemedi")
+                            continue
+                        }
+                        gateCookies = sessionCookies
+                        gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+                        d("vidmoly dil=$dil kapı çözüldü")
+                    } else {
+                        d("vidmoly dil=$dil gerçek adres kapıdan çıkarıldı")
                     }
-                    solveGate(ref)
-                    f = fetchEmbed(cand.first, ref).first
-                    if (f == null || f.contains("reCAPTCHA", true)) {
-                        gateFailUntil = System.currentTimeMillis() + 10 * 60_000L
-                        d("vidmoly dil=$dil kapı çözülemedi")
-                        continue
-                    }
-                    gateCookies = sessionCookies
-                    gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
-                    d("vidmoly dil=$dil kapı çözüldü")
+                    f = inner
                 }
                 if (f.isNullOrBlank() || f.contains("reCAPTCHA", true) || f in seen) continue
                 val buf = ArrayList<ExtractorLink>()
@@ -1342,13 +1377,14 @@ class SezonlukDizi : MainAPI() {
                 "sayfalar: " + pageLog.joinToString(" | "),
                 "dublaj: " + srcLog.filter { it.contains("0:") && !it.contains("1:") }.joinToString(" ; "),
                 "altyazı: " + srcLog.filter { it.contains("1:") }.joinToString(" ; "),
-                "byse: " + dbg.filter { it.startsWith("byse") || it.startsWith("captcha") || it.startsWith("vidmoly") }.takeLast(8).joinToString(" / ")
+                "byse: " + dbg.filter { it.startsWith("byse") }.takeLast(4).joinToString(" / "),
+                "kapı: " + dbg.filter { it.startsWith("captcha") || it.startsWith("vidmoly") }.takeLast(10).joinToString(" / ")
             )
             for ((i, line) in lines.withIndex()) {
                 callback(
                     newExtractorLink(
                         name,
-                        "DEBUG ${i + 1} [$eksik yok] " + line.take(420),
+                        "DEBUG ${i + 1} [$eksik yok] " + line.take(520),
                         "https://debug.invalid/$i",
                         ExtractorLinkType.VIDEO
                     ) {
