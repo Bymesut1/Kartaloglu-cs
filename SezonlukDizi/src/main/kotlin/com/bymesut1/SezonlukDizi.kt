@@ -14,7 +14,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import kotlinx.coroutines.withTimeoutOrNull
 
 class SezonlukDizi : MainAPI() {
     override var mainUrl = "https://sezonlukdizi.cc"
@@ -517,11 +516,11 @@ class SezonlukDizi : MainAPI() {
         // 0) Byse (bysejikuar.com): CloudStream'de hazır çözücü yok, kendi çözücümüz
         if (u.contains("byse", ignoreCase = true)) {
             val okByse = try {
-                withTimeoutOrNull(20_000L) { extractBysejikuar(u, label, callback) }
+                extractBysejikuar(u, label, callback)
             } catch (e: Exception) {
-                null
+                false
             }
-            if (okByse == true) return true
+            if (okByse) return true
         }
 
         // 1) hazır çözücüler
@@ -622,11 +621,8 @@ class SezonlukDizi : MainAPI() {
 
         // Tüm kaynaklar paralel çözülür
         val any = AtomicBoolean(false)
-        withTimeoutOrNull(60_000L) {
-            targets.amap { (label, embed) ->
-                val r = withTimeoutOrNull(40_000L) { emitEmbed(embed, label, subtitleCallback, callback) }
-                if (r == true) any.set(true)
-            }
+        targets.amap { (label, embed) ->
+            if (emitEmbed(embed, label, subtitleCallback, callback)) any.set(true)
         }
         return any.get()
     }
