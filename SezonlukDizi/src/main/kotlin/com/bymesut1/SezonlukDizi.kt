@@ -40,6 +40,113 @@ class SezonlukDizi : MainAPI() {
 
     private val liste = "$mainUrl/diziler.asp"
 
+    // ---------------- TMDB (Türkçe bilgiler) ----------------
+    // TMDB API anahtarını buraya yaz. Boş ya da varsayılan bırakılırsa TMDB özellikleri kapalı kalır, eklenti eskisi gibi çalışır.
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+    private val tmdbOn: Boolean get() = tmdbKey.isNotBlank() && tmdbKey != "BURAYA_TMDB_API_KEY"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
+    private val posterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val reGenericEp = Regex("""(?iu)^\s*(bölüm|episode|ep\.?)\s*\d+\s*$""")
+
+    private fun norm(t: String): String = t.lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), "")
+
+    private fun dateMs(s: String?): Long? = try {
+        if (s.isNullOrBlank()) null else java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).parse(s)?.time
+    } catch (e: Exception) {
+        null
+    }
+
+    // Sitedeki bölüm bağlantı yazısını temizler: "9,5 1. Sezon 3. Bölüm The Krakken" -> "The Krakken"; "Cevapla" -> null
+    private fun cleanLabel(raw: String): String? {
+        var t = raw.trim()
+        t = t.replace(Regex("""^\d+[.,]\d+\s*"""), "")
+        t = t.replace(Regex("""(?iu)^\s*\d+\s*\.?\s*sezon\s*\d+\s*\.?\s*bölüm\s*"""), "")
+        t = t.replace(Regex("""(?iu)^\s*\d+\s*\.?\s*bölüm\s*"""), "")
+        t = t.trim(' ', '-', '–', ':', '.')
+        if (t.isBlank() || t.equals("cevapla", true)) return null
+        return t
+    }
+
+    private suspend fun tmdbSearch(q: String): List<TmdbTvResult> = try {
+        app.get(
+            "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(q, "UTF-8")}",
+            timeout = 15L
+        ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    // Dizi ayrıntıları (Türkçe); özet Türkçe boşsa İngilizceden tamamlanır
+    private suspend fun tmdbDetails(id: Int): TmdbTvDetails? {
+        val tr = try {
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 15L)
+                .parsedSafe<TmdbTvDetails>()
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        if (!tr.overview.isNullOrBlank()) return tr
+        val en = try {
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 15L).parsedSafe<TmdbTvDetails>()
+        } catch (e: Exception) {
+            null
+        }
+        return if (en?.overview.isNullOrBlank()) tr else tr.copy(overview = en?.overview)
+    }
+
+    // Sitedeki diziyi TMDB'deki doğru diziyle eşler. Aynı adlı birden fazla dizi varsa (ör. Ben 10 2005 / 2016)
+    // sitedeki sezon başına bölüm sayısına en yakın olan seçilir.
+    private suspend fun tmdbMatch(title: String, siteCounts: Map<Int, Int>): TmdbTvDetails? {
+        if (!tmdbOn) return null
+        val key = norm(title)
+        if (key.isEmpty()) return null
+        val results = tmdbSearch(title)
+        if (results.isEmpty()) return null
+        val exact = results.filter {
+            norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key
+        }
+        val cands = if (exact.isNotEmpty()) exact.take(3) else listOfNotNull(
+            results.firstOrNull {
+                val n = norm(it.name.orEmpty())
+                n.isNotEmpty() && (n.contains(key) || key.contains(n))
+            }
+        )
+        if (cands.isEmpty()) return null
+        if (cands.size == 1) return cands[0].id?.let { tmdbDetails(it) }
+        val details = cands.amap { c -> c.id?.let { tmdbDetails(it) } }.filterNotNull()
+        if (details.isEmpty()) return null
+        return details.minByOrNull { d ->
+            val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
+            var score = 0
+            for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
+            score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
+        }
+    }
+
+    private suspend fun tmdbSeason(id: Int, sn: Int, lang: String): Map<Int, TmdbEpisode> = try {
+        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 15L)
+            .parsedSafe<TmdbSeasonDetails>()?.episodes.orEmpty()
+            .mapNotNull { e -> e.episode_number?.let { it to e } }.toMap()
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    // Arama kartı için TMDB afişi (sadece adı birebir eşleşen dizi); bulunamazsa null (sitenin afişi kalır)
+    private suspend fun tmdbPosterFor(title: String): String? {
+        val key = norm(title)
+        if (key.isEmpty()) return null
+        posterCache[key]?.let { return it.ifBlank { null } }
+        val best = tmdbSearch(title)
+            .filter {
+                !it.poster_path.isNullOrBlank() &&
+                    (norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key)
+            }
+            .maxByOrNull { it.popularity ?: 0.0 }
+        val url = best?.poster_path?.let { "$tmdbImg/w500$it" }.orEmpty()
+        posterCache[key] = url
+        return url.ifBlank { null }
+    }
+
     // data alanı: "soncikan" / "populer" (ana sayfa) ya da sayfalanabilir liste adresi (sonuna &s=<sayfa> eklenir)
     override val mainPage = mainPageOf(
         "soncikan" to "Son Çıkan Bölümler",
@@ -220,7 +327,17 @@ class SezonlukDizi : MainAPI() {
             val doc = r.document
             val list = cards(doc.selectFirst(".afis") ?: doc.body())
             d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
-            if (list.isNotEmpty()) return newSearchResponseList(list, page < maxPage(doc))
+            if (list.isNotEmpty()) {
+                if (tmdbOn) {
+                    // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
+                    list.amap { c ->
+                        val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
+                        if (!tp.isNullOrBlank()) c.posterUrl = tp
+                        c
+                    }
+                }
+                return newSearchResponseList(list, page < maxPage(doc))
+            }
         }
         if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
         return newSearchResponseList(emptyList(), false)
@@ -265,13 +382,15 @@ class SezonlukDizi : MainAPI() {
             }
             matched++
             val key = "$s-$e"
-            if (into.containsKey(key)) continue
             val epUrl = "$mainUrl/$slug/$s-sezon-$e-bolum.html"   // dublaj bağlantısı olsa da normal adrese çevrilir
-            val label = a.text().trim().ifBlank { a.attr("title").trim() }
+            val label = cleanLabel(a.text().trim().ifBlank { a.attr("title").trim() })
+            val old = into[key]
+            // Aynı bölüme giden birden fazla bağlantı olabilir ("Cevapla" gibi); ilk iyi yazıyı koru
+            if (old != null && !(old.name.isNullOrBlank() && label != null)) continue
             into[key] = newEpisode(epUrl) {
                 this.season = s
                 this.episode = e
-                this.name = label.ifBlank { null }
+                this.name = label
             }
         }
         return matched
@@ -327,10 +446,68 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        val list = eps.values.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+        // Liste SADECE sitede yayınlanmış bölümlerden oluşur; yeni bölüm sitede çıkınca listeye kendiliğinden eklenir.
+        val siteEps = eps.values.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+
+        var tm: TmdbTvDetails? = null
+        var trMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
+        var enMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
+        if (tmdbOn && siteEps.isNotEmpty()) {
+            try {
+                val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
+                tm = tmdbMatch(title, counts)
+                val tid = tm?.id
+                if (tid != null) {
+                    val rows = counts.keys.filter { it > 0 }.amap { sn ->
+                        Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+                    }
+                    trMap = rows.associate { it.first to it.second }
+                    enMap = rows.associate { it.first to it.third }
+                }
+            } catch (e: Exception) {
+            }
+        }
+
+        val list = siteEps.map { old ->
+            val sn = old.season ?: 0
+            val en = old.episode ?: 0
+            val tr = trMap[sn]?.get(en)
+            val us = enMap[sn]?.get(en)
+            // Türkçe ad yoksa ("Bölüm 3" gibi) İngilizce ad, o da yoksa sitenin temizlenmiş yazısı
+            val epName = tr?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: us?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: old.name
+            val overview = tr?.overview?.takeIf { it.isNotBlank() } ?: us?.overview?.takeIf { it.isNotBlank() }
+            val still = (tr?.still_path ?: us?.still_path)?.let { "$tmdbImg/w500$it" }
+            val runtime = tr?.runtime ?: us?.runtime
+            val airMs = dateMs(tr?.air_date ?: us?.air_date)
+            if (tm == null) old else newEpisode(old.data) {
+                this.season = old.season
+                this.episode = old.episode
+                this.name = epName
+                this.description = overview
+                this.posterUrl = still
+                if (runtime != null && runtime > 0) this.runTime = runtime
+                if (airMs != null) this.date = airMs
+            }
+        }
+
+        val t = tm
+        val tPoster = t?.poster_path?.let { "$tmdbImg/w500$it" }
+        val tBack = t?.backdrop_path?.let { "$tmdbImg/w1280$it" }
+        val tPlot = t?.overview?.takeIf { it.isNotBlank() }
+        val tYear = t?.first_air_date?.take(4)?.toIntOrNull()
+        val tTags = t?.genres.orEmpty().mapNotNull { it.name }.takeIf { it.isNotEmpty() }
+        val tActors = t?.credits?.cast.orEmpty().filter { !it.name.isNullOrBlank() }.take(15)
+            .map { c -> Actor(c.name.orEmpty(), c.profile_path?.let { p -> "$tmdbImg/w185$p" }) }
+
         return newTvSeriesLoadResponse(title, seriesUrl, TvType.TvSeries, list) {
-            this.posterUrl = poster?.let { abs(it) }
-            this.plot = plot
+            this.posterUrl = tPoster ?: poster?.let { abs(it) }
+            this.backgroundPosterUrl = tBack
+            this.plot = tPlot ?: plot
+            if (tYear != null) this.year = tYear
+            if (tTags != null) this.tags = tTags
+            if (tActors.isNotEmpty()) addActors(tActors)
         }
     }
 
@@ -960,3 +1137,69 @@ class SezonlukDizi : MainAPI() {
         return any
     }
 }
+
+// ---------------- TMDB JSON veri sınıfları ----------------
+// Alan adları TMDB'nin JSON adlarıyla birebir aynıdır (JsonProperty kullanılmaz).
+data class TmdbTvResult(
+    val id: Int? = null,
+    val name: String? = null,
+    val original_name: String? = null,
+    val first_air_date: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val overview: String? = null,
+    val popularity: Double? = null
+)
+
+data class TmdbSearchResponse(
+    val results: List<TmdbTvResult>? = null
+)
+
+data class TmdbGenre(
+    val id: Int? = null,
+    val name: String? = null
+)
+
+data class TmdbSeasonInfo(
+    val season_number: Int? = null,
+    val episode_count: Int? = null
+)
+
+data class TmdbCast(
+    val name: String? = null,
+    val character: String? = null,
+    val profile_path: String? = null
+)
+
+data class TmdbCredits(
+    val cast: List<TmdbCast>? = null
+)
+
+data class TmdbTvDetails(
+    val id: Int? = null,
+    val name: String? = null,
+    val original_name: String? = null,
+    val overview: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val first_air_date: String? = null,
+    val popularity: Double? = null,
+    val genres: List<TmdbGenre>? = null,
+    val seasons: List<TmdbSeasonInfo>? = null,
+    val credits: TmdbCredits? = null
+)
+
+data class TmdbEpisode(
+    val episode_number: Int? = null,
+    val season_number: Int? = null,
+    val name: String? = null,
+    val overview: String? = null,
+    val still_path: String? = null,
+    val runtime: Int? = null,
+    val air_date: String? = null,
+    val vote_average: Double? = null
+)
+
+data class TmdbSeasonDetails(
+    val episodes: List<TmdbEpisode>? = null
+)
