@@ -1,0 +1,521 @@
+package com.bymesut1
+
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
+import org.json.JSONObject
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+class SezonlukDizi : MainAPI() {
+    override var mainUrl = "https://sezonlukdizi.cc"
+    override var name = "SezonlukDizi"
+    override var lang = "tr"
+    override val hasMainPage = true
+    override val hasQuickSearch = false
+    override val supportedTypes = setOf(TvType.TvSeries)
+
+    // CAPTCHA / Cloudflare "tarayıcı kontrolü" killer:
+    // Site bir kontrol sayfası döndürürse otomatik geçer, çerezi saklar ve sonraki isteklerde kullanır.
+    // Kontrol yoksa isteği olduğu gibi geçirir. Sitedeki TÜM isteklerde (liste, arama, ajax) kullanılıyor.
+    private val cf = CloudflareKiller()
+
+    private val ua =
+        "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
+
+    private val liste = "$mainUrl/diziler.asp"
+
+    // data alanı: "soncikan" / "populer" (ana sayfa) ya da sayfalanabilir liste adresi (sonuna &s=<sayfa> eklenir)
+    override val mainPage = mainPageOf(
+        "soncikan" to "Son Çıkan Bölümler",
+        "populer" to "Popüler Diziler",
+        "$liste?dil=0&siralama_tipi=id&siralama_turu=desc" to "Türkçe Dublaj Diziler",
+        "$liste?siralama_tipi=id&siralama_turu=desc" to "Yeni Eklenenler",
+        "$liste?kat=1&siralama_tipi=imdb&siralama_turu=desc" to "Yabancı Diziler (IMDb)",
+        "$liste?kat=2&siralama_tipi=imdb&siralama_turu=desc" to "Yerli Diziler",
+        "$liste?kat=4&siralama_tipi=imdb&siralama_turu=desc" to "Animasyonlar",
+        "$liste?kat=5&siralama_tipi=imdb&siralama_turu=desc" to "Animeler"
+    )
+
+    // ---------------- Yardımcılar ----------------
+
+    private fun hdr(): Map<String, String> = mapOf(
+        "User-Agent" to ua,
+        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+    )
+
+    private fun ajaxHdr(referer: String): Map<String, String> = hdr() + mapOf(
+        "X-Requested-With" to "XMLHttpRequest",
+        "Referer" to referer,
+        "Origin" to mainUrl
+    )
+
+    private suspend fun get(url: String, referer: String = "$mainUrl/") =
+        app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
+
+    private fun abs(u: String): String = if (u.startsWith("http")) u else fixUrl(u)
+
+    // Site windows-1254 kullanıyor; Türkçe harfli aramalar için aynı kodlama denenir
+    private fun encQ(q: String): String = try {
+        URLEncoder.encode(q, "windows-1254")
+    } catch (e: Exception) {
+        URLEncoder.encode(q, "UTF-8")
+    }
+
+    // /diziler/mobland.html
+    private val reSeries = Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?(/diziler/[^/?#]+\.html)$""")
+
+    // /mobland/2-sezon-5-bolum.html  veya  /mobland/dublaj/2-sezon-5-bolum.html
+    private val reEp =
+        Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?/([a-z0-9-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
+
+    // 2-sezon-5-bolum.html (başında dizi adı olmayan göreli bağlantı)
+    private val reEpBare = Regex("""^(?:\./)?(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
+
+    private fun slugOf(seriesUrl: String): String =
+        Regex("""/diziler/([^/?#]+)\.html""").find(seriesUrl)?.groupValues?.get(1)?.removeSuffix("-izle") ?: ""
+
+    private fun cleanTitle(t: String): String =
+        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*SezonlukDizi.*$""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+izle$""", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+    // Listelerde resim "data-src" içinde (src sadece boş yer tutucu); ana sayfada doğrudan src
+    private fun posterOf(img: Element): String? {
+        val ds = img.attr("data-src").trim()
+        val s = img.attr("src").trim()
+        val u = when {
+            ds.isNotBlank() -> ds
+            s.isNotBlank() && !s.startsWith("data:") -> s
+            else -> return null
+        }
+        return abs(u)
+    }
+
+    // Sayfadaki dizi kartları (poster + bağlantı). Ana sayfadaki "bölüm" kartları bölüm adresiyle kalır,
+    // gerçek dizi sayfası load() sırasında bölüm sayfasından bulunur.
+    private fun cards(root: Element?): List<SearchResponse> {
+        if (root == null) return emptyList()
+        val out = LinkedHashMap<String, SearchResponse>()
+        for (a in root.select("a[href]")) {
+            val href = a.attr("href").trim()
+            val img = a.selectFirst("img") ?: continue
+            val epm = reEp.find(href)
+            val key: String
+            val link: String
+            when {
+                reSeries.containsMatchIn(href) -> {
+                    link = mainUrl + reSeries.find(href)!!.groupValues[1]
+                    key = "s:" + slugOf(link)
+                }
+                epm != null -> {
+                    link = abs(href)
+                    key = "s:" + epm.groupValues[1]
+                }
+                else -> continue
+            }
+            if (out.containsKey(key)) continue
+            val title = listOf(
+                a.selectFirst(".box-title .title")?.text(),
+                a.selectFirst(".description")?.text(),
+                a.selectFirst(".title")?.text(),
+                cleanTitle(a.attr("title")),
+                img.attr("alt")
+            ).firstOrNull { !it.isNullOrBlank() }?.trim() ?: continue
+            out[key] = newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
+                this.posterUrl = posterOf(img)
+            }
+        }
+        return out.values.toList()
+    }
+
+    // Sayfalama çubuğundaki en büyük sayfa numarası
+    private fun maxPage(doc: Document): Int =
+        doc.select("#filtresayfalama a.item").mapNotNull { it.text().trim().toIntOrNull() }.maxOrNull() ?: 1
+
+    // ---------------- Ana sayfa ----------------
+
+    private fun homeOf(title: String, list: List<SearchResponse>, hasNext: Boolean): HomePageResponse =
+        newHomePageResponse(
+            list = HomePageList(name = title, list = list, isHorizontalImages = false),
+            hasNext = hasNext
+        )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val key = request.data
+        if (key == "soncikan" || key == "populer") {
+            if (page > 1) return homeOf(request.name, emptyList(), false)
+            val doc = get(mainUrl).document
+            val list = if (key == "soncikan") {
+                cards(doc.selectFirst("#soncikan"))
+            } else {
+                cards(doc.selectFirst("#enler .active.tab") ?: doc.selectFirst("#enler"))
+            }
+            return homeOf(request.name, list, false)
+        }
+        val doc = get("$key&s=$page").document
+        val list = cards(doc.selectFirst(".afis") ?: doc.body())
+        return homeOf(request.name, list, list.isNotEmpty() && page < maxPage(doc))
+    }
+
+    // ---------------- Arama ----------------
+
+    override suspend fun search(query: String, page: Int): SearchResponseList {
+        val q = query.trim()
+        if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
+        val doc = get("$liste?adi=${encQ(q)}&s=$page").document
+        val list = cards(doc.selectFirst(".afis") ?: doc.body())
+        return newSearchResponseList(list, list.isNotEmpty() && page < maxPage(doc))
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
+
+    // ---------------- Dizi sayfası ----------------
+
+    // Bölüm adresinden gerçek dizi sayfasını bulur (dizi adresi bölüm adresindeki addan farklı olabilir)
+    private suspend fun resolveSeriesUrl(url: String): String {
+        reSeries.find(url)?.let { return mainUrl + it.groupValues[1] }
+        if (reEp.containsMatchIn(url)) {
+            val doc = try { get(abs(url)).document } catch (e: Exception) { null }
+            val href = doc?.selectFirst("h1 a[href*=\"/diziler/\"]")?.attr("href")
+                ?: doc?.selectFirst("a[href^=\"/diziler/\"][href$=\".html\"]")?.attr("href")
+            if (!href.isNullOrBlank()) reSeries.find(href)?.let { return mainUrl + it.groupValues[1] }
+            val slug = reEp.find(url)!!.groupValues[1]
+            return "$mainUrl/diziler/$slug.html"
+        }
+        return url
+    }
+
+    // Bulunan bölüm bağlantısı sayısını döndürür (sezon dolu mu boş mu anlamak için)
+    private fun parseEpisodes(doc: Document, into: MutableMap<String, Episode>, slugHint: String): Int {
+        var matched = 0
+        for (a in doc.select("a[href]")) {
+            val href = a.attr("href").trim()
+            val slug: String
+            val s: Int
+            val e: Int
+            val m = reEp.find(href)
+            if (m != null) {
+                slug = m.groupValues[1]
+                s = m.groupValues[2].toIntOrNull() ?: continue
+                e = m.groupValues[3].toIntOrNull() ?: continue
+            } else {
+                val b = reEpBare.find(href) ?: continue
+                slug = slugHint
+                s = b.groupValues[1].toIntOrNull() ?: continue
+                e = b.groupValues[2].toIntOrNull() ?: continue
+            }
+            matched++
+            val key = "$s-$e"
+            if (into.containsKey(key)) continue
+            val epUrl = "$mainUrl/$slug/$s-sezon-$e-bolum.html"   // dublaj bağlantısı olsa da normal adrese çevrilir
+            val label = a.text().trim().ifBlank { a.attr("title").trim() }
+            into[key] = newEpisode(epUrl) {
+                this.season = s
+                this.episode = e
+                this.name = label.ifBlank { null }
+            }
+        }
+        return matched
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val seriesUrl = resolveSeriesUrl(url)
+        val res = get(seriesUrl)
+        val html = res.text
+        val doc = res.document
+        val hint = slugOf(seriesUrl)
+
+        val title = (doc.selectFirst("h1")?.text()?.let { cleanTitle(it) }?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.let { cleanTitle(it) }
+            ?: cleanTitle(doc.title())).ifBlank { return null }
+
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("img[src*=\"/i/dizi/\"]")?.attr("src")
+        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+
+        val eps = LinkedHashMap<String, Episode>()
+        parseEpisodes(doc, eps, hint)
+
+        // Dizi numarası (did): sayfadaki did özelliği ya da poster adresinden (/i/dizi/y/b/2595.jpg)
+        val did = Regex("""did\s*[=:]\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
+            ?: Regex("""/i/dizi/(?:[a-z]/)+(\d+)\.jpg""").find(html)?.groupValues?.get(1)
+
+        if (did != null) {
+            val endpoint = Regex("""/ajax/dataIzleBolumler\w*\.asp""").find(html)?.value
+                ?: "/ajax/dataIzleBolumler.asp"
+
+            suspend fun season(sno: Int): Document? = try {
+                app.post(
+                    mainUrl + endpoint,
+                    data = mapOf("did" to did, "sno" to sno.toString()),
+                    headers = ajaxHdr(seriesUrl),
+                    interceptor = cf,
+                    timeout = 15L
+                ).document
+            } catch (e: Exception) {
+                null
+            }
+
+            // Sezonlar 8'erli gruplar halinde paralel denenir; grubun son sezonu boşsa durulur
+            var start = 1
+            while (start <= 40) {
+                val chunk = (start until start + 8).toList()
+                val docs = chunk.amap { season(it) }
+                var lastCount = 0
+                docs.forEachIndexed { i, d ->
+                    if (d != null) {
+                        val c = parseEpisodes(d, eps, hint)
+                        if (i == chunk.lastIndex) lastCount = c
+                    }
+                }
+                if (lastCount == 0) break
+                start += 8
+            }
+        }
+
+        val list = eps.values.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+        return newTvSeriesLoadResponse(title, seriesUrl, TvType.TvSeries, list) {
+            this.posterUrl = poster?.let { abs(it) }
+            this.plot = plot
+        }
+    }
+
+    // ---------------- Oynatma ----------------
+
+    private val reIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+
+    private var altEndpoints: List<String>? = null
+    private var embedEndpoints: List<String>? = null
+
+    // Sitenin ajax servis adları zamanla değişiyor (dataAlternatif3, dataAlternatif22 ...).
+    // Adları sayfadaki ve site.min.js içindeki kodlardan okuyup kullanıyoruz.
+    private suspend fun discoverEndpoints(doc: Document, html: String) {
+        if (altEndpoints != null && embedEndpoints != null) return
+        val sb = StringBuilder(html)
+        doc.select("script[src]").map { it.attr("src") }.filter { it.contains("site") }.take(3).forEach { src ->
+            try {
+                sb.append('\n').append(get(abs(src)).text)
+            } catch (e: Exception) {
+            }
+        }
+        val all = sb.toString()
+        altEndpoints = Regex("""/ajax/dataAlternatif\w*\.asp""").findAll(all).map { it.value }.distinct().toList()
+            .ifEmpty { listOf("/ajax/dataAlternatif3.asp") }
+        embedEndpoints = Regex("""/ajax/dataEmbed\w*\.asp""").findAll(all).map { it.value }.distinct().toList()
+            .ifEmpty { listOf("/ajax/dataEmbed.asp") }
+    }
+
+    // Alternatif listesi: JSON ({"data":[{"id":..,"baslik":..}]}) ya da HTML (data-id'li öğeler)
+    private fun altList(txt: String): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val t = txt.trim()
+        try {
+            val arr: JSONArray? = when {
+                t.startsWith("[") -> JSONArray(t)
+                t.startsWith("{") -> {
+                    val o = JSONObject(t)
+                    o.optJSONArray("data") ?: o.optJSONArray("veri") ?: o.optJSONArray("list")
+                }
+                else -> null
+            }
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val id = o.optString("id")
+                    val nm = o.optString("baslik").ifBlank { o.optString("name") }
+                    if (id.isNotBlank()) out.add(id to nm)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (out.isEmpty()) {
+            Regex("""data-id=["'](\d+)["'][^>]*>([^<]*)<""").findAll(t)
+                .forEach { out.add(it.groupValues[1] to it.groupValues[2].trim()) }
+        }
+        return out
+    }
+
+    private fun embedOf(txt: String): String? {
+        reIframe.find(txt)?.let { return it.groupValues[1] }
+        return Regex("""(?:https?:)?//[^"'\\\s<>]+""").findAll(txt)
+            .map { it.value }.firstOrNull { !it.contains("sezonlukdizi") }
+    }
+
+    // WebView yedeği yavaş olduğu için bir bölümde en fazla bu kadar kaynakta denenir
+    private val webviewLeft = AtomicInteger(0)
+
+    private fun originOf(u: String): String =
+        Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
+
+    // https://filemoon.sx/e/abc -> "Filemoon"
+    private fun hostLabel(u: String): String {
+        val h = Regex("""^https?://(?:www\.)?([^./]+)""").find(u)?.groupValues?.get(1) ?: return "Player"
+        return h.replaceFirstChar { it.uppercase() }
+    }
+
+    // Dil adını kaynak adının önüne ekler: "Dublaj - Filemoon (1080p)"
+    private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
+        newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
+            this.referer = l.referer
+            this.quality = l.quality
+            this.headers = l.headers
+        }
+
+    // CDN bağlantıları (SprintCDN vb.) Referer/Origin olmadan, süresi dolunca ya da başka IP'den açılınca
+    // 404 verir. Bu yüzden oynatıcıya gömülü sayfanın Referer ve Origin'i ile verilir.
+    private suspend fun emitM3u8(
+        m3u8: String,
+        label: String,
+        embed: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val origin = originOf(embed)
+        callback(
+            newExtractorLink(name, "$label - ${hostLabel(embed)}", m3u8, ExtractorLinkType.M3U8) {
+                this.referer = "$origin/"
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to "$origin/",
+                    "Origin" to origin
+                )
+            }
+        )
+    }
+
+    // Bir gömülü oynatıcı adresini çözer. Sırayla:
+    // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
+    // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
+    // 3) Görünmez WebView ile sayfayı çalıştırıp ağdan geçen .m3u8'i yakalamak
+    private suspend fun emitEmbed(
+        embed: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val u = if (embed.startsWith("//")) "https:$embed" else embed
+        if (!u.startsWith("http")) return false
+
+        // 1) hazır çözücüler
+        val tmp = ArrayList<ExtractorLink>()
+        try {
+            loadExtractor(u, "$mainUrl/", subtitleCallback) { synchronized(tmp) { tmp.add(it) } }
+        } catch (e: Exception) {
+        }
+        if (tmp.isNotEmpty()) {
+            tmp.forEach { callback(relabel(it, label)) }
+            return true
+        }
+
+        // 2) CloudflareKiller ile sayfayı aç, .m3u8 ara
+        try {
+            val page = app.get(u, referer = "$mainUrl/", interceptor = cf, timeout = 15L)
+                .text.replace("\\/", "/")
+            val m = Regex("""https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*""").find(page)
+            if (m != null) {
+                emitM3u8(m.value.replace("&amp;", "&"), label, u, callback)
+                return true
+            }
+        } catch (e: Exception) {
+        }
+
+        // 3) WebView ile yakala
+        if (webviewLeft.getAndDecrement() > 0) {
+            try {
+                val r = app.get(
+                    u,
+                    referer = "$mainUrl/",
+                    interceptor = WebViewResolver(Regex("""\.m3u8"""))
+                )
+                if (r.url.contains(".m3u8")) {
+                    emitM3u8(r.url, label, u, callback)
+                    return true
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return false
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        webviewLeft.set(2)
+        val res = get(data)
+        val doc = res.document
+        val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
+        val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil") ?: "1"
+        discoverEndpoints(doc, res.text)
+
+        fun dilName(d: String) = if (d == "0") "Dublaj" else "Altyazı"
+
+        // (etiket, gömülü adres) çiftleri: önce sayfada açık olan oynatıcı, sonra tüm alternatifler
+        val seen = HashSet<String>()
+        val targets = ArrayList<Pair<String, String>>()
+
+        val first = doc.selectFirst("iframe#hs")?.attr("src")
+            ?: doc.selectFirst("#embed iframe")?.attr("src")
+        if (!first.isNullOrBlank() && seen.add(first)) targets.add(dilName(activeDil) to first)
+
+        if (bid.isNotBlank()) {
+            for (dil in listOf("0", "1")) {   // dublaj = 0, altyazı = 1
+                var alts: List<Pair<String, String>> = emptyList()
+                for (ep in altEndpoints.orEmpty()) {
+                    val txt = try {
+                        app.post(
+                            mainUrl + ep,
+                            data = mapOf("bid" to bid, "dil" to dil),
+                            headers = ajaxHdr(data),
+                            interceptor = cf,
+                            timeout = 15L
+                        ).text
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    alts = altList(txt)
+                    if (alts.isNotEmpty()) break
+                }
+                val embeds = alts.amap { (id, _) ->
+                    var found: String? = null
+                    for (ep in embedEndpoints.orEmpty()) {
+                        val r = try {
+                            app.post(
+                                mainUrl + ep,
+                                data = mapOf("id" to id),
+                                headers = ajaxHdr(data),
+                                interceptor = cf,
+                                timeout = 15L
+                            ).text
+                        } catch (e: Exception) {
+                            ""
+                        }
+                        found = embedOf(r)
+                        if (found != null) break
+                    }
+                    found
+                }
+                for (e in embeds) {
+                    if (e.isNullOrBlank() || !seen.add(e)) continue
+                    targets.add(dilName(dil) to e)
+                }
+            }
+        }
+
+        // Tüm kaynaklar paralel çözülür
+        val any = AtomicBoolean(false)
+        targets.amap { (label, embed) ->
+            if (emitEmbed(embed, label, subtitleCallback, callback)) any.set(true)
+        }
+        return any.get()
+    }
+}
