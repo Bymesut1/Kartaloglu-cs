@@ -78,6 +78,9 @@ class SezonlukDizi : MainAPI() {
             app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
         }
 
+    // Daha önce çalışan kaynakların adı / sırası: sonraki bölümlerde önce onlar denenir (hız için)
+    private val goodKeys: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
+
     // Sayfadan ve ajax yanıtlarından gelen oturum çerezleri (ASP oturumu) sonraki ajax isteklerine eklenir
     @Volatile private var sessionCookies: Map<String, String> = emptyMap()
 
@@ -686,12 +689,35 @@ class SezonlukDizi : MainAPI() {
         val captchaSeen = HashSet<String>()
         val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
         val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
+        val emitted = HashSet<String>()        // bağlantısı listeye verilen diller (dil başına tek bağlantı)
         val okCnt = HashMap<String, Int>()     // dil başına çalışan kaynak sayısı
         val srcLog = ArrayList<String>()       // kaynak başına kısa sonuç (hata ayıklama)
         val pageLog = ArrayList<String>()
 
         fun short(x: String?, n: Int = 50): String =
             (x ?: "").replace(Regex("""\s+"""), " ").trim().take(n)
+
+        // Bir kaynağın topladığımız bağlantılarından dil başına TEK, temiz adlı bağlantı verir:
+        // "Türkçe Dublaj (720p)" / "Türkçe Altyazı (720p)". Dublaj üstte çıksın diye kalitesi biraz yüksek tutulur.
+        suspend fun flush(dil: String, buf: List<ExtractorLink>): Boolean {
+            if (buf.isEmpty()) return false
+            if (dil in emitted) return true
+            val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
+                ?: buf.maxByOrNull { it.quality }
+                ?: buf.first()
+            val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
+                .maxOrNull()
+            val linkName = "Türkçe ${dilName(dil)}" + (res?.let { " (${it}p)" } ?: "")
+            callback(
+                newExtractorLink(pick.source, linkName, pick.url, pick.type) {
+                    this.referer = pick.referer
+                    this.quality = if (dil == "0") Qualities.P1080.value else Qualities.P720.value
+                    this.headers = pick.headers
+                }
+            )
+            emitted.add(dil)
+            return true
+        }
 
         // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
         suspend fun emit(dil: String, embed0: String): Boolean {
@@ -705,17 +731,18 @@ class SezonlukDizi : MainAPI() {
                 embed = inner
             }
             if (!seen.add(embed)) return false
+            val buf = ArrayList<ExtractorLink>()
+            val collect: (ExtractorLink) -> Unit = { l -> synchronized(buf) { buf.add(l) } }
+            val ok: Boolean
             // Doğrudan .m3u8 adresi verilmişse hazır çözücüye gerek yok
             if (Regex("""\.m3u8(\?|$)""").containsMatchIn(embed)) {
                 val full = abs(embed)
-                emitM3u8(full, dilName(dil), full, callback)
-                any = true
-                got.add(dil)
-                okCnt[dil] = (okCnt[dil] ?: 0) + 1
-                d("kaynak ${dilName(dil)} m3u8 -> true")
-                return true
+                emitM3u8(full, dilName(dil), full, collect)
+                ok = flush(dil, buf)
+            } else {
+                val r = emitEmbed(embed, dilName(dil), subtitleCallback, collect)
+                ok = r && flush(dil, buf)
             }
-            val ok = emitEmbed(embed, dilName(dil), subtitleCallback, callback)
             d("kaynak ${dilName(dil)} $embed -> $ok")
             if (ok) {
                 any = true
@@ -757,7 +784,7 @@ class SezonlukDizi : MainAPI() {
         }
 
         // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
-        suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String) {
+        suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
             val (f, raw) = fetchEmbed(id, ref)
             val tag = "$tagPrefix$dil:$id"
             if (f.isNullOrBlank()) {
@@ -769,6 +796,10 @@ class SezonlukDizi : MainAPI() {
             val host = if (cap) "CAPTCHA" else (Regex("""^(?:https?:)?//([^/]+)""").find(f)?.groupValues?.get(1)
                 ?: short(f, 25))
             val ok = emit(dil, f)
+            if (ok) {
+                if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
+                if (idx >= 0) goodKeys.add("i:$dil:$idx")
+            }
             srcLog.add("$tag $host ${if (ok) "OK" else "yok"}")
         }
 
@@ -785,14 +816,22 @@ class SezonlukDizi : MainAPI() {
         } else listOf(data)
 
         val pages = ArrayList<Triple<String, String, String>>()   // (sayfa adresi, bid, aktif dil)
-        for (pu in pageUrls) {
-            val res = try {
-                get(pu)
+        // İki sayfa aynı anda istenir (hız için)
+        val fetched = pageUrls.amap { pu ->
+            try {
+                Pair(pu, get(pu))
             } catch (e: Exception) {
-                d("sayfa hata $pu ${e.javaClass.simpleName}: ${e.message}")
-                pageLog.add("HATA ${short(pu.substringAfter(".cc"), 40)}")
+                d("sayfa hata ${pu.takeLast(40)} ${e.javaClass.simpleName}: ${e.message}")
                 null
-            } ?: continue
+            }
+        }
+        for (item in fetched) {
+            if (item == null) {
+                pageLog.add("HATA")
+                continue
+            }
+            val pu = item.first
+            val res = item.second
             if (res.code !in 200..299) {
                 d("sayfa kod=${res.code} $pu")
                 pageLog.add("kod=${res.code}")
@@ -813,9 +852,22 @@ class SezonlukDizi : MainAPI() {
             try { Thread.sleep(250) } catch (e: Exception) { }
         }
 
-        // 2) Ajax ile alternatif kaynaklar: önce henüz kaynağı bulunmamış dil denenir.
-        //    Dublaj istekleri /dublaj/ sayfasını, altyazı istekleri normal sayfayı Referer olarak kullanır.
-        for (dil in listOf("1", "0").sortedBy { it in got }) {
+        // 2) Alternatif kaynak listeleri alınır. Çalışan kaynaklar (Byse / daha önce çalışanlar) öne alınır,
+        //    sonra iki dil sırayla (altyazı, dublaj, altyazı, dublaj ...) denenir; bir dilde kaynak bulununca o dil durur.
+        //    Böylece iki dil de çabuk gelir ve Cloudflare hız sınırına takılmaz.
+        fun prio(dil: String, idx: Int, nm: String): Int {
+            val n = nm.trim().lowercase()
+            return when {
+                n.contains("byse") -> 0
+                "i:$dil:$idx" in goodKeys -> 1
+                n.isNotBlank() && "n:$n" in goodKeys -> 2
+                else -> 3
+            }
+        }
+
+        val queues = HashMap<String, List<Triple<String, String, Int>>>()
+        val refs = HashMap<String, String>()
+        for (dil in listOf("0", "1")) {
             val refUrl = pages.map { it.first }.firstOrNull { (dil == "0") == it.contains("/dublaj/") }
                 ?: pages.firstOrNull()?.first ?: data
             val bid = pages.firstOrNull { it.first == refUrl }?.second?.takeIf { it.isNotBlank() }
@@ -839,14 +891,27 @@ class SezonlukDizi : MainAPI() {
                 if (alts.isEmpty()) d("alt boş dil=$dil yanıt='${short(txt, 60)}'")
                 if (alts.isNotEmpty()) break
             }
-            d("bid=$bid dil=$dil alt=${alts.size}")
-            srcLog.add("$dil: alt=${alts.size}")
+            d("bid=$bid dil=$dil alt=${alts.size} adlar=${alts.joinToString(",") { short(it.second, 12) }}")
+            srcLog.add("$dil: alt=${alts.size} adlar=${alts.joinToString(",") { short(it.second, 12) }}")
+            refs[dil] = refUrl
+            queues[dil] = alts.mapIndexed { i, a -> Triple(a.first, a.second, i) }
+                .sortedWith(compareBy({ prio(dil, it.third, it.second) }, { it.third }))
+        }
 
-            // Embedler SIRAYLA istenir (paralel istek sitede captcha tetikliyor)
-            for ((id, _) in alts) {
-                if ((okCnt[dil] ?: 0) >= 2) break
-                tryId(dil, id, refUrl, "")
-                try { Thread.sleep(1000) } catch (e: Exception) { }
+        val pos = HashMap<String, Int>()
+        var more = true
+        while (more) {
+            more = false
+            for (dil in listOf("0", "1")) {
+                if (dil in got) continue
+                val q = queues[dil] ?: continue
+                val i = pos[dil] ?: 0
+                if (i >= q.size) continue
+                pos[dil] = i + 1
+                more = true
+                val cand = q[i]
+                tryId(dil, cand.first, refs[dil] ?: data, "", cand.second, cand.third)
+                try { Thread.sleep(400) } catch (e: Exception) { }
             }
         }
 
