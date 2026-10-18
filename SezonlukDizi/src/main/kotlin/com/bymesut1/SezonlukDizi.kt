@@ -224,7 +224,7 @@ class SezonlukDizi : MainAPI() {
         Regex("""/diziler/([^/?#]+)\.html""").find(seriesUrl)?.groupValues?.get(1)?.removeSuffix("-izle") ?: ""
 
     private fun cleanTitle(t: String): String =
-        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*SezonlukDizi.*$""", RegexOption.IGNORE_CASE), "")
+        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*Sezonluk\s*Dizi.*$""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\s+izle$""", RegexOption.IGNORE_CASE), "")
             .trim()
 
@@ -468,7 +468,10 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        val list = siteEps.map { old ->
+        // Henüz yayınlanmamış bölümler (TMDB yayın tarihi bugünden sonra ya da belli değil) listeden çıkarılır
+        val now = System.currentTimeMillis()
+        val lastSeason = siteEps.maxOfOrNull { it.season ?: 0 } ?: 0
+        val list0 = siteEps.mapNotNull { old ->
             val sn = old.season ?: 0
             val en = old.episode ?: 0
             val tr = trMap[sn]?.get(en)
@@ -481,6 +484,11 @@ class SezonlukDizi : MainAPI() {
             val still = (tr?.still_path ?: us?.still_path)?.let { "$tmdbImg/w500$it" }
             val runtime = tr?.runtime ?: us?.runtime
             val airMs = dateMs(tr?.air_date ?: us?.air_date)
+            // Bölüm TMDB'de varsa: tarihi gelecekteyse gizle; tarihi hiç yoksa sadece son sezonda gizle
+            if (tm != null && (tr != null || us != null)) {
+                if (airMs != null && airMs > now) return@mapNotNull null
+                if (airMs == null && sn == lastSeason) return@mapNotNull null
+            }
             if (tm == null) old else newEpisode(old.data) {
                 this.season = old.season
                 this.episode = old.episode
@@ -491,6 +499,8 @@ class SezonlukDizi : MainAPI() {
                 if (airMs != null) this.date = airMs
             }
         }
+        // Güvenlik: hepsi elenirse (TMDB hatalıysa) sitedeki tüm bölümler gösterilir
+        val list = list0.ifEmpty { siteEps }
 
         val t = tm
         val tPoster = t?.poster_path?.let { "$tmdbImg/w500$it" }
