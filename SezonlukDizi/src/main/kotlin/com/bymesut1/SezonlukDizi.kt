@@ -28,6 +28,13 @@ class SezonlukDizi : MainAPI() {
     // Kontrol yoksa isteği olduğu gibi geçirir. Sitedeki TÜM isteklerde (liste, arama, ajax) kullanılıyor.
     private val cf = CloudflareKiller()
 
+    // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
+    // Her şey düzelince false yap.
+    private val debug = true
+    private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
+    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
+    private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
+
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
 
@@ -194,17 +201,25 @@ class SezonlukDizi : MainAPI() {
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
+        dbg.clear()
         val sfx = if (page > 1) "&s=$page" else ""
-        // 1. sayfada "&s=" hiç gönderilmez (çalışan eklenti de göndermiyor); olmazsa UTF-8 ile tekrar denenir
         val urls = listOf(
             "$liste?adi=${encQ(q)}$sfx",
             "$liste?adi=${URLEncoder.encode(q, "UTF-8")}$sfx"
         ).distinct()
         for (u in urls) {
-            val doc = try { get(u).document } catch (e: Exception) { null } ?: continue
+            val r = try {
+                get(u)
+            } catch (e: Exception) {
+                d("istek hatası ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } ?: continue
+            val doc = r.document
             val list = cards(doc.selectFirst(".afis") ?: doc.body())
+            d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
             if (list.isNotEmpty()) return newSearchResponseList(list, page < maxPage(doc))
         }
+        if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
         return newSearchResponseList(emptyList(), false)
     }
 
@@ -448,9 +463,24 @@ class SezonlukDizi : MainAPI() {
         // playback nesnesi: /api/videos/<id> ya da /api/videos/<id>/embed/playback içinde
         var pb: JSONObject? = null
         for (api in listOf("$origin/api/videos/$id", "$origin/api/videos/$id/embed/playback")) {
-            val txt = try { app.get(api, headers = h, timeout = 15L).text } catch (e: Exception) { continue }
-            val root = try { JSONObject(txt) } catch (e: Exception) { continue }
-            pb = root.optJSONObject("playback") ?: root.takeIf { it.has("payload") } ?: continue
+            val txt = try {
+                app.get(api, headers = h, timeout = 15L).text
+            } catch (e: Exception) {
+                d("byse api hata $api: ${e.message}")
+                continue
+            }
+            val root = try {
+                JSONObject(txt)
+            } catch (e: Exception) {
+                d("byse JSON değil $api: ${txt.take(100)}")
+                continue
+            }
+            val found = root.optJSONObject("playback") ?: root.takeIf { it.has("payload") }
+            if (found == null) {
+                d("byse playback yok $api: ${txt.take(100)}")
+                continue
+            }
+            pb = found
             break
         }
         val p = pb ?: return false
@@ -465,10 +495,14 @@ class SezonlukDizi : MainAPI() {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
             JSONObject(String(cipher.doFinal(enc), Charsets.UTF_8))
         } catch (e: Exception) {
+            d("byse çözme hatası ${e.javaClass.simpleName}: ${e.message}")
             return false
         }
 
-        val srcs = json.optJSONArray("sources") ?: return false
+        val srcs = json.optJSONArray("sources") ?: run {
+            d("byse sources yok: ${json.toString().take(100)}")
+            return false
+        }
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         var ok = false
         for (i in 0 until srcs.length()) {
@@ -510,7 +544,11 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val u = if (embed.startsWith("//")) "https:$embed" else embed
+        val u = when {
+            embed.startsWith("//") -> "https:$embed"
+            embed.startsWith("/") -> mainUrl + embed
+            else -> embed
+        }
         if (!u.startsWith("http")) return false
 
         // 0) Byse (bysejikuar.com): CloudStream'de hazır çözücü yok, kendi çözücümüz
@@ -518,6 +556,7 @@ class SezonlukDizi : MainAPI() {
             val okByse = try {
                 extractBysejikuar(u, label, callback)
             } catch (e: Exception) {
+                d("byse istisna ${e.javaClass.simpleName}: ${e.message}")
                 false
             }
             if (okByse) return true
@@ -571,11 +610,13 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webviewLeft.set(2)
+        dbg.clear()
         val res = get(data)
         val doc = res.document
         val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
         val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil") ?: "1"
         discoverEndpoints(doc, res.text)
+        d("sayfa kod=${res.code} bid='$bid' dil=$activeDil alt=$altEndpoints embed=$embedEndpoints")
 
         fun dilName(d: String) = if (d == "0") "Dublaj" else "Altyazı"
 
@@ -585,6 +626,7 @@ class SezonlukDizi : MainAPI() {
 
         val first = doc.selectFirst("iframe#hs")?.attr("src")
             ?: doc.selectFirst("#embed iframe")?.attr("src")
+        d("açık iframe=$first")
         if (!first.isNullOrBlank() && seen.add(first)) targets.add(dilName(activeDil) to first)
 
         if (bid.isNotBlank()) {
@@ -597,6 +639,7 @@ class SezonlukDizi : MainAPI() {
                         ""
                     }
                     alts = altList(txt)
+                    if (alts.isEmpty()) d("alt boş dil=$dil ep=$ep yanıt='${txt.take(80)}'")
                     if (alts.isNotEmpty()) break
                 }
                 val embeds = alts.amap { (id, _) ->
@@ -612,6 +655,7 @@ class SezonlukDizi : MainAPI() {
                     }
                     found
                 }
+                d("dil=$dil alt=${alts.size} embed=$embeds")
                 for (e in embeds) {
                     if (e.isNullOrBlank() || !seen.add(e)) continue
                     targets.add(dilName(dil) to e)
@@ -622,8 +666,11 @@ class SezonlukDizi : MainAPI() {
         // Tüm kaynaklar paralel çözülür
         val any = AtomicBoolean(false)
         targets.amap { (label, embed) ->
-            if (emitEmbed(embed, label, subtitleCallback, callback)) any.set(true)
+            val ok = emitEmbed(embed, label, subtitleCallback, callback)
+            d("kaynak $label $embed -> $ok")
+            if (ok) any.set(true)
         }
+        if (!any.get() && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
         return any.get()
     }
 }
