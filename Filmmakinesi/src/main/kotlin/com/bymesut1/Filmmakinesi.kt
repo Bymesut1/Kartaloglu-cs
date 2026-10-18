@@ -71,7 +71,12 @@ class Filmmakinesi : MainAPI() {
         val base = request.data.trimEnd('/') + "/"
         val url = if (page <= 1) base else "${base}sayfa/$page/"
         val list = fetchList(url)
-        return newHomePageResponse(request.name, list, list.isNotEmpty())
+        if (list.isEmpty()) {
+            // Geçici teşhis satırı: boş kalma nedenini ekranda gösterir (sorun çözülünce silinebilir)
+            val info = newMovieSearchResponse("⚠ Liste boş: $lastInfo", url, TvType.Movie)
+            return newHomePageResponse(request.name, listOf(info), false)
+        }
+        return newHomePageResponse(request.name, list, true)
     }
 
     // ---------------- Arama ----------------
@@ -82,15 +87,20 @@ class Filmmakinesi : MainAPI() {
     }
 
     // Liste sayfasını önce mobil, olmazsa masaüstü UA ile dener; sonucu loga yazar (sessiz boş liste olmasın)
+    @Volatile
+    private var lastInfo = ""
+
     private suspend fun fetchList(url: String): List<SearchResponse> {
         for ((i, ua) in listOf(androidUA, desktopUA).withIndex()) {
             val r = try {
                 app.get(url, headers = pageHeaders + mapOf("User-Agent" to ua), timeout = 15L)
             } catch (e: Exception) {
+                lastInfo = "hata ${e.message?.take(40)}"
                 log("liste hata ua=$i ${e.message?.take(60)} ${url.take(80)}")
                 null
             } ?: continue
             val list = try { parseCards(r.document) } catch (e: Exception) { emptyList() }
+            lastInfo = "kod=${r.code} len=${r.text.length}"
             log("liste ua=$i kod=${r.code} len=${r.text.length} kart=${list.size} ${url.take(80)}")
             if (list.isNotEmpty()) return list
         }
@@ -100,6 +110,58 @@ class Filmmakinesi : MainAPI() {
     private val cardHref = Regex("^(?:https?://[^/]+)?/(film|dizi)/[^/]+/?$")
 
     private fun parseCards(doc: Document): List<SearchResponse> {
+        val a = parseCardsMain(doc)
+        return if (a.isNotEmpty()) a else parseCardsLoose(doc)
+    }
+
+    // Site işaretlemesi değişirse: /film/xxx/ veya /dizi/xxx/ adresine giden, görseli olan her bağlantıyı kart say
+    private fun parseCardsLoose(doc: Document): List<SearchResponse> {
+        val seen = HashSet<String>()
+        val out = ArrayList<SearchResponse>()
+        for (el in doc.select("a[href]")) {
+            val href = el.attr("href")
+            val m = cardHref.find(href) ?: continue
+            val box = el.parent()
+            val img = el.selectFirst("img") ?: box?.selectFirst("img") ?: continue
+            val url = fixUrl(href)
+            if (!seen.add(url)) continue
+
+            val sel = ".item-title, .title, h2, h3"
+            val raw = listOf(
+                el.attr("data-title"),
+                el.attr("title"),
+                img.attr("alt"),
+                el.selectFirst(sel)?.text().orEmpty(),
+                box?.selectFirst(sel)?.text().orEmpty(),
+                el.text()
+            ).firstOrNull { it.isNotBlank() } ?: continue
+            val title = cleanTitle(raw).ifBlank { raw.trim() }
+
+            var poster = ""
+            for (k in listOf("src", "data-src", "data-original", "data-lazy-src")) {
+                val v = img.attr(k)
+                if (v.isNotBlank() && !v.startsWith("data:")) { poster = v; break }
+            }
+            if (poster.isBlank()) poster = img.attr("srcset").trim().substringBefore(" ")
+            val posterUrl = fixUrlNull(poster.ifBlank { null })
+            val year = Regex("(19|20)\\d{2}").find(el.text())?.value?.toIntOrNull()
+
+            if (m.groupValues[1] == "dizi") {
+                out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                    this.posterUrl = posterUrl
+                    this.year = year
+                })
+            } else {
+                out.add(newMovieSearchResponse(title, url, TvType.Movie) {
+                    this.posterUrl = posterUrl
+                    this.year = year
+                })
+            }
+        }
+        return out
+    }
+
+    private fun parseCardsMain(doc: Document): List<SearchResponse> {
         val seen = HashSet<String>()
         return doc.select("a.item").mapNotNull { el ->
             if (el.hasClass("soon") || el.hasClass("item-ep")) return@mapNotNull null
@@ -140,7 +202,10 @@ class Filmmakinesi : MainAPI() {
     // ---------------- Detay sayfası ----------------
 
     private fun cleanTitle(t: String): String =
-        t.replace(Regex("\\s*izle\\s*(\\(\\d{4}\\))?\\s*$", RegexOption.IGNORE_CASE), "").trim()
+        t.replace(
+            Regex("\\s+(?:(?:19|20)\\d{2}\\s+)?(?:Filmi\\s+|Dizisi\\s+)?(?:Full\\s+)?(?:HD\\s+)?[iİıI]zle\\b.*$", RegexOption.IGNORE_CASE),
+            ""
+        ).trim()
 
 
     // ---------------- TMDB ----------------
