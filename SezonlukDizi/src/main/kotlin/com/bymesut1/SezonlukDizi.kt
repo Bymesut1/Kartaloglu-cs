@@ -632,31 +632,91 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         webviewLeft.set(2)
         dbg.clear()
-        val res = get(data)
-        val doc = res.document
-        val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
-        val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil") ?: "1"
-        discoverEndpoints(doc, res.text)
-        d("sayfa kod=${res.code} bid='$bid' dil=$activeDil alt=$altEndpoints embed=$embedEndpoints")
 
         fun dilName(x: String) = if (x == "0") "Dublaj" else "Altyazı"
         var any = false
         val seen = HashSet<String>()
+        val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
+        val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
 
-        // Sayfada açık duran oynatıcı
-        val first = doc.selectFirst("iframe#hs")?.attr("src")
-            ?: doc.selectFirst("#embed iframe")?.attr("src")
-        d("açık iframe=$first")
-        if (!first.isNullOrBlank() && !first.contains("reCAPTCHA", true) && seen.add(first)) {
-            if (emitEmbed(first, dilName(activeDil), subtitleCallback, callback)) any = true
+        // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar
+        suspend fun emit(dil: String, embed: String): Boolean {
+            if (embed.isBlank() || embed.contains("reCAPTCHA", true)) return false
+            if (!seen.add(embed)) return false
+            val ok = emitEmbed(embed, dilName(dil), subtitleCallback, callback)
+            d("kaynak ${dilName(dil)} $embed -> $ok")
+            if (ok) {
+                any = true
+                got.add(dil)
+            }
+            return ok
         }
 
-        if (bid.isNotBlank()) {
-            for (dil in listOf("1", "0")) {   // altyazı = 1, dublaj = 0
+        // Kaynak id'sinden gömülü oynatıcı adresini ister
+        suspend fun fetchEmbed(id: String, ref: String): String? {
+            var found: String? = null
+            for (ep in embedEndpoints.orEmpty()) {
+                val r = try {
+                    post(mainUrl + ep, mapOf("id" to id), ref).text
+                } catch (e: Exception) {
+                    ""
+                }
+                found = embedOf(r)
+                if (found != null) break
+            }
+            return found
+        }
+
+        // 1) Hem normal (altyazı) hem /dublaj/ bölüm sayfası açılır; her ikisindeki açık oynatıcı kendi diliyle eklenir.
+        //    Böylece dublaj ile altyazı ayrı ayrı, ajax/captcha'ya takılmadan bulunur.
+        val m = reEp.find(data)
+        val pageUrls = if (m != null) {
+            val slug = m.groupValues[1]
+            val s = m.groupValues[2]
+            val e = m.groupValues[3]
+            listOf(
+                "$mainUrl/$slug/$s-sezon-$e-bolum.html",
+                "$mainUrl/$slug/dublaj/$s-sezon-$e-bolum.html"
+            )
+        } else listOf(data)
+
+        val pages = ArrayList<Triple<String, String, String>>()   // (sayfa adresi, bid, aktif dil)
+        for (pu in pageUrls) {
+            val res = try {
+                get(pu)
+            } catch (e: Exception) {
+                d("sayfa hata $pu ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } ?: continue
+            if (res.code !in 200..299) {
+                d("sayfa kod=${res.code} $pu")
+                continue
+            }
+            val doc = res.document
+            val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
+            val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil")
+                ?.takeIf { it == "0" || it == "1" }
+                ?: if (res.url.contains("/dublaj/")) "0" else "1"
+            discoverEndpoints(doc, res.text)
+            d("sayfa kod=${res.code} url=${res.url.takeLast(40)} bid='$bid' dil=$activeDil alt=$altEndpoints embed=$embedEndpoints")
+            pages.add(Triple(pu, bid, activeDil))
+
+            val first = doc.selectFirst("iframe#hs")?.attr("src")
+                ?: doc.selectFirst("#embed iframe")?.attr("src")
+            d("açık iframe($activeDil)=$first")
+            if (!first.isNullOrBlank()) emit(activeDil, first)
+            try { Thread.sleep(250) } catch (e: Exception) { }
+        }
+
+        // 2) Ajax ile alternatif kaynaklar: önce henüz kaynağı bulunmamış dil denenir
+        val ajaxDone = HashSet<String>()
+        for (dil in listOf("1", "0").sortedBy { it in got }) {
+            for ((pu, bid, _) in pages) {
+                if (bid.isBlank() || !ajaxDone.add("$bid|$dil")) continue
                 var alts: List<Pair<String, String>> = emptyList()
                 for (ep in altEndpoints.orEmpty()) {
                     val txt = try {
-                        post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), data).text
+                        post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), pu).text
                     } catch (e: Exception) {
                         ""
                     }
@@ -664,32 +724,39 @@ class SezonlukDizi : MainAPI() {
                     if (alts.isEmpty()) d("alt boş dil=$dil ep=$ep yanıt='${txt.take(80)}'")
                     if (alts.isNotEmpty()) break
                 }
-                d("dil=$dil alt=${alts.size}")
+                d("bid=$bid dil=$dil alt=${alts.size}")
 
                 // Embedler SIRAYLA istenir (paralel istek sitede captcha tetikliyor)
                 for ((id, _) in alts) {
-                    var found: String? = null
-                    for (ep in embedEndpoints.orEmpty()) {
-                        val r = try {
-                            post(mainUrl + ep, mapOf("id" to id), data).text
-                        } catch (e: Exception) {
-                            ""
-                        }
-                        found = embedOf(r)
-                        if (found != null) break
-                    }
-                    val f = found
+                    val f = fetchEmbed(id, pu)
                     d("dil=$dil id=$id embed=$f")
-                    if (f.isNullOrBlank() || f.contains("reCAPTCHA", true)) continue
-                    if (!seen.add(f)) continue
-                    val ok = emitEmbed(f, dilName(dil), subtitleCallback, callback)
-                    d("kaynak ${dilName(dil)} $f -> $ok")
-                    if (ok) any = true
+                    if (f.isNullOrBlank() || f.contains("reCAPTCHA", true)) {
+                        retryQ.add(Triple(dil, id, pu))
+                        continue
+                    }
+                    emit(dil, f)
                     try { Thread.sleep(250) } catch (e: Exception) { }
                 }
             }
         }
 
+        // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan kaynaklar bekleyerek yeniden denenir
+        for (dil in listOf("0", "1")) {
+            if (dil in got) continue
+            val todo = retryQ.filter { it.first == dil }.take(3)
+            for (attempt in 1..2) {
+                if (dil in got) break
+                for ((_, id, ref) in todo) {
+                    if (dil in got) break
+                    try { Thread.sleep(1000L * attempt) } catch (e: Exception) { }
+                    val f = fetchEmbed(id, ref)
+                    d("yeniden($attempt) dil=$dil id=$id embed=$f")
+                    if (!f.isNullOrBlank() && !f.contains("reCAPTCHA", true)) emit(dil, f)
+                }
+            }
+        }
+
+        d("özet dublaj=${"0" in got} altyazı=${"1" in got}")
         if (!any && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
         return any
     }
