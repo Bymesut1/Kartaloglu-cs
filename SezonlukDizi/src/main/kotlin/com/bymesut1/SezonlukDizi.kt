@@ -36,7 +36,7 @@ class SezonlukDizi : MainAPI() {
     private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
 
     private val ua =
-        "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
     private val liste = "$mainUrl/diziler.asp"
 
@@ -54,15 +54,11 @@ class SezonlukDizi : MainAPI() {
 
     // ---------------- Yardımcılar ----------------
 
-    private fun hdr(): Map<String, String> = mapOf(
-        "User-Agent" to ua,
-        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
-    )
+    private fun hdr(): Map<String, String> = mapOf("User-Agent" to ua)
 
     private fun ajaxHdr(referer: String): Map<String, String> = hdr() + mapOf(
         "X-Requested-With" to "XMLHttpRequest",
-        "Referer" to referer,
-        "Origin" to mainUrl
+        "Referer" to referer
     )
 
     // Önce düz istek atılır (hızlı, WebView açmaz). Sadece Cloudflare kontrol sayfası gelirse CloudflareKiller devreye girer.
@@ -447,70 +443,86 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val origin = originOf(embed)
-        val id = Regex("""/(?:e|d|v|embed)/([A-Za-z0-9_-]+)""").find(embed)?.groupValues?.get(1)
-            ?: embed.substringBefore("?").trimEnd('/').substringAfterLast('/')
-        if (id.isBlank()) return false
-
-        val h = mapOf(
-            "User-Agent" to ua,
-            "Accept" to "application/json, */*",
-            "Referer" to "$origin/e/$id",
-            "Origin" to origin,
-            "X-Embed-Parent" to embed,
-            "X-Embed-Origin" to mainUrl.removePrefix("https://")
-        )
-
-        // playback nesnesi: /api/videos/<id> ya da /api/videos/<id>/embed/playback içinde
-        var pb: JSONObject? = null
-        for (api in listOf("$origin/api/videos/$id", "$origin/api/videos/$id/embed/playback")) {
-            val txt = try {
-                app.get(api, headers = h, timeout = 15L).text
-            } catch (e: Exception) {
-                d("byse api hata $api: ${e.message}")
-                continue
-            }
-            val root = try {
-                JSONObject(txt)
-            } catch (e: Exception) {
-                d("byse JSON değil $api: ${txt.take(100)}")
-                continue
-            }
-            val found = root.optJSONObject("playback") ?: root.takeIf { it.has("payload") }
-            if (found == null) {
-                d("byse playback yok $api: ${txt.take(100)}")
-                continue
-            }
-            pb = found
-            break
+        val id = embed.substringAfterLast("/e/").substringBefore("?").substringBefore("/")
+        if (id.isBlank() || !embed.contains("/e/")) {
+            d("byse id bulunamadı: $embed")
+            return false
         }
-        val p = pb ?: return false
 
-        val json = try {
-            val parts = p.optJSONArray("key_parts") ?: return false
-            var key = ByteArray(0)
-            for (i in 0 until parts.length()) key += b64u(parts.getString(i))
-            val iv = b64u(p.getString("iv"))
-            val enc = b64u(p.getString("payload"))
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-            JSONObject(String(cipher.doFinal(enc), Charsets.UTF_8))
+        // Çalışan eklentideki gibi: sadece UA + Referer
+        val h = mapOf("User-Agent" to ua, "Referer" to embed)
+        val txt = try {
+            app.get("$origin/api/videos/$id", headers = h, timeout = 15L).text
         } catch (e: Exception) {
-            d("byse çözme hatası ${e.javaClass.simpleName}: ${e.message}")
+            d("byse api hata: ${e.message}")
+            return false
+        }
+        val p = try {
+            JSONObject(txt).optJSONObject("playback")
+        } catch (e: Exception) {
+            null
+        }
+        if (p == null) {
+            d("byse playback yok: ${txt.take(120)}")
             return false
         }
 
-        val srcs = json.optJSONArray("sources") ?: run {
-            d("byse sources yok: ${json.toString().take(100)}")
+        val arr = p.optJSONArray("key_parts")
+        if (arr == null || arr.length() < 1) {
+            d("byse key_parts yok, alanlar=${p.keys().asSequence().toList()}")
             return false
         }
+        val parts = (0 until arr.length()).map { b64u(arr.getString(it)) }
+        d("byse version=${p.optInt("version")} parça boyları=${parts.map { it.size }} alanlar=${p.keys().asSequence().toList()}")
+
+        // Anahtar adayları: ilk iki parça (çalışan eklenti böyle yapıyor), hepsi, tek tek. Sadece geçerli AES boyları denenir.
+        val cands = ArrayList<ByteArray>()
+        if (parts.size >= 2) cands.add(parts[0] + parts[1])
+        cands.add(parts.fold(ByteArray(0)) { x, y -> x + y })
+        parts.forEach { cands.add(it) }
+        val keys = cands.filter { it.size == 16 || it.size == 24 || it.size == 32 }.distinctBy { it.toList() }
+        if (keys.isEmpty()) {
+            d("byse geçerli anahtar boyu yok")
+            return false
+        }
+
+        val ivEnc = try {
+            Pair(b64u(p.getString("iv")), b64u(p.getString("payload")))
+        } catch (e: Exception) {
+            d("byse iv/payload yok: ${e.message}")
+            return false
+        }
+        val iv = ivEnc.first
+        val enc = ivEnc.second
+
+        var json: JSONObject? = null
+        for (key in keys) {
+            try {
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+                val o = JSONObject(String(cipher.doFinal(enc), Charsets.UTF_8))
+                if (o.optJSONArray("sources") != null) {
+                    json = o
+                    break
+                }
+            } catch (e: Exception) {
+                d("byse çözme denemesi (${key.size}B) hata: ${e.javaClass.simpleName}")
+            }
+        }
+        val srcs = json?.optJSONArray("sources")
+        if (srcs == null) {
+            d("byse çözülemedi")
+            return false
+        }
+
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         var ok = false
         for (i in 0 until srcs.length()) {
             val o = srcs.optJSONObject(i) ?: continue
             val url = o.optString("url").replace("\\/", "/")
             if (!url.startsWith("http")) continue
-            val ql = o.optString("label").ifBlank { o.optString("quality") }
-            val tag = if (ql.isBlank()) label else "$label $ql"
+            val ql = o.optString("label").ifBlank { "1080p" }
+            val tag = "$label ($ql)"
             val mime = o.optString("mime_type")
             if (url.contains(".m3u8") || mime.contains("mpegurl", true)) {
                 val links = try {
@@ -524,13 +536,14 @@ class SezonlukDizi : MainAPI() {
                 callback(
                     newExtractorLink(name, "$tag - Byse", url, ExtractorLinkType.VIDEO) {
                         this.referer = "$origin/"
-                        this.quality = o.optInt("height", 0).takeIf { it > 0 } ?: Qualities.Unknown.value
+                        this.quality = getQualityFromName(ql)
                         this.headers = headers
                     }
                 )
             }
             ok = true
         }
+        d("byse kaynak sayısı=${srcs.length()} ok=$ok")
         return ok
     }
 
@@ -575,7 +588,7 @@ class SezonlukDizi : MainAPI() {
 
         // 2) CloudflareKiller ile sayfayı aç, .m3u8 ara
         try {
-            val page = app.get(u, referer = "$mainUrl/", interceptor = cf, timeout = 15L)
+            val page = app.get(u, referer = "$mainUrl/", timeout = 10L)
                 .text.replace("\\/", "/")
             val m = Regex("""https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*""").find(page)
             if (m != null) {
@@ -618,19 +631,20 @@ class SezonlukDizi : MainAPI() {
         discoverEndpoints(doc, res.text)
         d("sayfa kod=${res.code} bid='$bid' dil=$activeDil alt=$altEndpoints embed=$embedEndpoints")
 
-        fun dilName(d: String) = if (d == "0") "Dublaj" else "Altyazı"
-
-        // (etiket, gömülü adres) çiftleri: önce sayfada açık olan oynatıcı, sonra tüm alternatifler
+        fun dilName(x: String) = if (x == "0") "Dublaj" else "Altyazı"
+        var any = false
         val seen = HashSet<String>()
-        val targets = ArrayList<Pair<String, String>>()
 
+        // Sayfada açık duran oynatıcı
         val first = doc.selectFirst("iframe#hs")?.attr("src")
             ?: doc.selectFirst("#embed iframe")?.attr("src")
         d("açık iframe=$first")
-        if (!first.isNullOrBlank() && seen.add(first)) targets.add(dilName(activeDil) to first)
+        if (!first.isNullOrBlank() && !first.contains("reCAPTCHA", true) && seen.add(first)) {
+            if (emitEmbed(first, dilName(activeDil), subtitleCallback, callback)) any = true
+        }
 
         if (bid.isNotBlank()) {
-            for (dil in listOf("0", "1")) {   // dublaj = 0, altyazı = 1
+            for (dil in listOf("1", "0")) {   // altyazı = 1, dublaj = 0
                 var alts: List<Pair<String, String>> = emptyList()
                 for (ep in altEndpoints.orEmpty()) {
                     val txt = try {
@@ -642,7 +656,10 @@ class SezonlukDizi : MainAPI() {
                     if (alts.isEmpty()) d("alt boş dil=$dil ep=$ep yanıt='${txt.take(80)}'")
                     if (alts.isNotEmpty()) break
                 }
-                val embeds = alts.amap { (id, _) ->
+                d("dil=$dil alt=${alts.size}")
+
+                // Embedler SIRAYLA istenir (paralel istek sitede captcha tetikliyor)
+                for ((id, _) in alts) {
                     var found: String? = null
                     for (ep in embedEndpoints.orEmpty()) {
                         val r = try {
@@ -653,24 +670,19 @@ class SezonlukDizi : MainAPI() {
                         found = embedOf(r)
                         if (found != null) break
                     }
-                    found
-                }
-                d("dil=$dil alt=${alts.size} embed=$embeds")
-                for (e in embeds) {
-                    if (e.isNullOrBlank() || !seen.add(e)) continue
-                    targets.add(dilName(dil) to e)
+                    val f = found
+                    d("dil=$dil id=$id embed=$f")
+                    if (f.isNullOrBlank() || f.contains("reCAPTCHA", true)) continue
+                    if (!seen.add(f)) continue
+                    val ok = emitEmbed(f, dilName(dil), subtitleCallback, callback)
+                    d("kaynak ${dilName(dil)} $f -> $ok")
+                    if (ok) any = true
+                    try { Thread.sleep(250) } catch (e: Exception) { }
                 }
             }
         }
 
-        // Tüm kaynaklar paralel çözülür
-        val any = AtomicBoolean(false)
-        targets.amap { (label, embed) ->
-            val ok = emitEmbed(embed, label, subtitleCallback, callback)
-            d("kaynak $label $embed -> $ok")
-            if (ok) any.set(true)
-        }
-        if (!any.get() && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
-        return any.get()
+        if (!any && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
+        return any
     }
 }
