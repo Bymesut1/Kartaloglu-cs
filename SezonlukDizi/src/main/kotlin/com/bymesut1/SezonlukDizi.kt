@@ -621,6 +621,9 @@ class SezonlukDizi : MainAPI() {
     // WebView yedeği yavaş olduğu için bir bölümde en fazla bu kadar kaynakta denenir
     private val webviewLeft = AtomicInteger(0)
 
+    // Captcha kapı sayfası bölüm başına yalnızca bir kez incelenir (hız sınırı için)
+    private val gateProbed = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun originOf(u: String): String =
         Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
 
@@ -824,9 +827,12 @@ class SezonlukDizi : MainAPI() {
             }
             val link = m3u8.replace("&amp;", "&")
             val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+            // Sayfada: label: "720p HD"
+            val q = Regex("""label\s*:\s*["'](\d{3,4})p""").find(clean)?.groupValues?.get(1)
+            val tag = if (q != null) "$label ${q}p" else label
 
             // Ana (master) liste: oynatıcı kaliteyi kendi seçer
-            emitM3u8(link, label, "$origin/", callback)
+            emitM3u8(link, tag, "$origin/", callback)
             // Kalite adlarını (720p vb.) görebilmek için alt listeler de eklenir
             try {
                 M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
@@ -950,7 +956,22 @@ class SezonlukDizi : MainAPI() {
         Regex("""https?://[^\s"'&<>]+""").findAll(dec.substringAfter("?", "")).map { it.value }
             .firstOrNull { !it.contains("sezonlukdizi", true) && !it.contains("recaptcha", true) }
             ?.let { return it }
-        return null   // captcha sayfasından gerçek adres çıkmıyor; ek istek atılmaz (Cloudflare hız sınırını tetikler)
+        // Kapı sayfasını bölüm başına BİR kez açıp yapısını hata ayıklamaya yazar; gerçek oynatıcı adresi
+        // sayfada açıkça yazıyorsa (Vidmoly vb.) onu kullanır.
+        if (gateProbed.compareAndSet(false, true)) {
+            try {
+                val h = app.get(full, headers = hdr(), referer = ref, cookies = sessionCookies, timeout = 10L).text
+                val ajax = Regex("""/ajax/[A-Za-z0-9_]+\.asp""").findAll(h).map { it.value }.distinct().take(6).toList()
+                val key = Regex("""sitekey["']?\s*[:=]\s*["']([^"']+)""").find(h)?.groupValues?.get(1)
+                val post = Regex("""\$\.(?:post|ajax)\([^;]{0,150}""").find(h)?.value?.replace(Regex("""\s+"""), " ")
+                d("captcha sayfa uzunluk=${h.length} ajax=$ajax sitekey=$key post=$post")
+                Regex("""https?://[^\s"'<>\\]*(?:vidmoly|embed-)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
+                    .find(h.replace("\\/", "/"))?.value?.let { return it }
+            } catch (e: Exception) {
+                d("captcha sayfa hata ${e.javaClass.simpleName}")
+            }
+        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -960,6 +981,7 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webviewLeft.set(2)
+        gateProbed.set(false)
         dbg.clear()
         sessionCookies = emptyMap()
 
