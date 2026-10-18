@@ -132,11 +132,20 @@ class SezonlukDizi : MainAPI() {
     }
 
     // Arama kartı için TMDB afişi (sadece adı birebir eşleşen dizi); bulunamazsa null (sitenin afişi kalır)
+    // Hız için kısa zaman aşımı (2 sn): TMDB yavaşsa beklemeden sitenin afişi kullanılır; başarısız sonuç önbelleğe yazılmaz.
     private suspend fun tmdbPosterFor(title: String): String? {
         val key = norm(title)
         if (key.isEmpty()) return null
         posterCache[key]?.let { return it.ifBlank { null } }
-        val best = tmdbSearch(title)
+        val res = try {
+            app.get(
+                "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(title, "UTF-8")}",
+                timeout = 2L
+            ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
+        } catch (e: Exception) {
+            return null
+        }
+        val best = res
             .filter {
                 !it.poster_path.isNullOrBlank() &&
                     (norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key)
@@ -176,10 +185,17 @@ class SezonlukDizi : MainAPI() {
             body.contains("cf-browser-verification", true) ||
             body.contains("/cdn-cgi/challenge-platform/h/b/orchestrate", true)
 
-    private suspend fun get(url: String, referer: String = "$mainUrl/") =
+    // Site Cloudflare kontrolü istediyse bir sonraki istekler boşuna düz denenmeden doğrudan CloudflareKiller ile atılır
+    @Volatile private var needCf = false
+
+    private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 15L) =
         try {
-            val r = app.get(url, headers = hdr(), referer = referer, timeout = 15L)
-            if (isChallenge(r.code, r.text)) throw Exception("cf")
+            if (needCf) throw Exception("cf")
+            val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
+            if (isChallenge(r.code, r.text)) {
+                needCf = true
+                throw Exception("cf")
+            }
             r
         } catch (e: Exception) {
             app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
@@ -308,35 +324,46 @@ class SezonlukDizi : MainAPI() {
 
     // ---------------- Arama ----------------
 
+    // Aynı aramayı tekrar yapınca anında göstermek için önbellek
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, SearchResponseList>()
+
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
+        val cacheKey = q.lowercase() + "|" + page
+        searchCache[cacheKey]?.let { return it }
         dbg.clear()
         val sfx = if (page > 1) "&s=$page" else ""
         val urls = listOf(
             "$liste?adi=${encQ(q)}$sfx",
             "$liste?adi=${URLEncoder.encode(q, "UTF-8")}$sfx"
         ).distinct()
-        for (u in urls) {
-            val r = try {
-                get(u)
+        val responses = urls.amap { u ->
+            try {
+                get(u, t = 10L)
             } catch (e: Exception) {
                 d("istek hatası ${e.javaClass.simpleName}: ${e.message}")
                 null
-            } ?: continue
+            }
+        }
+        for (r in responses) {
+            if (r == null) continue
             val doc = r.document
             val list = cards(doc.selectFirst(".afis") ?: doc.body())
             d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
                     // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    list.amap { c ->
+                    list.take(12).amap { c ->
                         val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
                         if (!tp.isNullOrBlank()) c.posterUrl = tp
                         c
                     }
                 }
-                return newSearchResponseList(list, page < maxPage(doc))
+                val out = newSearchResponseList(list, page < maxPage(doc))
+                if (searchCache.size > 30) searchCache.clear()
+                searchCache[cacheKey] = out
+                return out
             }
         }
         if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
