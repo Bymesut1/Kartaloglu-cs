@@ -987,9 +987,9 @@ class SezonlukDizi : MainAPI() {
                 cookies = sessionCookies,
                 interceptor = WebViewResolver(
                     Regex("""zz-asla-eslesmez-zz"""),
-                    userAgent = ua,
+                    userAgent = null,      // eskiden: ua
                     useOkhttp = false,
-                    timeout = 18_000L
+                    timeout = 12_000L      // eskiden: 18_000L
                 )
             )
         } catch (e: Exception) {
