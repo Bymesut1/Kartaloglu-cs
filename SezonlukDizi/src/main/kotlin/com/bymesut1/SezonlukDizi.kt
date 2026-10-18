@@ -667,16 +667,7 @@ class SezonlukDizi : MainAPI() {
         Regex("""https?://[^\s"'&<>]+""").findAll(dec.substringAfter("?", "")).map { it.value }
             .firstOrNull { !it.contains("sezonlukdizi", true) && !it.contains("recaptcha", true) }
             ?.let { return it }
-        val txt = try {
-            app.get(full, headers = ajaxHdr(ref), cookies = sessionCookies, timeout = 10L).text
-        } catch (e: Exception) {
-            return null
-        }
-        val fromIframe = reIframe.findAll(txt).map { it.groupValues[1] }
-            .firstOrNull { !it.contains("recaptcha", true) && !it.contains("google", true) }
-        if (fromIframe != null) return fromIframe
-        return Regex("""(?:https?:)?//[^"'\\\s<>]*byse[^"'\\\s<>]*/e/[^"'\\\s<>]+""", RegexOption.IGNORE_CASE)
-            .find(txt.replace("\\/", "/"))?.value
+        return null   // captcha sayfasından gerçek adres çıkmıyor; ek istek atılmaz (Cloudflare hız sınırını tetikler)
     }
 
     override suspend fun loadLinks(
@@ -695,6 +686,7 @@ class SezonlukDizi : MainAPI() {
         val captchaSeen = HashSet<String>()
         val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
         val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
+        val okCnt = HashMap<String, Int>()     // dil başına çalışan kaynak sayısı
         val srcLog = ArrayList<String>()       // kaynak başına kısa sonuç (hata ayıklama)
         val pageLog = ArrayList<String>()
 
@@ -719,6 +711,7 @@ class SezonlukDizi : MainAPI() {
                 emitM3u8(full, dilName(dil), full, callback)
                 any = true
                 got.add(dil)
+                okCnt[dil] = (okCnt[dil] ?: 0) + 1
                 d("kaynak ${dilName(dil)} m3u8 -> true")
                 return true
             }
@@ -727,23 +720,38 @@ class SezonlukDizi : MainAPI() {
             if (ok) {
                 any = true
                 got.add(dil)
+                okCnt[dil] = (okCnt[dil] ?: 0) + 1
             }
             return ok
         }
 
-        // Kaynak id'sinden gömülü oynatıcı adresini ister: (adres, ham yanıt)
+        // Cloudflare hız sınırı ("error code: 1015") yanıtı mı?
+        fun rl(x: String) = x.contains("1015") || x.contains("rate limit", true) || x.contains("too many", true)
+
+        // Hız sınırında beklemek için toplam süre bütçesi (ms)
+        var waitBudget = 40_000L
+
+        // Kaynak id'sinden gömülü oynatıcı adresini ister: (adres, ham yanıt).
+        // Cloudflare 1015 dönerse bekleyip aynı kaynağı tekrar dener.
         suspend fun fetchEmbed(id: String, ref: String): Pair<String?, String> {
             var found: String? = null
             var raw = ""
-            for (ep in embedEndpoints.orEmpty()) {
-                val r = try {
-                    post(mainUrl + ep, mapOf("id" to id), ref).text
-                } catch (e: Exception) {
-                    "HATA ${e.javaClass.simpleName}"
+            for (attempt in 0..2) {
+                for (ep in embedEndpoints.orEmpty()) {
+                    val r = try {
+                        post(mainUrl + ep, mapOf("id" to id), ref).text
+                    } catch (e: Exception) {
+                        "HATA ${e.javaClass.simpleName}"
+                    }
+                    raw = r
+                    found = embedOf(r)
+                    if (found != null) break
                 }
-                raw = r
-                found = embedOf(r)
-                if (found != null) break
+                if (found != null || !rl(raw) || waitBudget <= 0) break
+                val w = 5000L + attempt * 3000L
+                waitBudget -= w
+                d("hız sınırı id=$id bekle=${w}ms")
+                try { Thread.sleep(w) } catch (e: Exception) { }
             }
             return Pair(found, raw)
         }
@@ -762,7 +770,6 @@ class SezonlukDizi : MainAPI() {
                 ?: short(f, 25))
             val ok = emit(dil, f)
             srcLog.add("$tag $host ${if (ok) "OK" else "yok"}")
-            if (!ok && cap) retryQ.add(Triple(dil, id, ref))
         }
 
         // 1) Hem normal (altyazı) hem /dublaj/ bölüm sayfası açılır; her ikisindeki açık oynatıcı kendi diliyle eklenir.
@@ -817,10 +824,16 @@ class SezonlukDizi : MainAPI() {
 
             var alts: List<Pair<String, String>> = emptyList()
             for (ep in altEndpoints.orEmpty()) {
-                val txt = try {
-                    post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), refUrl).text
-                } catch (e: Exception) {
-                    ""
+                var txt = ""
+                for (att in 0..2) {
+                    txt = try {
+                        post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), refUrl).text
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    if (!rl(txt) || waitBudget <= 0) break
+                    waitBudget -= 5000L
+                    try { Thread.sleep(5000L) } catch (e: Exception) { }
                 }
                 alts = altList(txt)
                 if (alts.isEmpty()) d("alt boş dil=$dil yanıt='${short(txt, 60)}'")
@@ -831,8 +844,9 @@ class SezonlukDizi : MainAPI() {
 
             // Embedler SIRAYLA istenir (paralel istek sitede captcha tetikliyor)
             for ((id, _) in alts) {
+                if ((okCnt[dil] ?: 0) >= 2) break
                 tryId(dil, id, refUrl, "")
-                try { Thread.sleep(500) } catch (e: Exception) { }
+                try { Thread.sleep(1000) } catch (e: Exception) { }
             }
         }
 
@@ -844,7 +858,7 @@ class SezonlukDizi : MainAPI() {
                 if (dil in got) break
                 for ((_, id, ref) in todo) {
                     if (dil in got) break
-                    try { Thread.sleep(1000L * attempt) } catch (e: Exception) { }
+                    try { Thread.sleep(1500L * attempt) } catch (e: Exception) { }
                     tryId(dil, id, ref, "R$attempt ")
                 }
             }
