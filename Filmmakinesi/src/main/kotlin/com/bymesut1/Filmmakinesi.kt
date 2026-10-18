@@ -70,11 +70,7 @@ class Filmmakinesi : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val base = request.data.trimEnd('/') + "/"
         val url = if (page <= 1) base else "${base}sayfa/$page/"
-        val list = try {
-            parseCards(app.get(url, headers = pageHeaders).document)
-        } catch (e: Exception) {
-            emptyList()
-        }
+        val list = fetchList(url)
         return newHomePageResponse(request.name, list, list.isNotEmpty())
     }
 
@@ -82,8 +78,23 @@ class Filmmakinesi : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
-        val doc = app.get("$mainUrl/arama/?s=$q", headers = pageHeaders).document
-        return parseCards(doc)
+        return fetchList("$mainUrl/arama/?s=$q")
+    }
+
+    // Liste sayfasını önce mobil, olmazsa masaüstü UA ile dener; sonucu loga yazar (sessiz boş liste olmasın)
+    private suspend fun fetchList(url: String): List<SearchResponse> {
+        for ((i, ua) in listOf(androidUA, desktopUA).withIndex()) {
+            val r = try {
+                app.get(url, headers = pageHeaders + mapOf("User-Agent" to ua), timeout = 15L)
+            } catch (e: Exception) {
+                log("liste hata ua=$i ${e.message?.take(60)} ${url.take(80)}")
+                null
+            } ?: continue
+            val list = try { parseCards(r.document) } catch (e: Exception) { emptyList() }
+            log("liste ua=$i kod=${r.code} len=${r.text.length} kart=${list.size} ${url.take(80)}")
+            if (list.isNotEmpty()) return list
+        }
+        return emptyList()
     }
 
     private val cardHref = Regex("^(?:https?://[^/]+)?/(film|dizi)/[^/]+/?$")
