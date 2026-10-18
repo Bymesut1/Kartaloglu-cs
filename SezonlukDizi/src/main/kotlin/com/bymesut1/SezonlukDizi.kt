@@ -785,6 +785,60 @@ class SezonlukDizi : MainAPI() {
         return ok
     }
 
+    // ---- Vidmoly (vidmoly.biz / .to / .me / .net): oynatıcı sayfasında açık .m3u8 var ----
+    // Örnek adres: https://vidmoly.biz/embed-m90baavtu9m6.html
+    private suspend fun extractVidmoly(
+        embed: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val host0 = Regex("""^https?://([^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
+        val id = Regex("""(?:embed-|/w/|/e/|/embed/)([A-Za-z0-9]{6,})""").find(embed)?.groupValues?.get(1)
+        // Alan adı sık değişir: önce gelen adres, olmazsa aynı kimlikle diğer alan adları denenir
+        val hosts = (listOf(host0) + listOf("vidmoly.biz", "vidmoly.to", "vidmoly.me", "vidmoly.net")).distinct()
+
+        for (host in hosts) {
+            val url = when {
+                host == host0 -> embed
+                id != null -> "https://$host/embed-$id.html"
+                else -> continue
+            }
+            val origin = "https://$host"
+            val html = try {
+                app.get(
+                    url,
+                    referer = "$mainUrl/",
+                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
+                    timeout = 12L
+                ).text
+            } catch (e: Exception) {
+                d("vidmoly $host hata: ${e.javaClass.simpleName}")
+                continue
+            }
+            val clean = html.replace("\\/", "/")
+            val m3u8 = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(clean)?.groupValues?.get(1)
+                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(clean)?.groupValues?.get(1)
+            if (m3u8.isNullOrBlank()) {
+                d("vidmoly $host m3u8 yok uzunluk=${html.length} '${html.replace(Regex("""\s+"""), " ").take(60)}'")
+                continue
+            }
+            val link = m3u8.replace("&amp;", "&")
+            val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+
+            // Ana (master) liste: oynatıcı kaliteyi kendi seçer
+            emitM3u8(link, label, "$origin/", callback)
+            // Kalite adlarını (720p vb.) görebilmek için alt listeler de eklenir
+            try {
+                M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
+                    .forEach { callback(relabel(it, label)) }
+            } catch (e: Exception) {
+            }
+            d("vidmoly $host tamam")
+            return true
+        }
+        return false
+    }
+
     // Bir gömülü oynatıcı adresini çözer. Sırayla:
     // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
     // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
@@ -811,6 +865,17 @@ class SezonlukDizi : MainAPI() {
                 false
             }
             if (okByse) return true
+        }
+
+        // 0b) Vidmoly: kendi çözücümüz; olmazsa aşağıdaki hazır çözücüye düşer
+        if (u.contains("vidmoly", ignoreCase = true)) {
+            val okVm = try {
+                extractVidmoly(u, label, callback)
+            } catch (e: Exception) {
+                d("vidmoly istisna ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            if (okVm) return true
         }
 
         // 1) hazır çözücüler
@@ -1073,7 +1138,7 @@ class SezonlukDizi : MainAPI() {
         fun prio(dil: String, idx: Int, nm: String): Int {
             val n = nm.trim().lowercase()
             return when {
-                n.contains("byse") -> 0
+                n.contains("byse") || n.contains("vidmoly") -> 0
                 "i:$dil:$idx" in goodKeys -> 1
                 n.isNotBlank() && "n:$n" in goodKeys -> 2
                 else -> 3
