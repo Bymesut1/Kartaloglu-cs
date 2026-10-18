@@ -624,6 +624,45 @@ class SezonlukDizi : MainAPI() {
         return false
     }
 
+    // Sayfadaki oynatıcı adresleri (öncelik sırasıyla). iframe src yerine data-src de olabilir;
+    // hiç gerçek oynatıcı yoksa sayfa kaynağında Byse adresi ve diğer iframe'ler de aranır.
+    private fun pageEmbeds(doc: Document, html: String): List<String> {
+        val out = LinkedHashSet<String>()
+        for (e in doc.select("iframe#hs, #embed iframe")) {
+            listOf(e.attr("src"), e.attr("data-src")).forEach { if (it.isNotBlank()) out.add(it.trim()) }
+        }
+        if (out.none { !it.contains("reCAPTCHA", true) }) {
+            Regex("""(?:https?:)?//[^"'\\\s<>]*byse[^"'\\\s<>]*/e/[^"'\\\s<>]+""", RegexOption.IGNORE_CASE)
+                .findAll(html.replace("\\/", "/")).forEach { out.add(it.value) }
+            for (e in doc.select("iframe")) {
+                val u = listOf(e.attr("src"), e.attr("data-src")).firstOrNull { it.isNotBlank() }?.trim() ?: continue
+                if (u.startsWith("about:")) continue
+                if (listOf("google", "facebook", "youtube", "doubleclick", "histats").any { u.contains(it, true) }) continue
+                out.add(u)
+            }
+        }
+        return out.toList().take(3)
+    }
+
+    // reCAPTCHA kapısı dönen adresin içinde ya da sayfasında gerçek oynatıcı adresi var mı diye bakar
+    private suspend fun captchaInner(u: String, ref: String): String? {
+        val full = when {
+            u.startsWith("//") -> "https:$u"
+            u.startsWith("/") -> mainUrl + u
+            else -> u
+        }
+        val dec = try { java.net.URLDecoder.decode(full, "UTF-8") } catch (e: Exception) { full }
+        Regex("""https?://[^\s"'&<>]+""").findAll(dec.substringAfter("?", "")).map { it.value }
+            .firstOrNull { !it.contains("sezonlukdizi", true) && !it.contains("recaptcha", true) }
+            ?.let { return it }
+        val txt = try { get(full, ref).text } catch (e: Exception) { return null }
+        val fromIframe = reIframe.findAll(txt).map { it.groupValues[1] }
+            .firstOrNull { !it.contains("recaptcha", true) && !it.contains("google", true) }
+        if (fromIframe != null) return fromIframe
+        return Regex("""(?:https?:)?//[^"'\\\s<>]*byse[^"'\\\s<>]*/e/[^"'\\\s<>]+""", RegexOption.IGNORE_CASE)
+            .find(txt.replace("\\/", "/"))?.value
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -636,12 +675,21 @@ class SezonlukDizi : MainAPI() {
         fun dilName(x: String) = if (x == "0") "Dublaj" else "Altyazı"
         var any = false
         val seen = HashSet<String>()
+        val captchaSeen = HashSet<String>()
         val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
         val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
 
-        // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar
-        suspend fun emit(dil: String, embed: String): Boolean {
-            if (embed.isBlank() || embed.contains("reCAPTCHA", true)) return false
+        // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
+        suspend fun emit(dil: String, embed0: String): Boolean {
+            var embed = embed0
+            if (embed.isBlank()) return false
+            if (embed.contains("reCAPTCHA", true)) {
+                if (!captchaSeen.add(embed)) return false
+                val inner = try { captchaInner(embed, "$mainUrl/") } catch (e: Exception) { null }
+                d("captcha iç=$inner")
+                if (inner.isNullOrBlank()) return false
+                embed = inner
+            }
             if (!seen.add(embed)) return false
             val ok = emitEmbed(embed, dilName(dil), subtitleCallback, callback)
             d("kaynak ${dilName(dil)} $embed -> $ok")
@@ -668,7 +716,6 @@ class SezonlukDizi : MainAPI() {
         }
 
         // 1) Hem normal (altyazı) hem /dublaj/ bölüm sayfası açılır; her ikisindeki açık oynatıcı kendi diliyle eklenir.
-        //    Böylece dublaj ile altyazı ayrı ayrı, ajax/captcha'ya takılmadan bulunur.
         val m = reEp.find(data)
         val pageUrls = if (m != null) {
             val slug = m.groupValues[1]
@@ -698,13 +745,12 @@ class SezonlukDizi : MainAPI() {
                 ?.takeIf { it == "0" || it == "1" }
                 ?: if (res.url.contains("/dublaj/")) "0" else "1"
             discoverEndpoints(doc, res.text)
-            d("sayfa kod=${res.code} url=${res.url.takeLast(40)} bid='$bid' dil=$activeDil alt=$altEndpoints embed=$embedEndpoints")
+            d("sayfa kod=${res.code} url=${res.url.takeLast(45)} bid='$bid' dil=$activeDil")
             pages.add(Triple(pu, bid, activeDil))
 
-            val first = doc.selectFirst("iframe#hs")?.attr("src")
-                ?: doc.selectFirst("#embed iframe")?.attr("src")
-            d("açık iframe($activeDil)=$first")
-            if (!first.isNullOrBlank()) emit(activeDil, first)
+            val embeds = pageEmbeds(doc, res.text)
+            d("açık($activeDil)=${embeds.joinToString(" ; ")}")
+            for (f in embeds) emit(activeDil, f)
             try { Thread.sleep(250) } catch (e: Exception) { }
         }
 
@@ -721,7 +767,7 @@ class SezonlukDizi : MainAPI() {
                         ""
                     }
                     alts = altList(txt)
-                    if (alts.isEmpty()) d("alt boş dil=$dil ep=$ep yanıt='${txt.take(80)}'")
+                    if (alts.isEmpty()) d("alt boş dil=$dil yanıt='${txt.take(60)}'")
                     if (alts.isNotEmpty()) break
                 }
                 d("bid=$bid dil=$dil alt=${alts.size}")
@@ -729,12 +775,12 @@ class SezonlukDizi : MainAPI() {
                 // Embedler SIRAYLA istenir (paralel istek sitede captcha tetikliyor)
                 for ((id, _) in alts) {
                     val f = fetchEmbed(id, pu)
-                    d("dil=$dil id=$id embed=$f")
-                    if (f.isNullOrBlank() || f.contains("reCAPTCHA", true)) {
+                    d("dil=$dil id=$id embed=${f?.takeLast(70)}")
+                    if (f.isNullOrBlank()) {
                         retryQ.add(Triple(dil, id, pu))
                         continue
                     }
-                    emit(dil, f)
+                    if (!emit(dil, f) && f.contains("reCAPTCHA", true)) retryQ.add(Triple(dil, id, pu))
                     try { Thread.sleep(250) } catch (e: Exception) { }
                 }
             }
@@ -750,13 +796,33 @@ class SezonlukDizi : MainAPI() {
                     if (dil in got) break
                     try { Thread.sleep(1000L * attempt) } catch (e: Exception) { }
                     val f = fetchEmbed(id, ref)
-                    d("yeniden($attempt) dil=$dil id=$id embed=$f")
-                    if (!f.isNullOrBlank() && !f.contains("reCAPTCHA", true)) emit(dil, f)
+                    d("yeniden($attempt) dil=$dil id=$id embed=${f?.takeLast(70)}")
+                    if (!f.isNullOrBlank()) emit(dil, f)
                 }
             }
         }
 
+        val missing = listOf("0", "1").filter { it !in got }
         d("özet dublaj=${"0" in got} altyazı=${"1" in got}")
+
+        // Hata ayıklama: bir dil eksik kaldıysa sebebi kaynak listesinde "DEBUG" satırları olarak gösterilir
+        if (debug && any && missing.isNotEmpty()) {
+            val snap = dbg.toList().take(16)
+            for ((i, line) in snap.withIndex()) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        "DEBUG ${i + 1} [${missing.joinToString("+") { dilName(it) }} yok]: ${line.take(200)}",
+                        "https://debug.invalid/$i",
+                        ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+        }
+
         if (!any && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
         return any
     }
