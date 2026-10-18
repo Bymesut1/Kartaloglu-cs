@@ -42,7 +42,7 @@ class SezonlukDizi : MainAPI() {
 
     // ---------------- TMDB (Türkçe bilgiler) ----------------
     // TMDB API anahtarını buraya yaz. Boş ya da varsayılan bırakılırsa TMDB özellikleri kapalı kalır, eklenti eskisi gibi çalışır.
-    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+    private val tmdbKey = "BURAYA_TMDB_API_KEY"
     private val tmdbOn: Boolean get() = tmdbKey.isNotBlank() && tmdbKey != "BURAYA_TMDB_API_KEY"
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImg = "https://image.tmdb.org/t/p"
@@ -507,7 +507,8 @@ class SezonlukDizi : MainAPI() {
             this.plot = tPlot ?: plot
             if (tYear != null) this.year = tYear
             if (tTags != null) this.tags = tTags
-            if (tActors.isNotEmpty()) addActors(tActors)
+            // addActors yeni CloudStream sürümlerinde kaldırıldı; actors doğrudan atanır
+            if (tActors.isNotEmpty()) this.actors = tActors.map { ActorData(actor = it) }
         }
     }
 
