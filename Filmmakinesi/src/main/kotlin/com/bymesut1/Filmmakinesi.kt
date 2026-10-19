@@ -7,8 +7,6 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
@@ -16,6 +14,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Collections
 import java.util.Locale
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 class Filmmakinesi : MainAPI() {
@@ -28,7 +27,7 @@ class Filmmakinesi : MainAPI() {
     // Site Cloudflare doğrulaması (403 + küçük HTML) veriyor; WebView ile çözüp çerezi saklar
     @Volatile
     private var cfKiller = CloudflareKiller()
-    private val cfMutex = Mutex()
+    private val cfLock = Semaphore(1)
     @Volatile
     private var cfWarm = false
 
@@ -40,16 +39,24 @@ class Filmmakinesi : MainAPI() {
         var r = if (cfWarm) {
             app.get(url, headers = headers, interceptor = k, timeout = timeout)
         } else {
-            cfMutex.withLock { app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout) }
+            cfLock.acquire()
+            try {
+                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+            } finally {
+                cfLock.release()
+            }
         }
         if (r.code == 403 || r.code == 503) {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
-            r = cfMutex.withLock {
+            cfLock.acquire()
+            try {
                 if (cfKiller === k) {
                     cfKiller = CloudflareKiller()
                     cfWarm = false
                 }
-                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+                r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+            } finally {
+                cfLock.release()
             }
         }
         if (r.code in 200..299) cfWarm = true
