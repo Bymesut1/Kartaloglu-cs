@@ -1,5 +1,5 @@
 // Sürüm numarası: her güncellemede 1 artır (artmazsa güncelleme sayılmaz)
-version = 1
+version = 2
 
 cloudstream {
     description = "Webteizle: Türkçe dublaj ve altyazılı film izle (Filemoon, Vidmoly)"
