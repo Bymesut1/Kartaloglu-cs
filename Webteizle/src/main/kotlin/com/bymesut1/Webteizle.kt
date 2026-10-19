@@ -1,6 +1,7 @@
 package com.bymesut1
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
@@ -285,7 +286,8 @@ class Webteizle : MainAPI() {
         val year = Regex("""\((\d{4})\)""").find(doc.selectFirst("h1")?.text().orEmpty())?.groupValues?.get(1)?.toIntOrNull()
             ?: ld?.optString("datePublished")?.take(4)?.toIntOrNull()
 
-        val poster = doc.selectFirst(".filmbanner img")?.let { posterOf(it) }
+        val bannerImg: Element? = doc.selectFirst(".filmbanner img")
+        val poster = (if (bannerImg != null) posterOf(bannerImg) else null)
             ?: ld?.optString("image")?.takeIf { it.isNotBlank() }?.let { abs(it) }
             ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
 
