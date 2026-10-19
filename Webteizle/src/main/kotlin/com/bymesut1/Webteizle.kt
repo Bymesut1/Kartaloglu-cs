@@ -558,22 +558,44 @@ class Webteizle : MainAPI() {
         return null
     }
 
-    // Cevap player.js ile geliyorsa: dosyanın öznitelikleri nasıl okuduğunu hata ayıklama satırlarına yazar
-    private suspend fun analyzePlayerJs(txt: String) {
-        if (playerJsDone) return
+    // player.js içindeki vidmoly(id, div) gibi fonksiyonların oluşturduğu iframe adres öneklerini okur
+    @Volatile private var playerMap: Map<String, String>? = null
+
+    private suspend fun loadPlayerMap(txt: String) {
+        if (playerMap != null) return
         val src = Regex("""<script[^>]+src=["']([^"']*player[^"']*)["']""", RegexOption.IGNORE_CASE)
             .find(txt)?.groupValues?.get(1) ?: return
-        playerJsDone = true
-        val js = try { get(abs(src)).text } catch (e: Exception) { d("player.js hata ${e.javaClass.simpleName}"); return }
-        d("player.js uzunluk=${js.length}")
-        var n = 0
-        for (k in listOf("getAttribute", "attr(", "dataset", "atob", "fromCharCode", "iframe", "ajax", "post(")) {
-            val i = js.indexOf(k)
-            if (i >= 0 && n < 5) {
-                d("pjs[$k]: " + js.substring(maxOf(0, i - 80), minOf(js.length, i + 170)).replace(Regex("""\s+"""), " "))
-                n++
-            }
+        val js = try {
+            get(abs(src)).text
+        } catch (e: Exception) {
+            d("player.js hata ${e.javaClass.simpleName}")
+            playerMap = emptyMap()
+            return
         }
+        val map = HashMap<String, String>()
+        val fns = Regex("""function\s+(\w+)\s*\(\s*id\s*,\s*div\s*\)""").findAll(js).toList()
+        for ((i, m) in fns.withIndex()) {
+            val end = if (i + 1 < fns.size) fns[i + 1].range.first else js.length
+            val body = js.substring(m.range.last, end)
+            val pre = Regex("""src=\\?["']([^"']*)["']\s*\+\s*id""").find(body)?.groupValues?.get(1)
+            if (pre != null) map[m.groupValues[1].lowercase()] = pre
+        }
+        playerMap = map
+        d("player.js uzunluk=${js.length} harita=$map")
+    }
+
+    // vidmoly('58b4n33oez93','rv1') gibi satırdan oynatıcı adresi üretir
+    private fun embedFromFn(kind: String, id: String): String? {
+        val direct = when {
+            kind.contains("vidmoly") -> "https://vidmoly.biz/embed-$id.html"
+            kind.startsWith("ok") -> "https://ok.ru/videoembed/$id"
+            kind.contains("pixel") -> "https://pixeldrain.com/u/$id"
+            kind.contains("moon") || kind.contains("byse") -> "https://bysezoxexe.com/e/$id"
+            else -> null
+        }
+        val proxy = playerMap?.get(kind)?.let { abs(it + id) }
+        if (direct == null && proxy == null) return null
+        return (direct ?: "") + (if (proxy != null) "#wt=$proxy" else "")
     }
 
     // Reklam/captcha sarmalayıcısı: adresin içindeki gerçek oynatıcı adresini çıkarır
@@ -593,6 +615,13 @@ class Webteizle : MainAPI() {
         for (ep in embedEndpoints.orEmpty()) {
             for ((fi, form) in forms.distinct().withIndex()) {
                 val txt = postRl(mainUrl + ep, form, referer)
+                loadPlayerMap(txt)
+                val fm = Regex("""<script>\s*(\w+)\(\s*'([^']+)'""").find(txt)
+                if (fm != null) {
+                    val r = embedFromFn(fm.groupValues[1].lowercase(), fm.groupValues[2])
+                    if (r != null) return r
+                    d("fonksiyon bilinmiyor: ${fm.groupValues[1]}")
+                }
                 val e = embedOf(txt) ?: decodeDivEmbed(txt)
                 if (e != null && !e.contains("recaptcha", true)) return e
                 if (e != null) {
@@ -600,7 +629,6 @@ class Webteizle : MainAPI() {
                     return e
                 }
                 d("embed boş ep=${ep.substringAfterLast('/')} form=$fi yanıt='${txt.replace(Regex("""\s+"""), " ").take(500)}'")
-                analyzePlayerJs(txt)
             }
         }
         return null
@@ -862,8 +890,56 @@ class Webteizle : MainAPI() {
         return tmp.isNotEmpty()
     }
 
-    // Bir oynatıcı adresini video bağlantısına çevirir
+    // Sitenin kendi oynatıcı sayfası (/player/...): içinde .m3u8 ya da iç iframe aranır
+    private suspend fun extractProxy(
+        url: String,
+        label: String,
+        depth: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (depth > 2) return false
+        val html = try {
+            app.get(url, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 15L).text
+        } catch (e: Exception) {
+            d("proxy hata ${e.javaClass.simpleName}")
+            return false
+        }
+        d("proxy ${url.takeLast(40)} uzunluk=${html.length} '${html.replace(Regex("""\s+"""), " ").take(300)}'")
+        val clean = html.replace("\\/", "/")
+        val m3u8 = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(clean)?.groupValues?.get(1)
+            ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(clean)?.groupValues?.get(1)
+        if (!m3u8.isNullOrBlank()) {
+            emitHls(m3u8.replace("&amp;", "&"), label, "Webteizle", originOf(url), callback)
+            return true
+        }
+        val inner = reIframe.find(clean)?.groupValues?.get(1) ?: return false
+        val fu = when {
+            inner.startsWith("//") -> "https:$inner"
+            inner.startsWith("/") -> originOf(url) + inner
+            else -> inner
+        }
+        if (fu == url || fu.contains("recaptcha", true)) return false
+        return if (fu.startsWith(mainUrl + "/player/")) extractProxy(fu, label, depth + 1, subtitleCallback, callback)
+        else emitEmbed(fu, "", label, subtitleCallback, callback)
+    }
+
+    // "adres#wt=proxyAdres": önce doğrudan adres, olmazsa sitenin kendi oynatıcı sayfası denenir
     private suspend fun emitEmbed(
+        embed0: String,
+        nm: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val parts = embed0.split("#wt=")
+        if (parts[0].isNotBlank() && emitEmbed0(parts[0], nm, label, subtitleCallback, callback)) return true
+        if (parts.size > 1) return extractProxy(parts[1], label, 0, subtitleCallback, callback)
+        return false
+    }
+
+    // Bir oynatıcı adresini video bağlantısına çevirir
+    private suspend fun emitEmbed0(
         embed0: String,
         nm: String,
         label: String,
