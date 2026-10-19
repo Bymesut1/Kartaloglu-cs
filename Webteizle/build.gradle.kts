@@ -1,9 +1,14 @@
 // Sürüm numarası: her güncellemede 1 artır (artmazsa güncelleme sayılmaz)
-version = 2
+version = 1
 
 android {
-    namespace = "com.bymesut1.Webteizle"
+    namespace = "com.bymesut1"
 }
+
+cloudstream {
+    description = "Webteizle: Türkçe dublaj ve altyazılı film izle (Filemoon, Vidmoly)"
+    authors = listOf("Bymesut1")
+
     /**
      * Durum:
      * 0: Çalışmıyor
