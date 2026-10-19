@@ -1002,12 +1002,20 @@ class HDFilmCehennemi : MainAPI() {
         val trFound = java.util.concurrent.atomic.AtomicBoolean(false)
         val forcedRe = Regex("forced|zorunlu", IC)
 
+        // Türkçe adaylar en sonda cümle (altyazı satırı) sayısına göre elenir:
+        // "forced" gibi yalnızca tabela/yabancı yazı içeren kısa dosyalar atılır, tam altyazı "Türkçe" olur
+        val trCands = Collections.synchronizedList(ArrayList<String>())
+
         fun pushSub(label: String, url: String) {
             if (seenSub.add(url)) {
+                if (label == "Türkçe") {
+                    trCands.add(url)
+                    trFound.set(true)
+                    return
+                }
                 val n = labelCount.merge(label, 1) { a, b -> a + b } ?: 1
                 val shown = if (n <= 1) label else "$label $n"
                 subtitleCallback.invoke(SubtitleFile(shown, url))
-                if (label == "Türkçe") trFound.set(true)
             }
         }
 
@@ -1174,6 +1182,44 @@ class HDFilmCehennemi : MainAPI() {
                 } catch (e: Exception) {
                 }
                 if (trFound.get()) break
+            }
+        }
+
+        // 6) Türkçe adayları değerlendir: en dolu dosya "Türkçe", çok kısa olanlar (yalnızca tabela/forced) elenir
+        run {
+            val cands = trCands.toList()
+            if (cands.isNotEmpty()) {
+                val scored = cands.amap { u ->
+                    var cnt = -1
+                    for (rf in listOf(pageUrl, siteBase() + "/")) {
+                        val r: NiceResponse? = try {
+                            app.get(u, headers = embedHeaders(rf), timeout = 8L)
+                        } catch (e: Exception) {
+                            null
+                        }
+                        if (r != null && r.code == 200) {
+                            val c = Regex("-->").findAll(r.text).count()
+                            if (c > 0) {
+                                cnt = c
+                                break
+                            }
+                        }
+                    }
+                    Pair(u, cnt)
+                }
+                val okScored = scored.filter { it.second > 0 }
+                val chosen: List<String> = if (okScored.isNotEmpty()) {
+                    val mx = okScored.maxOf { it.second }
+                    // Çok kısa (50 satırdan az) ya da en doluya göre %40'ın altındaki dosyalar
+                    // "forced" (yalnızca tabela / yabancı yazı) sayılır ve tek başına bile olsa verilmez
+                    okScored.filter { it.second >= 50 && it.second * 10 >= mx * 4 }
+                        .sortedByDescending { it.second }
+                        .map { it.first }
+                } else cands
+                log("tr adaylar=${scored.map { it.second }} secilen=${chosen.size}")
+                chosen.forEachIndexed { i, u ->
+                    subtitleCallback.invoke(SubtitleFile(if (i == 0) "Türkçe" else "Türkçe ${i + 1}", u))
+                }
             }
         }
 
