@@ -188,12 +188,8 @@ class Filmmakinesi : MainAPI() {
         val base = request.data.trimEnd('/') + "/"
         val url = if (page <= 1) base else "${base}sayfa/$page/"
         val list = fetchList(url)
-        if (list.isEmpty()) {
-            // Geçici teşhis satırı: boş kalma nedenini ekranda gösterir (sorun çözülünce silinebilir)
-            val info = newMovieSearchResponse("⚠ Liste boş: $lastInfo", url, TvType.Movie)
-            return newHomePageResponse(request.name, listOf(info), false)
-        }
-        return newHomePageResponse(request.name, list, true)
+        // Liste boşsa ekranda hata kartı göstermeyiz; neden yalnızca logcat'e yazılır (fetchList içinde)
+        return newHomePageResponse(request.name, list, list.isNotEmpty())
     }
 
     // ---------------- Arama ----------------
