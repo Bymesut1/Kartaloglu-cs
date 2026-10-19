@@ -1,7 +1,9 @@
 package com.bymesut1
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
@@ -12,6 +14,7 @@ import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Collections
+import java.util.concurrent.Semaphore
 import kotlin.math.abs
 
 private data class SiteItem(
@@ -34,13 +37,135 @@ class HDFilmCehennemi : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // ---------------- Cloudflare çerezi (kalıcı) ----------------
+    // Site bazen Cloudflare doğrulaması (403/503) istiyor; WebView ile çözüp çerezi diske kaydeder.
+    // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
+    // bu yüzden 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
+    @Volatile
+    private var cfKiller = CloudflareKiller()
+    private val cfLock = Semaphore(1)
+    @Volatile
+    private var cfWarm = false
+
+    // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
+    // Her eklentinin dosya adı farklı olmalı (aynı klasörü paylaşıyorlar).
+    private val cfFile by lazy {
+        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "hdfilmcehennemi_cf.txt")
+    }
+    private val cfMaxAgeMs = 12L * 60 * 60 * 1000 // bundan eski kayıt kullanılmaz, yeniden çözülür
+    @Volatile
+    private var cfSavedSig = ""
+
+    private fun log(msg: String) {
+        try {
+            Log.d("HDFilmCehennemi", msg)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun cfRestore() {
+        try {
+            if (!cfFile.exists()) return
+            val lines = cfFile.readLines()
+            val ts = lines.firstOrNull()?.trim()?.toLongOrNull() ?: return
+            if (System.currentTimeMillis() - ts > cfMaxAgeMs) {
+                cfFile.delete()
+                return
+            }
+            var n = 0
+            for (ln in lines.drop(1)) {
+                val tab = ln.indexOf('\t')
+                if (tab <= 0) continue
+                val host = ln.substring(0, tab)
+                val map = LinkedHashMap<String, String>()
+                for (p in ln.substring(tab + 1).split(";")) {
+                    val i = p.indexOf('=')
+                    if (i > 0) map[p.substring(0, i).trim()] = p.substring(i + 1).trim()
+                }
+                if (map.isNotEmpty()) {
+                    cfKiller.savedCookies[host] = map
+                    n++
+                }
+            }
+            if (n > 0) {
+                cfWarm = true
+                cfSavedSig = lines.drop(1).joinToString("\n")
+                log("CF çerez diskten yüklendi host=$n")
+            }
+        } catch (e: Throwable) {
+            log("CF restore hata ${e.message?.take(60)}")
+        }
+    }
+
+    private fun cfSave() {
+        try {
+            val entries = cfKiller.savedCookies.entries.toList().filter { it.value.isNotEmpty() }
+            if (entries.isEmpty()) return
+            val body = entries.joinToString("\n") { en ->
+                en.key + "\t" + en.value.entries.joinToString(";") { "${it.key}=${it.value}" }
+            }
+            if (body == cfSavedSig) return // değişmediyse zaman damgasını yenileme
+            cfSavedSig = body
+            cfFile.writeText("${System.currentTimeMillis()}\n$body")
+            log("CF çerez diske kaydedildi")
+        } catch (e: Throwable) {
+            log("CF save hata ${e.message?.take(60)}")
+        }
+    }
+
+    private fun cfClear() {
+        try {
+            cfSavedSig = ""
+            if (cfFile.exists()) cfFile.delete()
+        } catch (_: Throwable) {
+        }
+    }
+
+    // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
+    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        val k = cfKiller
+        var r = if (cfWarm) {
+            app.get(url, headers = headers, interceptor = k, timeout = timeout)
+        } else {
+            cfLock.acquire()
+            try {
+                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+            } finally {
+                cfLock.release()
+            }
+        }
+        if (r.code == 403 || r.code == 503) {
+            log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
+            cfLock.acquire()
+            try {
+                if (cfKiller === k) {
+                    cfKiller = CloudflareKiller()
+                    cfWarm = false
+                    cfClear()
+                }
+                r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+            } finally {
+                cfLock.release()
+            }
+        }
+        if (r.code in 200..299) {
+            cfWarm = true
+            cfSave()
+        }
+        return r
+    }
+
+    init {
+        cfRestore()
+    }
+
     // ---------------- Ayarlar ----------------
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbSite = "https://www.themoviedb.org"
     private val imgBase = "https://image.tmdb.org/t/p"
     private val hosts = listOf("https://hdfilmcehennemi.nl", "https://www.hdfilmcehennemi.nl")
-    private val showSubbed = false          // true: "Altyazılı" oynatıcılar da eklensin
+    private val showSubbed = false          // true: "Altyazılı" oynatıcılar her zaman eklensin (false: yalnızca dual yoksa / çalışmazsa)
     private val maxPlayers = 4              // en fazla kaç oynatıcı (Close, Rapid ...)
     private val subLangs = listOf("tr", "en")   // gömülü altyazı dilleri
     private val uaMobile = "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
@@ -91,6 +216,30 @@ class HDFilmCehennemi : MainAPI() {
         }
         posterCache[key] = found ?: ""
         return found
+    }
+
+    // Sitede konu yazılmamışsa ("Konu Bulunamadı") TMDB'den Türkçe özet al
+    private suspend fun tmdbOverview(title: String, year: Int?, isTv: Boolean): String? {
+        try {
+            val parts = (title.split(Regex("""\s+[-–—]\s+""")) + title)
+                .map { it.trim() }.filter { it.length >= 2 }.distinct()
+            val ep = if (isTv) "tv" else "movie"
+            for (q0 in parts) {
+                val q = URLEncoder.encode(q0, "UTF-8")
+                val yp = if (year != null) (if (isTv) "&first_air_date_year=$year" else "&year=$year") else ""
+                val res = app.get("$tmdbApi/search/$ep?api_key=$tmdbKey&language=tr-TR&query=$q$yp")
+                    .parsedSafe<TmdbList>()?.results.orEmpty().filter { !it.overview.isNullOrBlank() }
+                val want = Decoder.norm(q0)
+                val hit = res.firstOrNull { r ->
+                    listOf(r.title, r.name, r.original_title, r.original_name)
+                        .any { n -> Decoder.norm(n ?: "") == want }
+                } ?: (if (year != null) res.firstOrNull() else null)
+                val ov = hit?.overview
+                if (!ov.isNullOrBlank()) return ov.trim()
+            }
+        } catch (e: Exception) {
+        }
+        return null
     }
 
     private suspend fun toSearchResponseHi(item: SiteItem): SearchResponse {
@@ -197,16 +346,19 @@ class HDFilmCehennemi : MainAPI() {
         val title: String = cleanSiteTitle(rawTitle)
         if (title.isBlank()) return null
         val sitePoster: String? = doc.selectFirst("meta[property=og:image]")?.attr("content")?.ifBlank { null }
-        val sitePlot: String? = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
+        val sitePlotRaw: String? = doc.selectFirst("meta[property=og:description]")?.attr("content")?.ifBlank { null }
+        // Sitede konu yoksa "Konu Bulunamadı" yazıyor; onu yok say
+        val sitePlot: String? = sitePlotRaw?.takeUnless { Regex("""bulunamad""", IC).containsMatchIn(it) }
         val yearTxt: String? = doc.selectFirst("[class*=year]")?.text()
         val year: Int? = Regex("""\((19|20)\d{2}\)""").find(rawTitle)?.value?.trim('(', ')')?.toIntOrNull()
             ?: yearTxt?.let { Regex("""(19|20)\d{2}""").find(it)?.value }?.toIntOrNull()
         val poster: String? = tmdbPoster(title, year, path.startsWith("/dizi/")) ?: upscale(sitePoster)
 
         if (!path.startsWith("/dizi/")) {
+            val moviePlot: String? = sitePlot ?: tmdbOverview(title, year, false)
             return newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
-                this.plot = sitePlot
+                this.plot = moviePlot
                 this.year = year
             }
         }
@@ -357,6 +509,22 @@ class HDFilmCehennemi : MainAPI() {
     }
 
     private suspend fun siteGet(path: String, extra: Map<String, String> = emptyMap()): NiceResponse? {
+        // 1) Cloudflare çerezi hazırsa (diskten yüklenmiş / daha önce çözülmüş) önce çözücüyle dene;
+        //    düz istek 403 verecekse boşa beklemeyelim
+        if (cfWarm) {
+            val g = good ?: Pair(hosts[0], false)
+            val r: NiceResponse? = try {
+                cfGet(g.first + path, siteHeaders(g.first, g.second, extra), 15L)
+            } catch (e: Exception) {
+                null
+            }
+            if (!denied(r)) {
+                good = g
+                return r
+            }
+        }
+
+        // 2) Düz istekler (adres + UA kombinasyonları)
         val tries = ArrayList<Pair<String, Boolean>>()
         good?.let { tries.add(it) }
         hosts.forEach { h ->
@@ -365,6 +533,7 @@ class HDFilmCehennemi : MainAPI() {
                 if (p != good) tries.add(p)
             }
         }
+        var cfSeen = false
         for ((host, desk) in tries) {
             val r: NiceResponse? = try {
                 app.get(host + path, headers = siteHeaders(host, desk, extra), timeout = 10L)
@@ -374,6 +543,30 @@ class HDFilmCehennemi : MainAPI() {
             if (!denied(r)) {
                 good = Pair(host, desk)
                 return r
+            }
+            // Cloudflare engeli: diğer kombinasyonları denemek yerine çözücüye geç
+            if (r != null && (r.code == 403 || r.code == 503) &&
+                r.headers["server"].orEmpty().contains("cloudflare", true)
+            ) {
+                cfSeen = true
+                break
+            }
+        }
+
+        // 3) Cloudflare engeli varsa WebView çözücü ile (çerez diske kaydedilir)
+        if (cfSeen) {
+            val cands = listOf(good ?: Pair(hosts[0], false), Pair(hosts[1], false)).distinct()
+            for ((host, desk) in cands) {
+                val r: NiceResponse? = try {
+                    cfGet(host + path, siteHeaders(host, desk, extra), 25L)
+                } catch (e: Exception) {
+                    null
+                }
+                log("CF çözücü ${host.take(40)} kod=${r?.code}")
+                if (!denied(r)) {
+                    good = Pair(host, desk)
+                    return r
+                }
             }
         }
         return null
@@ -551,13 +744,29 @@ class HDFilmCehennemi : MainAPI() {
     // ---------------- Film / bölüm sayfası ----------------
     private fun parseAlts(html: String): List<Alt> {
         val out = ArrayList<Alt>()
-        Jsoup.parse(html).select("div.alternative-links").forEach { div ->
+        val seen = HashSet<String>()
+        val doc = Jsoup.parse(html)
+        doc.select("div.alternative-links").forEach { div ->
             val lang = div.attr("data-lang")
             div.select("button[data-video]").forEach { b ->
                 val id = b.attr("data-video")
-                if (id.isBlank()) return@forEach
+                if (id.isBlank() || !seen.add(id)) return@forEach
                 out.add(Alt(id, b.text().trim().ifBlank { "Player" }, lang.ifBlank { b.attr("data-lang") }))
             }
+        }
+        if (out.isNotEmpty()) return out
+
+        // Yedek: kapsayıcı sınıf adı değişirse data-video taşıyan her öğeyi al, dili üst öğelerden bul
+        doc.select("[data-video]").forEach { b ->
+            val id = b.attr("data-video")
+            if (id.isBlank() || !seen.add(id)) return@forEach
+            var lg = b.attr("data-lang")
+            var p = b.parent()
+            while (lg.isBlank() && p != null) {
+                lg = p.attr("data-lang")
+                p = p.parent()
+            }
+            out.add(Alt(id, b.text().trim().ifBlank { "Player" }, lg))
         }
         return out
     }
@@ -611,13 +820,24 @@ class HDFilmCehennemi : MainAPI() {
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): EmbedResult? {
         val refs = listOf(siteBase() + "/", pageUrl).distinct()
         val variants = if (depth > 0) listOf(embedUrl) else embedVariants(embedUrl)
+        var cfTried = false // Cloudflare çözücüyü bu çağrıda en çok bir kez dene (gereksiz bekleme olmasın)
 
         for (v in variants) {
             for (rf in refs) {
-                val r: NiceResponse? = try {
+                var r: NiceResponse? = try {
                     app.get(v, headers = embedHeaders(rf), timeout = 10L)
                 } catch (e: Exception) {
                     null
+                }
+                if (r != null && (r.code == 403 || r.code == 503) && !cfTried &&
+                    r.headers["server"].orEmpty().contains("cloudflare", true)
+                ) {
+                    cfTried = true
+                    r = try {
+                        cfGet(v, embedHeaders(rf), 20L)
+                    } catch (e: Exception) {
+                        r
+                    }
                 }
                 if (r == null || r.code != 200) continue
                 val html = r.text
@@ -716,137 +936,190 @@ class HDFilmCehennemi : MainAPI() {
             val link = LinkData.decode(data) ?: return false
             findPage(link) ?: return false
         }
-        val html = siteGet(pathOf(pageUrl))?.text ?: return false
+        val html = siteGet(pathOf(pageUrl))?.text
+        if (html == null) {
+            log("sayfa alınamadı $pageUrl")
+            return false
+        }
         val ifr = pageIframe(html)
 
-        val players = ArrayList<Player>()
-        parseAlts(html).forEach { a ->
-            if (a.lang == "dual" || a.lang.isBlank() || (showSubbed && a.lang.isNotBlank())) {
-                players.add(Player(a.name, a.lang.ifBlank { "dual" }, a.id, null))
-            }
-        }
-        if (players.isEmpty() && ifr.isNotBlank()) players.add(Player("Player", "dual", null, ifr))
-        val jobs = players.take(maxPlayers)
-        if (jobs.isEmpty()) return false
+        val all = parseAlts(html).map { a -> Player(a.name, a.lang.ifBlank { "dual" }, a.id, null) }
+        val dual = all.filter { it.lang == "dual" }
+        val subbed = all.filter { it.lang != "dual" }
+        log("sayfa len=${html.length} dual=${dual.size} altyazili=${subbed.size} iframe=${ifr.isNotBlank()} ${pageUrl.take(80)}")
 
         val provider = this.name
         val seenEmb = Collections.synchronizedSet(HashSet<String>())
         val seenUrl = Collections.synchronizedSet(HashSet<String>())
         val seenSub = Collections.synchronizedSet(HashSet<String>())
         val gotExt = java.util.concurrent.atomic.AtomicBoolean(false)
+        val trFound = java.util.concurrent.atomic.AtomicBoolean(false)
+        val forcedRe = Regex("forced|zorunlu", IC)
 
-        jobs.amap { job ->
-            try {
-                val embedUrl = job.embed ?: run {
-                    val rr = siteGet(
-                        "/video/${job.id}/",
-                        mapOf(
-                            "Accept" to "application/json, text/plain, */*",
-                            "X-Requested-With" to "fetch",
-                            "Referer" to pageUrl
-                        )
-                    )
-                    iframeFromAjax(rr?.text.orEmpty()).ifBlank { if (job === jobs[0]) ifr else "" }
-                }
-                if (embedUrl.isBlank() || !seenEmb.add(embedUrl)) return@amap
-
-                val res = resolveEmbed(embedUrl, pageUrl)
-                if (res == null) {
-                    // Yedek: hazır çıkarıcıları dene (ör. Close)
-                    try {
-                        if (loadExtractor(embedUrl, pageUrl, subtitleCallback, callback)) gotExt.set(true)
-                    } catch (e: Exception) {
-                    }
-                    return@amap
-                }
-                val sets = streamHeaderSets(res.base)
-
-                // Altyazılar (oynatıcı sayfasından)
-                res.subs
-                    .filter { s ->
-                        (s.lang in subLangs || s.lang == "xx") &&
-                            !Regex("forced|zorunlu", IC).containsMatchIn(s.label + " " + s.url)
-                    }
-                    .forEach { s ->
-                        if (seenSub.add(s.url)) {
-                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { "Altyazı" }
-                            subtitleCallback.invoke(SubtitleFile(nameS, s.url))
-                        }
-                    }
-
-                // Rapid: sayfada altyazı bulunamadıysa akış adresinden türet
-                if (res.subs.none { it.lang == "tr" }) {
-                    for (su0 in res.urls) {
-                        val mm = Regex("""/hls\d?/\d+/(\d+)/([A-Za-z0-9]+)_""").find(su0) ?: continue
-                        val su = siteBase() + "/srt/" + mm.groupValues[1] + "/" + mm.groupValues[2] + "_Turkish.vtt/"
-                        val chk: NiceResponse? = try {
-                            app.get(su, headers = embedHeaders(pageUrl), timeout = 6L)
-                        } catch (e: Exception) {
-                            null
-                        }
-                        if (chk != null && chk.code == 200 && chk.text.trimStart().startsWith("WEBVTT") && seenSub.add(su)) {
-                            subtitleCallback.invoke(SubtitleFile("Türkçe", su))
-                        }
-                        break
-                    }
-                }
-
-                // Akışlar
-                val cands = res.urls
-                    .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
-                    .take(6)
-                val verified = cands.amap { u -> u to verifyUrl(u, sets) }
-
-                // Akışın içine gömülü (HLS) altyazı kanalları
-                verified.forEach { (mu, mv) ->
-                    if (mv.ok) {
-                        embeddedSubs(mv.text, mu).forEach { es ->
-                            if (seenSub.add(es.url)) subtitleCallback.invoke(SubtitleFile(es.label, es.url))
-                        }
-                    }
-                }
-                var okList = verified.filter { it.second.ok }
-                if (okList.isEmpty()) {
-                    // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
-                    val st = verified.filter { res.strict.contains(it.first) }
-                    val pick = if (st.isNotEmpty()) st.take(1) else emptyList<Pair<String, Verified>>()
-                    okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
-                }
-
-                val nm = when {
-                    job.name.contains("rapid", true) -> "Rapid"
-                    job.name.contains("close", true) -> "Close"
-                    else -> job.name
-                }
-                val lg = if (job.lang == "dual") "DUAL" else if (job.lang.isNotBlank()) "Altyazılı" else "TR"
-
-                okList.forEachIndexed { i, pair ->
-                    val u = pair.first
-                    val v = pair.second
-                    if (!seenUrl.add(u)) return@forEachIndexed
-                    val label = "$lg $nm" + (if (i > 0) " #${i + 1}" else "")
-                    val linkType = when {
-                        u.contains(".mp4", true) && !u.contains("master", true) -> ExtractorLinkType.VIDEO
-                        u.contains(".m3u8", true) || u.contains("master", true) || u.contains("/hls", true) -> ExtractorLinkType.M3U8
-                        else -> ExtractorLinkType.VIDEO
-                    }
-                    callback.invoke(
-                        newExtractorLink(
-                            source = provider,
-                            name = "$provider - $label",
-                            url = u,
-                            type = linkType
-                        ) {
-                            this.referer = v.headers["Referer"] ?: (siteBase() + "/")
-                            this.quality = Qualities.Unknown.value
-                            this.headers = v.headers
-                        }
-                    )
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+        fun pushSub(label: String, url: String) {
+            if (seenSub.add(url)) {
+                subtitleCallback.invoke(SubtitleFile(label, url))
+                if (label == "Türkçe") trFound.set(true)
             }
         }
+
+        // withVideo=false: yalnızca altyazı topla (akış ekleme)
+        suspend fun runJobs(list: List<Player>, withVideo: Boolean) {
+            list.take(maxPlayers).amap { job ->
+                try {
+                    val embedUrl = job.embed ?: run {
+                        val rr = siteGet(
+                            "/video/${job.id}/",
+                            mapOf(
+                                "Accept" to "application/json, text/plain, */*",
+                                "X-Requested-With" to "fetch",
+                                "Referer" to pageUrl
+                            )
+                        )
+                        iframeFromAjax(rr?.text.orEmpty()).ifBlank { if (job === list[0]) ifr else "" }
+                    }
+                    if (embedUrl.isBlank() || !seenEmb.add(embedUrl)) return@amap
+                    log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
+
+                    val res = resolveEmbed(embedUrl, pageUrl)
+                    if (res == null) {
+                        log("P ${job.name} çözülemedi")
+                        // Yedek: hazır çıkarıcıları dene (ör. Close)
+                        if (withVideo) {
+                            try {
+                                if (loadExtractor(embedUrl, pageUrl, subtitleCallback, callback)) gotExt.set(true)
+                            } catch (e: Exception) {
+                            }
+                        }
+                        return@amap
+                    }
+                    log("P ${job.name} akis=${res.urls.size} altyazi=${res.subs.size}")
+                    val sets = streamHeaderSets(res.base)
+
+                    // Altyazılar (oynatıcı sayfasından)
+                    res.subs
+                        .filter { s ->
+                            (s.lang in subLangs || s.lang == "xx") &&
+                                !forcedRe.containsMatchIn(s.label + " " + s.url)
+                        }
+                        .forEach { s ->
+                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { "Altyazı" }
+                            pushSub(nameS, s.url)
+                        }
+
+                    // Rapid: sayfada Türkçe altyazı bulunamadıysa akış adresinden türet
+                    if (res.subs.none { it.lang == "tr" }) {
+                        for (su0 in res.urls) {
+                            val mm = Regex("""/hls\d?/\d+/(\d+)/([A-Za-z0-9]+)[_/.]""").find(su0) ?: continue
+                            val no = mm.groupValues[1]
+                            val code = mm.groupValues[2]
+                            val want = ArrayList<Pair<String, String>>()
+                            want.add("Turkish" to "Türkçe")
+                            if ("en" in subLangs) want.add("English" to "English")
+                            for ((fn, lbl) in want) {
+                                val su = siteBase() + "/srt/" + no + "/" + code + "_" + fn + ".vtt/"
+                                if (seenSub.contains(su)) continue
+                                var chkCode = -1
+                                var chkOk = false
+                                for (rf in listOf(pageUrl, siteBase() + "/")) {
+                                    val chk: NiceResponse? = try {
+                                        app.get(su, headers = embedHeaders(rf), timeout = 6L)
+                                    } catch (e: Exception) {
+                                        null
+                                    }
+                                    if (chk != null) {
+                                        chkCode = chk.code
+                                        if (chk.code == 200 && chk.text.take(300).contains("WEBVTT")) {
+                                            chkOk = true
+                                            break
+                                        }
+                                    }
+                                }
+                                // Doğrulanamayan (engellenen / ağ hatası) Türkçe adresi de ekle; 404 ise ekleme
+                                if (chkOk || (fn == "Turkish" && (chkCode == 403 || chkCode == 503 || chkCode == -1))) {
+                                    pushSub(lbl, su)
+                                }
+                            }
+                            break
+                        }
+                    }
+
+                    if (!withVideo) return@amap
+
+                    // Akışlar
+                    val cands = res.urls
+                        .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
+                        .take(6)
+                    val verified = cands.amap { u -> u to verifyUrl(u, sets) }
+
+                    // Akışın içine gömülü (HLS) altyazı kanalları
+                    verified.forEach { (mu, mv) ->
+                        if (mv.ok) {
+                            embeddedSubs(mv.text, mu).forEach { es -> pushSub(es.label, es.url) }
+                        }
+                    }
+                    var okList = verified.filter { it.second.ok }
+                    if (okList.isEmpty()) {
+                        // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
+                        val st = verified.filter { res.strict.contains(it.first) }
+                        val pick = if (st.isNotEmpty()) st.take(1) else emptyList<Pair<String, Verified>>()
+                        okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
+                    }
+
+                    val nm = when {
+                        job.name.contains("rapid", true) -> "Rapid"
+                        job.name.contains("close", true) -> "Close"
+                        else -> job.name
+                    }
+                    val lg = if (job.lang == "dual") "DUAL" else if (job.lang.isNotBlank()) "Altyazılı" else "TR"
+
+                    okList.forEachIndexed { i, pair ->
+                        val u = pair.first
+                        val v = pair.second
+                        if (!seenUrl.add(u)) return@forEachIndexed
+                        val label = "$lg $nm" + (if (i > 0) " #${i + 1}" else "")
+                        val linkType = when {
+                            u.contains(".mp4", true) && !u.contains("master", true) -> ExtractorLinkType.VIDEO
+                            u.contains(".m3u8", true) || u.contains("master", true) || u.contains("/hls", true) -> ExtractorLinkType.M3U8
+                            else -> ExtractorLinkType.VIDEO
+                        }
+                        callback.invoke(
+                            newExtractorLink(
+                                source = provider,
+                                name = "$provider - $label",
+                                url = u,
+                                type = linkType
+                            ) {
+                                this.referer = v.headers["Referer"] ?: (siteBase() + "/")
+                                this.quality = Qualities.Unknown.value
+                                this.headers = v.headers
+                            }
+                        )
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+
+        // 1) Önce dual (Türkçe dublaj) oynatıcılar; hiç yoksa altyazılı olanlar
+        val first = if (showSubbed) all else dual
+        val firstList = if (first.isNotEmpty()) first else subbed
+        runJobs(firstList, true)
+
+        // 2) Hiç akış çıkmadıysa kalan altyazılı oynatıcıları dene (yalnızca altyazılı yayınlanan filmler için)
+        val rest = subbed.filter { s -> firstList.none { it.id == s.id } }
+        if (seenUrl.isEmpty() && !gotExt.get()) runJobs(rest, true)
+
+        // 3) Hâlâ yoksa sayfadaki doğrudan iframe
+        if (seenUrl.isEmpty() && !gotExt.get() && ifr.isNotBlank()) {
+            runJobs(listOf(Player("Player", "dual", null, ifr)), true)
+        }
+
+        // 4) Türkçe altyazı hiç bulunamadıysa altyazılı oynatıcılardan yalnızca altyazıyı topla
+        if (!trFound.get() && rest.isNotEmpty()) runJobs(rest, false)
+
+        log("bitti akis=${seenUrl.size} ext=${gotExt.get()} altyazi=${seenSub.size} tr=${trFound.get()}")
         return seenUrl.isNotEmpty() || gotExt.get()
     }
 
@@ -939,7 +1212,8 @@ data class TmdbItem(
     val release_date: String? = null,
     val first_air_date: String? = null,
     val original_name: String? = null,
-    val original_title: String? = null
+    val original_title: String? = null,
+    val overview: String? = null
 )
 
 data class TmdbGenre(val name: String? = null)
