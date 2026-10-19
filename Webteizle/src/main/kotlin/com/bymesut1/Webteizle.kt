@@ -29,8 +29,8 @@ class Webteizle : MainAPI() {
     // Her şey düzelince false yap.
     private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
-    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
-    private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
+    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(900)) }
+    private fun dbgText(): String = dbg.joinToString(" | ").take(4500)
 
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -376,6 +376,9 @@ class Webteizle : MainAPI() {
     // JS'de sabit yazılmış alan değerleri: {filmid:e,dil:t,s:a,b:n,bot:0} -> bot=0
     @Volatile private var altLits: Map<String, String> = emptyMap()
     @Volatile private var altOk: Pair<String, Int>? = null
+    @Volatile private var embedKeys: List<String> = emptyList()
+    @Volatile private var embedLits: Map<String, String> = emptyMap()
+    @Volatile private var playerJsDone = false
 
     private val reIframe = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
     private val reAsset = Regex(""".*\.(js|css|png|jpe?g|gif|svg|ico|woff2?)(\?.*)?$""", RegexOption.IGNORE_CASE)
@@ -415,6 +418,25 @@ class Webteizle : MainAPI() {
                 altLits = lits
             }
             d("alt js: ${seg.take(150)}")
+        }
+        // dataEmbed isteğinin alanları: dataEmbed.asp", {id:e,bot:0,...}
+        val em = Regex("""dataEmbed\w*\.asp["']\s*,\s*\{([^{}]{0,200})\}""").find(all)
+        if (em != null) {
+            val eo = em.groupValues[1]
+            embedKeys = Regex("""([A-Za-z_]\w*)\s*:""").findAll(eo).map { it.groupValues[1] }.toList()
+            val el = HashMap<String, String>()
+            Regex("""([A-Za-z_]\w*)\s*:\s*([^,}]+)""").findAll(eo).forEach { m ->
+                val v = m.groupValues[2].trim()
+                if (Regex("""-?\d+""").matches(v)) {
+                    el[m.groupValues[1]] = v
+                } else if (v.length >= 2 && (v.startsWith("\"") || v.startsWith("'"))) {
+                    el[m.groupValues[1]] = v.substring(1, v.length - 1)
+                }
+            }
+            embedLits = el
+            d("embed js: ${em.value.take(160)}")
+        } else {
+            d("embed js bulunamadı")
         }
         d("alt=$altEndpoints embed=$embedEndpoints alanlar=$altKeys")
     }
@@ -513,12 +535,73 @@ class Webteizle : MainAPI() {
         return emptyList()
     }
 
+    // Cevap <div ...> ile geliyorsa (player.js doldurur): öznitelik değerlerinden adres çıkarmayı dener
+    private fun decodeDivEmbed(txt: String): String? {
+        val doc = org.jsoup.Jsoup.parse(txt)
+        val urlRe = Regex("""https?://[^\s"'<>]+""")
+        for (el in doc.allElements) {
+            for (at in el.attributes()) {
+                val v = at.value.trim()
+                if (v.length < 6 || at.key == "src") continue
+                val cands = ArrayList<String>()
+                cands.add(v)
+                try { cands.add(java.net.URLDecoder.decode(v, "UTF-8")) } catch (e: Exception) { }
+                try { cands.add(String(b64u(v))) } catch (e: Exception) { }
+                try { cands.add(String(b64u(v.reversed()))) } catch (e: Exception) { }
+                try { cands.add(String(b64u(v)).reversed()) } catch (e: Exception) { }
+                for (c in cands) {
+                    val m = urlRe.find(c.replace("\\/", "/")) ?: continue
+                    if (!m.value.contains("webteizle", true) && !m.value.contains("recaptcha", true)) return m.value
+                }
+            }
+        }
+        return null
+    }
+
+    // Cevap player.js ile geliyorsa: dosyanın öznitelikleri nasıl okuduğunu hata ayıklama satırlarına yazar
+    private suspend fun analyzePlayerJs(txt: String) {
+        if (playerJsDone) return
+        val src = Regex("""<script[^>]+src=["']([^"']*player[^"']*)["']""", RegexOption.IGNORE_CASE)
+            .find(txt)?.groupValues?.get(1) ?: return
+        playerJsDone = true
+        val js = try { get(abs(src)).text } catch (e: Exception) { d("player.js hata ${e.javaClass.simpleName}"); return }
+        d("player.js uzunluk=${js.length}")
+        var n = 0
+        for (k in listOf("getAttribute", "attr(", "dataset", "atob", "fromCharCode", "iframe", "ajax", "post(")) {
+            val i = js.indexOf(k)
+            if (i >= 0 && n < 5) {
+                d("pjs[$k]: " + js.substring(maxOf(0, i - 80), minOf(js.length, i + 170)).replace(Regex("""\s+"""), " "))
+                n++
+            }
+        }
+    }
+
+    // Reklam/captcha sarmalayıcısı: adresin içindeki gerçek oynatıcı adresini çıkarır
+    private fun unwrapCaptcha(e: String): String? {
+        val dec = try { java.net.URLDecoder.decode(e, "UTF-8") } catch (x: Exception) { e }
+        return Regex("""https?://[^\s"'<>&]+""").findAll(dec).map { it.value }
+            .firstOrNull { !it.contains("recaptcha", true) && !it.contains("google.com", true) && !it.contains("webteizle", true) }
+    }
+
     private suspend fun fetchEmbed(id: String, referer: String): String? {
+        val forms = ArrayList<Map<String, String>>()
+        if (embedKeys.isNotEmpty()) {
+            forms.add(embedKeys.associateWith { embedLits[it] ?: if (it.lowercase().contains("id")) id else "" })
+        }
+        forms.add(mapOf("id" to id))
+        forms.add(mapOf("id" to id, "bot" to "0"))
         for (ep in embedEndpoints.orEmpty()) {
-            val txt = postRl(mainUrl + ep, mapOf("id" to id), referer)
-            val e = embedOf(txt)
-            if (e != null) return e
-            d("embed boş ep=${ep.substringAfterLast('/')} yanıt='${txt.replace(Regex("""\s+"""), " ").take(60)}'")
+            for ((fi, form) in forms.distinct().withIndex()) {
+                val txt = postRl(mainUrl + ep, form, referer)
+                val e = embedOf(txt) ?: decodeDivEmbed(txt)
+                if (e != null && !e.contains("recaptcha", true)) return e
+                if (e != null) {
+                    d("embed captcha form=$fi ham='${txt.replace(Regex("""\s+"""), " ").take(300)}'")
+                    return e
+                }
+                d("embed boş ep=${ep.substringAfterLast('/')} form=$fi yanıt='${txt.replace(Regex("""\s+"""), " ").take(500)}'")
+                analyzePlayerJs(txt)
+            }
         }
         return null
     }
@@ -813,7 +896,7 @@ class Webteizle : MainAPI() {
     // Hata ayıklama: sebep, kaynak listesinde "DEBUG" satırları olarak görünür (hata ekranı yerine)
     private suspend fun emitDebug(tag: String, callback: (ExtractorLink) -> Unit) {
         if (dbg.isEmpty()) d("kayıt yok")
-        val parts = dbgText().chunked(380).take(4)
+        val parts = dbgText().chunked(380).take(12)
         for ((i, part) in parts.withIndex()) {
             callback(
                 newExtractorLink(
@@ -878,13 +961,14 @@ class Webteizle : MainAPI() {
             // 1) Filemoon ve Vidmoly
             for ((id, nm) in alts.filter { wanted(it.second) }.sortedBy { if (it.second.contains("moly", true)) 1 else 0 }) {
                 if (okMoon && okMoly) break
-                val embed = fetchEmbed(id, pageUrl)
+                var embed = fetchEmbed(id, pageUrl)
+                if (!embed.isNullOrBlank() && embed.contains("recaptcha", true)) {
+                    val un = unwrapCaptcha(embed)
+                    d("dil=$dil id=$id captcha kapısı -> $un")
+                    embed = un
+                }
                 if (embed.isNullOrBlank()) {
                     d("dil=$dil id=$id embed yok")
-                    continue
-                }
-                if (embed.contains("reCAPTCHA", true)) {
-                    d("dil=$dil id=$id captcha kapısı")
                     continue
                 }
                 val isMoly = embed.contains("vidmoly", true)
@@ -901,8 +985,9 @@ class Webteizle : MainAPI() {
             // 2) Yedek: Filemoon / Vidmoly hiç çıkmadıysa diğer kaynaklar
             if (!okMoon && !okMoly) {
                 for ((id, nm) in alts.filter { !wanted(it.second) }.take(4)) {
-                    val embed = fetchEmbed(id, pageUrl)
-                    if (embed.isNullOrBlank() || embed.contains("reCAPTCHA", true) || !seen.add(embed)) continue
+                    var embed = fetchEmbed(id, pageUrl)
+                    if (!embed.isNullOrBlank() && embed.contains("recaptcha", true)) embed = unwrapCaptcha(embed)
+                    if (embed.isNullOrBlank() || !seen.add(embed)) continue
                     val ok = emitEmbed(embed, nm, label, subtitleCallback, callback)
                     d("dil=$dil yedek $nm ${embed.take(40)} -> $ok")
                     if (ok) {
