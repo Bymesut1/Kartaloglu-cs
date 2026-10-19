@@ -31,6 +31,77 @@ class Filmmakinesi : MainAPI() {
     @Volatile
     private var cfWarm = false
 
+    // ---- Kalıcı çerez: eklenti yeniden yüklense / uygulama kapansa da çerez diskte kalır ----
+    // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
+    private val cfFile by lazy {
+        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "filmmakinesi_cf.txt")
+    }
+    private val cfMaxAgeMs = 12L * 60 * 60 * 1000 // bundan eski kayıt kullanılmaz, yeniden çözülür
+    @Volatile
+    private var cfSavedSig = ""
+
+    private fun cfRestore() {
+        try {
+            if (!cfFile.exists()) return
+            val lines = cfFile.readLines()
+            val ts = lines.firstOrNull()?.trim()?.toLongOrNull() ?: return
+            if (System.currentTimeMillis() - ts > cfMaxAgeMs) {
+                cfFile.delete()
+                return
+            }
+            var n = 0
+            for (ln in lines.drop(1)) {
+                val tab = ln.indexOf('\t')
+                if (tab <= 0) continue
+                val host = ln.substring(0, tab)
+                val map = LinkedHashMap<String, String>()
+                for (p in ln.substring(tab + 1).split(";")) {
+                    val i = p.indexOf('=')
+                    if (i > 0) map[p.substring(0, i).trim()] = p.substring(i + 1).trim()
+                }
+                if (map.isNotEmpty()) {
+                    cfKiller.savedCookies[host] = map
+                    n++
+                }
+            }
+            if (n > 0) {
+                cfWarm = true
+                cfSavedSig = lines.drop(1).joinToString("\n")
+                log("CF çerez diskten yüklendi host=$n")
+            }
+        } catch (e: Throwable) {
+            log("CF restore hata ${e.message?.take(60)}")
+        }
+    }
+
+    private fun cfSave() {
+        try {
+            val entries = cfKiller.savedCookies.entries.toList().filter { it.value.isNotEmpty() }
+            if (entries.isEmpty()) return
+            val body = entries.joinToString("\n") { en ->
+                en.key + "\t" + en.value.entries.joinToString(";") { "${it.key}=${it.value}" }
+            }
+            if (body == cfSavedSig) return // değişmediyse zaman damgasını yenileme
+            cfSavedSig = body
+            cfFile.writeText("${System.currentTimeMillis()}\n$body")
+            log("CF çerez diske kaydedildi")
+        } catch (e: Throwable) {
+            log("CF save hata ${e.message?.take(60)}")
+        }
+    }
+
+    private fun cfClear() {
+        try {
+            cfSavedSig = ""
+            if (cfFile.exists()) cfFile.delete()
+        } catch (_: Throwable) {
+        }
+    }
+
+    init {
+        cfRestore()
+    }
+
     // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
     // bu yüzden bir süre sonra hep 403 gelir. 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
@@ -53,13 +124,17 @@ class Filmmakinesi : MainAPI() {
                 if (cfKiller === k) {
                     cfKiller = CloudflareKiller()
                     cfWarm = false
+                    cfClear()
                 }
                 r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
             }
         }
-        if (r.code in 200..299) cfWarm = true
+        if (r.code in 200..299) {
+            cfWarm = true
+            cfSave()
+        }
         return r
     }
 
