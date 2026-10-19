@@ -793,6 +793,25 @@ class Webteizle : MainAPI() {
     // Her dil (Türkçe Dublaj / Türkçe Altyazı) için Filemoon ve Vidmoly ayrı bağlantı olarak verilir.
     // Bu iki kaynak hiç çıkmazsa diğer kaynaklar (Okru vb.) yedek olarak denenir.
 
+    // Hata ayıklama: sebep, kaynak listesinde "DEBUG" satırları olarak görünür (hata ekranı yerine)
+    private suspend fun emitDebug(tag: String, callback: (ExtractorLink) -> Unit) {
+        if (dbg.isEmpty()) d("kayıt yok")
+        val parts = dbgText().chunked(380).take(4)
+        for ((i, part) in parts.withIndex()) {
+            callback(
+                newExtractorLink(
+                    name,
+                    "DEBUG ${i + 1} [$tag] $part",
+                    "https://debug.invalid/$i",
+                    ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -804,7 +823,7 @@ class Webteizle : MainAPI() {
         val slug = reFilm.find(data)?.groupValues?.get(1) ?: data.trimEnd('/').substringAfterLast('/')
         val page = fetchFilmPage(slug)
         if (page == null) {
-            if (debug) throw ErrorLoadingException("Film sayfası açılamadı: " + dbgText())
+            if (debug) { emitDebug("sayfa açılamadı", callback); return true }
             return false
         }
         val pageUrl = page.first
@@ -819,9 +838,9 @@ class Webteizle : MainAPI() {
         var dils = doc.select("#dilsec a[data-dil]").map { it.attr("data-dil") }
             .filter { it == "0" || it == "1" }.distinct()
         if (dils.isEmpty()) dils = listOf("0", "1")
-        d("film=$filmId diller=$dils sayfa=${pageUrl.removePrefix(mainUrl)}")
+        d("film=$filmId diller=$dils sayfa=${pageUrl.removePrefix(mainUrl)} html=${page.third.length} dilsec=${ds != null} attrs=$attrs")
         if (filmId.isBlank()) {
-            if (debug) throw ErrorLoadingException("Film numarası (#dilsec data-id) yok: " + dbgText())
+            if (debug) { emitDebug("#dilsec data-id yok", callback); return true }
             return false
         }
 
@@ -880,26 +899,11 @@ class Webteizle : MainAPI() {
             if (okMoon || okMoly) any = true else missing.add(label)
         }
 
-        // Hata ayıklama: bir dil eksik kalırsa sebebi kaynak listesinde kısa DEBUG satırları olarak gösterilir
-        if (debug && any && missing.isNotEmpty()) {
-            val parts = dbgText().chunked(380).take(3)
-            for ((i, part) in parts.withIndex()) {
-                callback(
-                    newExtractorLink(
-                        name,
-                        "DEBUG ${i + 1} [${missing.joinToString("+")} yok] $part",
-                        "https://debug.invalid/$i",
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-        }
+        // Hata ayıklama: bir dil eksik kalırsa sebebi kaynak listesinde DEBUG satırları olarak gösterilir
+        if (debug && any && missing.isNotEmpty()) emitDebug(missing.joinToString("+") + " yok", callback)
 
         if (!any) {
-            if (debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
+            if (debug) { emitDebug("kaynak yok", callback); return true }
             return false
         }
         return true
