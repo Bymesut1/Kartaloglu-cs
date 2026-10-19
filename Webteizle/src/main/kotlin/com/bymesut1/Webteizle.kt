@@ -36,8 +36,11 @@ class Webteizle : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
     override val mainPage = mainPageOf(
+        "$mainUrl/film-izle/1" to "Son Eklenenler",
         "$mainUrl/yeni-filmler" to "Yeni Filmler",
-        "$mainUrl/trend" to "Trend Filmler",
+        "trend:en-cok-hit-alan:hafta" to "Trend (Bu Hafta)",
+        "trend:en-cok-izlenen:ay" to "En Çok İzlenen (Bu Ay)",
+        "trend:en-favori:tum" to "En Favori (Tüm Zamanlar)",
         "$mainUrl/tr-dublaj-filmler" to "Türkçe Dublaj",
         "$mainUrl/tr-altyazili-filmler" to "Altyazılı Filmler",
         "$mainUrl/tavsiye-filmler" to "Tavsiye Filmler",
@@ -132,7 +135,7 @@ class Webteizle : MainAPI() {
     private val reFilm = Regex("""^(?:https?://[^/]+)?/(?:izle/(?:dublaj|altyazi)|hakkinda)/([^/?#]+)""")
 
     private fun cleanTitle(t: String): String =
-        t.replace(Regex("""\s+izle\b.*$""", RegexOption.IGNORE_CASE), "").trim()
+        t.replace(Regex("""[\s\u00A0]+izle\b.*$""", RegexOption.IGNORE_CASE), "").replace('\u00A0', ' ').trim()
 
     // Listelerde resim "data-src" içinde olabilir (src boş yer tutucu)
     private fun posterOf(img: Element): String? {
@@ -157,6 +160,8 @@ class Webteizle : MainAPI() {
             if (out.containsKey(slug)) continue
             val img = a.selectFirst("img") ?: a.parent()?.selectFirst("img") ?: continue
             val title = listOf(
+                a.parent()?.selectFirst(".filmname")?.text(),
+                a.selectFirst(".filmtitle")?.text(),
                 a.selectFirst(".title")?.text(),
                 a.selectFirst(".header")?.text(),
                 a.selectFirst(".filmname")?.text(),
@@ -177,10 +182,10 @@ class Webteizle : MainAPI() {
 
     private fun learnTemplate(base: String, doc: Document) {
         val a2 = doc.select("a[href]").firstOrNull {
-            it.text().trim() == "2" && Regex("""[?&=/]2/?(?:&.*)?$""").containsMatchIn(it.attr("href"))
+            it.text().trim() == "2" && Regex("""[?&=/]2/?(?:[?&].*)?$""").containsMatchIn(it.attr("href"))
         } ?: return
         val href = abs(a2.attr("href"))
-        val tpl = href.replace(Regex("""(?<=[?&=/])2(?=/?(?:&.*)?$)"""), "{n}")
+        val tpl = href.replace(Regex("""(?<=[?&=/])2(?=/?(?:[?&].*)?$)"""), "{n}")
         if (tpl.contains("{n}")) pageTpl[base] = tpl
     }
 
@@ -188,22 +193,56 @@ class Webteizle : MainAPI() {
         pageTpl[base]?.replace("{n}", page.toString())
             ?: if (base.contains("?")) "$base&p=$page" else "$base?p=$page"
 
+    // Liste boş çıkarsa sebebini görmek için kısa tanı bilgisi
+    private fun diag(code: Int, html: String, doc: Document): String {
+        val links = doc.select("a[href]")
+        val sample = doc.select("#sol a[href], #wrapper a[href], .cards a[href]")
+            .map { it.attr("href") }.distinct().take(5)
+        val ajax = Regex("""/ajax/\w+\.asp""").findAll(html).map { it.value }.distinct().take(3).toList()
+        return "kod=$code uzunluk=${html.length} başlık='${doc.title().take(40)}' bağlantı=${links.size} " +
+            "film=${links.count { reFilm.containsMatchIn(it.attr("href")) }} img=${doc.select("img[data-src]").size} " +
+            "card=${doc.select(".card").size} pfl=${html.contains("pageFilmListesi")} ajax=$ajax örnek=$sample"
+    }
+
     // ---------------- Ana sayfa ----------------
+
+    // Hata ayıklama: boş bölüm yerine nedenini gösteren tek kart
+    private suspend fun debugSection(name: String, info: String): HomePageResponse {
+        val card = newMovieSearchResponse("⚠ $name: $info", mainUrl, TvType.Movie)
+        return newHomePageResponse(
+            list = HomePageList(name = name, list = listOf(card), isHorizontalImages = false),
+            hasNext = false
+        )
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val base = request.data
+
+        // Trend sayfası film listesini sayfada vermez; site /ajax/dataTrend.asp'ye POST atıp doldurur
+        if (base.startsWith("trend:")) {
+            val parts = base.removePrefix("trend:").split(":")
+            val sekme = parts.getOrElse(0) { "en-cok-hit-alan" }
+            val tarih = parts.getOrElse(1) { "hafta" }
+            val r = post(
+                "$mainUrl/ajax/dataTrend.asp?sekme=$sekme&tarih=$tarih&s=$page",
+                emptyMap(),
+                "$mainUrl/trend"
+            )
+            val doc = org.jsoup.Jsoup.parse(r.text, mainUrl)
+            val list = cards(doc)
+            if (list.isEmpty() && debug && page <= 1) return debugSection(request.name, diag(r.code, r.text, doc))
+            return newHomePageResponse(
+                list = HomePageList(name = request.name, list = list, isHorizontalImages = false),
+                hasNext = list.isNotEmpty() && page < 10
+            )
+        }
+
         val url = if (page <= 1) base else pageUrl(base, page)
         val r = get(url)
         val doc = r.document
         if (page <= 1) learnTemplate(base, doc)
         val list = cards(doc)
-        if (list.isEmpty() && debug && page <= 1) {
-            val links = doc.select("a[href]")
-            throw ErrorLoadingException(
-                "Liste boş: kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title().take(40)}' " +
-                    "bağlantı=${links.size} film=${links.count { reFilm.containsMatchIn(it.attr("href")) }}"
-            )
-        }
+        if (list.isEmpty() && debug && page <= 1) return debugSection(request.name, diag(r.code, r.text, doc))
         return newHomePageResponse(
             list = HomePageList(name = request.name, list = list, isHorizontalImages = false),
             hasNext = list.isNotEmpty() && pageTpl.containsKey(base)
@@ -216,18 +255,15 @@ class Webteizle : MainAPI() {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)
         val base = "$mainUrl/filtre?a=${encQ(q)}"
-        val url = if (page <= 1) base else "$base&p=$page"
+        val url = if (page <= 1) base else pageUrl(base, page)
         val r = get(url)
         val doc = r.document
+        if (page <= 1) learnTemplate(base, doc)
         val list = cards(doc)
         if (list.isEmpty() && debug) {
-            val links = doc.select("a[href]")
-            throw ErrorLoadingException(
-                "Arama boş: kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title().take(40)}' " +
-                    "bağlantı=${links.size} film=${links.count { reFilm.containsMatchIn(it.attr("href")) }}"
-            )
+            throw ErrorLoadingException("Arama boş: " + diag(r.code, r.text, doc))
         }
-        return newSearchResponseList(list, list.isNotEmpty())
+        return newSearchResponseList(list, list.isNotEmpty() && pageTpl.containsKey(base))
     }
 
     // ---------------- Film sayfası ----------------
