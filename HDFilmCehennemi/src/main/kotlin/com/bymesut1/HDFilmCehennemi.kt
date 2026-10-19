@@ -27,7 +27,13 @@ private data class SiteItem(
 )
 private data class Alt(val id: String, val name: String, val lang: String)
 private data class Player(val name: String, val lang: String, val id: String?, val embed: String?)
-private data class EmbedResult(val urls: List<String>, val subs: List<SubItem>, val strict: Set<String>, val base: String)
+private data class EmbedResult(
+    val urls: List<String>,
+    val subs: List<SubItem>,
+    val strict: Set<String>,
+    val base: String,
+    val keys: List<Pair<String, String>> = emptyList()   // /srt/<no>/<code>_Turkish.vtt anahtarları
+)
 private data class Verified(val ok: Boolean, val headers: Map<String, String>, val text: String = "")
 
 class HDFilmCehennemi : MainAPI() {
@@ -170,6 +176,10 @@ class HDFilmCehennemi : MainAPI() {
     private val subLangs = listOf("tr", "en")   // gömülü altyazı dilleri
     private val uaMobile = "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
     private val uaDesktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+    // /srt/<no>/<kod>_<ad>.vtt/ dosya adı varyantları (Turkish, Turkish2 ...)
+    private val trSrtNames = listOf("Turkish", "Turkish2", "Turkish1", "Turkish3", "Turkce")
+    private val enSrtNames = listOf("English", "English2")
 
     private var good: Pair<String, Boolean>? = null   // çalışan adres + UA biçimi
     private val IC = RegexOption.IGNORE_CASE
@@ -859,7 +869,13 @@ class HDFilmCehennemi : MainAPI() {
                     allStrict.add(ld)
                 }
                 allUrls.addAll(c.urls)
-                if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v)
+
+                // Altyazı anahtarları (/srt/<no>/<kod>_...): sayfa metinlerinden + akış adreslerinden
+                val keySet = LinkedHashSet<Pair<String, String>>()
+                keySet.addAll(Decoder.keysFrom(blobs + listOf(v), false))
+                keySet.addAll(Decoder.keysFrom(allUrls.toList(), true))
+
+                if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v, keySet.toList())
 
                 val inner = Jsoup.parse(html).selectFirst("iframe[data-src], iframe[src]")
                 if (inner != null && depth < 1) {
@@ -867,7 +883,15 @@ class HDFilmCehennemi : MainAPI() {
                     if (raw.startsWith("http") || raw.startsWith("//")) {
                         val iu = if (raw.startsWith("//")) "https:$raw" else raw
                         val rr = resolveEmbed(iu, v, depth + 1)
-                        if (rr != null && rr.urls.isNotEmpty()) return rr
+                        if (rr != null && rr.urls.isNotEmpty()) {
+                            // dış sayfadaki altyazılar da korunsun
+                            val mergedSubs = ArrayList<SubItem>(rr.subs)
+                            val seenM = HashSet<String>(rr.subs.map { it.url })
+                            subs.forEach { s -> if (seenM.add(s.url)) mergedSubs.add(s) }
+                            val mergedKeys = LinkedHashSet<Pair<String, String>>(rr.keys)
+                            mergedKeys.addAll(keySet)
+                            return rr.copy(subs = mergedSubs, keys = mergedKeys.toList())
+                        }
                     }
                 }
             }
@@ -882,7 +906,10 @@ class HDFilmCehennemi : MainAPI() {
             )
             val u = wv.url
             if (Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)""").containsMatchIn(u)) {
-                return EmbedResult(listOf(u), emptyList(), setOf(u), embedUrl)
+                return EmbedResult(
+                    listOf(u), emptyList(), setOf(u), embedUrl,
+                    Decoder.keysFrom(listOf(u), true)
+                )
             }
         } catch (e: Exception) { }
         return null
@@ -922,6 +949,23 @@ class HDFilmCehennemi : MainAPI() {
         else -> 2
     }
 
+    // /srt/<no>/<kod>_<ad>.vtt/ adresini doğrula: (kod, doğrulandı mı)
+    private suspend fun checkSrt(su: String, pageUrl: String): Pair<Int, Boolean> {
+        var chkCode = -1
+        for (rf in listOf(pageUrl, siteBase() + "/")) {
+            val chk: NiceResponse? = try {
+                app.get(su, headers = embedHeaders(rf), timeout = 6L)
+            } catch (e: Exception) {
+                null
+            }
+            if (chk != null) {
+                chkCode = chk.code
+                if (chk.code == 200 && chk.text.take(300).contains("WEBVTT")) return Pair(200, true)
+            }
+        }
+        return Pair(chkCode, false)
+    }
+
     // ---------------- Bağlantıları ver ----------------
     override suspend fun loadLinks(
         data: String,
@@ -952,15 +996,32 @@ class HDFilmCehennemi : MainAPI() {
         val seenEmb = Collections.synchronizedSet(HashSet<String>())
         val seenUrl = Collections.synchronizedSet(HashSet<String>())
         val seenSub = Collections.synchronizedSet(HashSet<String>())
+        val embList = Collections.synchronizedList(ArrayList<String>())
+        val labelCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
         val gotExt = java.util.concurrent.atomic.AtomicBoolean(false)
         val trFound = java.util.concurrent.atomic.AtomicBoolean(false)
         val forcedRe = Regex("forced|zorunlu", IC)
 
         fun pushSub(label: String, url: String) {
             if (seenSub.add(url)) {
-                subtitleCallback.invoke(SubtitleFile(label, url))
+                val n = labelCount.merge(label, 1) { a, b -> a + b } ?: 1
+                val shown = if (n <= 1) label else "$label $n"
+                subtitleCallback.invoke(SubtitleFile(shown, url))
                 if (label == "Türkçe") trFound.set(true)
             }
+        }
+
+        fun pushItem(s: SubItem) {
+            if (!(s.lang in subLangs || s.lang == "xx")) return
+            if (forcedRe.containsMatchIn(s.label + " " + s.url)) return
+            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { "Altyazı" }
+            pushSub(nameS, s.url)
+        }
+
+        // Bölüm sayfasının kendisinde de altyazı bağlantısı olabilir (.vtt / .srt / /vtt/ / /srt/)
+        try {
+            Decoder.extractSubs(html, siteBase()).forEach { pushItem(it) }
+        } catch (e: Exception) {
         }
 
         // withVideo=false: yalnızca altyazı topla (akış ekleme)
@@ -979,6 +1040,7 @@ class HDFilmCehennemi : MainAPI() {
                         iframeFromAjax(rr?.text.orEmpty()).ifBlank { if (job === list[0]) ifr else "" }
                     }
                     if (embedUrl.isBlank() || !seenEmb.add(embedUrl)) return@amap
+                    embList.add(embedUrl)
                     log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
 
                     val res = resolveEmbed(embedUrl, pageUrl)
@@ -993,54 +1055,29 @@ class HDFilmCehennemi : MainAPI() {
                         }
                         return@amap
                     }
-                    log("P ${job.name} akis=${res.urls.size} altyazi=${res.subs.size}")
+                    log("P ${job.name} akis=${res.urls.size} altyazi=${res.subs.size} anahtar=${res.keys.size}")
                     val sets = streamHeaderSets(res.base)
 
-                    // Altyazılar (oynatıcı sayfasından)
-                    res.subs
-                        .filter { s ->
-                            (s.lang in subLangs || s.lang == "xx") &&
-                                !forcedRe.containsMatchIn(s.label + " " + s.url)
-                        }
-                        .forEach { s ->
-                            val nameS = if (s.lang == "tr") "Türkçe" else if (s.lang == "en") "English" else s.label.ifBlank { "Altyazı" }
-                            pushSub(nameS, s.url)
-                        }
+                    // Altyazılar (oynatıcı sayfasından; .mobi /vtt/ ve /srt/ bağlantıları dahil)
+                    res.subs.forEach { pushItem(it) }
 
-                    // Rapid: sayfada Türkçe altyazı bulunamadıysa akış adresinden türet
+                    // Sayfada Türkçe altyazı bulunamadıysa /srt/<no>/<kod>_<ad>.vtt/ adreslerini türet
+                    // (Turkish, Turkish2, Turkish1 ... ve English varyantları)
                     if (res.subs.none { it.lang == "tr" }) {
-                        for (su0 in res.urls) {
-                            val mm = Regex("""/hls\d?/\d+/(\d+)/([A-Za-z0-9]+)[_/.]""").find(su0) ?: continue
-                            val no = mm.groupValues[1]
-                            val code = mm.groupValues[2]
-                            val want = ArrayList<Pair<String, String>>()
-                            want.add("Turkish" to "Türkçe")
-                            if ("en" in subLangs) want.add("English" to "English")
-                            for ((fn, lbl) in want) {
+                        for ((no, code) in res.keys.take(3)) {
+                            val want = ArrayList<Triple<String, String, Boolean>>()
+                            trSrtNames.forEach { want.add(Triple(it, "Türkçe", true)) }
+                            if ("en" in subLangs) enSrtNames.forEach { want.add(Triple(it, "English", false)) }
+                            val checked = want.amap { (fn, lbl, isTr) ->
                                 val su = siteBase() + "/srt/" + no + "/" + code + "_" + fn + ".vtt/"
-                                if (seenSub.contains(su)) continue
-                                var chkCode = -1
-                                var chkOk = false
-                                for (rf in listOf(pageUrl, siteBase() + "/")) {
-                                    val chk: NiceResponse? = try {
-                                        app.get(su, headers = embedHeaders(rf), timeout = 6L)
-                                    } catch (e: Exception) {
-                                        null
-                                    }
-                                    if (chk != null) {
-                                        chkCode = chk.code
-                                        if (chk.code == 200 && chk.text.take(300).contains("WEBVTT")) {
-                                            chkOk = true
-                                            break
-                                        }
-                                    }
-                                }
-                                // Doğrulanamayan (engellenen / ağ hatası) Türkçe adresi de ekle; 404 ise ekleme
-                                if (chkOk || (fn == "Turkish" && (chkCode == 403 || chkCode == 503 || chkCode == -1))) {
-                                    pushSub(lbl, su)
-                                }
-                            }
-                            break
+                                if (seenSub.contains(su)) return@amap null
+                                val (cc, ok) = checkSrt(su, pageUrl)
+                                // Doğrulanamayan (engellenen / ağ hatası) ilk Türkçe adresi de ekle; 404 ise ekleme
+                                val soft = fn == "Turkish" && (cc == 403 || cc == 503 || cc == -1)
+                                if (ok || soft) Triple(lbl, su, isTr) else null
+                            }.filterNotNull()
+                            for ((lbl, su, _) in checked) pushSub(lbl, su)
+                            if (checked.isNotEmpty()) break
                         }
                     }
 
@@ -1119,6 +1156,27 @@ class HDFilmCehennemi : MainAPI() {
         // 4) Türkçe altyazı hiç bulunamadıysa altyazılı oynatıcılardan yalnızca altyazıyı topla
         if (!trFound.get() && rest.isNotEmpty()) runJobs(rest, false)
 
+        // 5) Hâlâ Türkçe altyazı yoksa: oynatıcıyı WebView'de aç, .vtt / /srt/ isteğini yakala
+        if (!trFound.get()) {
+            for (eu in embList.toList().take(2)) {
+                try {
+                    val wv = app.get(
+                        eu,
+                        referer = siteBase() + "/",
+                        interceptor = WebViewResolver(Regex("""\.vtt|/srt/\d|/vtt/\d"""))
+                    )
+                    val u = wv.url
+                    if (Regex("""\.vtt|/srt/\d|/vtt/\d""", IC).containsMatchIn(u)) {
+                        val lg = Decoder.subLang(u)
+                        if (lg == "tr") pushSub("Türkçe", u)
+                        else if (lg == "en") pushSub("English", u)
+                    }
+                } catch (e: Exception) {
+                }
+                if (trFound.get()) break
+            }
+        }
+
         log("bitti akis=${seenUrl.size} ext=${gotExt.get()} altyazi=${seenSub.size} tr=${trFound.get()}")
         return seenUrl.isNotEmpty() || gotExt.get()
     }
@@ -1131,7 +1189,7 @@ class HDFilmCehennemi : MainAPI() {
         for (line in master.lines()) {
             if (!line.startsWith("#EXT-X-MEDIA", true) || !line.contains("TYPE=SUBTITLES", true)) continue
             val uri = Regex("""URI="([^"]+)"""", IC).find(line)?.groupValues?.get(1) ?: continue
-            if (!Regex("""\.(?:vtt|srt)(?:\?|#|$)""", IC).containsMatchIn(uri)) continue
+            if (!Regex("""\.(?:vtt|srt)(?:\?|#|/|$)""", IC).containsMatchIn(uri)) continue
             val nm = Regex("""NAME="([^"]*)"""", IC).find(line)?.groupValues?.get(1).orEmpty()
             val lg = Regex("""LANGUAGE="([^"]*)"""", IC).find(line)?.groupValues?.get(1).orEmpty().lowercase()
             if (Regex("forced|zorunlu", IC).containsMatchIn("$nm $uri")) continue
@@ -1580,11 +1638,36 @@ object Decoder {
         return Cand(urls.toList(), strict)
     }
 
+    // ---------- Altyazı anahtarları: /srt/<no>/<kod>_<ad>.vtt/ ----------
+    private val srtKeyRe = Regex("""/srt/(\d{1,8})/([A-Za-z0-9]{6,32})_""", IC)
+    private val streamKeyRe = Regex("""/hls\d?/\d+/(\d+)/([A-Za-z0-9]+)[_/.]""")
+    private val looseKeyRe = Regex("""/(\d{4,6})/([A-Za-z0-9]{10,16})(?:[_/.]|$)""")
+
+    // texts: sayfa metinleri veya adresler. loose=true yalnızca akış adresleri için (hls/<x>/<no>/<kod> dışı biçimler)
+    fun keysFrom(texts: List<String>, loose: Boolean): List<Pair<String, String>> {
+        val out = LinkedHashSet<Pair<String, String>>()
+        for (raw in texts) {
+            val t = raw.replace("\\/", "/")
+            for (m in srtKeyRe.findAll(t)) out.add(Pair(m.groupValues[1], m.groupValues[2]))
+            for (m in streamKeyRe.findAll(t)) out.add(Pair(m.groupValues[1], m.groupValues[2]))
+        }
+        if (loose && out.isEmpty()) {
+            for (raw in texts) {
+                val t = raw.replace("\\/", "/").substringBefore("?")
+                for (m in looseKeyRe.findAll(t)) out.add(Pair(m.groupValues[1], m.groupValues[2]))
+            }
+        }
+        return out.toList()
+    }
+
     // ---------- Altyazılar ----------
     private val tagRe = Regex("""<track\b[^>]*>""", IC)
     private val objRe = Regex("""\{[^{}]{0,600}\}""")
-    private val subExtRe = Regex("""\.(?:vtt|srt|ass|ssa|sub)(?:\?|$)|/(?:srt|sub|subs|subtitle|subtitles|vtt)/""", IC)
-    private val anySubRe = Regex("""["'(]((?:https?://|/)[^"'\s\\)]*?(?:\.vtt|\.srt|/srt/)[^"'\s\\)]*)["')]""", IC)
+    private val subExtRe = Regex("""\.(?:vtt|srt|ass|ssa|sub)(?:\?|/|$)|/(?:srt|sub|subs|subtitle|subtitles|vtt)/""", IC)
+    private val anySubRe = Regex(
+        """["'(=\s]((?:https?://|//|/)[^"'\s\\)<>]*?(?:\.vtt|\.srt|/srt/\d|/vtt/\d)[^"'\s\\)<>]*)["')\s<>]""",
+        IC
+    )
     private val otherLangRe = Regex(
         """fransiz|french|portekiz|portug|ispanyol|spanish|almanca|german|deutsch|italyan|italian|arapca|arabic|rusca|russian|hollanda|dutch|yunan|greek|arnavut|albanian|sirp|serbian|isvec|swedish|japon|korece|korean|cince|chinese|bulgar|rumen|romanian|macar|hungar|lehce|polish|czech|ibran|hebrew|farsca|persian|hintce|hindi|\b(?:fr|fre|pt|por|es|spa|de|ger|it|ita|ar|ara|ru|nl|el|ja|ko|zh)\b""",
         IC
@@ -1604,13 +1687,16 @@ object Decoder {
         val path = url.replace(Regex("^https?://[^/]+", IC), "")
         val f = fold("$label $path")
         return when {
-            Regex("turk|turkce|\\btr\\b|/tr[._/-]").containsMatchIn(f) -> "tr"
+            Regex("turk|turkce|\\btr\\b|\\btur\\b|/tr[._/-]").containsMatchIn(f) -> "tr"
             Regex("ingiliz|english|\\ben\\b|\\beng\\b|/en[._/-]").containsMatchIn(f) -> "en"
             otherLangRe.containsMatchIn(f) -> "other"
             c.isNotBlank() -> c.take(2)
             else -> "xx"
         }
     }
+
+    // Dışarıdan: adresten dil tahmini ("tr" / "en" / "other" / "xx")
+    fun subLang(url: String, label: String = ""): String = langOf(label, "", url)
 
     // <track src label srclang>, {file:"..", label:"..", kind:"captions"} (tırnaklı / tırnaksız anahtar) ve yalın .vtt/.srt adresleri
     private fun attrOf(tag: String, name: String): String {
