@@ -107,7 +107,9 @@ class Webteizle : MainAPI() {
         var txt = ""
         for (att in 0..2) {
             txt = try {
-                post(url, form, ref).text
+                val pr = post(url, form, ref)
+                if (pr.text.isBlank()) d("post kod=${pr.code} boş yanıt")
+                pr.text
             } catch (e: Exception) {
                 d("post hata ${e.javaClass.simpleName}")
                 ""
@@ -371,6 +373,8 @@ class Webteizle : MainAPI() {
     @Volatile private var altEndpoints: List<String>? = null
     @Volatile private var embedEndpoints: List<String>? = null
     @Volatile private var altKeys: List<String> = emptyList()
+    // JS'de sabit yazılmış alan değerleri: {filmid:e,dil:t,s:a,b:n,bot:0} -> bot=0
+    @Volatile private var altLits: Map<String, String> = emptyMap()
     @Volatile private var altOk: Pair<String, Int>? = null
 
     private val reIframe = Regex("""<iframe[^>]+(?:src|data-src)=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
@@ -399,6 +403,16 @@ class Webteizle : MainAPI() {
             val obj = Regex("""\{([^{}]{0,300})\}""").find(seg)?.groupValues?.get(1)
             if (obj != null) {
                 altKeys = Regex("""([A-Za-z_]\w*)\s*:""").findAll(obj).map { it.groupValues[1] }.toList()
+                val lits = HashMap<String, String>()
+                Regex("""([A-Za-z_]\w*)\s*:\s*([^,}]+)""").findAll(obj).forEach { m ->
+                    val v = m.groupValues[2].trim()
+                    if (Regex("""-?\d+""").matches(v)) {
+                        lits[m.groupValues[1]] = v
+                    } else if (v.length >= 2 && (v.startsWith("\"") || v.startsWith("'"))) {
+                        lits[m.groupValues[1]] = v.substring(1, v.length - 1)
+                    }
+                }
+                altLits = lits
             }
             d("alt js: ${seg.take(150)}")
         }
@@ -440,7 +454,8 @@ class Webteizle : MainAPI() {
         } catch (e: Exception) {
         }
         if (out.isEmpty()) {
-            Regex("""data-id=["'](\d+)["'][^>]*>([^<]*)<""").findAll(t)
+            val t2 = t.replace("\\\"", "\"").replace("\\/", "/")
+            Regex("""data-id=["'](\d+)["'][^>]*>([^<]*)<""").findAll(t2)
                 .forEach { out.add(it.groupValues[1] to it.groupValues[2].trim()) }
         }
         return out
@@ -465,7 +480,9 @@ class Webteizle : MainAPI() {
         referer: String
     ): List<Pair<String, String>> {
         val forms = ArrayList<Map<String, String>>()
-        if (altKeys.isNotEmpty()) forms.add(altKeys.associateWith { formValue(it, filmId, dil, attrs) })
+        if (altKeys.isNotEmpty()) forms.add(altKeys.associateWith { altLits[it] ?: formValue(it, filmId, dil, attrs) })
+        forms.add(mapOf("filmid" to filmId, "dil" to dil, "s" to "", "b" to "", "bot" to "0"))
+        forms.add(mapOf("filmid" to filmId, "dil" to dil, "bot" to "0"))
         forms.add(mapOf("filmid" to filmId, "dil" to dil, "s" to "", "b" to "", "bd" to ""))
         forms.add(mapOf("bid" to filmId, "dil" to dil))
         forms.add(mapOf("id" to filmId, "dil" to dil))
