@@ -1,5 +1,5 @@
 // Sürüm numarası: her güncellemede 1 artır (artmazsa güncelleme sayılmaz)
-version = 10
+version = 11
 
 android {
     namespace = "com.bymesut1"
