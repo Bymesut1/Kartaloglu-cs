@@ -679,7 +679,7 @@ class Webteizle : MainAPI() {
     private suspend fun fetchTxt(u: String, h: Map<String, String>): String? {
         for (att in 0..1) {
             try {
-                return app.get(u, headers = h, timeout = 10L).text
+                return app.get(u, headers = h, timeout = 8L).text
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
@@ -704,8 +704,7 @@ class Webteizle : MainAPI() {
                     else -> m3u8.substringBefore("?").substringBeforeLast('/') + "/" + v
                 }
                 val vt = fetchTxt(vu, headers)
-                // Ağ hatası/zaman aşımı tek başına "ölü" sayılmaz; sadece alt liste geçerli bir liste değilse elenir
-                if (vt != null && !vt.contains("#EXTM3U")) return false to null
+                if (vt == null || !vt.contains("#EXTINF")) return false to null
             }
         }
         return true to w?.let { heightOf(it) }
@@ -1337,46 +1336,15 @@ class Webteizle : MainAPI() {
 
         // Eldeki oynatıcılar (ör. Vidmoly) kapı beklenmeden hemen çözülür; çözülemeyen sessizce atlanır
         val oksAll = ArrayList<Boolean>()
-
-        // Bağlantılar önce arabelleğe alınır, sonra sıralanıp verilir:
-        // Filemoon dublaj, Filemoon altyazı, Vidmoly dublaj, Vidmoly altyazı, sonra diğerleri (dublaj/altyazı sırayla)
-        val buffer = java.util.Collections.synchronizedList(ArrayList<ExtractorLink>())
-        fun srcRank(n: String): Int = when {
-            n.contains("Filemoon", true) -> 0
-            n.contains("Vidmoly", true) -> 1
-            n.contains("Ok.Ru", true) -> 2
-            n.contains("Mail.Ru", true) -> 3
-            n.contains("Pixel", true) -> 4
-            n.contains("Dzen", true) -> 5
-            else -> 9
-        }
-        fun langRank(n: String): Int = when {
-            n.startsWith("Türkçe Dublaj (Eski") -> 2
-            n.startsWith("Türkçe Dublaj") -> 0
-            n.startsWith("Türkçe Altyazı") -> 1
-            else -> 3
-        }
-        fun flush() {
-            val items = synchronized(buffer) {
-                val c = ArrayList(buffer)
-                buffer.clear()
-                c
-            }
-            items.sortedWith(
-                compareBy<ExtractorLink>({ srcRank(it.name) }, { langRank(it.name) }, { -it.quality })
-            ).forEach { callback(it) }
-        }
-
         suspend fun runJobs() {
             val batch = ArrayList(jobs)
             jobs.clear()
             oksAll.addAll(batch.amap { (nm, lbl, embed) ->
-                val ok = emitEmbed(embed, nm, lbl, subtitleCallback) { l -> buffer.add(l) }
+                val ok = emitEmbed(embed, nm, lbl, subtitleCallback, callback)
                 d("$lbl $nm ${embed.take(150)} -> $ok")
                 if (!ok) fails.add("$lbl $nm")
                 ok
             })
-            flush()
         }
         runJobs()
 
