@@ -27,7 +27,7 @@ class Webteizle : MainAPI() {
 
     // Hata ayıklama: true iken liste/arama boş döner ya da kaynak bulunamazsa sebep ekranda görünür.
     // Normal kullanımda false kalmalı.
-    private val debug = false
+    private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(900)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(4500)
