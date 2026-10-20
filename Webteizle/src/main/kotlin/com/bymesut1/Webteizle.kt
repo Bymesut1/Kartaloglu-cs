@@ -9,6 +9,13 @@ import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -25,9 +32,9 @@ class Webteizle : MainAPI() {
     // Site Cloudflare kontrolü isterse devreye girer (önce düz istek atılır)
     private val cf = CloudflareKiller()
 
-    // Hata ayıklama: true iken liste/arama boş döner ya da kaynak bulunamazsa sebep ekranda hata mesajı olarak görünür.
-    // Her şey düzelince false yap.
-    private val debug = true
+    // Hata ayıklama: true iken liste/arama boş döner ya da kaynak bulunamazsa sebep ekranda görünür.
+    // Normal kullanımda false kalmalı.
+    private val debug = false
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(900)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(4500)
@@ -45,7 +52,6 @@ class Webteizle : MainAPI() {
         "$mainUrl/tr-altyazili-filmler" to "Altyazılı Filmler",
         "$mainUrl/tavsiye-filmler" to "Tavsiye Filmler",
         "$mainUrl/odullu-filmler" to "Ödüllü Filmler",
-        "$mainUrl/imdb-top-250-izle" to "IMDb Top 250",
         "$mainUrl/imdb/8/" to "IMDb 8+",
         "$mainUrl/yil/2026/" to "2026 Filmleri",
         "$mainUrl/yil/2025/" to "2025 Filmleri",
@@ -111,12 +117,13 @@ class Webteizle : MainAPI() {
                 if (pr.text.isBlank()) d("post kod=${pr.code} boş yanıt")
                 pr.text
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 d("post hata ${e.javaClass.simpleName}")
                 ""
             }
             if (!rl(txt)) break
             d("hız sınırı, bekleniyor")
-            try { Thread.sleep(5000L + att * 3000L) } catch (e: Exception) { }
+            delay(3000L + att * 2000L)
         }
         return txt
     }
@@ -529,7 +536,7 @@ class Webteizle : MainAPI() {
                     return alts
                 }
                 d("alt boş ep=${ep.substringAfterLast('/')} form=$i yanıt='${txt.replace(Regex("""\s+"""), " ").take(60)}'")
-                try { Thread.sleep(200) } catch (e: Exception) { }
+                delay(200)
             }
         }
         return emptyList()
@@ -605,6 +612,9 @@ class Webteizle : MainAPI() {
             .firstOrNull { !it.contains("recaptcha", true) && !it.contains("google.com", true) && !it.contains("webteizle", true) }
     }
 
+    // Daha önce çalışan uç nokta + alan kombinasyonu bir sonraki isteklerde ilk olarak denenir
+    @Volatile private var embedOk: Pair<String, Int>? = null
+
     private suspend fun fetchEmbed(id: String, referer: String): String? {
         val forms = ArrayList<Map<String, String>>()
         if (embedKeys.isNotEmpty()) {
@@ -612,24 +622,37 @@ class Webteizle : MainAPI() {
         }
         forms.add(mapOf("id" to id))
         forms.add(mapOf("id" to id, "bot" to "0"))
-        for (ep in embedEndpoints.orEmpty()) {
-            for ((fi, form) in forms.distinct().withIndex()) {
-                val txt = postRl(mainUrl + ep, form, referer)
-                loadPlayerMap(txt)
-                val fm = Regex("""<script>\s*(\w+)\(\s*'([^']+)'""").find(txt)
-                if (fm != null) {
-                    val r = embedFromFn(fm.groupValues[1].lowercase(), fm.groupValues[2])
-                    if (r != null) return r
-                    d("fonksiyon bilinmiyor: ${fm.groupValues[1]}")
+        val uniq = forms.distinct()
+
+        val order = ArrayList<Pair<String, Int>>()
+        val first = embedOk
+        if (first != null && first.second < uniq.size) order.add(first)
+        for (ep in embedEndpoints.orEmpty()) for (fi in uniq.indices) {
+            if ((ep to fi) != first) order.add(ep to fi)
+        }
+
+        for ((ep, fi) in order) {
+            val txt = postRl(mainUrl + ep, uniq[fi], referer)
+            loadPlayerMap(txt)
+            val fm = Regex("""<script>\s*(\w+)\(\s*'([^']+)'""").find(txt)
+            if (fm != null) {
+                val r = embedFromFn(fm.groupValues[1].lowercase(), fm.groupValues[2])
+                if (r != null) {
+                    embedOk = ep to fi
+                    return r
                 }
-                val e = embedOf(txt) ?: decodeDivEmbed(txt)
-                if (e != null && !e.contains("recaptcha", true)) return e
-                if (e != null) {
-                    d("embed captcha form=$fi ham='${txt.replace(Regex("""\s+"""), " ").take(300)}'")
-                    return e
-                }
-                d("embed boş ep=${ep.substringAfterLast('/')} form=$fi yanıt='${txt.replace(Regex("""\s+"""), " ").take(500)}'")
+                d("fonksiyon bilinmiyor: ${fm.groupValues[1]}")
             }
+            val e = embedOf(txt) ?: decodeDivEmbed(txt)
+            if (e != null && !e.contains("recaptcha", true)) {
+                embedOk = ep to fi
+                return e
+            }
+            if (e != null) {
+                d("embed captcha form=$fi ham='${txt.replace(Regex("""\s+"""), " ").take(300)}'")
+                return e
+            }
+            d("embed boş ep=${ep.substringAfterLast('/')} form=$fi yanıt='${txt.replace(Regex("""\s+"""), " ").take(500)}'")
         }
         return null
     }
@@ -638,7 +661,7 @@ class Webteizle : MainAPI() {
 
     // Master listeden çözünürlük okunur (genişliğe göre): 1920x960 -> 1080p
     private suspend fun hlsHeight(m3u8: String, headers: Map<String, String>): Int? = try {
-        val t = app.get(m3u8, headers = headers, timeout = 10L).text
+        val t = app.get(m3u8, headers = headers, timeout = 6L).text
         val w = Regex("""RESOLUTION=(\d+)x(\d+)""").findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
         w?.let {
             when {
@@ -652,6 +675,7 @@ class Webteizle : MainAPI() {
             }
         }
     } catch (e: Exception) {
+        if (e is kotlinx.coroutines.CancellationException) throw e
         null
     }
 
@@ -703,9 +727,10 @@ class Webteizle : MainAPI() {
                     url,
                     referer = "$mainUrl/",
                     headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
-                    timeout = 12L
+                    timeout = 8L
                 ).text
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 d("vidmoly $host hata: ${e.javaClass.simpleName}")
                 continue
             }
@@ -759,13 +784,17 @@ class Webteizle : MainAPI() {
 
     // ---- Filemoon: klasik sayfa (packed JS içinde m3u8) ya da yeni Byse (şifreli API) ----
     private suspend fun extractMoon(embed: String, label: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // Byse adreslerinde klasik sayfayı beklemek zaman kaybı: önce doğrudan şifreli API denenir
+        val byseHost = embed.contains("byse", true)
+        if (byseHost && extractByse(embed, label, callback)) return true
         val h = mapOf("User-Agent" to ua, "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8", "Sec-Fetch-Dest" to "iframe")
         var pageUrl = embed
         var page = try {
-            app.get(embed, headers = h, referer = "$mainUrl/", timeout = 15L).text
+            app.get(embed, headers = h, referer = "$mainUrl/", timeout = 10L).text
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             d("moon sayfa hata ${e.javaClass.simpleName}")
-            return extractByse(embed, label, callback)
+            return if (byseHost) false else extractByse(embed, label, callback)
         }
 
         // İç iframe varsa (klasik Filemoon: /e/ sayfasının içinde asıl oynatıcı) onu da aç
@@ -778,9 +807,10 @@ class Webteizle : MainAPI() {
             }
             if (fu.startsWith("http") && (fu.contains("/e/") || fu.contains("/d/") || originOf(fu) == originOf(embed))) {
                 try {
-                    page = app.get(fu, headers = h, referer = embed, timeout = 15L).text
+                    page = app.get(fu, headers = h, referer = embed, timeout = 10L).text
                     pageUrl = fu
                 } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
                     d("moon iframe hata ${e.javaClass.simpleName}")
                 }
             }
@@ -799,19 +829,25 @@ class Webteizle : MainAPI() {
             d("moon klasik tamam")
             return true
         }
-        d("moon m3u8 yok uzunluk=${page.length}, Byse deneniyor")
-        return extractByse(embed, label, callback)
+        d("moon m3u8 yok uzunluk=${page.length}")
+        return if (byseHost) false else extractByse(embed, label, callback)
     }
 
     // Byse: /api/videos/<ID> şifreli JSON döndürür (AES-256-GCM)
     private suspend fun extractByse(embed: String, label: String, callback: (ExtractorLink) -> Unit): Boolean {
         val origin = originOf(embed)
         val id = Regex("""/(?:e|d|v)/([A-Za-z0-9_-]+)""").find(embed)?.groupValues?.get(1) ?: return false
-        val txt = try {
-            app.get("$origin/api/videos/$id", headers = mapOf("User-Agent" to ua, "Referer" to embed), timeout = 15L).text
-        } catch (e: Exception) {
-            d("byse api hata: ${e.message}")
-            return false
+        var txt = ""
+        for (att in 0..1) {
+            txt = try {
+                app.get("$origin/api/videos/$id", headers = mapOf("User-Agent" to ua, "Referer" to embed), timeout = 10L).text
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                d("byse api hata: ${e.message}")
+                ""
+            }
+            if (txt.contains("playback")) break
+            if (att == 0) delay(800)
         }
         val p = try {
             JSONObject(txt).optJSONObject("playback")
@@ -960,14 +996,16 @@ class Webteizle : MainAPI() {
                 else -> viaExtractor(u, label, subtitleCallback, callback) || extractMoon(u, label, callback)
             }
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             d("çözüm istisna ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
 
     // ---------------- Oynatma ----------------
-    // Her dil (Türkçe Dublaj / Türkçe Altyazı) için Filemoon ve Vidmoly ayrı bağlantı olarak verilir.
-    // Bu iki kaynak hiç çıkmazsa diğer kaynaklar (Okru vb.) yedek olarak denenir.
+    // Her dil (Türkçe Dublaj / Türkçe Altyazı) ve sitedeki her alternatif (Filemoon, Vidmoly, Pixel,
+    // [EskiDub] sürümleri...) ayrı bağlantı olarak verilir. Hepsi aynı anda çözülür, böylece uzun
+    // sürüp uygulama tarafından iptal edilmez; çözülemeyen sessizce atlanır.
 
     // Hata ayıklama: sebep, kaynak listesinde "DEBUG" satırları olarak görünür (hata ekranı yerine)
     private suspend fun emitDebug(tag: String, callback: (ExtractorLink) -> Unit) {
@@ -986,6 +1024,36 @@ class Webteizle : MainAPI() {
                 }
             )
         }
+    }
+
+    private val embedSem = Semaphore(3)
+
+    private fun isWanted(nm: String) = nm.contains("moon", true) || nm.contains("moly", true) || nm.contains("byse", true)
+
+    // Tek bir alternatifi (ör. "VidMoly [EskiDub]") video bağlantısına çevirir
+    private suspend fun tryAlt(
+        id: String,
+        nm: String,
+        label: String,
+        pageUrl: String,
+        seen: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var embed = embedSem.withPermit { fetchEmbed(id, pageUrl) }
+        if (!embed.isNullOrBlank() && embed.contains("recaptcha", true)) {
+            val un = unwrapCaptcha(embed)
+            d("id=$id captcha kapısı -> $un")
+            embed = un
+        }
+        if (embed.isNullOrBlank()) {
+            d("id=$id embed yok")
+            return false
+        }
+        if (!seen.add(embed)) return false
+        val ok = emitEmbed(embed, nm, label, subtitleCallback, callback)
+        d("$label $nm ${embed.take(40)} -> $ok")
+        return ok
     }
 
     override suspend fun loadLinks(
@@ -1020,67 +1088,44 @@ class Webteizle : MainAPI() {
             return false
         }
 
-        var any = false
-        val missing = ArrayList<String>()
-        val seen = HashSet<String>()
+        val any = java.util.concurrent.atomic.AtomicBoolean(false)
+        val missing = java.util.Collections.synchronizedList(ArrayList<String>())
+        val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-        for (dil in dils.sorted()) {   // "0" dublaj, "1" altyazı
-            val label = if (dil == "0") "Türkçe Dublaj" else "Türkçe Altyazı"
-            val alts = fetchAlts(filmId, dil, attrs, pageUrl)
-            d("dil=$dil alt=${alts.size} adlar=${alts.joinToString(",") { it.second.take(12) }}")
+        // Diller ve alternatifler aynı anda işlenir ("0" dublaj, "1" altyazı)
+        coroutineScope {
+            dils.sorted().map { dil ->
+                async {
+                    val label = if (dil == "0") "Türkçe Dublaj" else "Türkçe Altyazı"
+                    val alts = fetchAlts(filmId, dil, attrs, pageUrl)
+                    d("dil=$dil alt=${alts.size} adlar=${alts.joinToString(",") { it.second.take(14) }}")
 
-            var okMoon = false
-            var okMoly = false
-
-            fun wanted(nm: String) = nm.contains("moon", true) || nm.contains("moly", true) || nm.contains("byse", true)
-
-            // 1) Filemoon ve Vidmoly
-            for ((id, nm) in alts.filter { wanted(it.second) }.sortedBy { if (it.second.contains("moly", true)) 1 else 0 }) {
-                if (okMoon && okMoly) break
-                var embed = fetchEmbed(id, pageUrl)
-                if (!embed.isNullOrBlank() && embed.contains("recaptcha", true)) {
-                    val un = unwrapCaptcha(embed)
-                    d("dil=$dil id=$id captcha kapısı -> $un")
-                    embed = un
-                }
-                if (embed.isNullOrBlank()) {
-                    d("dil=$dil id=$id embed yok")
-                    continue
-                }
-                val isMoly = embed.contains("vidmoly", true)
-                if ((isMoly && okMoly) || (!isMoly && okMoon)) continue
-                if (!seen.add(embed)) continue
-                val ok = emitEmbed(embed, nm, label, subtitleCallback, callback)
-                d("dil=$dil $nm ${embed.take(40)} -> $ok")
-                if (ok) {
-                    if (isMoly) okMoly = true else okMoon = true
-                }
-                try { Thread.sleep(250) } catch (e: Exception) { }
-            }
-
-            // 2) Yedek: Filemoon / Vidmoly hiç çıkmadıysa diğer kaynaklar
-            if (!okMoon && !okMoly) {
-                for ((id, nm) in alts.filter { !wanted(it.second) }.take(4)) {
-                    var embed = fetchEmbed(id, pageUrl)
-                    if (!embed.isNullOrBlank() && embed.contains("recaptcha", true)) embed = unwrapCaptcha(embed)
-                    if (embed.isNullOrBlank() || !seen.add(embed)) continue
-                    val ok = emitEmbed(embed, nm, label, subtitleCallback, callback)
-                    d("dil=$dil yedek $nm ${embed.take(40)} -> $ok")
-                    if (ok) {
-                        okMoon = true
-                        break
+                    val langOk = java.util.concurrent.atomic.AtomicBoolean(false)
+                    coroutineScope {
+                        alts.map { (id, nm) ->
+                            async {
+                                // [EskiDub] gibi sürümler ayrı etiketle gösterilir
+                                val lbl = if (nm.contains("eski", true)) "$label (Eski Dub)" else label
+                                val limit = if (isWanted(nm)) 40_000L else 20_000L
+                                val ok = withTimeoutOrNull(limit) {
+                                    tryAlt(id, nm, lbl, pageUrl, seen, subtitleCallback, callback)
+                                } ?: false
+                                if (ok) {
+                                    any.set(true)
+                                    langOk.set(true)
+                                }
+                            }
+                        }.awaitAll()
                     }
-                    try { Thread.sleep(250) } catch (e: Exception) { }
+                    if (!langOk.get()) missing.add(label)
                 }
-            }
-
-            if (okMoon || okMoly) any = true else missing.add(label)
+            }.awaitAll()
         }
 
-        // Hata ayıklama: bir dil eksik kalırsa sebebi kaynak listesinde DEBUG satırları olarak gösterilir
-        if (debug && any && missing.isNotEmpty()) emitDebug(missing.joinToString("+") + " yok", callback)
+        // Hata ayıklama (yalnızca debug=true iken): eksik kalan dil varsa sebebi gösterilir
+        if (debug && any.get() && missing.isNotEmpty()) emitDebug(missing.joinToString("+") + " yok", callback)
 
-        if (!any) {
+        if (!any.get()) {
             if (debug) { emitDebug("kaynak yok", callback); return true }
             return false
         }
