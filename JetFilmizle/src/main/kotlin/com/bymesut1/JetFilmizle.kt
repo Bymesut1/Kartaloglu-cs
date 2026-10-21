@@ -238,22 +238,10 @@ class JetFilmizle : MainAPI() {
     // ---------------- Oynatma: kaynak listesi ----------------
 
     private data class Src(val lang: String, val name: String, val url: String)
-    private data class SrcCand(val idx: Int, val el: Element, val direct: String?, val internal: String?)
 
     private val langNames = listOf("Türkçe Dublaj", "Türkçe Altyazılı", "Dil+")
 
     private val reUrlIn = Regex("""(?:https?:)?//[^\s"'<>\\)]+""")
-
-    // Oynatıcı olamayacak adresler: reklam/analitik/sosyal/varlık dosyaları
-    private val junkHost = Regex(
-        """(?i)youtube|youtu\.be|googletagmanager|google-analytics|googleapis|gstatic|googlesyndication|doubleclick|facebook|twitter|instagram|cloudflare|cdn-cgi|gravatar|jquery|bootstrap|fontawesome|cdnjs|jsdelivr|unpkg|histats|yandex|adsterra|popads|schema\.org|w3\.org|tmdb\.org|themoviedb|imdb\.com|t\.me|telegram|whatsapp|disqus|addthis|sharethis|gmpg\.org|wordpress|/wp-content/|/wp-includes/"""
-    )
-    private val assetExt = Regex("""(?i)\.(?:css|js|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|map|xml)(?:\?|#|$)""")
-
-    private fun playerOk(u: String): Boolean {
-        if (!u.startsWith("http", true)) return false
-        return !junkHost.containsMatchIn(u) && !assetExt.containsMatchIn(u)
-    }
 
     // Bir metinden (düz, kaçışlı ya da base64) oynatıcı adresi çıkarır
     private fun urlOf(raw0: String): String? {
@@ -270,48 +258,19 @@ class JetFilmizle : MainAPI() {
         return null
     }
 
-    private val skipAttrs = setOf(
-        "class", "style", "id", "title", "alt", "target", "rel", "type", "role", "tabindex", "name", "width", "height", "href"
-    )
-    private val reSrcPath = Regex("""(?i)player|embed|source|kaynak|video|ajax|part|film|izle""")
-
-    // Buton öğesinin taşıdığı oynatıcı adresi (herhangi bir öznitelik, onclick ya da dış bağlantı)
+    // Buton öğesinin taşıdığı oynatıcı adresi (data-* öznitelikleri, onclick ya da dış bağlantı)
     private fun srcOfEl(el: Element): String? {
         for (at in el.attributes()) {
-            val k = at.key.lowercase()
-            if (k in skipAttrs || k.startsWith("aria-")) continue
+            if (!at.key.lowercase().startsWith("data-")) continue
+            urlOf(at.value)?.let { return it }
             val v = at.value.trim()
-            if (v.isBlank()) continue
-            urlOf(v)?.let { if (playerOk(it)) return it }
-            if (k.startsWith("data-") && v.startsWith("/") && reSrcPath.containsMatchIn(v)) return mainUrl + v
+            if (v.startsWith("/") && Regex("""(?i)player|embed|source|kaynak|video""").containsMatchIn(v)) return mainUrl + v
         }
         val oc = el.attr("onclick")
-        if (oc.isNotBlank()) {
-            urlOf(oc)?.let { if (playerOk(it)) return it }
-            Regex("""['"](/[^'"\s]*(?:player|embed|source|kaynak|video|ajax|part)[^'"\s]*)['"]""", RegexOption.IGNORE_CASE)
-                .find(oc)?.groupValues?.get(1)?.let { return mainUrl + it }
-        }
+        if (oc.isNotBlank()) urlOf(oc)?.let { return it }
         val href = el.attr("href").trim()
-        if (href.startsWith("http") && !href.contains("jetfilmizle", true) && playerOk(href)) return href
+        if (href.startsWith("http") && !href.contains("jetfilmizle", true)) return href
         return null
-    }
-
-    // Aynı siteye giden kaynak bağlantısı (örn. /film/dusler/2): sayfası açılıp içindeki oynatıcı bulunur
-    private fun internalHref(el: Element, pageUrl: String): String? {
-        val h = el.attr("href").trim()
-        if (h.isBlank() || h.startsWith("#") || h.startsWith("javascript", true) ||
-            h.startsWith("mailto", true) || h.startsWith("tel", true)
-        ) return null
-        val u = if (h.startsWith("//")) "https:$h" else abs(h)
-        if (!u.contains("jetfilmizle", true)) return null
-        if (u.trimEnd('/') == pageUrl.trimEnd('/')) return null
-        val path = u.replace(Regex("""^https?://[^/]+"""), "").substringBefore("#")
-        if (path.isBlank() || path == "/") return null
-        val nav = Regex(
-            """(?i)^/(?:filmler|kategoriler|giris|kayit|uye|login|register|iletisim|dmca|tur/|yil/|oyuncu/|turkce-dublaj|turkce-altyazili|yerli-filmler|orijinal-filmler|oscar|tavsiye)"""
-        )
-        if (nav.containsMatchIn(path)) return null
-        return u
     }
 
     // Atalarda "dublaj" ya da "altyazı" geçen kimlik/sınıf varsa dil buradan anlaşılır
@@ -330,100 +289,55 @@ class JetFilmizle : MainAPI() {
         return null
     }
 
-    // Sayfadaki kaynaklar. Her dilin paneli "Fragmanı İzle" butonuyla biter; paneller dil
+    // Sayfadaki kaynak butonları. Her dilin paneli "Fragmanı İzle" butonuyla biter; paneller dil
     // butonlarının sırasıyla eşleştirilir (Türkçe Dublaj, Türkçe Altyazılı, Dil+).
-    // Kaynak şu yollarla aranır: buton öznitelikleri / onclick / dış bağlantı, aynı siteye giden kaynak
-    // bağlantıları, sayfadaki varsayılan oynatıcı iframe'i, betikteki "vip: url" biçimleri ve bilinen oynatıcı adresleri.
-    private fun collectSources(doc: Document, html: String, pageUrl: String): List<Src> {
-        val els: List<Element> = doc.allElements
+    private fun collectSources(doc: Document, html: String): List<Src> {
         val order = ArrayList<String>()
-        for (el in els) {
+        for (el in doc.allElements) {
             val t = el.ownText().trim()
             if (t in langNames && t !in order) order.add(t)
         }
 
-        // "Fragmanı İzle" düğmeleri panel sınırı; ilk dil düğmesinden son Fragman'a kadar olan alan "kaynak penceresi"
-        val fragIdx = ArrayList<Int>()
-        for ((i, el) in els.withIndex()) {
-            if (el.ownText().trim().contains("Fragmanı İzle", true)) fragIdx.add(i)
-        }
-        var lastLang = -1
-        if (fragIdx.isNotEmpty()) {
-            for (i in 0 until fragIdx[0]) {
-                if (els[i].ownText().trim() in langNames) lastLang = i
-            }
-        }
-        fun segOf(i: Int): Int = fragIdx.count { it < i }
-        fun inWindow(i: Int): Boolean = fragIdx.isNotEmpty() && i > lastLang && i < fragIdx[fragIdx.size - 1]
-
-        val cands = ArrayList<SrcCand>()
-        for ((i, el) in els.withIndex()) {
+        val found = ArrayList<Pair<Element, String>>()
+        for (el in doc.allElements) {
             if (el.attributes().none { it.key.startsWith("data-") } && el.attr("onclick").isBlank() && !el.hasAttr("href")) continue
             val t = el.text().trim()
             if (t.isEmpty() || t.length > 24) continue
             if (t in langNames || t.contains("Fragman", true)) continue
             if (el.children().size > 2) continue
-            val direct = srcOfEl(el)
-            val inner = if (direct == null && inWindow(i)) internalHref(el, pageUrl) else null
-            if (direct == null && inner == null) continue
-            cands.add(SrcCand(i, el, direct, inner))
+            val u = srcOfEl(el) ?: continue
+            found.add(el to u)
         }
-        d("diller=$order fragman=${fragIdx.size} pencere=$lastLang dogrudan=${cands.count { it.direct != null }} ic=${cands.count { it.internal != null }}")
+        d("diller=$order butonlu_kaynak=${found.size}")
+
+        val urlByEl = HashMap<Element, String>()
+        for ((el, u) in found) urlByEl[el] = u
 
         val out = ArrayList<Src>()
-        for (c in cands) {
-            val lang = langHint(c.el) ?: order.getOrNull(segOf(c.idx)) ?: "Kaynak"
-            out.add(Src(lang, c.el.text().trim(), c.direct ?: c.internal.orEmpty()))
-        }
-        val have = out.map { it.url }.toHashSet()
-
-        // Varsayılan oynatıcı: sayfadaki iframe (etkin dil ve etkin kaynak düğmesinin adıyla)
-        val activeLang = order.firstOrNull() ?: "Kaynak"
-        var activeName = "Vip"
-        if (fragIdx.isNotEmpty() && lastLang >= 0) {
-            for (i in (lastLang + 1) until fragIdx[0]) {
-                val el = els[i]
-                val t = el.text().trim()
-                if (t.isNotEmpty() && t.length <= 16 && t !in langNames &&
-                    Regex("""active|selected|current|warning""").containsMatchIn(el.className().lowercase())
-                ) {
-                    activeName = t
-                    break
-                }
+        var seg = 0
+        for (el in doc.allElements) {
+            if (el.ownText().trim().contains("Fragmanı İzle", true)) {
+                seg++
+                continue
             }
-        }
-        var iframes = 0
-        for (f in doc.select("div#movie iframe, iframe")) {
-            val raw = f.attr("data-src").ifBlank { f.attr("data-lazy-src") }.ifBlank { f.attr("src") }.trim()
-            if (raw.isBlank() || raw.startsWith("about:") || raw.startsWith("javascript", true)) continue
-            val u = if (raw.startsWith("//")) "https:$raw" else abs(raw)
-            if (!playerOk(u) || u in have) continue
-            have.add(u)
-            out.add(Src(activeLang, activeName, u))
-            iframes++
-        }
-
-        val clean = html.replace("\\/", "/").replace("\\u002F", "/").replace("&amp;", "&")
-
-        // Betikte "vip": "https://..." ya da base64 biçiminde tutulan kaynaklar
-        var scriptSrc = 0
-        val keyRe = Regex("""(?i)["'](vip|oplay|okru|ok\.ru|stape|moly|gold|aby|pixeldrain|tr-en)["']\s*[:=]\s*["']([^"']{8,}?)["']""")
-        for (m in keyRe.findAll(clean)) {
-            val u = urlOf(m.groupValues[2]) ?: continue
-            if (!playerOk(u) || u in have) continue
-            have.add(u)
-            out.add(Src(activeLang, m.groupValues[1], u))
-            scriptSrc++
+            val u = urlByEl[el] ?: continue
+            val lang = langHint(el) ?: order.getOrNull(seg) ?: "Kaynak"
+            out.add(Src(lang, el.text().trim(), u))
         }
 
         // Sayfanın içine gömülü bilinen oynatıcı adresleri (örn. varsayılan oynatıcı iframe'i)
-        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet)""")
+        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx)""")
+        val clean = html.replace("\\/", "/").replace("\\u002F", "/").replace("&amp;", "&")
+        val have = out.map { it.url }.toHashSet()
         for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(clean)) {
             val u = m.value
             if (u in have || !known.containsMatchIn(u) || u.contains("youtube", true) || u.contains("jetfilmizle", true)) continue
             have.add(u)
             val nm = when {
+                u.contains("dplayer", true) && u.contains("workers.dev", true) -> "Vip"
+                u.contains("workers.dev/m/", true) && u.contains("//ok.", true) -> "OPlay"
                 u.contains("godrive", true) || u.contains("workers.dev", true) -> "Gold"
+                u.contains("vmpx", true) -> "Moly"
                 u.contains("ok.ru", true) -> "OkRu"
                 u.contains("moly", true) -> "Moly"
                 u.contains("tape", true) -> "STape"
@@ -432,46 +346,15 @@ class JetFilmizle : MainAPI() {
             out.add(Src("Kaynak", nm, u))
         }
 
-        // Hâlâ hiç kaynak yoksa: sayfadaki, reklam/varlık olmayan tüm dış adresler ve base64 gömülü adresler aday olur
-        var generic = 0
-        if (out.isEmpty()) {
-            val hint = Regex("""(?i)player|embed|kaynak|source|video""")
-            for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(clean)) {
-                val u = m.value.trimEnd(',', ';', ')', ']', '}')
-                if (!playerOk(u) || u in have) continue
-                if (u.contains("jetfilmizle", true) && !hint.containsMatchIn(u)) continue
-                have.add(u)
-                val nm = Regex("""^https?://(?:www\.)?([^/]+)""").find(u)?.groupValues?.get(1) ?: "Kaynak"
-                out.add(Src(activeLang, nm, u))
-                if (++generic >= 8) break
-            }
-            if (generic == 0) {
-                for (m in Regex("""["']([A-Za-z0-9+/=_-]{28,})["']""").findAll(clean).take(300)) {
-                    val u = urlOf(m.groupValues[1]) ?: continue
-                    if (!playerOk(u) || u in have) continue
-                    have.add(u)
-                    out.add(Src(activeLang, Regex("""^https?://(?:www\.)?([^/]+)""").find(u)?.groupValues?.get(1) ?: "Kaynak", u))
-                    if (++generic >= 6) break
-                }
-            }
-        }
-        d("iframe=$iframes betik=$scriptSrc genel=$generic")
-
-        // Tanı: panel yapısı ve ilk birkaç kaynak butonunun HTML'i (sonraki düzeltmeler için)
-        if (fragIdx.isNotEmpty()) {
-            val fr = els[fragIdx[0]]
-            val box = fr.parent()?.parent() ?: fr.parent()
-            d("panel: ${box?.outerHtml()?.replace(Regex("""\s+"""), " ")?.take(700)}")
-        }
+        // Tanı: ilk birkaç kaynak butonunun HTML'i (sonraki düzeltmeler için)
         var n = 0
-        for (el in els) {
+        for (el in doc.allElements) {
             val t = el.text().trim()
             if (t in listOf("Gold", "Vip", "OPlay", "OkRu", "Moly", "STape", "Aby", "Ok.ru", "TR-EN") && el.children().size <= 2) {
                 d("buton: ${el.outerHtml().take(350)}")
                 if (++n >= 6) break
             }
         }
-        for (s in out.take(12)) d("kaynak: ${s.lang} | ${s.name} | ${s.url.take(110)}")
         d("toplam kaynak=${out.size}")
         return out
     }
@@ -530,23 +413,11 @@ class JetFilmizle : MainAPI() {
         return true
     }
 
-    // Tanınmayan oynatıcılar / site içi kaynak sayfaları: sayfada .m3u8 / .mp4 ya da iç iframe aranır.
-    // İç iframe bulunursa o adres de aynı çözücülerle (OkRu, Vidmoly, hazır çıkarıcılar...) açılır.
-    private suspend fun extractGeneric(
-        u: String,
-        label: String,
-        src: String,
-        depth: Int,
-        subCb: (SubtitleFile) -> Unit,
-        cb: (ExtractorLink) -> Unit
-    ): Boolean {
+    // Tanınmayan oynatıcılar: sayfada .m3u8 / .mp4 ya da iç iframe aranır
+    private suspend fun extractGeneric(u: String, label: String, src: String, depth: Int, cb: (ExtractorLink) -> Unit): Boolean {
         if (depth > 2) return false
         val html = try {
-            if (u.startsWith(mainUrl, true)) {
-                get(u, "$mainUrl/", 12L).text
-            } else {
-                app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
-            }
+            app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             d("generic hata ${e.javaClass.simpleName} $u")
@@ -575,36 +446,14 @@ class JetFilmizle : MainAPI() {
             return true
         }
 
-        for (m in reIframe.findAll(hay)) {
-            val inner = m.groupValues[1]
-            val fu = when {
-                inner.startsWith("//") -> "https:$inner"
-                inner.startsWith("/") -> originOf(u) + inner
-                else -> inner
-            }
-            if (fu == u || !fu.startsWith("http") || !playerOk(fu)) continue
-            if (resolveUrl(fu, label, src, depth + 1, subCb, cb)) return true
+        val inner = reIframe.find(hay)?.groupValues?.get(1) ?: return false
+        val fu = when {
+            inner.startsWith("//") -> "https:$inner"
+            inner.startsWith("/") -> originOf(u) + inner
+            else -> inner
         }
-        return false
-    }
-
-    // Bir adresi, türüne göre uygun çözücüyle açar
-    private suspend fun resolveUrl(
-        u: String,
-        lang: String,
-        nm: String,
-        depth: Int,
-        subCb: (SubtitleFile) -> Unit,
-        cb: (ExtractorLink) -> Unit
-    ): Boolean {
-        return when {
-            u.contains("godrive", true) || u.contains("workers.dev", true) || u.contains(".mp4", true) ->
-                extractDirect(u, lang, nm, cb)
-            u.contains(".m3u8", true) -> emitHls(u, lang, nm, originOf(u), cb)
-            u.contains("ok.ru", true) -> extractOkRu(u, lang, cb) || viaExtractor(u, lang, subCb, cb)
-            u.contains("vidmoly", true) || u.contains("moly", true) -> extractVidmoly(u, lang, cb)
-            else -> viaExtractor(u, lang, subCb, cb) || extractGeneric(u, lang, nm, depth, subCb, cb)
-        }
+        if (fu == u || !fu.startsWith("http")) return false
+        return extractGeneric(fu, label, src, depth + 1, cb)
     }
 
     // Bir kaynağı (Gold, Vip, OkRu, Moly, STape...) adresine göre uygun çözücüyle açar
@@ -612,7 +461,22 @@ class JetFilmizle : MainAPI() {
         s: Src,
         subCb: (SubtitleFile) -> Unit,
         cb: (ExtractorLink) -> Unit
-    ): Boolean = resolveUrl(s.url, s.lang, s.name, 0, subCb, cb)
+    ): Boolean {
+        val u = s.url
+        return when {
+            // Vip / OPlay: workers.dev/m/... sayfası içinde <video><source ...mpegurl> var
+            u.contains("workers.dev/m/", true) -> extractWorkerHls(u, s.lang, s.name, 0, cb)
+            u.contains("godrive", true) || u.contains("workers.dev", true) || u.contains(".mp4", true) ->
+                extractDirect(u, s.lang, s.name, cb)
+            // Vidmoly CDN (vmpx.online) master.m3u8: Referer vidmoly olmalı
+            u.contains(".m3u8", true) && (u.contains("vmpx", true) || u.contains("vidmoly", true)) ->
+                emitHlsAny(u, s.lang, "Vidmoly", vidmolyOrigins, cb)
+            u.contains(".m3u8", true) -> emitHls(u, s.lang, s.name, originOf(u), cb)
+            u.contains("ok.ru", true) -> extractOkRu(u, s.lang, cb) || viaExtractor(u, s.lang, subCb, cb)
+            u.contains("vidmoly", true) || u.contains("moly", true) || u.contains("vmpx", true) -> extractVidmoly(u, s.lang, cb)
+            else -> viaExtractor(u, s.lang, subCb, cb) || extractGeneric(u, s.lang, s.name, 0, cb)
+        }
+    }
 
     private fun langRank(l: String): Int = when (l) {
         "Türkçe Dublaj" -> 0
@@ -628,7 +492,7 @@ class JetFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val r = get(data)
-        val srcs = collectSources(r.document, r.text, data).toMutableList()
+        val srcs = collectSources(r.document, r.text).toMutableList()
         if (srcs.isEmpty()) {
             val cap = webViewCapture(data)
             d("webview yakalama: $cap")
@@ -656,41 +520,18 @@ class JetFilmizle : MainAPI() {
             ok
         }
 
-        val items = synchronized(out) { ArrayList(out) }
-        items.sortedWith(compareBy<Pair<Int, ExtractorLink>>({ it.first }, { -it.second.quality })).forEach { callback(it.second) }
-        var any = oks.any { it }
-
-        // Hiçbir bağlantı çıkmadıysa: oynatıcı sayfalarını görünmez WebView'de açıp ağ isteğinden video adresi yakala
-        if (!any) {
-            var tried = 0
-            for (s in srcs) {
-                if (tried >= 2) break
-                if (s.url.contains("jetfilmizle", true) && !Regex("""(?i)player|embed""").containsMatchIn(s.url)) continue
-                tried++
-                val cap = webViewCapture(s.url) ?: continue
-                d("webview ${s.name}: ${cap.take(120)}")
-                val ok = when {
-                    cap.contains(".m3u8", true) -> emitHls(cap, s.lang, s.name, originOf(s.url), callback)
-                    cap.contains(".mp4", true) -> {
-                        val h = mapOf("User-Agent" to ua, "Referer" to "${originOf(s.url)}/")
-                        callback(
-                            newExtractorLink(name, "${s.lang} - ${s.name}", cap, ExtractorLinkType.VIDEO) {
-                                this.referer = "${originOf(s.url)}/"
-                                this.quality = Qualities.Unknown.value
-                                this.headers = h
-                            }
-                        )
-                        true
-                    }
-                    else -> false
-                }
-                if (ok) {
-                    any = true
-                    break
-                }
+        if (!oks.any { it } && synchronized(out) { out.isEmpty() }) {
+            val cap = webViewCapture(data)
+            d("son çare webview: $cap")
+            if (cap != null && cap.contains(".m3u8", true)) {
+                emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
+                return true
             }
         }
-        return any
+
+        val items = synchronized(out) { ArrayList(out) }
+        items.sortedWith(compareBy<Pair<Int, ExtractorLink>>({ it.first }, { -it.second.quality })).forEach { callback(it.second) }
+        return oks.any { it }
     }
 
     private fun heightOf(w: Int): Int = when {
@@ -745,11 +586,12 @@ class JetFilmizle : MainAPI() {
         label: String,
         src: String,
         origin: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        force: Boolean = false
     ): Boolean {
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         val (alive, q) = probeHls(m3u8, headers)
-        if (!alive) {
+        if (!alive && !force) {
             d("$src ölü bağlantı atlandı: ${m3u8.take(100)}")
             return false
         }
@@ -815,6 +657,83 @@ class JetFilmizle : MainAPI() {
     }
 
 
+    private val vidmolyOrigins = listOf("https://vidmoly.biz", "https://vidmoly.net", "https://vidmoly.to", "https://vidmoly.me")
+
+    // Farklı Referer/Origin'lerle dener; hiçbiri doğrulanamazsa yine de ilkiyle verir ("bağlantı yok" dememesi için)
+    private suspend fun emitHlsAny(
+        url: String, label: String, src: String, origins: List<String>, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        for (o in origins) if (emitHls(url, label, src, o, cb)) return true
+        return emitHls(url, label, src, origins.first(), cb, force = true)
+    }
+
+    // ---- Vip / OPlay (workers.dev/m/...): HTML sayfa -> <source src=...> (mpegurl) -> m3u8 ----
+    private suspend fun extractWorkerHls(
+        u: String, label: String, src: String, depth: Int, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (depth > 3) return false
+        val origins = listOf(mainUrl, originOf(u))
+        for (o in origins) {
+            val r = try {
+                app.get(
+                    u,
+                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to if (depth == 0) "iframe" else "video"),
+                    referer = "$o/",
+                    timeout = 12L
+                )
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("worker hata ${e.javaClass.simpleName} $src")
+                continue
+            }
+            val ct = r.headers["Content-Type"].orEmpty().lowercase()
+            val len = r.headers["Content-Length"]?.toLongOrNull() ?: 0L
+            val finalUrl = r.url
+            // Doğrudan video akışı
+            if ((ct.startsWith("video/") && !ct.contains("mpegurl")) || len > 2_000_000L) {
+                cb(
+                    newExtractorLink(name, "$label - $src", finalUrl, ExtractorLinkType.VIDEO) {
+                        this.referer = "$o/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to ua, "Referer" to "$o/")
+                    }
+                )
+                return true
+            }
+            val body = r.text
+            // Doğrudan m3u8
+            if (body.trimStart().startsWith("#EXTM3U")) {
+                return emitHlsAny(finalUrl, label, src, origins, cb)
+            }
+            // HTML sayfası: <video><source src=...>
+            val doc = org.jsoup.Jsoup.parse(body, finalUrl)
+            val inner = doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
+                ?.takeIf { it.startsWith("http") }
+                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""")
+                    .find(body.replace("\\/", "/"))?.groupValues?.get(1)
+            if (inner != null && inner != u && inner != finalUrl) {
+                d("worker $src ic kaynak: ${inner.take(90)}")
+                if (extractWorkerHls(inner, label, src, depth + 1, cb)) return true
+                // İç adres alınamadı/doğrulanamadı: mpegurl olarak yine de ver
+                return emitHlsAny(inner, label, src, origins, cb)
+            }
+        }
+        return false
+    }
+
+    private suspend fun webViewHls(pageUrl: String, referer: String): String? = try {
+        val r = app.get(
+            pageUrl,
+            referer = referer,
+            interceptor = WebViewResolver(Regex("""(?i)\.m3u8"""), userAgent = null, useOkhttp = false, timeout = 15_000L),
+            timeout = 25L
+        )
+        r.url.takeIf { it != pageUrl && it.contains(".m3u8", true) }
+    } catch (e: Exception) {
+        if (e is java.util.concurrent.CancellationException) throw e
+        null
+    }
+
     private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
         newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
             this.referer = l.referer
@@ -863,6 +782,9 @@ class JetFilmizle : MainAPI() {
             d("vidmoly $host tamam")
             return true
         }
+        // Gömülü sayfa m3u8 vermediyse görünmez WebView ile yakala
+        val cap = webViewHls(embed, "$mainUrl/")
+        if (cap != null) return emitHlsAny(cap, label, "Vidmoly", vidmolyOrigins, callback)
         return false
     }
 
