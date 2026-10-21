@@ -1,6 +1,10 @@
 // Sürüm numarası: her güncellemede 1 artır
 version = 1
 
+android {
+    namespace = "com.bymesut1"
+}
+
 cloudstream {
     description = "JetFilmizle - Türkçe dublaj ve altyazılı film izle"
     authors = listOf("Bymesut1")
