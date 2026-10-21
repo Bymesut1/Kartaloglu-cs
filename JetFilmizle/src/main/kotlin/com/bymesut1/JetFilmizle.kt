@@ -239,6 +239,20 @@ class JetFilmizle : MainAPI() {
 
     private data class Src(val lang: String, val name: String, val url: String)
 
+    private val playerHostRe = Regex("""(?i)(videopark|godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx)""")
+
+    private fun findPostId(s: String): String? {
+        Regex("""videopark\.top/(?:vip|oplayer)/\?id=(\d+)""").find(s)?.let { return it.groupValues[1] }
+        val pats = listOf(
+            """(?i)(?:post[_-]?id|postid|movie[_-]?id|film[_-]?id|video[_-]?id|content[_-]?id|data-id|data-post|data-film|data-movie)["'\s:=\]\[]+["']?(\d{4,8})""",
+            """(?i)shortlink[^>]*[?&]p=(\d{4,8})""",
+            """(?i)\bpostid-(\d{4,8})""",
+            """(?i)[?&](?:id|p)=(\d{5,8})\b"""
+        )
+        for (p in pats) Regex(p).find(s)?.let { return it.groupValues[1] }
+        return null
+    }
+
     private val langNames = listOf("Türkçe Dublaj", "Türkçe Altyazılı", "Dil+")
 
     private val reUrlIn = Regex("""(?:https?:)?//[^\s"'<>\\)]+""")
@@ -291,7 +305,7 @@ class JetFilmizle : MainAPI() {
 
     // Sayfadaki kaynak butonları. Her dilin paneli "Fragmanı İzle" butonuyla biter; paneller dil
     // butonlarının sırasıyla eşleştirilir (Türkçe Dublaj, Türkçe Altyazılı, Dil+).
-    private fun collectSources(doc: Document, html: String): List<Src> {
+    private fun collectSources(doc: Document, html: String, pidOverride: String? = null): List<Src> {
         val order = ArrayList<String>()
         for (el in doc.allElements) {
             val t = el.ownText().trim()
@@ -305,7 +319,7 @@ class JetFilmizle : MainAPI() {
             if (t.isEmpty() || t.length > 24) continue
             if (t in langNames || t.contains("Fragman", true)) continue
             if (el.children().size > 2) continue
-            val u = srcOfEl(el) ?: continue
+            val u = srcOfEl(el)?.takeIf { playerHostRe.containsMatchIn(it) || it.startsWith(mainUrl) } ?: continue
             found.add(el to u)
         }
         d("diller=$order butonlu_kaynak=${found.size}")
@@ -346,6 +360,34 @@ class JetFilmizle : MainAPI() {
             out.add(Src("Kaynak", nm, u))
         }
 
+        // Butonlarda adres yok (data-source-index / data-player-type): adresler film kimliğinden kurulur
+        val pid = pidOverride ?: findPostId(clean)
+        val mid = Regex("""(?i)(?:embed-|vidmoly\.[a-z]+/(?:w/|e/)?)([a-z0-9]{12})\b""").find(clean)?.groupValues?.get(1)
+        d("postId=$pid molyId=$mid")
+        for (el in doc.select("[data-source-index]")) {
+            val nm = el.text().trim()
+            val lang = when (el.attr("data-player-type").lowercase()) {
+                "dublaj" -> "Türkçe Dublaj"
+                "altyazili" -> "Türkçe Altyazılı"
+                else -> "Kaynak"
+            }
+            val u = when (nm.lowercase()) {
+                "vip" -> pid?.let { "https://videopark.top/vip/?id=$it" }
+                "oplay" -> pid?.let { "https://videopark.top/oplayer/?id=$it" }
+                "moly" -> mid?.let { "https://vidmoly.biz/embed-$it.html" }
+                else -> null
+            } ?: continue
+            if (have.add(u)) out.add(Src(lang, nm, u))
+        }
+        var sc = 0
+        for (sEl in doc.select("script:not([src])")) {
+            val t = sEl.data()
+            if (Regex("""(?i)player-source|data-source|videopark|vidmoly|ajax|fetch\(""").containsMatchIn(t)) {
+                d("script: ${t.replace(Regex("\\s+"), " ").take(850)}")
+                if (++sc >= 6) break
+            }
+        }
+
         // Tanı: ilk birkaç kaynak butonunun HTML'i (sonraki düzeltmeler için)
         var n = 0
         for (el in doc.allElements) {
@@ -364,7 +406,7 @@ class JetFilmizle : MainAPI() {
         val r = app.get(
             pageUrl,
             interceptor = WebViewResolver(
-                Regex("""(?i)(\.m3u8|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
+                Regex("""(?i)(videopark\.top/(?:vip|oplayer)/\?id=|\.m3u8|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
                 userAgent = null,
                 useOkhttp = false,
                 timeout = 20_000L
@@ -376,6 +418,52 @@ class JetFilmizle : MainAPI() {
         if (e is java.util.concurrent.CancellationException) throw e
         d("webview hata ${e.javaClass.simpleName}")
         null
+    }
+
+    // Film sayfası ilk kaynağı (Vip) kendiliğinden yükler; iframe adresindeki id film kimliğidir
+    private suspend fun captureVideoparkId(pageUrl: String): String? = try {
+        val r = app.get(
+            pageUrl,
+            interceptor = WebViewResolver(
+                Regex("""(?i)videopark\.top/(?:vip|oplayer)/\?id=\d+"""),
+                userAgent = null,
+                useOkhttp = false,
+                timeout = 20_000L
+            ),
+            timeout = 30L
+        )
+        Regex("""id=(\d+)""").find(r.url)?.groupValues?.get(1)
+    } catch (e: Exception) {
+        if (e is java.util.concurrent.CancellationException) throw e
+        d("kimlik webview hata ${e.javaClass.simpleName}")
+        null
+    }
+
+    // Tanı: sitenin kendi JS dosyalarında buton -> adres mantığını arar ve logcat'e yazar
+    private suspend fun dumpSiteJs(doc: Document) {
+        try {
+            val urls = doc.select("script[src]").map { abs(it.attr("src")) }
+                .filter { originOf(it).contains("jetfilmizle", true) }.take(8)
+            d("site js: $urls")
+            val re = Regex("""(?i)player-source-btn|data-source-index|sourceIndex|source-index""")
+            for (u in urls) {
+                val t = try {
+                    app.get(u, referer = "$mainUrl/", timeout = 10L).text
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    continue
+                }
+                var n = 0
+                for (m in re.findAll(t)) {
+                    val a = maxOf(0, m.range.first - 200)
+                    val b = minOf(t.length, m.range.last + 600)
+                    d("js ${u.substringAfterLast('/').take(28)}@${m.range.first}: ${t.substring(a, b).replace(Regex("\\s+"), " ")}")
+                    if (++n >= 3) break
+                }
+            }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
     }
 
     // ---------------- Oynatma: kaynakları video bağlantısına çevirme ----------------
@@ -493,7 +581,14 @@ class JetFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val r = get(data)
-        val srcs = collectSources(r.document, r.text).toMutableList()
+        var srcs = collectSources(r.document, r.text).toMutableList()
+        val hasBtns = r.document.select("[data-source-index]").isNotEmpty()
+        if (hasBtns && srcs.none { it.url.contains("videopark", true) }) {
+            val pid = captureVideoparkId(data)
+            d("webview film kimliği: $pid")
+            if (pid != null) srcs = collectSources(r.document, r.text, pid).toMutableList()
+        }
+        if (hasBtns && srcs.none { it.name.equals("Moly", true) }) dumpSiteJs(r.document)
         if (srcs.isEmpty()) {
             val cap = webViewCapture(data)
             d("webview yakalama: $cap")
@@ -524,7 +619,9 @@ class JetFilmizle : MainAPI() {
         if (!oks.any { it } && synchronized(out) { out.isEmpty() }) {
             val cap = webViewCapture(data)
             d("son çare webview: $cap")
-            if (cap != null && cap.contains(".m3u8", true)) {
+            if (cap != null && cap.contains("videopark", true)) {
+                if (extractVideopark(cap, "Kaynak", "JetFilmizle", callback)) return true
+            } else if (cap != null && cap.contains(".m3u8", true)) {
                 emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
                 return true
             }
@@ -723,7 +820,64 @@ class JetFilmizle : MainAPI() {
     }
 
     // ---- videopark.top/vip/?id=..  ve  /oplayer/?id=.. ----
+    // oplayer: sayfada VIDEO_DATA = {...} (mp4Sources + hlsSource) hazır gelir.
+    // vip: sayfa WORKER_URL/api/stream?pubId=..&title=..&publisherId=.. adresinden aynı biçimde JSON alır.
+    private fun jsonAssign(s: String, name: String): String? {
+        val m = Regex(name + """\s*=\s*\{""").find(s) ?: return null
+        val st = m.range.last
+        var depth = 0
+        var inStr = false
+        var esc = false
+        for (k in st until s.length) {
+            val c = s[k]
+            if (inStr) {
+                if (esc) esc = false
+                else if (c == '\\') esc = true
+                else if (c == '"') inStr = false
+            } else {
+                when (c) {
+                    '"' -> inStr = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return s.substring(st, k + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private suspend fun emitStream(j: JSONObject, label: String, src: String, base: String, cb: (ExtractorLink) -> Unit): Boolean {
+        var ok = false
+        val h = mapOf("User-Agent" to ua, "Referer" to "$base/")
+        val arr = j.optJSONArray("mp4Sources")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val f = o.optString("file").replace("\\/", "/")
+                if (!f.startsWith("http")) continue
+                val q = o.optInt("height", 0).takeIf { it > 0 }
+                    ?: Regex("""(\d{3,4})p""").find(o.optString("label"))?.groupValues?.get(1)?.toIntOrNull()
+                cb(
+                    newExtractorLink(name, "$label - $src${if (q != null) " (${q}p)" else ""}", f, ExtractorLinkType.VIDEO) {
+                        this.referer = "$base/"
+                        this.quality = q ?: Qualities.Unknown.value
+                        this.headers = h
+                    }
+                )
+                ok = true
+            }
+        }
+        val hls = j.optJSONObject("hlsSource")?.optString("file")?.replace("\\/", "/")
+        if (!hls.isNullOrBlank() && hls.startsWith("http")) {
+            if (emitHlsAny(hls, label, "$src Auto", listOf(base, mainUrl), cb)) ok = true
+        }
+        return ok
+    }
+
     private suspend fun extractVideopark(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val base = originOf(u)
         val html = try {
             app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
         } catch (e: Exception) {
@@ -732,26 +886,56 @@ class JetFilmizle : MainAPI() {
             null
         }
         if (html != null) {
-            d("videopark $src uzunluk=${html.length} ${html.replace(Regex("""\s+"""), " ").take(500)}")
-            val unp = try { if (html.contains("eval(function(p,a,c,k,e,")) unpackJs(html) else "" } catch (e: Throwable) { "" }
-            val hay = (unp + "\n" + html).replace("\\/", "/").replace("&amp;", "&")
-            val urls = Regex("""https?://[^\s"'<>\\]+""").findAll(hay).map { it.value }.distinct().toList()
-            for (x in urls) {
-                if (x.contains("videopark.top", true) && !x.contains(".m3u8", true)) continue
+            d("videopark $src uzunluk=${html.length}")
+            // 1) sayfaya gömülü VIDEO_DATA
+            val inline = jsonAssign(html, "VIDEO_DATA")
+            if (inline != null) {
+                try {
+                    if (emitStream(JSONObject(inline), label, src, base, cb)) return true
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    d("VIDEO_DATA json hata ${e.javaClass.simpleName}")
+                }
+            }
+            // 2) WORKER_URL/api/stream
+            fun cst(n: String): String =
+                Regex("""(?:const|var|let)\s+""" + n + """\s*=\s*["']([^"']*)["']""").find(html)?.groupValues?.get(1).orEmpty()
+            val worker = cst("WORKER_URL")
+            val pub = cst("PUB_ID")
+            val title = cst("VIDEO_TITLE").ifBlank { cst("VIDEO_ID") }
+            val publisher = cst("PUBLISHER_ID")
+            if (worker.startsWith("http") && pub.isNotBlank()) {
+                var api = "$worker/api/stream?pubId=${URLEncoder.encode(pub, "UTF-8")}&title=${URLEncoder.encode(title, "UTF-8")}"
+                if (publisher.isNotBlank()) api += "&publisherId=${URLEncoder.encode(publisher, "UTF-8")}"
+                try {
+                    val r = app.get(
+                        api,
+                        headers = mapOf("User-Agent" to ua, "Accept" to "application/json", "Origin" to base),
+                        referer = "$base/",
+                        timeout = 15L
+                    )
+                    d("videopark api ${r.code} uzunluk=${r.text.length}")
+                    if (emitStream(JSONObject(r.text), label, src, base, cb)) return true
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    d("videopark api hata ${e.javaClass.simpleName}")
+                }
+            }
+            // 3) sayfadaki açık adresler
+            val hay = html.replace("\\/", "/").replace("&amp;", "&")
+            for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(hay)) {
+                val x = m.value
                 val ok = when {
                     x.contains("workers.dev/m/", true) -> extractWorkerHls(x, label, src, 0, cb)
-                    x.contains(".m3u8", true) -> emitHlsAny(x, label, src, listOf(originOf(u), mainUrl), cb)
-                    x.contains(".mp4", true) -> extractDirect(x, label, src, cb)
-                    x.contains("vidmoly", true) || x.contains("vmpx", true) -> extractVidmoly(x, label, cb)
+                    x.contains(".m3u8", true) -> emitHlsAny(x, label, src, listOf(base, mainUrl), cb)
                     else -> false
                 }
                 if (ok) return true
             }
-            if (extractGeneric(u, label, src, 0, cb)) return true
         }
-        // Adres sayfada açık değilse (JS ile geliyorsa) WebView ile yakala
+        // 4) hiçbiri olmazsa WebView ile yakala
         val cap = webViewHls(u, "$mainUrl/") ?: return false
-        return emitHlsAny(cap, label, src, listOf(originOf(u), mainUrl), cb)
+        return emitHlsAny(cap, label, src, listOf(base, mainUrl), cb)
     }
 
     private suspend fun webViewHls(pageUrl: String, referer: String): String? = try {
