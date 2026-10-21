@@ -326,7 +326,7 @@ class JetFilmizle : MainAPI() {
         }
 
         // Sayfanın içine gömülü bilinen oynatıcı adresleri (örn. varsayılan oynatıcı iframe'i)
-        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx)""")
+        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx|videopark)""")
         val clean = html.replace("\\/", "/").replace("\\u002F", "/").replace("&amp;", "&")
         val have = out.map { it.url }.toHashSet()
         for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(clean)) {
@@ -464,6 +464,7 @@ class JetFilmizle : MainAPI() {
     ): Boolean {
         val u = s.url
         return when {
+            u.contains("videopark.top", true) -> extractVideopark(u, s.lang, s.name, cb)
             // Vip / OPlay: workers.dev/m/... sayfası içinde <video><source ...mpegurl> var
             u.contains("workers.dev/m/", true) -> extractWorkerHls(u, s.lang, s.name, 0, cb)
             u.contains("godrive", true) || u.contains("workers.dev", true) || u.contains(".mp4", true) ->
@@ -719,6 +720,38 @@ class JetFilmizle : MainAPI() {
             }
         }
         return false
+    }
+
+    // ---- videopark.top/vip/?id=..  ve  /oplayer/?id=.. ----
+    private suspend fun extractVideopark(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = try {
+            app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("videopark hata ${e.javaClass.simpleName}")
+            null
+        }
+        if (html != null) {
+            d("videopark $src uzunluk=${html.length} ${html.replace(Regex("""\s+"""), " ").take(500)}")
+            val unp = try { if (html.contains("eval(function(p,a,c,k,e,")) unpackJs(html) else "" } catch (e: Throwable) { "" }
+            val hay = (unp + "\n" + html).replace("\\/", "/").replace("&amp;", "&")
+            val urls = Regex("""https?://[^\s"'<>\\]+""").findAll(hay).map { it.value }.distinct().toList()
+            for (x in urls) {
+                if (x.contains("videopark.top", true) && !x.contains(".m3u8", true)) continue
+                val ok = when {
+                    x.contains("workers.dev/m/", true) -> extractWorkerHls(x, label, src, 0, cb)
+                    x.contains(".m3u8", true) -> emitHlsAny(x, label, src, listOf(originOf(u), mainUrl), cb)
+                    x.contains(".mp4", true) -> extractDirect(x, label, src, cb)
+                    x.contains("vidmoly", true) || x.contains("vmpx", true) -> extractVidmoly(x, label, cb)
+                    else -> false
+                }
+                if (ok) return true
+            }
+            if (extractGeneric(u, label, src, 0, cb)) return true
+        }
+        // Adres sayfada açık değilse (JS ile geliyorsa) WebView ile yakala
+        val cap = webViewHls(u, "$mainUrl/") ?: return false
+        return emitHlsAny(cap, label, src, listOf(originOf(u), mainUrl), cb)
     }
 
     private suspend fun webViewHls(pageUrl: String, referer: String): String? = try {
