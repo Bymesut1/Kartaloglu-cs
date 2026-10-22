@@ -375,6 +375,7 @@ class JetFilmizle : MainAPI() {
                 "vip" -> pid?.let { "https://videopark.top/vip/?id=$it" }
                 "oplay" -> pid?.let { "https://videopark.top/oplayer/?id=$it" }
                 "moly" -> mid?.let { "https://vidmoly.biz/embed-$it.html" }
+                "gold" -> pid?.let { "https://godrive.erikkalinina1994.workers.dev/v/$it?q=1080" }
                 else -> null
             } ?: continue
             if (have.add(u)) out.add(Src(lang, nm, u))
@@ -437,33 +438,6 @@ class JetFilmizle : MainAPI() {
         if (e is java.util.concurrent.CancellationException) throw e
         d("kimlik webview hata ${e.javaClass.simpleName}")
         null
-    }
-
-    // Tanı: sitenin kendi JS dosyalarında buton -> adres mantığını arar ve logcat'e yazar
-    private suspend fun dumpSiteJs(doc: Document) {
-        try {
-            val urls = doc.select("script[src]").map { abs(it.attr("src")) }
-                .filter { originOf(it).contains("jetfilmizle", true) }.take(8)
-            d("site js: $urls")
-            val re = Regex("""(?i)player-source-btn|data-source-index|sourceIndex|source-index""")
-            for (u in urls) {
-                val t = try {
-                    app.get(u, referer = "$mainUrl/", timeout = 10L).text
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    continue
-                }
-                var n = 0
-                for (m in re.findAll(t)) {
-                    val a = maxOf(0, m.range.first - 200)
-                    val b = minOf(t.length, m.range.last + 600)
-                    d("js ${u.substringAfterLast('/').take(28)}@${m.range.first}: ${t.substring(a, b).replace(Regex("\\s+"), " ")}")
-                    if (++n >= 3) break
-                }
-            }
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-        }
     }
 
     // ---------------- Oynatma: kaynakları video bağlantısına çevirme ----------------
@@ -544,6 +518,42 @@ class JetFilmizle : MainAPI() {
         return extractGeneric(fu, label, src, depth + 1, cb)
     }
 
+    // Vip / OPlay: videopark oynatıcı sayfasında workers.dev/m/<jeton> adresi (HLS) bulunur.
+    // Bu adres yalnızca videopark Referer'i ile açılır.
+    private suspend fun extractVideopark(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val reTok = Regex("""https?://[A-Za-z0-9.-]+\.workers\.dev/m/[A-Za-z0-9_\-]+""")
+        val html = try {
+            app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("videopark hata ${e.javaClass.simpleName} $u")
+            ""
+        }
+        val clean = html.replace("\\/", "/").replace("&amp;", "&")
+        var tok = reTok.find(clean)?.value
+        if (tok == null) {
+            // adres sayfada yazılı değil, oynatıcı betiği ağdan çağırıyor: WebView ile yakalanır
+            tok = try {
+                app.get(
+                    u,
+                    interceptor = WebViewResolver(
+                        Regex("""(?i)workers\.dev/m/"""),
+                        userAgent = null,
+                        useOkhttp = false,
+                        timeout = 20_000L
+                    ),
+                    timeout = 30L
+                ).url.takeIf { reTok.containsMatchIn(it) }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                null
+            }
+        }
+        d("videopark $src jeton=${tok?.take(80)}")
+        if (tok != null && emitHls(tok, label, src, "https://videopark.top", cb)) return true
+        return extractGeneric(u, label, src, 0, cb)
+    }
+
     // Bir kaynağı (Gold, Vip, OkRu, Moly, STape...) adresine göre uygun çözücüyle açar
     private suspend fun resolve(
         s: Src,
@@ -552,17 +562,12 @@ class JetFilmizle : MainAPI() {
     ): Boolean {
         val u = s.url
         return when {
-            u.contains("videopark.top", true) -> extractVideopark(u, s.lang, s.name, cb)
-            // Vip / OPlay: workers.dev/m/... sayfası içinde <video><source ...mpegurl> var
-            u.contains("workers.dev/m/", true) -> extractWorkerHls(u, s.lang, s.name, 0, cb)
+            u.contains("videopark", true) -> extractVideopark(u, s.lang, s.name, cb)
             u.contains("godrive", true) || u.contains("workers.dev", true) || u.contains(".mp4", true) ->
                 extractDirect(u, s.lang, s.name, cb)
-            // Vidmoly CDN (vmpx.online) master.m3u8: Referer vidmoly olmalı
-            u.contains(".m3u8", true) && (u.contains("vmpx", true) || u.contains("vidmoly", true)) ->
-                emitHlsAny(u, s.lang, "Vidmoly", vidmolyOrigins, cb)
             u.contains(".m3u8", true) -> emitHls(u, s.lang, s.name, originOf(u), cb)
             u.contains("ok.ru", true) -> extractOkRu(u, s.lang, cb) || viaExtractor(u, s.lang, subCb, cb)
-            u.contains("vidmoly", true) || u.contains("moly", true) || u.contains("vmpx", true) -> extractVidmoly(u, s.lang, cb)
+            u.contains("vidmoly", true) || u.contains("moly", true) -> extractVidmoly(u, s.lang, cb)
             else -> viaExtractor(u, s.lang, subCb, cb) || extractGeneric(u, s.lang, s.name, 0, cb)
         }
     }
@@ -582,13 +587,12 @@ class JetFilmizle : MainAPI() {
     ): Boolean {
         val r = get(data)
         var srcs = collectSources(r.document, r.text).toMutableList()
-        val hasBtns = r.document.select("[data-source-index]").isNotEmpty()
-        if (hasBtns && srcs.none { it.url.contains("videopark", true) }) {
+        // Butonlarda adres yok ve film kimliği sayfada görünmüyorsa: sayfa Vip'i kendiliğinden yükler, kimlik oradan alınır
+        if (srcs.none { it.url.contains("videopark", true) } && r.document.select("[data-source-index]").isNotEmpty()) {
             val pid = captureVideoparkId(data)
             d("webview film kimliği: $pid")
             if (pid != null) srcs = collectSources(r.document, r.text, pid).toMutableList()
         }
-        if (hasBtns && srcs.none { it.name.equals("Moly", true) }) dumpSiteJs(r.document)
         if (srcs.isEmpty()) {
             val cap = webViewCapture(data)
             d("webview yakalama: $cap")
@@ -614,17 +618,6 @@ class JetFilmizle : MainAPI() {
             }
             d("${s.lang} ${s.name} ${s.url.take(120)} -> $ok")
             ok
-        }
-
-        if (!oks.any { it } && synchronized(out) { out.isEmpty() }) {
-            val cap = webViewCapture(data)
-            d("son çare webview: $cap")
-            if (cap != null && cap.contains("videopark", true)) {
-                if (extractVideopark(cap, "Kaynak", "JetFilmizle", callback)) return true
-            } else if (cap != null && cap.contains(".m3u8", true)) {
-                emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
-                return true
-            }
         }
 
         val items = synchronized(out) { ArrayList(out) }
@@ -684,12 +677,11 @@ class JetFilmizle : MainAPI() {
         label: String,
         src: String,
         origin: String,
-        callback: (ExtractorLink) -> Unit,
-        force: Boolean = false
+        callback: (ExtractorLink) -> Unit
     ): Boolean {
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         val (alive, q) = probeHls(m3u8, headers)
-        if (!alive && !force) {
+        if (!alive) {
             d("$src ölü bağlantı atlandı: ${m3u8.take(100)}")
             return false
         }
@@ -755,202 +747,6 @@ class JetFilmizle : MainAPI() {
     }
 
 
-    private val vidmolyOrigins = listOf("https://vidmoly.biz", "https://vidmoly.net", "https://vidmoly.to", "https://vidmoly.me")
-
-    // Farklı Referer/Origin'lerle dener; hiçbiri doğrulanamazsa yine de ilkiyle verir ("bağlantı yok" dememesi için)
-    private suspend fun emitHlsAny(
-        url: String, label: String, src: String, origins: List<String>, cb: (ExtractorLink) -> Unit
-    ): Boolean {
-        for (o in origins) if (emitHls(url, label, src, o, cb)) return true
-        return emitHls(url, label, src, origins.first(), cb, force = true)
-    }
-
-    // ---- Vip / OPlay (workers.dev/m/...): HTML sayfa -> <source src=...> (mpegurl) -> m3u8 ----
-    private suspend fun extractWorkerHls(
-        u: String, label: String, src: String, depth: Int, cb: (ExtractorLink) -> Unit
-    ): Boolean {
-        if (depth > 3) return false
-        val origins = listOf(mainUrl, originOf(u))
-        for (o in origins) {
-            val r = try {
-                app.get(
-                    u,
-                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to if (depth == 0) "iframe" else "video"),
-                    referer = "$o/",
-                    timeout = 12L
-                )
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                d("worker hata ${e.javaClass.simpleName} $src")
-                continue
-            }
-            val ct = r.headers["Content-Type"].orEmpty().lowercase()
-            val len = r.headers["Content-Length"]?.toLongOrNull() ?: 0L
-            val finalUrl = r.url
-            // Doğrudan video akışı
-            if ((ct.startsWith("video/") && !ct.contains("mpegurl")) || len > 2_000_000L) {
-                cb(
-                    newExtractorLink(name, "$label - $src", finalUrl, ExtractorLinkType.VIDEO) {
-                        this.referer = "$o/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mapOf("User-Agent" to ua, "Referer" to "$o/")
-                    }
-                )
-                return true
-            }
-            val body = r.text
-            // Doğrudan m3u8
-            if (body.trimStart().startsWith("#EXTM3U")) {
-                return emitHlsAny(finalUrl, label, src, origins, cb)
-            }
-            // HTML sayfası: <video><source src=...>
-            val doc = org.jsoup.Jsoup.parse(body, finalUrl)
-            val inner = doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
-                ?.takeIf { it.startsWith("http") }
-                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""")
-                    .find(body.replace("\\/", "/"))?.groupValues?.get(1)
-            if (inner != null && inner != u && inner != finalUrl) {
-                d("worker $src ic kaynak: ${inner.take(90)}")
-                if (extractWorkerHls(inner, label, src, depth + 1, cb)) return true
-                // İç adres alınamadı/doğrulanamadı: mpegurl olarak yine de ver
-                return emitHlsAny(inner, label, src, origins, cb)
-            }
-        }
-        return false
-    }
-
-    // ---- videopark.top/vip/?id=..  ve  /oplayer/?id=.. ----
-    // oplayer: sayfada VIDEO_DATA = {...} (mp4Sources + hlsSource) hazır gelir.
-    // vip: sayfa WORKER_URL/api/stream?pubId=..&title=..&publisherId=.. adresinden aynı biçimde JSON alır.
-    private fun jsonAssign(s: String, name: String): String? {
-        val m = Regex(name + """\s*=\s*\{""").find(s) ?: return null
-        val st = m.range.last
-        var depth = 0
-        var inStr = false
-        var esc = false
-        for (k in st until s.length) {
-            val c = s[k]
-            if (inStr) {
-                if (esc) esc = false
-                else if (c == '\\') esc = true
-                else if (c == '"') inStr = false
-            } else {
-                when (c) {
-                    '"' -> inStr = true
-                    '{' -> depth++
-                    '}' -> {
-                        depth--
-                        if (depth == 0) return s.substring(st, k + 1)
-                    }
-                }
-            }
-        }
-        return null
-    }
-
-    private suspend fun emitStream(j: JSONObject, label: String, src: String, base: String, cb: (ExtractorLink) -> Unit): Boolean {
-        var ok = false
-        val h = mapOf("User-Agent" to ua, "Referer" to "$base/")
-        val arr = j.optJSONArray("mp4Sources")
-        if (arr != null) {
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val f = o.optString("file").replace("\\/", "/")
-                if (!f.startsWith("http")) continue
-                val q = o.optInt("height", 0).takeIf { it > 0 }
-                    ?: Regex("""(\d{3,4})p""").find(o.optString("label"))?.groupValues?.get(1)?.toIntOrNull()
-                cb(
-                    newExtractorLink(name, "$label - $src${if (q != null) " (${q}p)" else ""}", f, ExtractorLinkType.VIDEO) {
-                        this.referer = "$base/"
-                        this.quality = q ?: Qualities.Unknown.value
-                        this.headers = h
-                    }
-                )
-                ok = true
-            }
-        }
-        val hls = j.optJSONObject("hlsSource")?.optString("file")?.replace("\\/", "/")
-        if (!hls.isNullOrBlank() && hls.startsWith("http")) {
-            if (emitHlsAny(hls, label, "$src Auto", listOf(base, mainUrl), cb)) ok = true
-        }
-        return ok
-    }
-
-    private suspend fun extractVideopark(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
-        val base = originOf(u)
-        val html = try {
-            app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            d("videopark hata ${e.javaClass.simpleName}")
-            null
-        }
-        if (html != null) {
-            d("videopark $src uzunluk=${html.length}")
-            // 1) sayfaya gömülü VIDEO_DATA
-            val inline = jsonAssign(html, "VIDEO_DATA")
-            if (inline != null) {
-                try {
-                    if (emitStream(JSONObject(inline), label, src, base, cb)) return true
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    d("VIDEO_DATA json hata ${e.javaClass.simpleName}")
-                }
-            }
-            // 2) WORKER_URL/api/stream
-            fun cst(n: String): String =
-                Regex("""(?:const|var|let)\s+""" + n + """\s*=\s*["']([^"']*)["']""").find(html)?.groupValues?.get(1).orEmpty()
-            val worker = cst("WORKER_URL")
-            val pub = cst("PUB_ID")
-            val title = cst("VIDEO_TITLE").ifBlank { cst("VIDEO_ID") }
-            val publisher = cst("PUBLISHER_ID")
-            if (worker.startsWith("http") && pub.isNotBlank()) {
-                var api = "$worker/api/stream?pubId=${URLEncoder.encode(pub, "UTF-8")}&title=${URLEncoder.encode(title, "UTF-8")}"
-                if (publisher.isNotBlank()) api += "&publisherId=${URLEncoder.encode(publisher, "UTF-8")}"
-                try {
-                    val r = app.get(
-                        api,
-                        headers = mapOf("User-Agent" to ua, "Accept" to "application/json", "Origin" to base),
-                        referer = "$base/",
-                        timeout = 15L
-                    )
-                    d("videopark api ${r.code} uzunluk=${r.text.length}")
-                    if (emitStream(JSONObject(r.text), label, src, base, cb)) return true
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    d("videopark api hata ${e.javaClass.simpleName}")
-                }
-            }
-            // 3) sayfadaki açık adresler
-            val hay = html.replace("\\/", "/").replace("&amp;", "&")
-            for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(hay)) {
-                val x = m.value
-                val ok = when {
-                    x.contains("workers.dev/m/", true) -> extractWorkerHls(x, label, src, 0, cb)
-                    x.contains(".m3u8", true) -> emitHlsAny(x, label, src, listOf(base, mainUrl), cb)
-                    else -> false
-                }
-                if (ok) return true
-            }
-        }
-        // 4) hiçbiri olmazsa WebView ile yakala
-        val cap = webViewHls(u, "$mainUrl/") ?: return false
-        return emitHlsAny(cap, label, src, listOf(base, mainUrl), cb)
-    }
-
-    private suspend fun webViewHls(pageUrl: String, referer: String): String? = try {
-        val r = app.get(
-            pageUrl,
-            referer = referer,
-            interceptor = WebViewResolver(Regex("""(?i)\.m3u8"""), userAgent = null, useOkhttp = false, timeout = 15_000L),
-            timeout = 25L
-        )
-        r.url.takeIf { it != pageUrl && it.contains(".m3u8", true) }
-    } catch (e: Exception) {
-        if (e is java.util.concurrent.CancellationException) throw e
-        null
-    }
-
     private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
         newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
             this.referer = l.referer
@@ -999,9 +795,6 @@ class JetFilmizle : MainAPI() {
             d("vidmoly $host tamam")
             return true
         }
-        // Gömülü sayfa m3u8 vermediyse görünmez WebView ile yakala
-        val cap = webViewHls(embed, "$mainUrl/")
-        if (cap != null) return emitHlsAny(cap, label, "Vidmoly", vidmolyOrigins, callback)
         return false
     }
 
