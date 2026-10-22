@@ -240,7 +240,7 @@ class JetFilmizle : MainAPI() {
 
     private data class Src(val lang: String, val name: String, val url: String)
 
-    private val playerHostRe = Regex("""(?i)(videopark|godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx)""")
+    private val playerHostRe = Regex("""(?i)(videopark|godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx|playerx)""")
 
     private fun findPostId(s: String): String? {
         Regex("""videopark\.top/(?:vip|oplayer)/\?id=(\d+)""").find(s)?.let { return it.groupValues[1] }
@@ -341,7 +341,7 @@ class JetFilmizle : MainAPI() {
         }
 
         // Sayfanın içine gömülü bilinen oynatıcı adresleri (örn. varsayılan oynatıcı iframe'i)
-        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx|videopark)""")
+        val known = Regex("""(?i)(godrive|workers\.dev|ok\.ru|vidmoly|moly|streamtape|strtape|stape|mail\.ru|dzen|voe\.sx|dood|mixdrop|filemoon|byse|pixeldrain|upstream|sibnet|vmpx|videopark|playerx)""")
         val clean = html.replace("\\/", "/").replace("\\u002F", "/").replace("&amp;", "&")
         val have = out.map { it.url }.toHashSet()
         for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(clean)) {
@@ -352,6 +352,7 @@ class JetFilmizle : MainAPI() {
                 u.contains("dplayer", true) && u.contains("workers.dev", true) -> "Vip"
                 u.contains("workers.dev/m/", true) && u.contains("//ok.", true) -> "OPlay"
                 u.contains("godrive", true) || u.contains("workers.dev", true) -> "Gold"
+                u.contains("playerx", true) -> "PlayerX"
                 u.contains("vmpx", true) -> "Moly"
                 u.contains("ok.ru", true) -> "OkRu"
                 u.contains("moly", true) -> "Moly"
@@ -408,7 +409,7 @@ class JetFilmizle : MainAPI() {
         val r = app.get(
             pageUrl,
             interceptor = WebViewResolver(
-                Regex("""(?i)(videopark\.top/(?:vip|oplayer)/\?id=|\.m3u8|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
+                Regex("""(?i)(videopark\.top/(?:vip|oplayer)/\?id=|\.m3u8|hls\.playerx\.info/hls/|videopark\.top/apollo/hls/|playerx\.info/\?id=|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
                 userAgent = null,
                 useOkhttp = false,
                 timeout = 20_000L
@@ -430,9 +431,9 @@ class JetFilmizle : MainAPI() {
                 Regex("""(?i)videopark\.top/(?:vip|oplayer)/\?id=\d+"""),
                 userAgent = null,
                 useOkhttp = false,
-                timeout = 12_000L
+                timeout = 25_000L
             ),
-            timeout = 20L
+            timeout = 35L
         )
         Regex("""id=(\d+)""").find(r.url)?.groupValues?.get(1)
     } catch (e: Exception) {
@@ -555,6 +556,10 @@ class JetFilmizle : MainAPI() {
     ): Boolean {
         val u = s.url
         return when {
+            // PlayerX: oynatıcı sayfası (playerx.info/?id=..) ya da doğrudan HLS (hls.playerx.info/hls/..)
+            u.contains("playerx.info", true) -> extractPlayerX(u, s.lang, s.name, cb)
+            // videopark apollo: uzantısız HLS master listesi (1080p/720p/360p varyantları)
+            u.contains("videopark.top/apollo/", true) -> emitHlsAny(u, s.lang, s.name, listOf("https://videopark.top", mainUrl), cb)
             u.contains("videopark.top/go/", true) -> extractGold(u, s.lang, s.name, cb)
             u.contains("videopark.top", true) -> extractVideopark(u, s.lang, s.name, cb)
             // Vip / OPlay: workers.dev/m/... sayfası içinde <video><source ...mpegurl> var
@@ -600,6 +605,7 @@ class JetFilmizle : MainAPI() {
 
         val seen = ConcurrentHashMap.newKeySet<String>()
         val total = AtomicInteger(0)
+        val seenLinks = ConcurrentHashMap.newKeySet<String>()
 
         // Kaynaklar aynı anda çözülür. Sonuçlar eski sıralamayla (Dublaj, Altyazı, diğerleri; sayfa sırası;
         // aynı kaynakta yüksek kalite önce) ama hazır oldukça verilir: tüm kaynakların bitmesi beklenmez.
@@ -627,6 +633,7 @@ class JetFilmizle : MainAPI() {
                     slots[i] = got.sortedBy { -it.quality }
                     while (next < ordered.size && slots[next] != null) {
                         for (l in slots[next]!!) {
+                            if (!seenLinks.add(l.url)) continue
                             total.incrementAndGet()
                             callback(l)
                         }
@@ -655,7 +662,7 @@ class JetFilmizle : MainAPI() {
             val cap = webViewCapture(data)
             d("son çare webview: $cap")
             if (cap != null) {
-                if (cap.contains("videopark", true)) {
+                if (cap.contains("videopark", true) && !cap.contains("/apollo/", true)) {
                     if (extractVideopark(cap, "Kaynak", "JetFilmizle", callback)) return true
                 } else if (cap.contains(".m3u8", true)) {
                     emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
@@ -831,6 +838,39 @@ class JetFilmizle : MainAPI() {
         return emitHls(url, label, src, origins.first(), cb, force = true, expand = expand)
     }
 
+    // ---- PlayerX: playerx.info/?id=..  ->  <video><source src="https://hls.playerx.info/hls/..."> ----
+    private suspend fun extractPlayerX(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val origins = listOf("https://playerx.info", mainUrl)
+        // Doğrudan HLS adresi (uzantısız)
+        if (u.contains("hls.playerx.info", true)) return emitHlsAny(u, label, src, origins, cb)
+        val body = try {
+            app.get(
+                u,
+                headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
+                referer = "$mainUrl/",
+                timeout = 12L
+            ).text.replace("\\/", "/")
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("playerx hata ${e.javaClass.simpleName}")
+            null
+        }
+        if (body != null) {
+            val doc = org.jsoup.Jsoup.parse(body, u)
+            val inner = doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
+                ?.takeIf { it.startsWith("http") }
+                ?: Regex("""https?://hls\.playerx\.info/hls/[^"'\s<>\\]+""").find(body)?.value
+                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(body)?.groupValues?.get(1)
+            if (inner != null) {
+                d("playerx ic kaynak: ${inner.take(90)}")
+                return emitHlsAny(inner, label, src, origins, cb)
+            }
+        }
+        // Sayfa Cloudflare ile korunuyorsa WebView ile yakala
+        val cap = webViewHls(u, "$mainUrl/", Regex("""(?i)hls\.playerx\.info/hls/|\.m3u8""")) ?: return false
+        return emitHlsAny(cap, label, src, origins, cb)
+    }
+
     // ---- Vip / OPlay (workers.dev/m/...): HTML sayfa -> <source src=...> (mpegurl) -> m3u8 ----
     private suspend fun extractWorkerHls(
         u: String, label: String, src: String, depth: Int, cb: (ExtractorLink) -> Unit
@@ -992,6 +1032,8 @@ class JetFilmizle : MainAPI() {
             for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(hay)) {
                 val x = m.value
                 val ok = when {
+                    x.contains("playerx.info", true) -> extractPlayerX(x, label, src, cb)
+                    x.contains("/apollo/hls/", true) -> emitHlsAny(x, label, src, listOf(base, mainUrl), cb)
                     x.contains("workers.dev/m/", true) -> extractWorkerHls(x, label, src, 0, cb)
                     x.contains(".m3u8", true) -> emitHlsAny(x, label, src, listOf(base, mainUrl), cb)
                     else -> false
@@ -1073,14 +1115,18 @@ class JetFilmizle : MainAPI() {
         return true
     }
 
-    private suspend fun webViewHls(pageUrl: String, referer: String): String? = try {
+    private suspend fun webViewHls(
+        pageUrl: String,
+        referer: String,
+        pattern: Regex = Regex("""(?i)\.m3u8""")
+    ): String? = try {
         val r = app.get(
             pageUrl,
             referer = referer,
-            interceptor = WebViewResolver(Regex("""(?i)\.m3u8"""), userAgent = null, useOkhttp = false, timeout = 9_000L),
+            interceptor = WebViewResolver(pattern, userAgent = null, useOkhttp = false, timeout = 9_000L),
             timeout = 15L
         )
-        r.url.takeIf { it != pageUrl && it.contains(".m3u8", true) }
+        r.url.takeIf { it != pageUrl && pattern.containsMatchIn(it) }
     } catch (e: Exception) {
         if (e is java.util.concurrent.CancellationException) throw e
         null
