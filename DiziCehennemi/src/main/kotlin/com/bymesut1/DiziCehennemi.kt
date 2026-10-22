@@ -110,13 +110,14 @@ class DiziCehennemi : MainAPI() {
 
     // ---------------- Kartlar, ana sayfa, arama ----------------
 
-    private val reItem = Regex("""^(?:https?://[^/]*)?/(film|dizi)/([^/?#]+)/?(?:[?#].*)?$""")
+    private val reItem = Regex("""^(?:https?://[^/]*)?/(film|dizi|anime)/([^/?#]+)/?(?:[?#].*)?$""")
 
     // "Watch The Marvels Film" -> "The Marvels"
     private fun titleFromAlt(alt: String): String =
         alt.replace('\u00A0', ' ').trim()
             .removePrefix("Watch ")
-            .replace(Regex("""\s+(Film|Dizi|Anime)\s*$"""), "")
+            .replace(Regex("""(?i)\s+(Film|Dizi|Anime)(\s+izle)?\s*$"""), "")
+            .replace(Regex("""(?i)\s+izle\s*$"""), "")
             .trim()
 
     private fun posterOf(img: Element): String? {
@@ -149,14 +150,14 @@ class DiziCehennemi : MainAPI() {
             }
             val im: Element = img ?: continue
             val alt = im.attr("alt")
-            val title = listOf(titleFromAlt(alt), a.attr("title").trim(), a.text().trim())
+            val title = listOf(titleFromAlt(alt), titleFromAlt(a.attr("title")), titleFromAlt(a.text()))
                 .firstOrNull { it.isNotBlank() } ?: continue
             val poster = posterOf(im)
             val href = abs(href0)
             out[key] = if (kind == "film") {
                 newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
             } else {
-                val isAnime = anime || alt.trim().endsWith("Anime", true)
+                val isAnime = kind == "anime" || anime || alt.trim().endsWith("Anime", true)
                 newTvSeriesSearchResponse(title, href, if (isAnime) TvType.Anime else TvType.TvSeries) {
                     this.posterUrl = poster
                 }
@@ -181,15 +182,72 @@ class DiziCehennemi : MainAPI() {
         pageTpl[base]?.replace("{n}", page.toString())
             ?: if (base.contains("?")) "$base&page=$page" else "$base?page=$page"
 
+    // Satırın adresi değişmişse (boş sayfa) bulunan gerçek adres burada saklanır
+    private val altBase = ConcurrentHashMap<String, String>()
+
+    // Boş gelen satır için: önce ana sayfadaki menü bağlantılarında satır adıyla eşleşen adres,
+    // sonra yaygın yazım ayrımları (apple-tv-plus, appletv...) denenir. Kart çıkaran ilk adres seçilir.
+    private suspend fun discoverBase(name: String, base: String): String? {
+        altBase[base]?.let { return it }
+        val want = norm(name)
+        if (want.length < 4) return null
+        val clean0 = base.substringBefore("?").trimEnd('/')
+        val tried = HashSet<String>()
+        tried.add(clean0)
+        val cands = ArrayList<String>()
+        try {
+            val home: Document = get("$mainUrl/").document
+            for (a in home.select("a[href]")) {
+                val href = a.attr("href").trim()
+                if (href.isBlank() || href.startsWith("#") || href.startsWith("javascript", true)) continue
+                val u = abs(href)
+                val txt = norm(a.text())
+                val hn = norm(u.substringAfter(mainUrl))
+                if (txt == want || hn.endsWith(want) || (want.length >= 5 && txt.contains(want))) cands.add(u)
+            }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
+        val parent = clean0.substringBeforeLast('/')
+        val seg = clean0.substringAfterLast('/')
+        cands.add("$parent/$seg-plus")
+        cands.add("$parent/" + seg.replace("-", ""))
+        cands.add("$parent/" + seg.replace("-", "_"))
+        for (u in cands.distinct()) {
+            if (tried.size > 8) break
+            val key = u.substringBefore("?").trimEnd('/')
+            if (!tried.add(key)) continue
+            try {
+                val d: Document = get(u).document
+                if (cards(d, u.contains("/anime")).isNotEmpty()) {
+                    altBase[base] = u
+                    return u
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        return null
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val base = request.data
-        val url = if (page <= 1) base else pageUrl(base, page)
-        val doc = get(url).document
-        if (page <= 1) learnTemplate(base, doc)
-        val list = cards(doc, base.contains("/animes"))
+        var useBase = altBase[base] ?: base
+        val url = if (page <= 1) useBase else pageUrl(useBase, page)
+        var doc: Document = get(url).document
+        var list: List<SearchResponse> = cards(doc, useBase.contains("/anime"))
+        if (list.isEmpty() && page <= 1) {
+            val alt = discoverBase(request.name, base)
+            if (alt != null) {
+                useBase = alt
+                doc = get(alt).document
+                list = cards(doc, alt.contains("/anime"))
+            }
+        }
+        if (page <= 1) learnTemplate(useBase, doc)
         return newHomePageResponse(
             list = HomePageList(name = request.name, list = list, isHorizontalImages = false),
-            hasNext = list.isNotEmpty() && pageTpl.containsKey(base)
+            hasNext = list.isNotEmpty() && pageTpl.containsKey(useBase)
         )
     }
 
@@ -259,13 +317,13 @@ class DiziCehennemi : MainAPI() {
 
     // ---------------- Sayfa (dizi / film) ----------------
 
-    private val reEp = Regex("""/dizi/([^/?#]+)/sezon-(\d+)/bolum-(\d+)""")
+    private val reEp = Regex("""/(?:dizi|anime)/([^/?#]+)/sezon-(\d+)/bolum-(\d+)""")
 
     override suspend fun load(url: String): LoadResponse? {
-        val m = Regex("""/(film|dizi)/([^/?#]+)""").find(url) ?: return null
+        val m = Regex("""/(film|dizi|anime)/([^/?#]+)""").find(url) ?: return null
         val kind = m.groupValues[1]
         val slug = m.groupValues[2]
-        val isTv = kind == "dizi"
+        val isTv = kind != "film"
         val pageUrl = "$mainUrl/$kind/$slug"
 
         val doc = get(pageUrl).document
@@ -358,7 +416,7 @@ class DiziCehennemi : MainAPI() {
 
         val episodes = keys.map { (s, e) ->
             val info = tmEps[s to e]
-            val epUrl = siteEps[s to e] ?: "$mainUrl/dizi/$slug/sezon-$s/bolum-$e"
+            val epUrl = siteEps[s to e] ?: "$mainUrl/$kind/$slug/sezon-$s/bolum-$e"
             newEpisode(epUrl) {
                 this.name = info?.str("name")?.takeIf { it.isNotBlank() } ?: "$e. Bölüm"
                 this.season = s
@@ -370,8 +428,9 @@ class DiziCehennemi : MainAPI() {
             }
         }
 
-        val isAnime = det?.optJSONArray("genres")?.objs().orEmpty().any { it.optInt("id") == 16 } &&
-            det?.str("original_language") == "ja"
+        val isAnime = kind == "anime" ||
+            (det?.optJSONArray("genres")?.objs().orEmpty().any { it.optInt("id") == 16 } &&
+                det?.str("original_language") == "ja")
         return newTvSeriesLoadResponse(siteTitle, pageUrl, if (isAnime) TvType.Anime else TvType.TvSeries, episodes) {
             this.seasonNames = keys.map { it.first }.distinct().sorted().map { SeasonData(it, "$it. Sezon") }
             this.posterUrl = poster
