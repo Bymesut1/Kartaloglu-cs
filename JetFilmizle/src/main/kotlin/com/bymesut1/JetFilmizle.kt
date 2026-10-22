@@ -11,9 +11,6 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 
 class JetFilmizle : MainAPI() {
     override var mainUrl = "https://jetfilmizle.now"
@@ -581,9 +578,6 @@ class JetFilmizle : MainAPI() {
         else -> 3
     }
 
-    // Her kaynağa tanınan en uzun süre; yavaş kaynak diğerlerini bekletmesin
-    private val sourceTimeoutMs = 15_000L
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -622,9 +616,7 @@ class JetFilmizle : MainAPI() {
                 val mine = java.util.Collections.synchronizedList(ArrayList<ExtractorLink>())
                 var ok = false
                 try {
-                    ok = withTimeoutOrNull(sourceTimeoutMs) {
-                        resolve(s, subtitleCallback) { l -> mine.add(l) }
-                    } ?: false
+                    ok = resolve(s, subtitleCallback) { l -> mine.add(l) }
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     d("çözüm istisna ${s.name}: ${e.javaClass.simpleName}")
@@ -647,16 +639,16 @@ class JetFilmizle : MainAPI() {
         }
 
         // Film kimliği için WebView (yavaş) kaynaklar çözülürken arkada çalışır
-        coroutineScope {
-            val wv = if (needId) async { captureVideoparkId(data) } else null
-            runPhase(srcs)
-            if (wv != null) {
-                val pid = wv.await()
-                d("webview film kimliği: $pid film_id=$fid")
-                if (pid != null && pid != fid) {
-                    runPhase(collectSources(doc, html, pid))
-                }
-            }
+        val res = listOf(0, 1).amap { k ->
+            if (k == 0) {
+                runPhase(srcs)
+                null
+            } else if (needId) captureVideoparkId(data) else null
+        }
+        val pid: String? = res.getOrNull(1)
+        if (needId) {
+            d("webview film kimliği: $pid film_id=$fid")
+            if (pid != null && pid != fid) runPhase(collectSources(doc, html, pid))
         }
 
         if (total.get() == 0) {
