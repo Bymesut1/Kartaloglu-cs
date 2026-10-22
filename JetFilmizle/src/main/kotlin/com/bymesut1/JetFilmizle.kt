@@ -409,7 +409,7 @@ class JetFilmizle : MainAPI() {
         val r = app.get(
             pageUrl,
             interceptor = WebViewResolver(
-                Regex("""(?i)(videopark\.top/(?:vip|oplayer)/\?id=|\.m3u8|hls\.playerx\.info/hls/|videopark\.top/apollo/hls/|playerx\.info/\?id=|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
+                Regex("""(?i)(videopark\.top/(?:vip|oplayer)/\?id=|\.m3u8|hls\.playerx\.info/(?:hls|s)/|videopark\.top/apollo/hls/|playerx\.info/\?id=|\.mp4|godrive|workers\.dev/v/|ok\.ru/videoembed|vidmoly|streamtape|strtape|byse|filemoon)"""),
                 userAgent = null,
                 useOkhttp = false,
                 timeout = 20_000L
@@ -446,22 +446,28 @@ class JetFilmizle : MainAPI() {
     private suspend fun dumpSiteJs(doc: Document) {
         try {
             val urls = doc.select("script[src]").map { abs(it.attr("src")) }
-                .filter { originOf(it).contains("jetfilmizle", true) }.take(8)
+                .filter { originOf(it).contains("jetfilmizle", true) }.take(12)
             d("site js: $urls")
-            val re = Regex("""(?i)player-source-btn|data-source-index|sourceIndex|source-index""")
+            val re = Regex("""(?i)jetplayer|player-source-btn|data-source-index|sourceIndex|/api/[a-z_/-]*(?:player|kaynak|source)""")
+            var total = 0
             for (u in urls) {
+                if (total >= 8) break
                 val t = try {
                     app.get(u, referer = "$mainUrl/", timeout = 10L).text
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     continue
                 }
+                var last = -10000
                 var n = 0
                 for (m in re.findAll(t)) {
-                    val a = maxOf(0, m.range.first - 200)
-                    val b = minOf(t.length, m.range.last + 600)
-                    d("js ${u.substringAfterLast('/').take(28)}@${m.range.first}: ${t.substring(a, b).replace(Regex("\\s+"), " ")}")
-                    if (++n >= 3) break
+                    if (m.range.first - last < 700) continue
+                    last = m.range.first
+                    val a2 = maxOf(0, m.range.first - 250)
+                    val b2 = minOf(t.length, m.range.first + 650)
+                    d("JS ${u.substringAfterLast('/').take(22)}@${m.range.first}: ${t.substring(a2, b2).replace(Regex("\\s+"), " ")}")
+                    total++
+                    if (++n >= 5 || total >= 8) break
                 }
             }
         } catch (e: Exception) {
@@ -646,11 +652,16 @@ class JetFilmizle : MainAPI() {
         }
 
         // Film kimliği için WebView (yavaş) kaynaklar çözülürken arkada çalışır
-        val res = listOf(0, 1).amap { k ->
+        val res = listOf(0, 1, 2).amap { k ->
             if (k == 0) {
                 runPhase(srcs)
                 null
-            } else if (needId) captureVideoparkId(data) else null
+            } else if (k == 1) {
+                if (needId) captureVideoparkId(data) else null
+            } else {
+                if (hasBtns) dumpSiteJs(doc)
+                null
+            }
         }
         val pid: String? = res.getOrNull(1)
         if (needId) {
@@ -856,10 +867,14 @@ class JetFilmizle : MainAPI() {
             null
         }
         if (body != null) {
+            d("playerx uzunluk=${body.length}")
+            Regex("""(?i)hls\.playerx|jwplayer\(|setup\(|sources|atob\(|file\s*:""").find(body)?.let { m ->
+                d("playerx ipucu@${m.range.first}: ${body.substring(maxOf(0, m.range.first - 150), minOf(body.length, m.range.first + 700)).replace(Regex("\\s+"), " ")}")
+            }
             val doc = org.jsoup.Jsoup.parse(body, u)
             val inner = doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
                 ?.takeIf { it.startsWith("http") }
-                ?: Regex("""https?://hls\.playerx\.info/hls/[^"'\s<>\\]+""").find(body)?.value
+                ?: Regex("""https?://hls\.playerx\.info/(?:hls|s)/[^"'\s<>\\]+""").find(body)?.value
                 ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(body)?.groupValues?.get(1)
             if (inner != null) {
                 d("playerx ic kaynak: ${inner.take(90)}")
@@ -867,7 +882,7 @@ class JetFilmizle : MainAPI() {
             }
         }
         // Sayfa Cloudflare ile korunuyorsa WebView ile yakala
-        val cap = webViewHls(u, "$mainUrl/", Regex("""(?i)hls\.playerx\.info/hls/|\.m3u8""")) ?: return false
+        val cap = webViewHls(u, "$mainUrl/", Regex("""(?i)hls\.playerx\.info/(?:hls|s)/|\.m3u8""")) ?: return false
         return emitHlsAny(cap, label, src, origins, cb)
     }
 
