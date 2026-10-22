@@ -565,7 +565,7 @@ class JetFilmizle : MainAPI() {
             // PlayerX: oynatıcı sayfası (playerx.info/?id=..) ya da doğrudan HLS (hls.playerx.info/hls/..)
             u.contains("playerx.info", true) -> extractPlayerX(u, s.lang, s.name, cb)
             // videopark apollo: uzantısız HLS master listesi (1080p/720p/360p varyantları)
-            u.contains("videopark.top/apollo/", true) -> emitHlsAny(u, s.lang, s.name, listOf("https://videopark.top", mainUrl), cb)
+            u.contains("videopark.top/apollo/hls/", true) -> emitHlsAny(u, s.lang, s.name, listOf("https://videopark.top", mainUrl), cb)
             u.contains("videopark.top/go/", true) -> extractGold(u, s.lang, s.name, cb)
             u.contains("videopark.top", true) -> extractVideopark(u, s.lang, s.name, cb)
             // Vip / OPlay: workers.dev/m/... sayfası içinde <video><source ...mpegurl> var
@@ -598,9 +598,21 @@ class JetFilmizle : MainAPI() {
         val r = get(data)
         val doc = r.document
         val html = r.text
-        val srcs = collectSources(doc, html).toMutableList()
         val hasBtns = doc.select("[data-source-index]").isNotEmpty()
-        val needId = hasBtns && srcs.none { it.url.contains("videopark", true) }
+        val pageFilmId = doc.selectFirst("input[name=film_id]")?.attr("value")?.trim()?.takeIf { it.isNotBlank() }
+        // Asıl yol: sitenin kendi /jetplayer API'si her buton için gerçek oynatıcı adresini verir
+        val apiSrcs = if (hasBtns && pageFilmId != null) fetchApiSources(doc, pageFilmId, data) else emptyList()
+        val srcs = ArrayList<Src>(apiSrcs)
+        run {
+            val have = apiSrcs.map { it.url }.toHashSet()
+            val guessRe = Regex("""(?i)videopark\.top/(?:vip|oplayer|go)/\?id=""")
+            for (x in collectSources(doc, html)) {
+                // API çalışıyorsa film kimliğinden tahmin edilen (yanlış olabilen) adresler atlanır
+                if (apiSrcs.isNotEmpty() && guessRe.containsMatchIn(x.url)) continue
+                if (have.add(x.url)) srcs.add(x)
+            }
+        }
+        val needId = hasBtns && apiSrcs.isEmpty() && srcs.none { it.url.contains("videopark", true) }
         val fid = if (needId)
             doc.selectFirst("input[name=film_id]")?.attr("value")?.trim()?.takeIf { it.matches(Regex("""\d{4,9}""")) }
         else null
@@ -652,15 +664,12 @@ class JetFilmizle : MainAPI() {
         }
 
         // Film kimliği için WebView (yavaş) kaynaklar çözülürken arkada çalışır
-        val res = listOf(0, 1, 2).amap { k ->
+        val res = listOf(0, 1).amap { k ->
             if (k == 0) {
                 runPhase(srcs)
                 null
-            } else if (k == 1) {
-                if (needId) captureVideoparkId(data) else null
             } else {
-                if (hasBtns) dumpSiteJs(doc)
-                null
+                if (needId) captureVideoparkId(data) else null
             }
         }
         val pid: String? = res.getOrNull(1)
@@ -750,9 +759,10 @@ class JetFilmizle : MainAPI() {
         origin: String,
         callback: (ExtractorLink) -> Unit,
         force: Boolean = false,
-        expand: Boolean = true
+        expand: Boolean = true,
+        hdrs: Map<String, String>? = null
     ): Boolean {
-        val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+        val headers = hdrs ?: mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         val (alive, q, vars) = probeHls(m3u8, headers)
         if (!alive && !force) {
             d("$src ölü bağlantı atlandı: ${m3u8.take(100)}")
@@ -849,40 +859,121 @@ class JetFilmizle : MainAPI() {
         return emitHls(url, label, src, origins.first(), cb, force = true, expand = expand)
     }
 
-    // ---- PlayerX: playerx.info/?id=..  ->  <video><source src="https://hls.playerx.info/hls/..."> ----
-    private suspend fun extractPlayerX(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
-        val origins = listOf("https://playerx.info", mainUrl)
-        // Doğrudan HLS adresi (uzantısız)
-        if (u.contains("hls.playerx.info", true)) return emitHlsAny(u, label, src, origins, cb)
+    // ---- JetFilmizle kaynak API'si: POST /jetplayer (film_id, source_index, player_type) -> iframe ----
+    private fun langOfType(t: String): String = when (t.lowercase()) {
+        "dublaj" -> "Türkçe Dublaj"
+        "altyazili" -> "Türkçe Altyazılı"
+        "genel" -> "Dil+"
+        else -> "Kaynak"
+    }
+
+    private suspend fun jetPlayerUrl(filmId: String, idx: String, type: String, pageUrl: String): String? {
         val body = try {
-            app.get(
-                u,
-                headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
-                referer = "$mainUrl/",
+            app.post(
+                "$mainUrl/jetplayer",
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest", "User-Agent" to ua, "Origin" to mainUrl),
+                referer = pageUrl,
+                data = mapOf("film_id" to filmId, "source_index" to idx, "player_type" to type),
                 timeout = 12L
-            ).text.replace("\\/", "/")
+            ).text
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
-            d("playerx hata ${e.javaClass.simpleName}")
-            null
+            d("jetplayer hata ${e.javaClass.simpleName} $type#$idx")
+            return null
         }
-        if (body != null) {
-            d("playerx uzunluk=${body.length}")
-            Regex("""(?i)hls\.playerx|jwplayer\(|setup\(|sources|atob\(|file\s*:""").find(body)?.let { m ->
-                d("playerx ipucu@${m.range.first}: ${body.substring(maxOf(0, m.range.first - 150), minOf(body.length, m.range.first + 700)).replace(Regex("\\s+"), " ")}")
+        val doc = org.jsoup.Jsoup.parse(body, "$mainUrl/")
+        val u = doc.selectFirst("iframe[src]")?.absUrl("src")?.takeIf { it.startsWith("http") }
+            ?: doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")?.takeIf { it.startsWith("http") }
+            ?: urlOf(body)?.let { if (it.startsWith("//")) "https:$it" else it }
+        if (u == null) d("jetplayer yanıt $type#$idx: ${body.take(300)}")
+        return u
+    }
+
+    private suspend fun fetchApiSources(doc: Document, filmId: String, pageUrl: String): List<Src> {
+        val btns = doc.select("[data-source-index]").mapNotNull { el ->
+            val idx = el.attr("data-source-index").trim()
+            val type = el.attr("data-player-type").trim()
+            if (idx.isEmpty() || type.isEmpty()) null else Triple(idx, type, el.text().trim())
+        }.distinctBy { it.first + "|" + it.second }
+        val res = btns.amap { (idx, type, nm) ->
+            val u = jetPlayerUrl(filmId, idx, type, pageUrl)
+            d("jetplayer $type#$idx $nm -> ${u?.take(110)}")
+            if (u == null) null
+            else Src(langOfType(type), nm.ifBlank { "Kaynak ${(idx.toIntOrNull() ?: 0) + 1}" }, u)
+        }
+        return res.filterNotNull()
+    }
+
+    // ---- PlayerX: playerx.info/?id=..  ->  <video><source src="https://hls.playerx.info/hls/..."> ----
+    private suspend fun extractPlayerX(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val px = "https://playerx.info"
+        val origins = listOf(px, mainUrl)
+        val cands = ArrayList<String>()
+        var cookieHdr: String? = null
+        if (u.contains("hls.playerx.info", true)) {
+            cands.add(u)
+        } else {
+            val pr = try {
+                app.get(
+                    u,
+                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
+                    referer = "$mainUrl/",
+                    timeout = 12L
+                )
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("playerx hata ${e.javaClass.simpleName}")
+                null
             }
-            val doc = org.jsoup.Jsoup.parse(body, u)
-            val inner = doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
-                ?.takeIf { it.startsWith("http") }
-                ?: Regex("""https?://hls\.playerx\.info/(?:hls|s)/[^"'\s<>\\]+""").find(body)?.value
-                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(body)?.groupValues?.get(1)
-            if (inner != null) {
-                d("playerx ic kaynak: ${inner.take(90)}")
-                return emitHlsAny(inner, label, src, origins, cb)
+            val body = pr?.text?.replace("\\/", "/")
+            if (body != null) {
+                d("playerx uzunluk=${body.length}")
+                cookieHdr = pr?.cookies?.entries?.joinToString("; ") { "${it.key}=${it.value}" }?.ifBlank { null }
+                val doc = org.jsoup.Jsoup.parse(body, u)
+                doc.selectFirst("video source[src], source[src], video[src]")?.absUrl("src")
+                    ?.takeIf { it.startsWith("http") }?.let { cands.add(it) }
+                for (m in Regex("""https?://hls\.playerx\.info/(?:hls|s)/[^"'\s<>\\)]+""").findAll(body)) {
+                    if (m.value !in cands) cands.add(m.value)
+                }
+                for (m in Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").findAll(body)) {
+                    if (m.groupValues[1] !in cands) cands.add(m.groupValues[1])
+                }
             }
         }
-        // Sayfa Cloudflare ile korunuyorsa WebView ile yakala
+        d("playerx adaylar=${cands.size} cerez=${cookieHdr != null}")
+        val base = mapOf("User-Agent" to ua, "Referer" to "$px/", "Origin" to px)
+        val browserLike = base + mapOf(
+            "Accept" to "*/*",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-site"
+        )
+        val variants = ArrayList<Map<String, String>>()
+        variants.add(base)
+        variants.add(browserLike)
+        val ckh = cookieHdr
+        if (ckh != null) variants.add(browserLike + ("Cookie" to ckh))
+        variants.add(mapOf("User-Agent" to ua))
+        for (c in cands.take(4)) {
+            for ((i, h) in variants.withIndex()) {
+                val r = try {
+                    app.get(c, headers = h, timeout = 7L)
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    d("playerx v$i hata ${e.javaClass.simpleName} ${c.takeLast(12)}")
+                    null
+                }
+                val t = r?.text.orEmpty()
+                d("playerx v$i ...${c.takeLast(10)} kod=${r?.code} tip=${r?.headers?.get("Content-Type")} gövde=${t.take(70).replace("\n", " ")}")
+                if (t.contains("#EXTM3U")) {
+                    return emitHls(c, label, src, px, cb, force = true, hdrs = h)
+                }
+            }
+        }
+        // Hiçbiri doğrulanamadıysa sayfayı WebView ile aç ve oynatıcının istediği HLS adresini yakala
         val cap = webViewHls(u, "$mainUrl/", Regex("""(?i)hls\.playerx\.info/(?:hls|s)/|\.m3u8""")) ?: return false
+        d("playerx webview yakalama: ${cap.take(80)}")
         return emitHlsAny(cap, label, src, origins, cb)
     }
 
