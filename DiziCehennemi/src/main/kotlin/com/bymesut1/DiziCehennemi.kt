@@ -39,11 +39,13 @@ class DiziCehennemi : MainAPI() {
         "$mainUrl/diziler" to "Diziler",
         "$mainUrl/diziler?sirala=yeni" to "Yeni Eklenen Diziler",
         "$mainUrl/filmler" to "Filmler",
+        "$mainUrl/animes" to "Animeler",
         "$mainUrl/trend" to "Trend",
         "$mainUrl/platform/netflix" to "Netflix",
         "$mainUrl/platform/disney" to "Disney+",
         "$mainUrl/platform/hbo-max" to "HBO Max",
         "$mainUrl/platform/amazon-prime" to "Amazon Prime",
+        "$mainUrl/platform/apple-tv" to "Apple TV+",
         "$mainUrl/platform/exxen" to "Exxen",
         "$mainUrl/platform/blutv" to "BluTV",
         "$mainUrl/platform/tabii" to "tabii",
@@ -337,10 +339,20 @@ class DiziCehennemi : MainAPI() {
         }
 
         val cmp = compareBy<Pair<Int, Int>>({ it.first }, { it.second })
-        val keys: List<Pair<Int, Int>> = when {
-            siteEps.isNotEmpty() -> siteEps.keys.sortedWith(cmp)
-            tmEps.isNotEmpty() -> tmEps.keys.sortedWith(cmp)
-            else -> listOf(1 to 1)
+        // Site sayfası çoğu zaman yalnızca ilk sezonun bölümlerini listeler; diğer sezonlar TMDB'den tamamlanır.
+        // Sitede olmayan bölümün adresi sezon-N/bolum-M kalıbıyla kurulur. Yayın tarihi gelmemiş (ya da tarihi
+        // olmayan) TMDB bölümleri eklenmez.
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(java.util.Date())
+        val keys: List<Pair<Int, Int>> = run {
+            val all = LinkedHashSet<Pair<Int, Int>>()
+            all.addAll(siteEps.keys)
+            for ((k, info) in tmEps) {
+                if (siteEps.containsKey(k)) continue
+                val air = info.str("air_date")
+                if (air.isBlank() || air > today) continue
+                all.add(k)
+            }
+            if (all.isEmpty()) listOf(1 to 1) else all.sortedWith(cmp)
         }
         val defRun = det?.optJSONArray("episode_run_time")?.optInt(0, 0)?.takeIf { it > 0 }
 
@@ -361,6 +373,7 @@ class DiziCehennemi : MainAPI() {
         val isAnime = det?.optJSONArray("genres")?.objs().orEmpty().any { it.optInt("id") == 16 } &&
             det?.str("original_language") == "ja"
         return newTvSeriesLoadResponse(siteTitle, pageUrl, if (isAnime) TvType.Anime else TvType.TvSeries, episodes) {
+            this.seasonNames = keys.map { it.first }.distinct().sorted().map { SeasonData(it, "$it. Sezon") }
             this.posterUrl = poster
             this.backgroundPosterUrl = bg
             this.plot = plot.ifBlank { null }
