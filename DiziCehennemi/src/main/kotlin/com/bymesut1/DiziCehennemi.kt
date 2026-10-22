@@ -275,8 +275,9 @@ class DiziCehennemi : MainAPI() {
                 ?.substringBefore(" | ")?.replace(Regex("""(?i)\s+(full\s+)?izle.*$"""), "")?.trim()
         ).firstOrNull { !it.isNullOrBlank() } ?: slug.replace('-', ' ')
 
-        val sitePoster = doc.selectFirst("img[src*=/storage/tmdb/posters/], img[data-src*=/storage/tmdb/posters/]")
-            ?.let { posterOf(it) }
+        // Tipler açıkça yazıldı: jsoup'un jspecify @Nullable ek açıklaması derleyicide çıkarım hatası veriyordu
+        val posterEl: Element? = doc.selectFirst("img[src*=/storage/tmdb/posters/], img[data-src*=/storage/tmdb/posters/]")
+        val sitePoster: String? = (if (posterEl != null) posterOf(posterEl) else null)
             ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
         val sitePlot = doc.selectFirst("meta[name=description]")?.attr("content")?.takeIf { it.isNotBlank() }
 
