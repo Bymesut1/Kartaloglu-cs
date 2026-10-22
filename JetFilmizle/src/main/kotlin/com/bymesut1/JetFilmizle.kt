@@ -1,4 +1,4 @@
-package com.bymesut1
+package com.bymesut1.
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
