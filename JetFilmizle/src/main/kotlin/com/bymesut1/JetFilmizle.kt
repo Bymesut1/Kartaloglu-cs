@@ -10,6 +10,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 
 class JetFilmizle : MainAPI() {
     override var mainUrl = "https://jetfilmizle.now"
@@ -429,9 +433,9 @@ class JetFilmizle : MainAPI() {
                 Regex("""(?i)videopark\.top/(?:vip|oplayer)/\?id=\d+"""),
                 userAgent = null,
                 useOkhttp = false,
-                timeout = 20_000L
+                timeout = 12_000L
             ),
-            timeout = 30L
+            timeout = 20L
         )
         Regex("""id=(\d+)""").find(r.url)?.groupValues?.get(1)
     } catch (e: Exception) {
@@ -485,19 +489,20 @@ class JetFilmizle : MainAPI() {
         add(u, q0)
         if (q0 != null) {
             val base = u.substringBefore("?")
-            for (q in listOf(1080, 720, 480, 360)) {
-                if (q == q0) continue
+            // Tüm kaliteler aynı anda denenir (sırayla beklemek yerine)
+            val okQs = listOf(1080, 720, 480, 360).filter { it != q0 }.amap { q ->
                 val alt = "$base?q=$q"
                 val ok = try {
-                    val r = app.get(alt, headers = h + mapOf("Range" to "bytes=0-1"), timeout = 8L)
+                    val r = app.get(alt, headers = h + mapOf("Range" to "bytes=0-1"), timeout = 5L)
                     val ct = r.headers["Content-Type"].orEmpty()
                     r.code in 200..206 && (ct.startsWith("video", true) || ct.contains("octet-stream", true))
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     false
                 }
-                if (ok) add(alt, q)
-            }
+                q to ok
+            }.filter { it.second }.map { it.first }
+            for (q in okQs) add("$base?q=$q", q)
         }
         return true
     }
@@ -576,6 +581,9 @@ class JetFilmizle : MainAPI() {
         else -> 3
     }
 
+    // Her kaynağa tanınan en uzun süre; yavaş kaynak diğerlerini bekletmesin
+    private val sourceTimeoutMs = 15_000L
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -583,62 +591,93 @@ class JetFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val r = get(data)
-        var srcs = collectSources(r.document, r.text).toMutableList()
-        val hasBtns = r.document.select("[data-source-index]").isNotEmpty()
-        if (hasBtns && srcs.none { it.url.contains("videopark", true) }) {
-            val pid = captureVideoparkId(data)
-            val fid = r.document.selectFirst("input[name=film_id]")?.attr("value")?.trim()?.takeIf { it.matches(Regex("""\d{4,9}""")) }
-            d("webview film kimliği: $pid film_id=$fid")
-            // İki kimlik de denenir (hangisi doğruysa o çalışır); aynı adres iki kez eklenmez
+        val doc = r.document
+        val html = r.text
+        val srcs = collectSources(doc, html).toMutableList()
+        val hasBtns = doc.select("[data-source-index]").isNotEmpty()
+        val needId = hasBtns && srcs.none { it.url.contains("videopark", true) }
+        val fid = if (needId)
+            doc.selectFirst("input[name=film_id]")?.attr("value")?.trim()?.takeIf { it.matches(Regex("""\d{4,9}""")) }
+        else null
+        if (fid != null) {
             val have = srcs.map { it.url }.toHashSet()
-            val merged = ArrayList(srcs)
-            for (id in listOf(pid, fid).filterNotNull().distinct()) {
-                for (x in collectSources(r.document, r.text, id)) if (have.add(x.url)) merged.add(x)
-            }
-            srcs = merged
-        }
-        if (hasBtns && srcs.none { it.name.equals("Moly", true) }) dumpSiteJs(r.document)
-        if (srcs.isEmpty()) {
-            val cap = webViewCapture(data)
-            d("webview yakalama: $cap")
-            if (cap != null) srcs.add(Src("Kaynak", "JetFilmizle", cap))
-        }
-        if (srcs.isEmpty()) {
-            d("kaynak bulunamadı; sayfa uzunluk=${r.text.length} script=${r.document.select("script[src]").map { it.attr("src") }.take(8)}")
-            return false
+            for (x in collectSources(doc, html, fid)) if (have.add(x.url)) srcs.add(x)
         }
 
-        // Çıkan bağlantılar önce toplanır, sonra sıralanıp verilir: Dublaj, Altyazı, diğerleri; sayfadaki sırayla
-        val out = java.util.Collections.synchronizedList(ArrayList<Pair<Int, ExtractorLink>>())
         val seen = ConcurrentHashMap.newKeySet<String>()
-        val oks = srcs.withIndex().toList().amap { (i, s) ->
-            if (!seen.add(s.url)) return@amap false
-            val rank = langRank(s.lang) * 1000 + i
-            val ok = try {
-                resolve(s, subtitleCallback) { l -> out.add(rank to l) }
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                d("çözüm istisna ${s.name}: ${e.javaClass.simpleName}")
-                false
+        val total = AtomicInteger(0)
+
+        // Kaynaklar aynı anda çözülür. Sonuçlar eski sıralamayla (Dublaj, Altyazı, diğerleri; sayfa sırası;
+        // aynı kaynakta yüksek kalite önce) ama hazır oldukça verilir: tüm kaynakların bitmesi beklenmez.
+        suspend fun runPhase(list: List<Src>): Boolean {
+            val ordered = list.withIndex()
+                .sortedWith(compareBy({ langRank(it.value.lang) }, { it.index }))
+                .map { it.value }
+                .filter { seen.add(it.url) }
+            if (ordered.isEmpty()) return false
+            val slots = arrayOfNulls<List<ExtractorLink>>(ordered.size)
+            val lock = Any()
+            var next = 0
+            val oks = ordered.withIndex().toList().amap { (i, s) ->
+                val mine = java.util.Collections.synchronizedList(ArrayList<ExtractorLink>())
+                var ok = false
+                try {
+                    ok = withTimeoutOrNull(sourceTimeoutMs) {
+                        resolve(s, subtitleCallback) { l -> mine.add(l) }
+                    } ?: false
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    d("çözüm istisna ${s.name}: ${e.javaClass.simpleName}")
+                }
+                d("${s.lang} ${s.name} ${s.url.take(120)} -> $ok")
+                val got = synchronized(mine) { ArrayList(mine) }
+                synchronized(lock) {
+                    slots[i] = got.sortedBy { -it.quality }
+                    while (next < ordered.size && slots[next] != null) {
+                        for (l in slots[next]!!) {
+                            total.incrementAndGet()
+                            callback(l)
+                        }
+                        next++
+                    }
+                }
+                ok || got.isNotEmpty()
             }
-            d("${s.lang} ${s.name} ${s.url.take(120)} -> $ok")
-            ok
+            return oks.any { it }
         }
 
-        if (!oks.any { it } && synchronized(out) { out.isEmpty() }) {
+        // Film kimliği için WebView (yavaş) kaynaklar çözülürken arkada çalışır
+        coroutineScope {
+            val wv = if (needId) async { captureVideoparkId(data) } else null
+            runPhase(srcs)
+            if (wv != null) {
+                val pid = wv.await()
+                d("webview film kimliği: $pid film_id=$fid")
+                if (pid != null && pid != fid) {
+                    runPhase(collectSources(doc, html, pid))
+                }
+            }
+        }
+
+        if (total.get() == 0) {
             val cap = webViewCapture(data)
             d("son çare webview: $cap")
-            if (cap != null && cap.contains("videopark", true)) {
-                if (extractVideopark(cap, "Kaynak", "JetFilmizle", callback)) return true
-            } else if (cap != null && cap.contains(".m3u8", true)) {
-                emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
-                return true
+            if (cap != null) {
+                if (cap.contains("videopark", true)) {
+                    if (extractVideopark(cap, "Kaynak", "JetFilmizle", callback)) return true
+                } else if (cap.contains(".m3u8", true)) {
+                    emitHlsAny(cap, "Kaynak", "JetFilmizle", listOf(originOf(cap), mainUrl), callback)
+                    return true
+                } else {
+                    runPhase(listOf(Src("Kaynak", "JetFilmizle", cap)))
+                }
             }
         }
-
-        val items = synchronized(out) { ArrayList(out) }
-        items.sortedWith(compareBy<Pair<Int, ExtractorLink>>({ it.first }, { -it.second.quality })).forEach { callback(it.second) }
-        return oks.any { it }
+        if (total.get() == 0) {
+            d("kaynak bulunamadı; sayfa uzunluk=${r.text.length}")
+            return false
+        }
+        return true
     }
 
     private fun heightOf(w: Int): Int = when {
@@ -654,7 +693,7 @@ class JetFilmizle : MainAPI() {
     private suspend fun fetchTxt(u: String, h: Map<String, String>): String? {
         for (att in 0..1) {
             try {
-                return app.get(u, headers = h, timeout = 10L).text
+                return app.get(u, headers = h, timeout = 8L).text
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
@@ -662,42 +701,49 @@ class JetFilmizle : MainAPI() {
         return null
     }
 
+    private data class HlsVar(val q: Int?, val url: String, val bw: Int)
+
     // Bağlantı gerçekten canlı mı: master liste geçerli olmalı ve ilk alt liste gerçek parçalar içermeli.
-    // Ölü bağlantılar kaynak listesine hiç konmaz. Ayrıca çözünürlük (genişliğe göre) okunur.
-    private suspend fun probeHls(m3u8: String, headers: Map<String, String>): Pair<Boolean, Int?> {
-        val t = fetchTxt(m3u8, headers) ?: return false to null
-        if (!t.contains("#EXTM3U")) return false to null
-        val w = Regex("""RESOLUTION=(\d+)x(\d+)""").findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-        val lines = t.lines().map { it.trim() }
-        val si = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF") }
-        if (si >= 0) {
-            val v = lines.drop(si + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }
-            if (v != null) {
-                val vu = when {
-                    v.startsWith("http") -> v
-                    v.startsWith("/") -> originOf(m3u8) + v
-                    else -> m3u8.substringBefore("?").substringBeforeLast('/') + "/" + v
-                }
-                val vt = fetchTxt(vu, headers)
-                // Ağ hatası/zaman aşımı tek başına "ölü" sayılmaz; sadece alt liste geçerli bir liste değilse elenir
-                if (vt != null && !vt.contains("#EXTM3U")) return false to null
-            }
+    // Ölü bağlantılar kaynak listesine hiç konmaz. Ayrıca tüm kalite varyantları (1080p, 720p...) okunur.
+    private suspend fun probeHls(m3u8: String, headers: Map<String, String>): Triple<Boolean, Int?, List<HlsVar>> {
+        val t = fetchTxt(m3u8, headers) ?: return Triple(false, null, emptyList())
+        if (!t.contains("#EXTM3U")) return Triple(false, null, emptyList())
+        fun full(v: String): String = when {
+            v.startsWith("http") -> v
+            v.startsWith("/") -> originOf(m3u8) + v
+            else -> m3u8.substringBefore("?").substringBeforeLast('/') + "/" + v
         }
-        return true to w?.let { heightOf(it) }
+        val lines = t.lines().map { it.trim() }
+        val vars = ArrayList<HlsVar>()
+        for ((i, ln) in lines.withIndex()) {
+            if (!ln.startsWith("#EXT-X-STREAM-INF")) continue
+            val v = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
+            val w = Regex("""RESOLUTION=(\d+)x(\d+)""").find(ln)?.groupValues?.get(1)?.toIntOrNull()
+            val bw = Regex("""BANDWIDTH=(\d+)""").find(ln)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            vars.add(HlsVar(w?.let { heightOf(it) }, full(v), bw))
+        }
+        if (vars.isNotEmpty()) {
+            val vt = fetchTxt(vars.first().url, headers)
+            // Ağ hatası/zaman aşımı tek başına "ölü" sayılmaz; sadece alt liste geçerli bir liste değilse elenir
+            if (vt != null && !vt.contains("#EXTM3U")) return Triple(false, null, emptyList())
+        }
+        return Triple(true, vars.mapNotNull { it.q }.maxOrNull(), vars)
     }
 
     // CDN bağlantıları Referer/Origin olmadan, süresi dolunca ya da başka ağdan açılınca 404 verir.
     // Bu yüzden oynatıcı sayfasının Referer ve Origin'i ile verilir. Ölü bağlantı verilmez (false döner).
+    // expand=true: "Auto" bağlantısına ek olarak her kalite (1080p, 720p, 480p...) ayrı kaynak olarak da verilir.
     private suspend fun emitHls(
         m3u8: String,
         label: String,
         src: String,
         origin: String,
         callback: (ExtractorLink) -> Unit,
-        force: Boolean = false
+        force: Boolean = false,
+        expand: Boolean = true
     ): Boolean {
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
-        val (alive, q) = probeHls(m3u8, headers)
+        val (alive, q, vars) = probeHls(m3u8, headers)
         if (!alive && !force) {
             d("$src ölü bağlantı atlandı: ${m3u8.take(100)}")
             return false
@@ -710,6 +756,24 @@ class JetFilmizle : MainAPI() {
                 this.headers = headers
             }
         )
+        if (expand && alive) {
+            val best = vars.filter { it.q != null }
+                .groupBy { it.q!! }
+                .mapValues { e -> e.value.maxByOrNull { it.bw }!! }
+            if (best.size >= 2) {
+                val baseName = src.removeSuffix(" Auto")
+                for (hq in best.keys.sortedDescending()) {
+                    val v = best[hq] ?: continue
+                    callback(
+                        newExtractorLink(name, "$label - $baseName (${hq}p)", v.url, ExtractorLinkType.M3U8) {
+                            this.referer = "$origin/"
+                            this.quality = hq
+                            this.headers = headers
+                        }
+                    )
+                }
+            }
+        }
         return true
     }
 
@@ -768,10 +832,11 @@ class JetFilmizle : MainAPI() {
 
     // Farklı Referer/Origin'lerle dener; hiçbiri doğrulanamazsa yine de ilkiyle verir ("bağlantı yok" dememesi için)
     private suspend fun emitHlsAny(
-        url: String, label: String, src: String, origins: List<String>, cb: (ExtractorLink) -> Unit
+        url: String, label: String, src: String, origins: List<String>, cb: (ExtractorLink) -> Unit,
+        expand: Boolean = true
     ): Boolean {
-        for (o in origins) if (emitHls(url, label, src, o, cb)) return true
-        return emitHls(url, label, src, origins.first(), cb, force = true)
+        for (o in origins) if (emitHls(url, label, src, o, cb, expand = expand)) return true
+        return emitHls(url, label, src, origins.first(), cb, force = true, expand = expand)
     }
 
     // ---- Vip / OPlay (workers.dev/m/...): HTML sayfa -> <source src=...> (mpegurl) -> m3u8 ----
@@ -880,7 +945,7 @@ class JetFilmizle : MainAPI() {
         }
         val hls = j.optJSONObject("hlsSource")?.optString("file")?.replace("\\/", "/")
         if (!hls.isNullOrBlank() && hls.startsWith("http")) {
-            if (emitHlsAny(hls, label, "$src Auto", listOf(base, mainUrl), cb)) ok = true
+            if (emitHlsAny(hls, label, "$src Auto", listOf(base, mainUrl), cb, expand = !ok)) ok = true
         }
         return ok
     }
@@ -978,19 +1043,19 @@ class JetFilmizle : MainAPI() {
             if (e is java.util.concurrent.CancellationException) throw e
             d("gold info hata ${e.javaClass.simpleName}")
         }
-        // Liste eksik olabilir: bilinen tüm kaliteler ayrıca denenir, çalışanlar eklenir
-        for (q in listOf(2160, 1440, 1080, 720, 480, 360, 240)) {
-            if (q in quals) continue
+        // Liste eksik olabilir: bilinen tüm kaliteler ayrıca denenir (hepsi aynı anda), çalışanlar eklenir
+        val extra = listOf(2160, 1440, 1080, 720, 480, 360, 240).filter { it !in quals }.amap { q ->
             val ok = try {
-                val r = app.get("$worker/v/$vid?q=$q", headers = h + mapOf("Range" to "bytes=0-1"), referer = "$pageOrigin/", timeout = 8L)
+                val r = app.get("$worker/v/$vid?q=$q", headers = h + mapOf("Range" to "bytes=0-1"), referer = "$pageOrigin/", timeout = 5L)
                 val ct = r.headers["Content-Type"].orEmpty()
                 r.code in 200..206 && (ct.startsWith("video", true) || ct.contains("octet-stream", true))
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 false
             }
-            if (ok) quals.add(q)
-        }
+            q to ok
+        }.filter { it.second }.map { it.first }
+        quals.addAll(extra)
         d("gold kaliteler=$quals")
 
         if (quals.isEmpty()) {
@@ -1020,8 +1085,8 @@ class JetFilmizle : MainAPI() {
         val r = app.get(
             pageUrl,
             referer = referer,
-            interceptor = WebViewResolver(Regex("""(?i)\.m3u8"""), userAgent = null, useOkhttp = false, timeout = 15_000L),
-            timeout = 25L
+            interceptor = WebViewResolver(Regex("""(?i)\.m3u8"""), userAgent = null, useOkhttp = false, timeout = 9_000L),
+            timeout = 15L
         )
         r.url.takeIf { it != pageUrl && it.contains(".m3u8", true) }
     } catch (e: Exception) {
