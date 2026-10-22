@@ -1,5 +1,5 @@
 // Her yayında bu sayıyı 1 artır (eklenti güncellemesi böyle algılanır)
-version = 1
+version = 2
 
 android {
     namespace = "com.bymesut1"
