@@ -18,15 +18,16 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 class Dizipal : MainAPI() {
-    override var mainUrl = "https://dizipal2142.com"
+    // dizipal2142.com artık SSL el sıkışmasında kapanıyor; çalışan adres 2143
+    override var mainUrl = "https://dizipal2143.com"
     override var name = "Dizipal"
     override val hasMainPage = true
     override var lang = "tr"
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Site adresi değişirse sıradakine geçilir (duyuru: sonraki adres dizipal2143.com)
-    private val bases = listOf("https://dizipal2142.com", "https://dizipal2143.com")
+    // Site adresi değişirse sıradakine geçilir
+    private val bases = listOf("https://dizipal2143.com", "https://dizipal2142.com")
 
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
@@ -134,16 +135,34 @@ class Dizipal : MainAPI() {
             ""
         }
 
-    // "Erişim doğrulanıyor" ara sayfası mı?
+    private fun titleOf(t: String): String =
+        Regex("<title[^>]*>([^<]*)</title>", RegexOption.IGNORE_CASE).find(t)?.groupValues?.get(1)?.trim() ?: ""
+
+    // "Erişim doğrulanıyor" / "Doğrulama" ara sayfası mı?
     private fun isChallenge(t: String): Boolean {
+        // Sayfa başlığı "Doğrulama · DiziPAL" ise kesin doğrulama sayfasıdır
+        val title = titleOf(t)
+        if (title.contains("Doğrulama", true) || title.contains("Dogrulama", true)) return true
         val phrase = t.contains("Erişim doğrulanıyor", true) ||
             t.contains("Erisim dogrulaniyor", true)
         if (!phrase) return false
         // Gerçek sayfalarda da gizli bir "Erişim doğrulanıyor" katmanı olabilir: içerik varsa sorun yok
         val real = t.contains("content-card") || t.contains("data-cfg") ||
-            t.contains("/bolum/") || t.contains("og:image") || t.contains("trending-item")
+            t.contains("trending-item") || t.contains("episode-list-item")
         return !real
     }
+
+    // Hata ayıklama için doğrulama sayfasının script özeti
+    private fun challengeInfo(t: String): String =
+        try {
+            val d = Jsoup.parse(t)
+            val sc = d.select("script").joinToString(" ") { it.data() }
+                .replace(Regex("\\s+"), " ").trim()
+            val body = d.body().text().replace(Regex("\\s+"), " ").trim()
+            "js=" + sc.take(450) + " txt=" + body.take(120)
+        } catch (e: Exception) {
+            ""
+        }
 
     // Doğrulama sayfasındaki isteklerden çerez/token al
     private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
@@ -179,31 +198,30 @@ class Dizipal : MainAPI() {
 
     private suspend fun fetchSite(path: String): Fetched? {
         val order = listOf(mainUrl) + bases.filter { it != mainUrl }
+        var info = ""
         for (b in order) {
             try {
                 var r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
                 sessionCookies.putAll(r.cookies)
                 var tries = 0
-                while (isChallenge(r.text) && tries < 2) {
+                while (isChallenge(r.text) && tries < 3) {
                     passChallenge(b, r.text, b + path)
                     r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
                     sessionCookies.putAll(r.cookies)
                     tries++
                 }
-                val title = try {
-                    Jsoup.parse(r.text).title().take(40)
-                } catch (e: Exception) {
-                    ""
-                }
-                dbg = "code=${r.code} len=${r.text.length} ch=${isChallenge(r.text)} ck=${sessionCookies.keys.joinToString(",")} t=$title"
-                if (r.code == 200 && r.text.isNotBlank() && !isChallenge(r.text)) {
+                val ch = isChallenge(r.text)
+                dbg = "${hostOf(b)} code=${r.code} len=${r.text.length} ch=$ch ck=${sessionCookies.keys.joinToString(",")} t=${titleOf(r.text).take(40)}"
+                if (ch) info = challengeInfo(r.text)
+                if (r.code == 200 && r.text.isNotBlank() && !ch) {
                     mainUrl = b
                     return Fetched(b, r.text, sessionCookies.toMap())
                 }
             } catch (e: Exception) {
-                dbg = "hata: ${e.message}"
+                dbg = "${hostOf(b)} hata: ${e.message}"
             }
         }
+        if (info.isNotBlank()) dbg = "$dbg $info"
         return null
     }
 
@@ -353,7 +371,23 @@ class Dizipal : MainAPI() {
             path = path.replace("/bolum/", "/dizi/").replace(Regex("-\\d+-sezon-\\d+-bolum/?$"), "")
         }
         val isMovie = path.contains("/film/")
-        val f = fetchSite(path) ?: return null
+        val f = fetchSite(path)
+
+        if (f == null) {
+            // Detay sayfası alınamadı (doğrulama / ağ). Film ise adresten basit bir sayfa kur,
+            // böylece film açılır ve oynatma aşamasında yeniden denenir.
+            if (isMovie) {
+                val slug0 = path.substringAfterLast("/").substringBefore("?")
+                val t0 = slug0.split("-").filter { it.isNotBlank() }
+                    .joinToString(" ") { w -> w.replaceFirstChar { c -> c.uppercase() } }
+                val full0 = mainUrl.trimEnd('/') + path
+                return newMovieLoadResponse(t0, full0, TvType.Movie, full0) {
+                    this.plot = "Site detay sayfası alınamadı (doğrulama ekranı). Oynatmayı deneyin."
+                }
+            }
+            return null
+        }
+
         val doc = Jsoup.parse(f.text, f.base)
 
         val h1 = doc.select("h1").map { it.text().trim() }
@@ -491,7 +525,7 @@ class Dizipal : MainAPI() {
         if (f == null) {
             if (debug) {
                 callback(
-                    newExtractorLink(name, "DEBUG sayfa alinamadi: $dbg".take(220), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                    newExtractorLink(name, "DEBUG sayfa alinamadi: $dbg".take(700), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
                         this.referer = ""
                         this.quality = Qualities.Unknown.value
                     }
@@ -556,7 +590,7 @@ class Dizipal : MainAPI() {
         if (!any && debug) {
             val info = "cfg=${cfg?.t ?: "yok"} embed=${embeds.size} ${embeds.firstOrNull()?.take(60) ?: ""} | $dbg"
             callback(
-                newExtractorLink(name, "DEBUG $info".take(220), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                newExtractorLink(name, "DEBUG $info".take(700), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
                 }
