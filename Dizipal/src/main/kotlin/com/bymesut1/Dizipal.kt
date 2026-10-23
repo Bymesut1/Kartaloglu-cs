@@ -9,6 +9,10 @@ import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -26,6 +30,18 @@ class Dizipal : MainAPI() {
 
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
+
+    // TMDB (Türkçe bölüm adı, açıklama, resim, süre, tarih). Boş/placeholder ise kapalı.
+    private val tmdbKey = "BURAYA_TMDB_API_KEY"
+
+    // Link bulunamazsa kaynak listesine "DEBUG ..." satırı ekler (sorun bitince false yap)
+    private val debug = true
+
+    // Siteden gelen doğrulama çerezleri (Erişim doğrulanıyor ekranı için)
+    private val sessionCookies = ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var dbg = ""
 
     override val mainPage = mainPageOf(
         "home:Trend Diziler" to "Trend Diziler",
@@ -52,6 +68,15 @@ class Dizipal : MainAPI() {
     private class Cfg(val t: String, val v: String, val raw: String)
 
     private class Var(val url: String, val bw: Int, val h: Int)
+
+    private class Tm(
+        val id: Int,
+        val overview: String?,
+        val poster: String?,
+        val backdrop: String?,
+        val year: Int?,
+        val runtime: Int?
+    )
 
     private fun hdr(ref: String? = null, extra: Map<String, String> = emptyMap()): Map<String, String> {
         val h = LinkedHashMap<String, String>()
@@ -109,16 +134,69 @@ class Dizipal : MainAPI() {
             ""
         }
 
+    // "Erişim doğrulanıyor" ara sayfası mı?
+    private fun isChallenge(t: String): Boolean =
+        t.contains("Erişim doğrulanıyor", true) ||
+            t.contains("Erisim dogrulaniyor", true) ||
+            t.contains("Erişim Doğrulanıyor", true)
+
+    // Doğrulama sayfasındaki isteklerden çerez/token al
+    private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
+        val hx = mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Accept" to "application/json, text/plain, */*"
+        )
+        val endpoints = LinkedHashSet<String>()
+        endpoints.add("/ajax-token")
+        Regex("""(?:fetch|get|post)\(\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
+            .findAll(text).forEach { endpoints.add(it.groupValues[1]) }
+        val names = LinkedHashSet<String>()
+        names.add("_ct")
+        Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=""")
+            .findAll(text).forEach { names.add(it.groupValues[1]) }
+        for (ep in endpoints.take(6)) {
+            val r = try {
+                app.get(base + ep, headers = hdr(pageUrl, hx), cookies = sessionCookies.toMap())
+            } catch (e: Exception) {
+                continue
+            }
+            sessionCookies.putAll(r.cookies)
+            val tok = try {
+                val o = JSONObject(r.text)
+                listOf("t", "token", "value", "k").map { o.optString(it, "") }
+                    .firstOrNull { it.isNotBlank() && it != "null" }
+            } catch (e: Exception) {
+                null
+            }
+            if (tok != null) names.forEach { sessionCookies[it] = tok }
+        }
+    }
+
     private suspend fun fetchSite(path: String): Fetched? {
         val order = listOf(mainUrl) + bases.filter { it != mainUrl }
         for (b in order) {
             try {
-                val r = app.get(b + path, headers = hdr("$b/"))
-                if (r.code == 200 && r.text.isNotBlank()) {
+                var r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
+                sessionCookies.putAll(r.cookies)
+                var tries = 0
+                while (isChallenge(r.text) && tries < 2) {
+                    passChallenge(b, r.text, b + path)
+                    r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
+                    sessionCookies.putAll(r.cookies)
+                    tries++
+                }
+                val title = try {
+                    Jsoup.parse(r.text).title().take(40)
+                } catch (e: Exception) {
+                    ""
+                }
+                dbg = "code=${r.code} len=${r.text.length} ch=${isChallenge(r.text)} ck=${sessionCookies.keys.joinToString(",")} t=$title"
+                if (r.code == 200 && r.text.isNotBlank() && !isChallenge(r.text)) {
                     mainUrl = b
-                    return Fetched(b, r.text, r.cookies)
+                    return Fetched(b, r.text, sessionCookies.toMap())
                 }
             } catch (e: Exception) {
+                dbg = "hata: ${e.message}"
             }
         }
         return null
@@ -152,6 +230,79 @@ class Dizipal : MainAPI() {
         } else {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // TMDB
+    // ------------------------------------------------------------------
+    private fun tmdbOn(): Boolean = tmdbKey.isNotBlank() && !tmdbKey.startsWith("BURAYA")
+
+    private suspend fun tmdbGet(path: String): JSONObject? {
+        if (!tmdbOn()) return null
+        return try {
+            val sep = if (path.contains("?")) "&" else "?"
+            val t = app.get(
+                "https://api.themoviedb.org/3$path${sep}api_key=$tmdbKey&language=tr-TR",
+                headers = mapOf("User-Agent" to ua)
+            ).text
+            JSONObject(t)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun jStr(o: JSONObject, k: String): String? {
+        val s = o.optString(k, "")
+        return if (s.isBlank() || s == "null") null else s
+    }
+
+    private suspend fun tmdbInfo(title: String, movie: Boolean): Tm? {
+        if (!tmdbOn()) return null
+        val kind = if (movie) "movie" else "tv"
+        val q = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        val res = tmdbGet("/search/$kind?query=$q&include_adult=false")?.optJSONArray("results") ?: return null
+        if (res.length() == 0) return null
+        var pick: JSONObject? = null
+        for (i in 0 until res.length()) {
+            val o = res.optJSONObject(i) ?: continue
+            val n = o.optString(if (movie) "title" else "name", "")
+            val on = o.optString(if (movie) "original_title" else "original_name", "")
+            if (n.equals(title, true) || on.equals(title, true)) {
+                pick = o
+                break
+            }
+        }
+        if (pick == null) pick = res.optJSONObject(0)
+        val p = pick ?: return null
+        val id = p.optInt("id", 0)
+        if (id == 0) return null
+        val d = tmdbGet("/$kind/$id") ?: p
+        val date = jStr(d, if (movie) "release_date" else "first_air_date")
+        val year = date?.take(4)?.toIntOrNull()
+        val runtime = if (movie) {
+            d.optInt("runtime", 0).takeIf { it > 0 }
+        } else {
+            d.optJSONArray("episode_run_time")?.optInt(0, 0)?.takeIf { it > 0 }
+        }
+        return Tm(
+            id,
+            jStr(d, "overview"),
+            jStr(d, "poster_path")?.let { "https://image.tmdb.org/t/p/w500$it" },
+            jStr(d, "backdrop_path")?.let { "https://image.tmdb.org/t/p/w780$it" },
+            year,
+            runtime
+        )
+    }
+
+    // bölüm numarası -> TMDB bölüm bilgisi
+    private suspend fun tmdbSeason(id: Int, season: Int): Map<Int, JSONObject> {
+        val arr = tmdbGet("/tv/$id/season/$season")?.optJSONArray("episodes") ?: return emptyMap()
+        val m = HashMap<Int, JSONObject>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            m[o.optInt("episode_number", -1)] = o
+        }
+        return m
     }
 
     // ------------------------------------------------------------------
@@ -205,18 +356,25 @@ class Dizipal : MainAPI() {
                 ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
                 ?: return null
         )
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.startsWith("http") }
-        val plot = (doc.selectFirst("meta[property=og:description]")?.attr("content")
+        val sitePoster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.startsWith("http") }
+        val sitePlot = (doc.selectFirst("meta[property=og:description]")?.attr("content")
             ?: doc.selectFirst("meta[name=description]")?.attr("content"))
             ?.takeIf { it.isNotBlank() }
         val tags = doc.select("a[href*=/kategori/]").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val fullUrl = f.base + path
 
+        val tm = tmdbInfo(title, isMovie)
+        val poster = tm?.poster ?: sitePoster
+        val plot = tm?.overview ?: sitePlot
+
         if (isMovie) {
             return newMovieLoadResponse(title, fullUrl, TvType.Movie, fullUrl) {
                 this.posterUrl = poster
+                this.backgroundPosterUrl = tm?.backdrop
                 this.plot = plot
                 this.tags = tags
+                this.year = tm?.year
+                this.duration = tm?.runtime
             }
         }
 
@@ -251,7 +409,7 @@ class Dizipal : MainAPI() {
                     val hits = batch.amap { e ->
                         val p = "/bolum/$slug-$s-sezon-$e-bolum"
                         val ok = try {
-                            val r = app.get(f.base + p, headers = hdr("${f.base}/"))
+                            val r = app.get(f.base + p, headers = hdr("${f.base}/"), cookies = sessionCookies.toMap())
                             r.code == 200 && r.text.contains("data-cfg")
                         } catch (ex: Exception) {
                             false
@@ -274,10 +432,41 @@ class Dizipal : MainAPI() {
 
         eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
+        // TMDB: bölüm adı, açıklama, resim, süre, tarih (gelecek tarihli bölümler gizlenir)
+        if (tm != null) {
+            val seasons = eps.mapNotNull { it.season }.distinct()
+            val maps = seasons.amap { s -> s to tmdbSeason(tm.id, s) }.toMap()
+            val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            val out = ArrayList<Episode>()
+            for (ep in eps) {
+                val j = maps[ep.season]?.get(ep.episode)
+                if (j != null) {
+                    val air = jStr(j, "air_date")
+                    if (air != null && air > today) continue
+                    jStr(j, "name")?.let { ep.name = it }
+                    jStr(j, "overview")?.let { ep.description = it }
+                    jStr(j, "still_path")?.let { ep.posterUrl = "https://image.tmdb.org/t/p/w300$it" }
+                    val rt = j.optInt("runtime", 0)
+                    if (rt > 0) ep.runTime = rt
+                    if (air != null) {
+                        try {
+                            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(air)?.time?.let { ep.date = it }
+                        } catch (e: Exception) {
+                        }
+                    }
+                }
+                out.add(ep)
+            }
+            eps.clear()
+            eps.addAll(out)
+        }
+
         return newTvSeriesLoadResponse(title, fullUrl, TvType.TvSeries, eps) {
             this.posterUrl = poster
+            this.backgroundPosterUrl = tm?.backdrop
             this.plot = plot
             this.tags = tags
+            this.year = tm?.year
         }
     }
 
@@ -291,7 +480,19 @@ class Dizipal : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val path = pathOf(data)
-        val f = fetchSite(path) ?: return false
+        val f = fetchSite(path)
+        if (f == null) {
+            if (debug) {
+                callback(
+                    newExtractorLink(name, "DEBUG sayfa alinamadi: $dbg".take(220), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return true
+            }
+            return false
+        }
         val pageUrl = f.base + path
         var any = false
 
@@ -343,6 +544,17 @@ class Dizipal : MainAPI() {
                 }
             }
             if (got) any = true
+        }
+
+        if (!any && debug) {
+            val info = "cfg=${cfg?.t ?: "yok"} embed=${embeds.size} ${embeds.firstOrNull()?.take(60) ?: ""} | $dbg"
+            callback(
+                newExtractorLink(name, "DEBUG $info".take(220), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                    this.referer = ""
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
         }
         return any
     }
@@ -422,7 +634,9 @@ class Dizipal : MainAPI() {
         } catch (e: Exception) {
             ""
         }
-        return parseCfg(rc)
+        val res = parseCfg(rc)
+        if (res == null) dbg = "$dbg | cfgA=${ra.take(60)} cfgB=${rb.take(60)}"
+        return res
     }
 
     private fun parseCfg(text: String): Cfg? {
