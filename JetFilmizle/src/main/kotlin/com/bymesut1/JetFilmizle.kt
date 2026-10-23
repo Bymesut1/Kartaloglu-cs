@@ -938,9 +938,27 @@ class JetFilmizle : MainAPI() {
                 for (m in Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").findAll(body)) {
                     if (m.groupValues[1] !in cands) cands.add(m.groupValues[1])
                 }
+                // Hostsuz yazılmış /hls/... ya da /s/... yolları
+                for (m in Regex("""["'`]/?((?:hls|s)/[A-Za-z0-9_\-~.%=]{40,})["'`]""").findAll(body)) {
+                    val full = "https://hls.playerx.info/" + m.groupValues[1]
+                    if (full !in cands) cands.add(full)
+                }
+                // Uzun şifreli jeton: /hls/<jeton> olarak denenir
+                for (m in Regex("""["'`]([A-Za-z0-9_\-~]{120,})["'`]""").findAll(body).take(3)) {
+                    val full = "https://hls.playerx.info/hls/" + m.groupValues[1]
+                    if (full !in cands) cands.add(full)
+                }
+                var dn = 0
+                for (m in Regex("""(?i)\.setup\(|sources\s*:|file\s*:|atob\(|[\"']hls[\"']|/hls/""").findAll(body)) {
+                    val a2 = maxOf(0, m.range.first - 150)
+                    val b2 = minOf(body.length, m.range.first + 650)
+                    d("px ctx@${m.range.first}: ${body.substring(a2, b2).replace(Regex("\\s+"), " ")}")
+                    if (++dn >= 6) break
+                }
+                cands.sortBy { if (it.contains("/hls/")) 0 else 1 }
             }
         }
-        d("playerx adaylar=${cands.size} cerez=${cookieHdr != null}")
+        d("playerx adaylar=${cands.size} cerez=${cookieHdr != null} ${cands.map { it.substringAfter("playerx.info").take(14) }}")
         val base = mapOf("User-Agent" to ua, "Referer" to "$px/", "Origin" to px)
         val browserLike = base + mapOf(
             "Accept" to "*/*",
@@ -1123,6 +1141,18 @@ class JetFilmizle : MainAPI() {
                     d("vp ctx@${m.range.first}: ${html.substring(a2, b2).replace(Regex("\\s+"), " ")}")
                     if (++dn >= 6) break
                 }
+                val ai = html.indexOf("api_sources")
+                if (ai >= 0) {
+                    val seg = html.substring(maxOf(0, ai - 700), minOf(html.length, ai + 700)).replace(Regex("\\s+"), " ")
+                    d("vp api1: ${seg.take(800)}")
+                    if (seg.length > 800) d("vp api2: ${seg.substring(800)}")
+                }
+                val si = html.indexOf("jwplayer(\"player\").setup")
+                if (si > 1200) {
+                    val seg = html.substring(si - 1400, si).replace(Regex("\\s+"), " ")
+                    d("vp pre1: ${seg.take(700)}")
+                    d("vp pre2: ${seg.drop(700).take(700)}")
+                }
                 val rels = Regex("""["'](/[A-Za-z0-9_\-./]*(?:apollo|hls|stream|api)[A-Za-z0-9_\-./?=&%]*)["']""").findAll(html)
                     .map { it.groupValues[1] }.distinct().take(10).toList()
                 if (rels.isNotEmpty()) d("vp yollar: $rels")
@@ -1135,6 +1165,32 @@ class JetFilmizle : MainAPI() {
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     d("VIDEO_DATA json hata ${e.javaClass.simpleName}")
+                }
+            }
+            // 1b) Apollo: sayfa /jetembed/backend/api_sources.php'den {hlsUrl} alıyor
+            if (html.contains("api_sources")) {
+                val vid = Regex("""[?&]id=(\d+)""").find(u)?.groupValues?.get(1)
+                val apiBase = "$base/jetembed/backend/api_sources.php"
+                val tries = ArrayList<Pair<String, Map<String, String>?>>()
+                if (vid != null) {
+                    tries.add("$apiBase?id=$vid" to null)
+                    tries.add("$apiBase?video_id=$vid" to null)
+                    tries.add(apiBase to mapOf("id" to vid))
+                }
+                for ((url, form) in tries) {
+                    try {
+                        val h = mapOf("User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest", "Origin" to base)
+                        val r = if (form == null) app.get(url, headers = h, referer = u, timeout = 12L)
+                        else app.post(url, headers = h, referer = u, data = form, timeout = 12L)
+                        val txt = r.text.replace("\\/", "/")
+                        d("apollo api ${url.substringAfter("php")} kod=${r.code} ${txt.take(260).replace("\n", " ")}")
+                        val hls = Regex(""""hlsUrl"\s*:\s*"([^"]+)"""").find(txt)?.groupValues?.get(1)
+                            ?: Regex("""(https?://[^"'\s<>]+(?:/hls/|\.m3u8)[^"'\s<>]*)""").find(txt)?.groupValues?.get(1)
+                        if (!hls.isNullOrBlank() && emitHlsAny(hls, label, src, listOf(base, mainUrl), cb)) return true
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        d("apollo api hata ${e.javaClass.simpleName}")
+                    }
                 }
             }
             // 2) WORKER_URL/api/stream
