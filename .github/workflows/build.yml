@@ -41,6 +41,7 @@ jobs:
           cp Webteizle/build/*.cs3 out/
           cp JetFilmizle/build/*.cs3 out/
           cp DiziCehennemi/build/*.cs3 out/
+          cp FullHDFilmizlesene/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
