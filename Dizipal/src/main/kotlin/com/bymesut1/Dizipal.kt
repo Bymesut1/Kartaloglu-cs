@@ -32,7 +32,7 @@ class Dizipal : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
 
     // TMDB (Türkçe bölüm adı, açıklama, resim, süre, tarih). Boş/placeholder ise kapalı.
-    private val tmdbKey = "BURAYA_TMDB_API_KEY"
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
 
     // Link bulunamazsa kaynak listesine "DEBUG ..." satırı ekler (sorun bitince false yap)
     private val debug = true
@@ -135,10 +135,15 @@ class Dizipal : MainAPI() {
         }
 
     // "Erişim doğrulanıyor" ara sayfası mı?
-    private fun isChallenge(t: String): Boolean =
-        t.contains("Erişim doğrulanıyor", true) ||
-            t.contains("Erisim dogrulaniyor", true) ||
-            t.contains("Erişim Doğrulanıyor", true)
+    private fun isChallenge(t: String): Boolean {
+        val phrase = t.contains("Erişim doğrulanıyor", true) ||
+            t.contains("Erisim dogrulaniyor", true)
+        if (!phrase) return false
+        // Gerçek sayfalarda da gizli bir "Erişim doğrulanıyor" katmanı olabilir: içerik varsa sorun yok
+        val real = t.contains("content-card") || t.contains("data-cfg") ||
+            t.contains("/bolum/") || t.contains("og:image") || t.contains("trending-item")
+        return !real
+    }
 
     // Doğrulama sayfasındaki isteklerden çerez/token al
     private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
@@ -351,8 +356,10 @@ class Dizipal : MainAPI() {
         val f = fetchSite(path) ?: return null
         val doc = Jsoup.parse(f.text, f.base)
 
+        val h1 = doc.select("h1").map { it.text().trim() }
+            .firstOrNull { it.isNotBlank() && !it.contains("doğrulan", true) }
         val title = cleanTitle(
-            doc.selectFirst("h1")?.text()
+            h1
                 ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
                 ?: return null
         )
