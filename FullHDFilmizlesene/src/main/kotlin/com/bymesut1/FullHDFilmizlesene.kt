@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class FullHDFilmizlesene : MainAPI() {
     override var mainUrl = "https://www.fullhdfilmizlesene.now"
-    override var name = "fullhdfilmizlesene"
+    override var name = "FullHDFilmizlesene"
     override var lang = "tr"
     override val hasMainPage = true
     override val hasQuickSearch = false
