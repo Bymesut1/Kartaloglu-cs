@@ -955,7 +955,9 @@ class JetFilmizle : MainAPI() {
         val ckh = cookieHdr
         if (ckh != null) variants.add(browserLike + ("Cookie" to ckh))
         variants.add(mapOf("User-Agent" to ua))
-        for (c in cands.take(4)) {
+        var found = 0
+        for (c in cands.take(5)) {
+            var okThis = false
             for ((i, h) in variants.withIndex()) {
                 val r = try {
                     app.get(c, headers = h, timeout = 7L)
@@ -967,10 +969,18 @@ class JetFilmizle : MainAPI() {
                 val t = r?.text.orEmpty()
                 d("playerx v$i ...${c.takeLast(10)} kod=${r?.code} tip=${r?.headers?.get("Content-Type")} gövde=${t.take(70).replace("\n", " ")}")
                 if (t.contains("#EXTM3U")) {
-                    return emitHls(c, label, src, px, cb, force = true, hdrs = h)
+                    // Sayfada birden fazla akış olabilir (örn. farklı ses/dil): çalışan hepsi ayrı kaynak olarak verilir
+                    val nm = if (found == 0) src else "$src ${found + 1}"
+                    if (emitHls(c, label, nm, px, cb, force = true, hdrs = h)) {
+                        found++
+                        okThis = true
+                    }
+                    break
                 }
             }
+            if (okThis && found >= 3) break
         }
+        if (found > 0) return true
         // Hiçbiri doğrulanamadıysa sayfayı WebView ile aç ve oynatıcının istediği HLS adresini yakala
         val cap = webViewHls(u, "$mainUrl/", Regex("""(?i)hls\.playerx\.info/(?:hls|s)/|\.m3u8""")) ?: return false
         d("playerx webview yakalama: ${cap.take(80)}")
