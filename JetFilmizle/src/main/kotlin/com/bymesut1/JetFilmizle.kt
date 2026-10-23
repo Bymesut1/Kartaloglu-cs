@@ -955,6 +955,11 @@ class JetFilmizle : MainAPI() {
         val ckh = cookieHdr
         if (ckh != null) variants.add(browserLike + ("Cookie" to ckh))
         variants.add(mapOf("User-Agent" to ua))
+        // Cloudflare 1011 (Referer denetimi) için: tam sayfa adresi ve gömen sitenin Referer'i de denenir
+        variants.add(base + ("Referer" to u))
+        variants.add(browserLike + ("Referer" to u))
+        variants.add(mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Origin" to mainUrl, "Accept" to "*/*"))
+        variants.add(mapOf("User-Agent" to ua, "Referer" to "$px/", "Accept" to "*/*"))
         var found = 0
         for (c in cands.take(5)) {
             var okThis = false
@@ -968,6 +973,7 @@ class JetFilmizle : MainAPI() {
                 }
                 val t = r?.text.orEmpty()
                 d("playerx v$i ...${c.takeLast(10)} kod=${r?.code} tip=${r?.headers?.get("Content-Type")} gövde=${t.take(70).replace("\n", " ")}")
+                if (t.startsWith("WEBVTT")) break // altyazı dosyası, video değil
                 if (t.contains("#EXTM3U")) {
                     // Sayfada birden fazla akış olabilir (örn. farklı ses/dil): çalışan hepsi ayrı kaynak olarak verilir
                     val nm = if (found == 0) src else "$src ${found + 1}"
@@ -1109,6 +1115,18 @@ class JetFilmizle : MainAPI() {
         }
         if (html != null) {
             d("videopark $src uzunluk=${html.length}")
+            run {
+                var dn = 0
+                for (m in Regex("""(?i)apollo/hls|hlsSource|\.m3u8|VIDEO_DATA|WORKER_URL|jwplayer|new Hls|fetch\(|XMLHttpRequest|\.post\(""").findAll(html)) {
+                    val a2 = maxOf(0, m.range.first - 120)
+                    val b2 = minOf(html.length, m.range.first + 420)
+                    d("vp ctx@${m.range.first}: ${html.substring(a2, b2).replace(Regex("\\s+"), " ")}")
+                    if (++dn >= 6) break
+                }
+                val rels = Regex("""["'](/[A-Za-z0-9_\-./]*(?:apollo|hls|stream|api)[A-Za-z0-9_\-./?=&%]*)["']""").findAll(html)
+                    .map { it.groupValues[1] }.distinct().take(10).toList()
+                if (rels.isNotEmpty()) d("vp yollar: $rels")
+            }
             // 1) sayfaya gömülü VIDEO_DATA
             val inline = jsonAssign(html, "VIDEO_DATA")
             if (inline != null) {
@@ -1145,6 +1163,10 @@ class JetFilmizle : MainAPI() {
             }
             // 3) sayfadaki açık adresler
             val hay = html.replace("\\/", "/").replace("&amp;", "&")
+            // Göreli /apollo/hls/... adresleri (sayfada hostsuz yazılmış olabilir)
+            for (m in Regex("""["'](/apollo/hls/[^"'\s<>\\]+)["']""").findAll(hay)) {
+                if (emitHlsAny(base + m.groupValues[1], label, src, listOf(base, mainUrl), cb)) return true
+            }
             for (m in Regex("""https?://[^\s"'<>\\]+""").findAll(hay)) {
                 val x = m.value
                 val ok = when {
