@@ -3,6 +3,8 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -171,21 +173,40 @@ class Dizipal : MainAPI() {
     private fun metaOf(doc: org.jsoup.nodes.Document, n: String): String =
         doc.selectFirst("meta[name=$n]")?.attr("content")?.trim() ?: ""
 
-    // Doğrulama: sayfadaki /_bcs?t=... script'i XOR+base64 ile gizlenmiş; meta etiketlerinden
-    // (_bc: gönderim adresi, _cn: tek kullanımlık kod, _bk: gereken etkinlik sayısı, _br: dönüş adresi) okur.
-    private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
-        val hx = mapOf(
-            "X-Requested-With" to "XMLHttpRequest",
-            "Accept" to "application/json, text/plain, */*"
-        )
-        val doc = Jsoup.parse(text, base)
-        var all = text
+    private fun sha256Hex(str: String): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val h = md.digest(str.toByteArray(Charsets.UTF_8))
+        val hex = "0123456789abcdef"
+        val sb = StringBuilder(64)
+        for (x in h) {
+            val v = x.toInt() and 255
+            sb.append(hex[v shr 4]).append(hex[v and 15])
+        }
+        return sb.toString()
+    }
 
-        // 1) /_bcs script'ini oturum çerezleriyle iste (tarayıcı gibi)
+    // Sitenin PoW'u: sha256(nonce + ":" + tahmin) onaltılık çıktısı "0" * zeros ile başlamalı
+    private fun solvePow(nonce: String, zeros: Int): String? {
+        val pre = "0".repeat(zeros)
+        var i = 0
+        while (i <= 8000000) {
+            if (sha256Hex("$nonce:$i").startsWith(pre)) return i.toString()
+            i++
+        }
+        return null
+    }
+
+    // Doğrulama ekranı (/_bcs script'inin yaptığı iş):
+    // meta _bc (token), _bn (nonce), _bk (sıfır sayısı), _br (dönüş adresi) okunur,
+    // PoW çözülür ve JSON olarak /_bc_verify adresine POST edilir; sunucu doğrulama çerezini verir.
+    private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
+        val doc = Jsoup.parse(text, base)
+
+        // Tarayıcı gibi /_bcs script'ini de iste (oturum çerezleriyle)
         try {
             val srcs = doc.select("script[src]").map { it.attr("abs:src") }
                 .filter { it.startsWith("http") && hostOf(it) == hostOf(base) }
-                .take(3)
+                .take(2)
             for (u in srcs) {
                 val rs = try {
                     app.get(
@@ -205,103 +226,81 @@ class Dizipal : MainAPI() {
                     null
                 }
                 if (rs != null) sessionCookies.putAll(rs.cookies)
-                all += "\n" + (rs?.text ?: "")
             }
         } catch (e: Exception) {
         }
 
-        // 2) Gizli script gövdesini çöz: var k="<anahtar>",p="<base64>"
-        var dec = ""
-        try {
-            val m = Regex("""var k=["]([0-9A-Za-z]{8,64})["],p=["]([A-Za-z0-9+/=_-]{40,})["]""").find(all)
-            if (m != null) {
-                val key = m.groupValues[1]
-                val bytes = b64bin(m.groupValues[2])
-                val sb = StringBuilder()
-                for (i in bytes.indices) sb.append(((bytes[i].toInt() and 255) xor key[i % key.length].code).toChar())
-                dec = sb.toString()
-                all += "\n" + dec
-            }
-        } catch (e: Exception) {
-        }
-
-        // Sayfadaki tüm "_" ile başlayan meta etiketleri (_bc, _bk, _br ...)
         val metas = LinkedHashMap<String, String>()
         doc.select("meta[name]").forEach {
             val n = it.attr("name")
             if (n.startsWith("_")) metas[n] = it.attr("content")
         }
-        val br = metas["_br"] ?: ""
-        val bk = metas["_bk"] ?: ""
-        chDbg = "metas=" + metas.entries.joinToString(",") { "${it.key}:${it.value.length}" } +
-            " bk=$bk br=$br dec=${dec.length}"
-
-        // Hata ayıklama: logcat'e yaz (System.out etiketiyle görünür)
-        logBig("DZP-DEC", dec)
-        logBig("DZP-HTML", text)
-
-        // Script içinde düz yazılmış çerez ataması varsa doğrudan uygula
-        Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=([^;"']+)""")
-            .findAll(all).forEach { sessionCookies[it.groupValues[1]] = it.groupValues[2] }
-
-        // Sayfa birkaç saniye bekletiyor
-        try {
-            Thread.sleep(2000)
-        } catch (e: Exception) {
+        val bc = metas["_bc"] ?: ""
+        val bn = metas["_bn"] ?: ""
+        val zeros = metas["_bk"]?.toIntOrNull() ?: 4
+        val ret = metas["_br"].let { if (it.isNullOrBlank()) "/" else it }
+        if (bc.isBlank() || bn.isBlank()) {
+            chDbg = "meta eksik: ${metas.keys}"
+            return
         }
 
-        // 3) Tahmini bildirim: tüm meta değerleri + etkinlik sayıları aynı sayfaya POST
+        // Sayfa 350-600 ms bekleyip çözmeye başlıyor
+        val t0 = System.currentTimeMillis()
         try {
-            val cnt = bk.toIntOrNull() ?: 3
-            val fields = LinkedHashMap<String, String>()
-            metas.forEach { (k, v) -> if (k != "_br") fields[k] = v }
-            fields["m"] = (cnt * 4).toString()
-            fields["tc"] = cnt.toString()
-            fields["sc"] = "1"
-            fields["fp"] = "0000000000000000"
+            Thread.sleep(500)
+        } catch (e: Exception) {
+        }
+        val ans = solvePow(bn, zeros)
+        if (ans == null) {
+            chDbg = "pow bulunamadi"
+            return
+        }
+        val elapsed = (System.currentTimeMillis() - t0).toInt() + 150
+
+        val o = JSONObject()
+        o.put("b", bc)
+        o.put("a", ans)
+        o.put("t", elapsed)
+        o.put("m", 9)
+        o.put("tc", 6)
+        o.put("sc", 1)
+        o.put("c", "7f3a9c2e5b1d4068")
+        o.put("w", "Qualcomm|Adreno (TM) 619|WebGL 1.0 (OpenGL ES 2.0 Chromium)")
+        o.put("au", "124.04347")
+        o.put("pl", 0)
+        o.put("hw", 8)
+        o.put("dp", 2.75)
+        o.put("sw", "393x873")
+        o.put("tz", -180)
+        o.put("tn", "Europe/Istanbul")
+        o.put("lg", "tr-TR")
+        o.put("wd", 0)
+        o.put("ck", 1)
+        o.put("pm", "prompt")
+        o.put("vs", "visible")
+        o.put("r", ret)
+
+        try {
+            val body = o.toString().toRequestBody("application/json".toMediaTypeOrNull())
             val r = app.post(
-                pageUrl,
-                headers = hdr(pageUrl, hx + mapOf("Origin" to base)),
-                data = fields,
+                base + "/_bc_verify",
+                headers = hdr(
+                    pageUrl,
+                    mapOf(
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Origin" to base,
+                        "Accept" to "*/*"
+                    )
+                ),
+                requestBody = body,
                 cookies = sessionCookies.toMap()
             )
             sessionCookies.putAll(r.cookies)
-            logBig("DZP-POST", "code=${r.code} ck=${r.cookies.keys} body=${r.text.take(600)}")
+            chDbg = "verify code=${r.code} ck=${r.cookies.keys} body=${r.text.take(160)}"
+            println("DZP-VERIFY $chDbg")
         } catch (e: Exception) {
-            logBig("DZP-POST", "hata ${e.message}")
-        }
-
-        // 4) Eski yol: /ajax-token ve sayfada geçen uç noktalar
-        val endpoints = LinkedHashSet<String>()
-        endpoints.add("/ajax-token")
-        Regex("""(?:fetch|get|post|getJSON)\(\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
-            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
-        val names = LinkedHashSet<String>()
-        names.add("_ct")
-        for (ep in endpoints.take(5)) {
-            val r = try {
-                app.get(base + ep, headers = hdr(pageUrl, hx), cookies = sessionCookies.toMap())
-            } catch (e: Exception) {
-                continue
-            }
-            sessionCookies.putAll(r.cookies)
-            val tok = try {
-                val o = JSONObject(r.text)
-                listOf("t", "token", "value", "k").map { o.optString(it, "") }
-                    .firstOrNull { it.isNotBlank() && it != "null" }
-            } catch (e: Exception) {
-                null
-            }
-            if (tok != null) names.forEach { sessionCookies[it] = tok }
-        }
-
-        // 5) Dönüş adresine çerezlerle git
-        if (br.isNotBlank()) {
-            try {
-                val r = app.get(resolveUrl(pageUrl, br), headers = hdr(pageUrl), cookies = sessionCookies.toMap())
-                sessionCookies.putAll(r.cookies)
-            } catch (e: Exception) {
-            }
+            chDbg = "verify hata ${e.message}"
+            println("DZP-VERIFY $chDbg")
         }
     }
 
