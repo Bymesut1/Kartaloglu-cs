@@ -20,7 +20,7 @@ class VkVideo : MainAPI() {
         private const val CLIENT_ID = "52461373"
 
         // Bu süreden kısa videolar (klip vb.) listeden elenir (saniye)
-        private const val MIN_DURATION = 0
+        private const val MIN_DURATION = 1200
 
         // true: açılan posteri olmayan kartlar listeden çıkarılır
         private const val REQUIRE_POSTER = true
