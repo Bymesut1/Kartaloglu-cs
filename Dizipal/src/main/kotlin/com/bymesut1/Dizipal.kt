@@ -3,7 +3,6 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.delay
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -194,7 +193,10 @@ class Dizipal : MainAPI() {
         chDbg = ext
 
         // "Birkaç saniye içinde yönlendirileceksiniz": sunucu bekleme süresi isteyebilir
-        delay(2500)
+        try {
+            Thread.sleep(2500)
+        } catch (e: Exception) {
+        }
 
         val endpoints = LinkedHashSet<String>()
         endpoints.add("/ajax-token")
