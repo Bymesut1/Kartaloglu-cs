@@ -2,6 +2,7 @@ package com.bymesut1
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
 import org.json.JSONObject
 
 class VkVideo : MainAPI() {
@@ -12,9 +13,12 @@ class VkVideo : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie)
 
     companion object {
-        private const val API = "https://api.vk.ru/method"
+        private const val API = "https://api.vkvideo.ru/method"
         private const val V = "5.289"
         private const val CLIENT_ID = "52461373"
+
+        // Bu süreden kısa videolar (klip vb.) listeden elenir (saniye)
+        private const val MIN_DURATION = 1200
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         // Aşağıdaki 3 değeri o isteğe bakıp doldur:
@@ -23,12 +27,13 @@ class VkVideo : MainAPI() {
         private const val DEVICE_ID = ""
 
         private const val UA =
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
     }
 
     private val hdr = mapOf(
         "User-Agent" to UA,
+        "Accept" to "*/*",
         "Referer" to "https://vkvideo.ru/",
         "Origin" to "https://vkvideo.ru"
     )
@@ -66,7 +71,7 @@ class VkVideo : MainAPI() {
         method: String,
         params: Map<String, String>,
         retry: Boolean = true
-    ): JSONObject {
+    ): Any? {
         val text = app.post(
             "$API/$method?v=$V&client_id=$CLIENT_ID",
             headers = hdr,
@@ -75,16 +80,33 @@ class VkVideo : MainAPI() {
         val json = JSONObject(text)
         val err = json.optJSONObject("error")
         if (err != null) {
-            if (retry && err.optInt("error_code") == 5) {
+            val code = err.optInt("error_code")
+            if (retry && code == 5) {
                 token = null
                 return api(method, params, false)
             }
-            throw ErrorLoadingException(err.optString("error_msg"))
+            throw ErrorLoadingException("VK hata $code ($method): ${err.optString("error_msg")}")
         }
-        return json.getJSONObject("response")
+        return json.opt("response")
     }
 
     // ---------- Helpers ----------
+
+    // Yanıtın içinde nerede olursa olsun video nesnelerini bulur
+    private fun collectVideos(node: Any?, out: LinkedHashMap<String, JSONObject>) {
+        when (node) {
+            is JSONObject -> {
+                if (node.has("owner_id") && node.has("id") && node.has("title")) {
+                    out.putIfAbsent(videoKey(node), node)
+                }
+                val ks = node.keys()
+                while (ks.hasNext()) collectVideos(node.opt(ks.next()), out)
+            }
+            is JSONArray -> {
+                for (i in 0 until node.length()) collectVideos(node.opt(i), out)
+            }
+        }
+    }
 
     private fun videoKey(o: JSONObject): String {
         val k = "${o.optLong("owner_id")}_${o.optLong("id")}"
@@ -101,47 +123,52 @@ class VkVideo : MainAPI() {
         return o.optString("photo_800").ifBlank { o.optString("photo_320") }.ifBlank { null }
     }
 
-    private suspend fun searchVideos(q: String, offset: Int): List<SearchResponse> {
+    private suspend fun searchVideos(q: String): List<SearchResponse> {
         val r = api(
-            "video.search",
-            mapOf(
-                "q" to q,
-                "count" to "30",
-                "offset" to offset.toString(),
-                "longer" to "1200"
-            )
+            "catalog.getVideoSearchWeb2",
+            mapOf("q" to q, "count" to "30", "extended" to "1")
         )
-        val items = r.optJSONArray("items") ?: return emptyList()
-        val list = ArrayList<SearchResponse>()
-        for (i in 0 until items.length()) {
-            val o = items.getJSONObject(i)
-            val title = o.optString("title")
-            if (title.isBlank()) continue
-            val key = videoKey(o)
-            list.add(
-                newMovieSearchResponse(title, "$mainUrl/video$key", TvType.Movie) {
+        val found = LinkedHashMap<String, JSONObject>()
+        collectVideos(r, found)
+        return found.values
+            .filter { !it.has("duration") || it.optInt("duration") >= MIN_DURATION }
+            .map { o ->
+                newMovieSearchResponse(
+                    o.optString("title"),
+                    "$mainUrl/video${videoKey(o)}",
+                    TvType.Movie
+                ) {
                     this.posterUrl = poster(o)
                 }
-            )
+            }
+    }
+
+    private suspend fun fetchItem(key: String): JSONObject {
+        val r = try {
+            api("video.getByIds", mapOf("videos" to key))
+        } catch (e: Exception) {
+            api("video.get", mapOf("videos" to key))
         }
-        return list
+        val found = LinkedHashMap<String, JSONObject>()
+        collectVideos(r, found)
+        return found.values.firstOrNull()
+            ?: throw ErrorLoadingException("Video bilgisi bulunamadı: $key")
     }
 
     // ---------- CloudStream ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val items = searchVideos(request.data, (page - 1) * 30)
-        return newHomePageResponse(request.name, items)
+        val items = if (page == 1) searchVideos(request.data) else emptyList()
+        return newHomePageResponse(request.name, items, false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return searchVideos(query, 0)
+        return searchVideos(query)
     }
 
     override suspend fun load(url: String): LoadResponse {
         val key = url.substringAfter("/video").substringBefore("?")
-        val item = api("video.get", mapOf("videos" to key))
-            .getJSONArray("items").getJSONObject(0)
+        val item = fetchItem(key)
         val title = item.optString("title")
         val desc = item.optString("description")
         val dur = item.optInt("duration") / 60
@@ -159,8 +186,7 @@ class VkVideo : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val item = api("video.get", mapOf("videos" to data))
-            .getJSONArray("items").getJSONObject(0)
+        val item = fetchItem(data)
         var found = false
 
         // 1) API "files" alanı (varsa)
