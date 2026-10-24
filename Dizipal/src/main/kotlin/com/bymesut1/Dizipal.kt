@@ -155,6 +155,19 @@ class Dizipal : MainAPI() {
         return !real
     }
 
+    private fun logBig(tag: String, t: String) {
+        try {
+            var i = 0
+            var n = 0
+            while (i < t.length && n < 40) {
+                println("$tag[$n] " + t.substring(i, minOf(t.length, i + 900)).replace("\n", " "))
+                i += 900
+                n++
+            }
+        } catch (e: Exception) {
+        }
+    }
+
     private fun metaOf(doc: org.jsoup.nodes.Document, n: String): String =
         doc.selectFirst("meta[name=$n]")?.attr("content")?.trim() ?: ""
 
@@ -212,12 +225,20 @@ class Dizipal : MainAPI() {
         } catch (e: Exception) {
         }
 
-        val bc = metaOf(doc, "_bc")
-        val cn = metaOf(doc, "_cn")
-        val bk = metaOf(doc, "_bk")
-        val br = metaOf(doc, "_br")
-        chDbg = "bc=$bc cn=${cn.take(10)} bk=$bk br=$br dec=" +
-            dec.drop(330).replace(Regex("\\s+"), " ").trim().take(560)
+        // Sayfadaki tüm "_" ile başlayan meta etiketleri (_bc, _bk, _br ...)
+        val metas = LinkedHashMap<String, String>()
+        doc.select("meta[name]").forEach {
+            val n = it.attr("name")
+            if (n.startsWith("_")) metas[n] = it.attr("content")
+        }
+        val br = metas["_br"] ?: ""
+        val bk = metas["_bk"] ?: ""
+        chDbg = "metas=" + metas.entries.joinToString(",") { "${it.key}:${it.value.length}" } +
+            " bk=$bk br=$br dec=${dec.length}"
+
+        // Hata ayıklama: logcat'e yaz (System.out etiketiyle görünür)
+        logBig("DZP-DEC", dec)
+        logBig("DZP-HTML", text)
 
         // Script içinde düz yazılmış çerez ataması varsa doğrudan uygula
         Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=([^;"']+)""")
@@ -229,34 +250,25 @@ class Dizipal : MainAPI() {
         } catch (e: Exception) {
         }
 
-        // 3) Etkinlik bildirimi: tarayıcıda fare/dokunma sayılıp _bc adresine gönderilir
-        if (bc.isNotBlank() && cn.isNotBlank()) {
-            val ep = resolveUrl(pageUrl, bc)
-            val cnt = bk.toIntOrNull() ?: 4
+        // 3) Tahmini bildirim: tüm meta değerleri + etkinlik sayıları aynı sayfaya POST
+        try {
+            val cnt = bk.toIntOrNull() ?: 3
             val fields = LinkedHashMap<String, String>()
-            for (k in listOf("n", "nonce", "t", "token", "cn", "c", "_cn")) fields[k] = cn
-            fields["m"] = (cnt * 7).toString()
+            metas.forEach { (k, v) -> if (k != "_br") fields[k] = v }
+            fields["m"] = (cnt * 4).toString()
             fields["tc"] = cnt.toString()
-            fields["rc"] = cnt.toString()
-            fields["k"] = cnt.toString()
-            fields["r"] = br.ifBlank { "/" }
-            try {
-                val r = app.post(
-                    ep,
-                    headers = hdr(pageUrl, hx + mapOf("Origin" to base)),
-                    data = fields,
-                    cookies = sessionCookies.toMap()
-                )
-                sessionCookies.putAll(r.cookies)
-                try {
-                    val o = JSONObject(r.text)
-                    listOf("t", "token", "value", "k", "_ct").map { o.optString(it, "") }
-                        .firstOrNull { it.isNotBlank() && it != "null" }
-                        ?.let { sessionCookies["_ct"] = it }
-                } catch (e: Exception) {
-                }
-            } catch (e: Exception) {
-            }
+            fields["sc"] = "1"
+            fields["fp"] = "0000000000000000"
+            val r = app.post(
+                pageUrl,
+                headers = hdr(pageUrl, hx + mapOf("Origin" to base)),
+                data = fields,
+                cookies = sessionCookies.toMap()
+            )
+            sessionCookies.putAll(r.cookies)
+            logBig("DZP-POST", "code=${r.code} ck=${r.cookies.keys} body=${r.text.take(600)}")
+        } catch (e: Exception) {
+            logBig("DZP-POST", "hata ${e.message}")
         }
 
         // 4) Eski yol: /ajax-token ve sayfada geçen uç noktalar
