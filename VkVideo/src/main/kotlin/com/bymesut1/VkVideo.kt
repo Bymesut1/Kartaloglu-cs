@@ -21,6 +21,9 @@ class VkVideo : MainAPI() {
         // Bu süreden kısa videolar (klip vb.) listeden elenir (saniye)
         private const val MIN_DURATION = 1200
 
+        // true: açılan posteri olmayan kartlar listeden çıkarılır
+        private const val REQUIRE_POSTER = true
+
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = ""
@@ -92,10 +95,14 @@ class VkVideo : MainAPI() {
 
     // ---------- Video listesi yardımcıları ----------
 
+    // Sadece gerçek videoları toplar (albüm/oynatma listesi gibi nesneler elenir)
     private fun collectVideos(node: Any?, out: LinkedHashMap<String, JSONObject>) {
         when (node) {
             is JSONObject -> {
-                if (node.has("owner_id") && node.has("id") && node.has("title")) {
+                if (node.has("owner_id") && node.has("id") && node.has("title") &&
+                    node.has("duration") && node.optLong("id") != 0L &&
+                    node.optLong("owner_id") != 0L
+                ) {
                     out.putIfAbsent(videoKey(node), node)
                 }
                 val ks = node.keys()
@@ -113,30 +120,64 @@ class VkVideo : MainAPI() {
         return if (ak.isNotBlank()) "${k}_$ak" else k
     }
 
-    private fun poster(o: JSONObject): String? {
-        val cands = ArrayList<Pair<String, Int>>()
+    // ---------- Poster ----------
+
+    private fun posterCandidates(o: JSONObject): List<String> {
+        val raw = ArrayList<Pair<String, Int>>()
         for (k in listOf("image", "first_frame")) {
             val a = o.optJSONArray(k) ?: continue
             for (i in 0 until a.length()) {
                 val e = a.optJSONObject(i) ?: continue
                 val u = e.optString("url")
-                if (u.isNotBlank()) cands.add(u to e.optInt("width"))
+                if (u.isNotBlank()) raw.add(u to e.optInt("width"))
             }
         }
         for (k in listOf("photo_800", "photo_640", "photo_320", "photo_130")) {
             val u = o.optString(k)
-            if (u.isNotBlank()) cands.add(u to k.removePrefix("photo_").toInt())
+            if (u.isNotBlank()) raw.add(u to k.removePrefix("photo_").toInt())
         }
-        if (cands.isEmpty()) return null
         // okcdn önizlemeleri sona, ~640px genişliğe en yakın olan öne
-        val best = cands.sortedWith(
+        val sorted = raw.sortedWith(
             compareBy<Pair<String, Int>>(
                 { it.first.contains("okcdn.ru") },
                 { abs(it.second - 640) }
             )
-        ).first()
-        return best.first.replace("userapi.com", "vkuserphoto.ru")
+        )
+        val out = LinkedHashSet<String>()
+        for ((u, _) in sorted) {
+            if (u.contains("userapi.com")) out.add(u.replace("userapi.com", "vkuserphoto.ru"))
+            out.add(u)
+        }
+        return out.toList()
     }
+
+    private suspend fun imageOk(u: String): Boolean {
+        return try {
+            val r = app.get(
+                u,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Accept" to "image/*",
+                    "Range" to "bytes=0-1023"
+                ),
+                timeout = 5L
+            )
+            val ct = r.headers["Content-Type"] ?: ""
+            r.code in 200..206 && (ct.isEmpty() || ct.startsWith("image"))
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Gerçekten açılan ilk posteri döndürür, hiçbiri açılmazsa null
+    private suspend fun workingPoster(o: JSONObject): String? {
+        for (u in posterCandidates(o).take(4)) {
+            if (imageOk(u)) return u
+        }
+        return null
+    }
+
+    // ---------- Arama ----------
 
     private suspend fun searchVideos(q: String): List<SearchResponse> {
         val r = api(
@@ -145,17 +186,21 @@ class VkVideo : MainAPI() {
         )
         val found = LinkedHashMap<String, JSONObject>()
         collectVideos(r, found)
-        return found.values
-            .filter { !it.has("duration") || it.optInt("duration") >= MIN_DURATION }
-            .map { o ->
+        val videos = found.values.filter { it.optInt("duration") >= MIN_DURATION }
+        return videos.amap { o ->
+            val p = workingPoster(o)
+            if (p == null && REQUIRE_POSTER) {
+                null
+            } else {
                 newMovieSearchResponse(
                     o.optString("title"),
                     "$mainUrl/video${videoKey(o)}",
                     TvType.Movie
                 ) {
-                    this.posterUrl = poster(o)
+                    this.posterUrl = p
                 }
             }
+        }.filterNotNull()
     }
 
     private suspend fun fetchItem(key: String): JSONObject {
@@ -302,7 +347,7 @@ class VkVideo : MainAPI() {
         val title = item.optString("title")
         val desc = item.optString("description")
         val dur = item.optInt("duration") / 60
-        val img = poster(item)
+        val img = workingPoster(item)
         return newMovieLoadResponse(title, url, TvType.Movie, key) {
             this.posterUrl = img
             this.plot = desc.ifBlank { null }
