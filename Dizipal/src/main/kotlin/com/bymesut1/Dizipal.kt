@@ -155,34 +155,25 @@ class Dizipal : MainAPI() {
         return !real
     }
 
-    // Hata ayıklama için doğrulama sayfasının özeti
-    private fun challengeInfo(t: String): String =
-        try {
-            val d = Jsoup.parse(t)
-            val srcs = d.select("script[src]").joinToString(",") { it.attr("src").take(70) }
-            val sc = d.select("script").joinToString(" ") { it.data() }
-                .replace(Regex("\\s+"), " ").trim()
-            val meta = d.select("meta[http-equiv]").joinToString(",") { it.attr("content").take(60) }
-            "src=[$srcs] meta=[$meta] js=" + sc.take(200)
-        } catch (e: Exception) {
-            ""
-        }
+    private fun metaOf(doc: org.jsoup.nodes.Document, n: String): String =
+        doc.selectFirst("meta[name=$n]")?.attr("content")?.trim() ?: ""
 
-    // Doğrulama sayfasındaki isteklerden çerez/token al
+    // Doğrulama: sayfadaki /_bcs?t=... script'i XOR+base64 ile gizlenmiş; meta etiketlerinden
+    // (_bc: gönderim adresi, _cn: tek kullanımlık kod, _bk: gereken etkinlik sayısı, _br: dönüş adresi) okur.
     private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
         val hx = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Accept" to "application/json, text/plain, */*"
         )
-        // Sayfa script'i dışarıdaysa onu da oku
+        val doc = Jsoup.parse(text, base)
         var all = text
-        var ext = ""
+
+        // 1) /_bcs script'ini oturum çerezleriyle iste (tarayıcı gibi)
         try {
-            val srcs = Jsoup.parse(text, base).select("script[src]").map { it.attr("abs:src") }
+            val srcs = doc.select("script[src]").map { it.attr("abs:src") }
                 .filter { it.startsWith("http") && hostOf(it) == hostOf(base) }
-                .take(4)
+                .take(3)
             for (u in srcs) {
-                // /_bcs?t=... doğrulama script'i: oturum çerezleriyle ve tarayıcı başlıklarıyla istenmeli
                 val rs = try {
                     app.get(
                         u,
@@ -201,39 +192,81 @@ class Dizipal : MainAPI() {
                     null
                 }
                 if (rs != null) sessionCookies.putAll(rs.cookies)
-                val js = rs?.text ?: ""
-                all += "\n" + js
-                if (ext.isEmpty() && js.isNotBlank()) {
-                    ext = "ext[${rs?.code} ck=${rs?.cookies?.keys?.joinToString(",")}]=" +
-                        js.replace(Regex("\\s+"), " ").trim().take(420)
-                }
+                all += "\n" + (rs?.text ?: "")
             }
         } catch (e: Exception) {
         }
-        chDbg = ext
+
+        // 2) Gizli script gövdesini çöz: var k="<anahtar>",p="<base64>"
+        var dec = ""
+        try {
+            val m = Regex("""var k=["]([0-9A-Za-z]{8,64})["],p=["]([A-Za-z0-9+/=_-]{40,})["]""").find(all)
+            if (m != null) {
+                val key = m.groupValues[1]
+                val bytes = b64bin(m.groupValues[2])
+                val sb = StringBuilder()
+                for (i in bytes.indices) sb.append(((bytes[i].toInt() and 255) xor key[i % key.length].code).toChar())
+                dec = sb.toString()
+                all += "\n" + dec
+            }
+        } catch (e: Exception) {
+        }
+
+        val bc = metaOf(doc, "_bc")
+        val cn = metaOf(doc, "_cn")
+        val bk = metaOf(doc, "_bk")
+        val br = metaOf(doc, "_br")
+        chDbg = "bc=$bc cn=${cn.take(10)} bk=$bk br=$br dec=" +
+            dec.drop(330).replace(Regex("\\s+"), " ").trim().take(560)
+
         // Script içinde düz yazılmış çerez ataması varsa doğrudan uygula
         Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=([^;"']+)""")
             .findAll(all).forEach { sessionCookies[it.groupValues[1]] = it.groupValues[2] }
 
-        // "Birkaç saniye içinde yönlendirileceksiniz": sunucu bekleme süresi isteyebilir
+        // Sayfa birkaç saniye bekletiyor
         try {
-            Thread.sleep(2500)
+            Thread.sleep(2000)
         } catch (e: Exception) {
         }
 
+        // 3) Etkinlik bildirimi: tarayıcıda fare/dokunma sayılıp _bc adresine gönderilir
+        if (bc.isNotBlank() && cn.isNotBlank()) {
+            val ep = resolveUrl(pageUrl, bc)
+            val cnt = bk.toIntOrNull() ?: 4
+            val fields = LinkedHashMap<String, String>()
+            for (k in listOf("n", "nonce", "t", "token", "cn", "c", "_cn")) fields[k] = cn
+            fields["m"] = (cnt * 7).toString()
+            fields["tc"] = cnt.toString()
+            fields["rc"] = cnt.toString()
+            fields["k"] = cnt.toString()
+            fields["r"] = br.ifBlank { "/" }
+            try {
+                val r = app.post(
+                    ep,
+                    headers = hdr(pageUrl, hx + mapOf("Origin" to base)),
+                    data = fields,
+                    cookies = sessionCookies.toMap()
+                )
+                sessionCookies.putAll(r.cookies)
+                try {
+                    val o = JSONObject(r.text)
+                    listOf("t", "token", "value", "k", "_ct").map { o.optString(it, "") }
+                        .firstOrNull { it.isNotBlank() && it != "null" }
+                        ?.let { sessionCookies["_ct"] = it }
+                } catch (e: Exception) {
+                }
+            } catch (e: Exception) {
+            }
+        }
+
+        // 4) Eski yol: /ajax-token ve sayfada geçen uç noktalar
         val endpoints = LinkedHashSet<String>()
         endpoints.add("/ajax-token")
         Regex("""(?:fetch|get|post|getJSON)\(\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
             .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
-        Regex("""open\(\s*["'](?:GET|POST)["']\s*,\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
-        Regex("""url\s*:\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
-            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
         val names = LinkedHashSet<String>()
         names.add("_ct")
-        Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=""")
-            .findAll(all).forEach { names.add(it.groupValues[1]) }
-        for (ep in endpoints.take(8)) {
+        for (ep in endpoints.take(5)) {
             val r = try {
                 app.get(base + ep, headers = hdr(pageUrl, hx), cookies = sessionCookies.toMap())
             } catch (e: Exception) {
@@ -250,44 +283,43 @@ class Dizipal : MainAPI() {
             if (tok != null) names.forEach { sessionCookies[it] = tok }
         }
 
-        // Yönlendirme adresi varsa (location / meta refresh) o adrese de git
-        val redir = Regex("""location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.replace\(\s*["']([^"']+)["']|url=([^"'>\s]+)""", RegexOption.IGNORE_CASE)
-            .find(all)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-        if (redir != null && !redir.startsWith("javascript", true)) {
+        // 5) Dönüş adresine çerezlerle git
+        if (br.isNotBlank()) {
             try {
-                val r = app.get(resolveUrl(pageUrl, redir), headers = hdr(pageUrl), cookies = sessionCookies.toMap())
+                val r = app.get(resolveUrl(pageUrl, br), headers = hdr(pageUrl), cookies = sessionCookies.toMap())
                 sessionCookies.putAll(r.cookies)
             } catch (e: Exception) {
             }
         }
     }
 
-    private suspend fun fetchSite(path: String): Fetched? {
+    // tries: doğrulama ekranı çıkarsa kaç kez çözmeye çalışılsın (0 = hiç, hızlı dön)
+    private suspend fun fetchSite(path: String, tries: Int = 1): Fetched? {
         val order = listOf(mainUrl) + bases.filter { it != mainUrl }
-        var info = ""
         for (b in order) {
             try {
                 var r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
                 sessionCookies.putAll(r.cookies)
-                var tries = 0
-                while (isChallenge(r.text) && tries < 3) {
+                var n = 0
+                while (isChallenge(r.text) && n < tries) {
                     passChallenge(b, r.text, b + path)
                     r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
                     sessionCookies.putAll(r.cookies)
-                    tries++
+                    n++
                 }
                 val ch = isChallenge(r.text)
-                dbg = "${hostOf(b)} code=${r.code} len=${r.text.length} ch=$ch ck=${sessionCookies.keys.joinToString(",")} t=${titleOf(r.text).take(40)}"
-                if (ch) info = challengeInfo(r.text) + " " + chDbg
+                dbg = "${hostOf(b)} code=${r.code} ch=$ch ck=${sessionCookies.keys.joinToString(",")}" +
+                    (if (ch) " $chDbg" else "")
                 if (r.code == 200 && r.text.isNotBlank() && !ch) {
                     mainUrl = b
                     return Fetched(b, r.text, sessionCookies.toMap())
                 }
+                // Site ayakta ama doğrulama ekranı verdi: diğer adrese geçmek süreyi boşa harcar
+                if (r.code == 200) return null
             } catch (e: Exception) {
                 dbg = "${hostOf(b)} hata: ${e.message}"
             }
         }
-        if (info.isNotBlank()) dbg = "$dbg $info"
         return null
     }
 
@@ -400,7 +432,7 @@ class Dizipal : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.data.startsWith("home:")) {
             if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
-            val f = fetchSite("/") ?: return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
+            val f = fetchSite("/", 1) ?: return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
             val doc = Jsoup.parse(f.text)
             val title = request.data.removePrefix("home:")
             val sec = doc.select("section").firstOrNull {
@@ -437,7 +469,7 @@ class Dizipal : MainAPI() {
             path = path.replace("/bolum/", "/dizi/").replace(Regex("-\\d+-sezon-\\d+-bolum/?$"), "")
         }
         val isMovie = path.contains("/film/")
-        val f = fetchSite(path)
+        val f = fetchSite(path, if (isMovie) 0 else 1)
 
         if (f == null) {
             // Detay sayfası alınamadı (doğrulama / ağ). Film ise adresten basit bir sayfa kur,
@@ -587,7 +619,7 @@ class Dizipal : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val path = pathOf(data)
-        val f = fetchSite(path)
+        val f = fetchSite(path, 2)
         if (f == null) {
             if (debug) {
                 callback(
