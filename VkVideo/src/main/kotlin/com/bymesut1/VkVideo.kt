@@ -120,6 +120,12 @@ class VkVideo : MainAPI() {
         return if (ak.isNotBlank()) "${k}_$ak" else k
     }
 
+    private fun shape(r: Any?): String = when (r) {
+        is JSONObject -> "obj{" + r.keys().asSequence().joinToString(",").take(110) + "}"
+        is JSONArray -> "arr[${r.length()}]"
+        else -> r.toString().take(60)
+    }
+
     // ---------- Poster ----------
 
     private fun posterCandidates(o: JSONObject): List<String> {
@@ -273,7 +279,7 @@ class VkVideo : MainAPI() {
         seen: HashSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val u = rawUrl.replace("\\/", "/")
+        val u = rawUrl.replace("\\/", "/").replace("\\u0026", "&")
         if (!seen.add(u)) return false
         val ref = "$mainUrl/"
         val hdrs = mapOf("User-Agent" to UA, "Origin" to mainUrl, "Referer" to ref)
@@ -370,7 +376,12 @@ class VkVideo : MainAPI() {
         val oid = parts.getOrNull(0) ?: ""
         val vid = parts.getOrNull(1) ?: ""
 
-        debug.add("keys=" + item.keys().asSequence().joinToString(","))
+        debug.add(
+            "info type=${item.optString("type")} srv=${item.optString("server")} " +
+                "ovp=${item.optString("ov_provider_id")} h=${item.optInt("height")}"
+        )
+        debug.add("download=" + item.opt("download").toString().take(80))
+        debug.add("direct=" + item.optString("direct_url").take(80))
 
         // 1) getByIds / get yanıtı içindeki linkler
         val urls1 = ArrayList<Pair<String, String>>()
@@ -400,7 +411,7 @@ class VkVideo : MainAPI() {
                             n++
                         }
                     }
-                    debug.add("$m ok links=$n urls=${list.size}")
+                    debug.add("$m links=$n urls=${list.size} ${shape(r)}")
                 } catch (e: Exception) {
                     debug.add("$m: ${e.message?.take(90)}")
                 }
@@ -430,19 +441,22 @@ class VkVideo : MainAPI() {
                             n++
                         }
                     }
-                    debug.add("embed len=${html.length} links=$n")
+                    debug.add(
+                        "embed len=${html.length} links=$n head=" +
+                            html.take(80).replace("\n", " ")
+                    )
                 }
             } catch (e: Exception) {
                 debug.add("embed: ${e.message?.take(90)}")
             }
         }
 
-        // 4) Hiçbiri olmadıysa teşhis satırları göster
+        // 4) Hiçbiri olmadıysa teşhis satırları göster (her satırın adresi benzersiz)
         if (!found) {
             debug.add("player=" + player.take(70))
-            for (d in debug) {
+            debug.forEachIndexed { i, d ->
                 callback(
-                    newExtractorLink(name, "DEBUG $d", "https://debug.invalid/") { }
+                    newExtractorLink(name, "DEBUG $d", "https://debug.invalid/$i") { }
                 )
             }
             return true
