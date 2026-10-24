@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.abs
 
 class VkVideo : MainAPI() {
     override var mainUrl = "https://vkvideo.ru"
@@ -21,7 +22,6 @@ class VkVideo : MainAPI() {
         private const val MIN_DURATION = 1200
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
-        // Aşağıdaki 3 değeri o isteğe bakıp doldur:
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = ""
         private const val DEVICE_ID = ""
@@ -90,9 +90,8 @@ class VkVideo : MainAPI() {
         return json.opt("response")
     }
 
-    // ---------- Helpers ----------
+    // ---------- Video listesi yardımcıları ----------
 
-    // Yanıtın içinde nerede olursa olsun video nesnelerini bulur
     private fun collectVideos(node: Any?, out: LinkedHashMap<String, JSONObject>) {
         when (node) {
             is JSONObject -> {
@@ -115,12 +114,28 @@ class VkVideo : MainAPI() {
     }
 
     private fun poster(o: JSONObject): String? {
-        val imgs = o.optJSONArray("image")
-        if (imgs != null && imgs.length() > 0) {
-            val u = imgs.getJSONObject(imgs.length() - 1).optString("url")
-            if (u.isNotBlank()) return u
+        val cands = ArrayList<Pair<String, Int>>()
+        for (k in listOf("image", "first_frame")) {
+            val a = o.optJSONArray(k) ?: continue
+            for (i in 0 until a.length()) {
+                val e = a.optJSONObject(i) ?: continue
+                val u = e.optString("url")
+                if (u.isNotBlank()) cands.add(u to e.optInt("width"))
+            }
         }
-        return o.optString("photo_800").ifBlank { o.optString("photo_320") }.ifBlank { null }
+        for (k in listOf("photo_800", "photo_640", "photo_320", "photo_130")) {
+            val u = o.optString(k)
+            if (u.isNotBlank()) cands.add(u to k.removePrefix("photo_").toInt())
+        }
+        if (cands.isEmpty()) return null
+        // okcdn önizlemeleri sona, ~640px genişliğe en yakın olan öne
+        val best = cands.sortedWith(
+            compareBy<Pair<String, Int>>(
+                { it.first.contains("okcdn.ru") },
+                { abs(it.second - 640) }
+            )
+        ).first()
+        return best.first.replace("userapi.com", "vkuserphoto.ru")
     }
 
     private suspend fun searchVideos(q: String): List<SearchResponse> {
@@ -155,6 +170,121 @@ class VkVideo : MainAPI() {
             ?: throw ErrorLoadingException("Video bilgisi bulunamadı: $key")
     }
 
+    // ---------- Link yardımcıları ----------
+
+    private fun isImage(u: String): Boolean =
+        u.contains(".jpg") || u.contains(".jpeg") || u.contains(".png") ||
+            u.contains(".webp") || u.contains("getVideoPreview") ||
+            u.contains("userapi.com") || u.contains("vkuserphoto")
+
+    private fun isMedia(u: String): Boolean {
+        if (isImage(u)) return false
+        if (u.contains("video_ext.php") || u.contains("vkvideo.ru") ||
+            u.contains("vk.com") || u.contains("vk.ru")
+        ) return false
+        return u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") ||
+            u.contains("okcdn.ru")
+    }
+
+    // JSON içinde nerede olursa olsun http ile başlayan metinleri bulur
+    private fun scanUrls(node: Any?, hint: String, out: MutableList<Pair<String, String>>) {
+        when (node) {
+            is JSONObject -> {
+                val ks = node.keys()
+                while (ks.hasNext()) {
+                    val k = ks.next()
+                    if (k == "image" || k == "first_frame" || k.startsWith("photo_")) continue
+                    scanUrls(node.opt(k), k, out)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until node.length()) scanUrls(node.opt(i), hint, out)
+            }
+            is String -> {
+                if (node.startsWith("http")) out.add(hint to node)
+            }
+        }
+    }
+
+    private fun qualityOf(hint: String, u: String): Int? {
+        Regex("(\\d{3,4})").find(hint)?.value?.toIntOrNull()?.let { return it }
+        val t = Regex("[?&]type=(\\d+)").find(u)?.groupValues?.get(1)?.toIntOrNull()
+        return when (t) {
+            0 -> 144
+            1 -> 240
+            2 -> 360
+            3 -> 480
+            4 -> 720
+            5 -> 1080
+            6 -> 1440
+            7 -> 2160
+            else -> null
+        }
+    }
+
+    private suspend fun emitMedia(
+        hint: String,
+        rawUrl: String,
+        seen: HashSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val u = rawUrl.replace("\\/", "/")
+        if (!seen.add(u)) return false
+        val ref = "$mainUrl/"
+        val hdrs = mapOf("User-Agent" to UA, "Origin" to mainUrl, "Referer" to ref)
+        when {
+            u.contains(".m3u8") || hint.contains("hls") -> {
+                try {
+                    M3u8Helper.generateM3u8(name, u, ref, headers = hdrs).forEach(callback)
+                } catch (e: Exception) {
+                    callback(
+                        newExtractorLink(name, "$name HLS", u, ExtractorLinkType.M3U8) {
+                            this.referer = ref
+                            this.headers = hdrs
+                        }
+                    )
+                }
+            }
+            u.contains(".mpd") || hint.contains("dash") -> {
+                callback(
+                    newExtractorLink(name, "$name DASH", u, ExtractorLinkType.DASH) {
+                        this.referer = ref
+                        this.headers = hdrs
+                    }
+                )
+            }
+            else -> {
+                val q = qualityOf(hint, u)
+                val label = if (q != null) "${q}p" else hint.ifBlank { "MP4" }
+                callback(
+                    newExtractorLink(name, "$name $label", u) {
+                        this.referer = ref
+                        this.headers = hdrs
+                        this.quality = q ?: Qualities.Unknown.value
+                    }
+                )
+            }
+        }
+        return true
+    }
+
+    // Yönlendirmeleri elle takip eder, çerezleri taşır (döngüyü kırar)
+    private suspend fun fetchFollow(url: String): String? {
+        var u = url
+        var cookies = emptyMap<String, String>()
+        repeat(10) {
+            val r = app.get(u, headers = hdr, cookies = cookies, allowRedirects = false)
+            cookies = cookies + r.cookies
+            val loc = r.headers["Location"]
+            if (r.code in 300..399 && !loc.isNullOrBlank()) {
+                u = java.net.URI(u).resolve(loc).toString()
+            } else {
+                return r.text
+            }
+        }
+        return null
+    }
+
     // ---------- CloudStream ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -187,57 +317,91 @@ class VkVideo : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val item = fetchItem(data)
+        val seen = HashSet<String>()
+        val debug = ArrayList<String>()
         var found = false
 
-        // 1) API "files" alanı (varsa)
-        val files = item.optJSONObject("files")
-        if (files != null) {
-            val keys = files.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val u = files.optString(k)
-                if (u.isBlank()) continue
-                if (k.startsWith("mp4_")) {
-                    val q = k.removePrefix("mp4_").toIntOrNull() ?: Qualities.Unknown.value
-                    callback(
-                        newExtractorLink(name, "$name ${q}p", u) {
-                            this.referer = "$mainUrl/"
-                            this.quality = q
+        val parts = data.split("_")
+        val oid = parts.getOrNull(0) ?: ""
+        val vid = parts.getOrNull(1) ?: ""
+
+        debug.add("keys=" + item.keys().asSequence().joinToString(","))
+
+        // 1) getByIds / get yanıtı içindeki linkler
+        val urls1 = ArrayList<Pair<String, String>>()
+        scanUrls(item, "", urls1)
+        for ((k, u) in urls1) {
+            if (isMedia(u) && emitMedia(k, u, seen, callback)) found = true
+        }
+
+        // 2) Sitenin kendi oynatma metodları
+        if (!found) {
+            val playParams = mapOf(
+                "videos" to data,
+                "video" to data,
+                "owner_id" to oid,
+                "video_id" to vid,
+                "id" to vid
+            )
+            for (m in listOf("video.getForPlay", "video.getPlayerConfig")) {
+                try {
+                    val r = api(m, playParams)
+                    val list = ArrayList<Pair<String, String>>()
+                    scanUrls(r, "", list)
+                    var n = 0
+                    for ((k, u) in list) {
+                        if (isMedia(u) && emitMedia(k, u, seen, callback)) {
+                            found = true
+                            n++
                         }
-                    )
-                    found = true
-                } else if (k == "hls" || k == "hls_ondemand") {
-                    M3u8Helper.generateM3u8(name, u, "$mainUrl/").forEach(callback)
-                    found = true
+                    }
+                    debug.add("$m ok links=$n urls=${list.size}")
+                } catch (e: Exception) {
+                    debug.add("$m: ${e.message?.take(90)}")
                 }
             }
         }
 
-        // 2) Yedek: player (embed) sayfasındaki playerParams
+        // 3) Yedek: oynatıcı (embed) sayfası
+        var player = item.optString("player")
         if (!found) {
-            val player = item.optString("player")
-            if (player.isNotBlank()) {
-                val html = app.get(player, headers = hdr).text
-                val rx = Regex("\"(url\\d+|hls)\"\\s*:\\s*\"([^\"]+)\"")
-                for (m in rx.findAll(html)) {
-                    val k = m.groupValues[1]
-                    val u = m.groupValues[2].replace("\\/", "/")
-                    if (k == "hls") {
-                        M3u8Helper.generateM3u8(name, u, "$mainUrl/").forEach(callback)
-                        found = true
-                    } else {
-                        val q = k.removePrefix("url").toIntOrNull() ?: Qualities.Unknown.value
-                        callback(
-                            newExtractorLink(name, "$name ${q}p", u) {
-                                this.referer = "$mainUrl/"
-                                this.quality = q
-                            }
-                        )
-                        found = true
+            if (player.isBlank()) {
+                val ak = item.optString("access_key")
+                player = "$mainUrl/video_ext.php?oid=$oid&id=$vid" +
+                    (if (ak.isNotBlank()) "&hash=$ak" else "")
+            }
+            try {
+                val html = fetchFollow(player)
+                if (html == null) {
+                    debug.add("embed: yönlendirme döngüsü")
+                } else {
+                    val rx = Regex(
+                        "\"(hls|dash_sep|dash_uni|url\\d+|mp4_\\d+)\"\\s*:\\s*\"(http[^\"]+)\""
+                    )
+                    var n = 0
+                    for (m in rx.findAll(html)) {
+                        if (emitMedia(m.groupValues[1], m.groupValues[2], seen, callback)) {
+                            found = true
+                            n++
+                        }
                     }
+                    debug.add("embed len=${html.length} links=$n")
                 }
+            } catch (e: Exception) {
+                debug.add("embed: ${e.message?.take(90)}")
             }
         }
-        return found
+
+        // 4) Hiçbiri olmadıysa teşhis satırları göster
+        if (!found) {
+            debug.add("player=" + player.take(70))
+            for (d in debug) {
+                callback(
+                    newExtractorLink(name, "DEBUG $d", "https://debug.invalid/") { }
+                )
+            }
+            return true
+        }
+        return true
     }
 }
