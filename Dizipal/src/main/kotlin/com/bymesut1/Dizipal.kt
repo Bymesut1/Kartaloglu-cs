@@ -152,6 +152,7 @@ class Dizipal : MainAPI() {
         val hls = LinkedHashSet<String>()
         val mp4 = LinkedHashSet<String>()
         val subs = LinkedHashMap<String, String>() // adres -> etiket
+        val cookies = LinkedHashMap<String, String>() // sadece fireplayer_* oturum çerezi
     }
 
     private class Cfg(val t: String, val v: String, val raw: String)
@@ -221,6 +222,18 @@ class Dizipal : MainAPI() {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
             ""
+        }
+
+    private suspend fun fetchTextCk(
+        url: String,
+        headers: Map<String, String>,
+        cookies: Map<String, String> = emptyMap()
+    ): Pair<String, Map<String, String>> =
+        try {
+            val r = app.get(url, headers = headers, cookies = cookies)
+            Pair(r.text, r.cookies)
+        } catch (e: Exception) {
+            Pair("", emptyMap())
         }
 
     private fun titleOf(t: String): String =
@@ -830,10 +843,10 @@ class Dizipal : MainAPI() {
             found.subs.putAll(pageFound.subs)
             var got = false
             for (u in found.hls.take(3)) {
-                if (emitHls(u, found.origin, f.base, found.subs, subtitleCallback, callback)) got = true
+                if (emitHls(u, found.origin, f.base, found.subs, subtitleCallback, callback, found.cookies)) got = true
             }
             for (u in found.mp4.take(2)) {
-                emitMp4(u, found.origin, callback); got = true
+                emitMp4(u, found.origin, callback, found.cookies); got = true
             }
             if (!got) {
                 // son çare: CloudStream'in hazır çıkarıcıları
@@ -998,7 +1011,9 @@ class Dizipal : MainAPI() {
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int): Found {
         val origin = originOf(embedUrl)
         val found = Found(origin)
-        val html = fetchText(embedUrl, hdr(pageUrl))
+        val (html, embedCk) = fetchTextCk(embedUrl, hdr(pageUrl))
+        // Fire HLS Player (imagestoo vb.): oturum çerezi (fireplayer_player) master ve parçalar için gerekli
+        embedCk.forEach { (k, v) -> if (k.contains("fireplayer", true)) found.cookies[k] = v }
 
         val texts = ArrayList<String>()
         texts.add(html)
@@ -1023,7 +1038,10 @@ class Dizipal : MainAPI() {
             if (fid == null && Regex("FirePlayer|fireplay", RegexOption.IGNORE_CASE).containsMatchIn(html)) {
                 fid = Regex("/video/([A-Za-z0-9]{16,64})").find(embedUrl)?.groupValues?.get(1)
             }
-            if (fid != null) fireVideo(embedUrl, pageUrl, fid, found)
+            if (fid == null) {
+                fid = Regex("index\\.php\\?data=([A-Za-z0-9]{16,64})").find(joined)?.groupValues?.get(1)
+            }
+            if (fid != null) fireVideo(embedUrl, pageUrl, fid, found, embedCk)
         }
 
         // iç içe iframe
@@ -1036,7 +1054,7 @@ class Dizipal : MainAPI() {
         return found
     }
 
-    private suspend fun fireVideo(embedUrl: String, pageUrl: String, id: String, found: Found) {
+    private suspend fun fireVideo(embedUrl: String, pageUrl: String, id: String, found: Found, ck: Map<String, String>) {
         val origin = originOf(embedUrl)
         val url = "$origin/player/index.php?data=$id&do=getVideo"
         val h = hdr(
@@ -1047,11 +1065,17 @@ class Dizipal : MainAPI() {
                 "Accept" to "application/json, text/javascript, */*; q=0.01"
             )
         )
+        val sendCk = HashMap<String, String>(ck)
         for (rf in listOf(pageUrl, "")) {
-            val t = try {
-                app.post(url, headers = h, data = mapOf("hash" to id, "r" to rf)).text
+            val resp = try {
+                app.post(url, headers = h, data = mapOf("hash" to id, "r" to rf), cookies = sendCk)
             } catch (e: Exception) {
-                ""
+                null
+            }
+            val t = resp?.text ?: ""
+            resp?.cookies?.forEach { (k, v) ->
+                sendCk[k] = v
+                if (k.contains("fireplayer", true)) found.cookies[k] = v
             }
             try {
                 val o = JSONObject(t)
@@ -1081,6 +1105,11 @@ class Dizipal : MainAPI() {
         // uzantısız HLS: https://host/m3/<şifreli-token>
         Regex("https?://[^\\s\"'<>\\\\)]+?/m3/[A-Za-z0-9+/=_%\\-.]{24,}")
             .findAll(t).forEach { f.hls.add(it.value) }
+        // Fire HLS Player: .../cdn/hls/<kod>/master.txt
+        Regex("https?://[^\\s\"'<>\\\\)]+?/master\\.txt(?:\\?[^\\s\"'<>\\\\)]*)?", RegexOption.IGNORE_CASE)
+            .findAll(t).forEach { f.hls.add(it.value) }
+        Regex("[\"'](/[^\"'\\s]+?/master\\.txt[^\"'\\s]*)[\"']", RegexOption.IGNORE_CASE)
+            .findAll(t).forEach { f.hls.add(origin + it.groupValues[1]) }
         Regex("https?://[^\\s\"'<>\\\\)]+?\\.mp4(?:\\?[^\\s\"'<>\\\\)]*)?", RegexOption.IGNORE_CASE)
             .findAll(t).forEach { f.mp4.add(it.value) }
         Regex("https?://[^\\s\"'<>\\\\)]+?\\.(?:vtt|srt)(?:\\?[^\\s\"'<>\\\\)]*)?", RegexOption.IGNORE_CASE)
@@ -1227,13 +1256,21 @@ class Dizipal : MainAPI() {
         }
     }
 
-    private suspend fun emitMp4(url: String, refBase: String, callback: (ExtractorLink) -> Unit) {
+    private fun cookieHeader(c: Map<String, String>): Map<String, String> =
+        if (c.isEmpty()) emptyMap() else mapOf("Cookie" to c.entries.joinToString("; ") { "${it.key}=${it.value}" })
+
+    private suspend fun emitMp4(
+        url: String,
+        refBase: String,
+        callback: (ExtractorLink) -> Unit,
+        cookies: Map<String, String> = emptyMap()
+    ) {
         val ref = refBase.trimEnd('/') + "/"
         callback(
             newExtractorLink(name, name, url, ExtractorLinkType.VIDEO) {
                 this.referer = ref
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to ua, "Referer" to ref, "Origin" to ref.trimEnd('/'))
+                this.headers = mapOf("User-Agent" to ua, "Referer" to ref, "Origin" to ref.trimEnd('/')) + cookieHeader(cookies)
             }
         )
     }
@@ -1245,9 +1282,11 @@ class Dizipal : MainAPI() {
         pageBase: String,
         subs: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        cookies: Map<String, String> = emptyMap()
     ): Boolean {
-        fun hdrFor(r: String) = mapOf("User-Agent" to ua, "Referer" to r, "Origin" to r.trimEnd('/'))
+        var ck: Map<String, String> = cookies
+        fun hdrFor(r: String) = mapOf("User-Agent" to ua, "Referer" to r, "Origin" to r.trimEnd('/')) + cookieHeader(ck)
         var ref = refBase.trimEnd('/') + "/"
         var body = fetchText(url, hdrFor(ref))
         if (!body.contains("#EXTM3U") && pageBase.trimEnd('/') != refBase.trimEnd('/')) {
@@ -1255,6 +1294,20 @@ class Dizipal : MainAPI() {
             val b2 = fetchText(url, hdrFor(alt))
             if (b2.contains("#EXTM3U")) {
                 body = b2; ref = alt
+            }
+        }
+        // Yedek: oynatıcı sunucusu çerez istiyorsa (örn. imagestoo "security error") ana adresine
+        // uğrayıp fireplayer_* çerezini al ve yeniden dene. Sadece liste alınamadığında çalışır.
+        if (!body.contains("#EXTM3U") && ck.isEmpty()) {
+            val own = originOf(url) + "/"
+            val (_, c2) = fetchTextCk(own, hdr(refBase.trimEnd('/') + "/"))
+            val fp = c2.filterKeys { it.contains("fireplayer", true) }
+            if (fp.isNotEmpty()) {
+                ck = fp
+                val b3 = fetchText(url, hdrFor(own))
+                if (b3.contains("#EXTM3U")) {
+                    body = b3; ref = own
+                }
             }
         }
         val headers = hdrFor(ref)
