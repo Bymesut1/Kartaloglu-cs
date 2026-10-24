@@ -2,12 +2,14 @@ package com.bymesut1
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.io.File
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -15,6 +17,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -29,7 +32,12 @@ class Dizipal : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     // Site adresi değişirse sıradakine geçilir
-    private val bases = listOf("https://dizipal2143.com", "https://dizipal2142.com")
+    private val bases = listOf(
+        "https://dizipal2143.com",
+        "https://dizipal2144.com",
+        "https://dizipal2145.com",
+        "https://dizipal2142.com"
+    )
 
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
@@ -48,6 +56,81 @@ class Dizipal : MainAPI() {
 
     @Volatile
     private var chDbg = ""
+
+    // ---- Kalıcı oturum (doğrulama çerezi) ----
+    // Çerezler diske yazılır; açılışta geri yüklenir; cfMaxAgeMs'den eskiyse kullanılmaz.
+    private val cfMaxAgeMs = 6L * 60 * 60 * 1000
+    private val sessionFile = File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "dizipal_session.txt")
+
+    @Volatile
+    private var sessRestored = false
+
+    @Volatile
+    private var sessFromDisk = false
+
+    // İlk çözüm sırasında onlarca istek aynı anda doğrulama yapmasın (kotlinx yok, Semaphore kullanılır)
+    private val solveLock = Semaphore(1)
+
+    // Cloudflare 403/503 durumunda yedek çözücü
+    @Volatile
+    private var cfKiller: CloudflareKiller? = null
+
+    private fun killer(): CloudflareKiller {
+        var k = cfKiller
+        if (k == null) {
+            k = CloudflareKiller()
+            cfKiller = k
+        }
+        return k
+    }
+
+    private fun sessRestore() {
+        if (sessRestored) return
+        sessRestored = true
+        try {
+            if (!sessionFile.exists()) return
+            val lines = sessionFile.readLines()
+            val ts = lines.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (System.currentTimeMillis() - ts > cfMaxAgeMs) {
+                sessionFile.delete()
+                println("Dizipal: oturum kaydı eski, silindi")
+                return
+            }
+            var n = 0
+            for (ln in lines.drop(1)) {
+                val i = ln.indexOf('\t')
+                if (i <= 0) continue
+                sessionCookies[ln.substring(0, i)] = ln.substring(i + 1)
+                n++
+            }
+            if (n > 0) {
+                sessFromDisk = true
+                println("Dizipal: oturum diskten yüklendi ($n çerez)")
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun sessSave() {
+        try {
+            val sb = StringBuilder()
+            sb.append(System.currentTimeMillis()).append('\n')
+            sessionCookies.forEach { (k, v) -> sb.append(k).append('\t').append(v).append('\n') }
+            sessionFile.writeText(sb.toString())
+            println("Dizipal: oturum diske kaydedildi")
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun sessClear() {
+        sessionCookies.clear()
+        sessFromDisk = false
+        try {
+            sessionFile.delete()
+        } catch (e: Exception) {
+        }
+        println("Dizipal: oturum sıfırlandı")
+    }
 
     override val mainPage = mainPageOf(
         "home:Trend Diziler" to "Trend Diziler",
@@ -196,13 +279,13 @@ class Dizipal : MainAPI() {
         return null
     }
 
-    // Doğrulama ekranı (/_bcs script'inin yaptığı iş):
-    // meta _bc (token), _bn (nonce), _bk (sıfır sayısı), _br (dönüş adresi) okunur,
-    // PoW çözülür ve JSON olarak /_bc_verify adresine POST edilir; sunucu doğrulama çerezini verir.
+    // Doğrulama ekranı (/_bcs script'inin yaptığı iş). Alan adları, uç nokta ve ayraç mümkünse
+    // çözülmüş script'ten okunur (site değiştirirse otomatik uyum), yoksa bilinen değerler kullanılır.
     private suspend fun passChallenge(base: String, text: String, pageUrl: String) {
         val doc = Jsoup.parse(text, base)
 
-        // Tarayıcı gibi /_bcs script'ini de iste (oturum çerezleriyle)
+        // /_bcs script'ini oturum çerezleriyle iste ve gövdesini al
+        var scriptText = ""
         try {
             val srcs = doc.select("script[src]").map { it.attr("abs:src") }
                 .filter { it.startsWith("http") && hostOf(it) == hostOf(base) }
@@ -225,22 +308,46 @@ class Dizipal : MainAPI() {
                 } catch (e: Exception) {
                     null
                 }
-                if (rs != null) sessionCookies.putAll(rs.cookies)
+                if (rs != null) {
+                    sessionCookies.putAll(rs.cookies)
+                    scriptText += "\n" + rs.text
+                }
             }
         } catch (e: Exception) {
         }
 
-        val metas = LinkedHashMap<String, String>()
-        doc.select("meta[name]").forEach {
-            val n = it.attr("name")
-            if (n.startsWith("_")) metas[n] = it.attr("content")
+        // Gizli gövdeyi çöz: var k="..",p=".."
+        var dec = ""
+        try {
+            val m = Regex("""var k=["]([0-9A-Za-z]{8,64})["],p=["]([A-Za-z0-9+/=_-]{40,})["]""").find(scriptText)
+            if (m != null) {
+                val key = m.groupValues[1]
+                val bytes = b64bin(m.groupValues[2])
+                val sb = StringBuilder()
+                for (i in bytes.indices) sb.append(((bytes[i].toInt() and 255) xor key[i % key.length].code).toChar())
+                dec = sb.toString()
+            }
+        } catch (e: Exception) {
         }
-        val bc = metas["_bc"] ?: ""
-        val bn = metas["_bn"] ?: ""
-        val zeros = metas["_bk"]?.toIntOrNull() ?: 4
-        val ret = metas["_br"].let { if (it.isNullOrBlank()) "/" else it }
+
+        // Meta adları: var B=meta("_bc"),N=meta("_bn"),Z=parseInt(meta("_bk")..),R=meta("_br")
+        var nBc = "_bc"
+        var nBn = "_bn"
+        var nBk = "_bk"
+        var nBr = "_br"
+        Regex("""B=meta\("([^"]+)"\),N=meta\("([^"]+)"\),Z=parseInt\(meta\("([^"]+)"\)""").find(dec)?.let {
+            nBc = it.groupValues[1]; nBn = it.groupValues[2]; nBk = it.groupValues[3]
+        }
+        Regex("""R=meta\("([^"]+)"\)""").find(dec)?.let { nBr = it.groupValues[1] }
+        val endpoint = Regex("""fetch\(["'](/[^"']+)["']""").find(dec)?.groupValues?.get(1) ?: "/_bc_verify"
+        val sep = Regex("""sha256Hex\(nonce\+["'](.)["']\+guess\)""").find(dec)?.groupValues?.get(1) ?: ":"
+
+        val bc = doc.selectFirst("meta[name=$nBc]")?.attr("content") ?: ""
+        val bn = doc.selectFirst("meta[name=$nBn]")?.attr("content") ?: ""
+        val zeros = doc.selectFirst("meta[name=$nBk]")?.attr("content")?.toIntOrNull() ?: 4
+        val ret = doc.selectFirst("meta[name=$nBr]")?.attr("content").let { if (it.isNullOrBlank()) "/" else it }
         if (bc.isBlank() || bn.isBlank()) {
-            chDbg = "meta eksik: ${metas.keys}"
+            chDbg = "meta eksik ($nBc/$nBn)"
             return
         }
 
@@ -250,7 +357,15 @@ class Dizipal : MainAPI() {
             Thread.sleep(500)
         } catch (e: Exception) {
         }
-        val ans = solvePow(bn, zeros)
+        val pre = "0".repeat(zeros)
+        var ans: String? = null
+        var i = 0
+        while (i <= 8000000) {
+            if (sha256Hex("$bn$sep$i").startsWith(pre)) {
+                ans = i.toString(); break
+            }
+            i++
+        }
         if (ans == null) {
             chDbg = "pow bulunamadi"
             return
@@ -283,7 +398,7 @@ class Dizipal : MainAPI() {
         try {
             val body = o.toString().toRequestBody("application/json".toMediaTypeOrNull())
             val r = app.post(
-                base + "/_bc_verify",
+                base + endpoint,
                 headers = hdr(
                     pageUrl,
                     mapOf(
@@ -297,25 +412,59 @@ class Dizipal : MainAPI() {
             )
             sessionCookies.putAll(r.cookies)
             chDbg = "verify code=${r.code} ck=${r.cookies.keys} body=${r.text.take(160)}"
-            println("DZP-VERIFY $chDbg")
+            println("Dizipal: $chDbg")
         } catch (e: Exception) {
             chDbg = "verify hata ${e.message}"
-            println("DZP-VERIFY $chDbg")
+            println("Dizipal: $chDbg")
         }
     }
 
-    // tries: doğrulama ekranı çıkarsa kaç kez çözmeye çalışılsın (0 = hiç, hızlı dön)
+    // tries: doğrulama ekranı çıkarsa kaç kez çözülsün (0 = hiç)
     private suspend fun fetchSite(path: String, tries: Int = 1): Fetched? {
+        sessRestore()
         val order = listOf(mainUrl) + bases.filter { it != mainUrl }
         for (b in order) {
             try {
                 var r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
                 sessionCookies.putAll(r.cookies)
+
+                // Cloudflare 403/503: yedek olarak CloudflareKiller (WebView ile çözer)
+                if (r.code == 403 || r.code == 503) {
+                    println("Dizipal: CF ${r.code}, CloudflareKiller deneniyor")
+                    cfKiller = null
+                    try {
+                        r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap(), interceptor = killer())
+                        sessionCookies.putAll(r.cookies)
+                    } catch (e: Exception) {
+                    }
+                }
+
+                // Diskten gelen eski çerezle doğrulama ekranı çıktıysa: kaydı sil, temiz oturumla yeniden iste
+                if (isChallenge(r.text) && sessFromDisk) {
+                    sessClear()
+                    r = app.get(b + path, headers = hdr("$b/"))
+                    sessionCookies.putAll(r.cookies)
+                }
+
                 var n = 0
                 while (isChallenge(r.text) && n < tries) {
-                    passChallenge(b, r.text, b + path)
-                    r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
-                    sessionCookies.putAll(r.cookies)
+                    solveLock.acquire()
+                    try {
+                        // Başka bir istek bu arada çözmüş olabilir
+                        r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
+                        sessionCookies.putAll(r.cookies)
+                        if (isChallenge(r.text)) {
+                            passChallenge(b, r.text, b + path)
+                            r = app.get(b + path, headers = hdr("$b/"), cookies = sessionCookies.toMap())
+                            sessionCookies.putAll(r.cookies)
+                            if (!isChallenge(r.text)) {
+                                sessSave()
+                                sessFromDisk = true
+                            }
+                        }
+                    } finally {
+                        solveLock.release()
+                    }
                     n++
                 }
                 val ch = isChallenge(r.text)
@@ -480,7 +629,7 @@ class Dizipal : MainAPI() {
             path = path.replace("/bolum/", "/dizi/").replace(Regex("-\\d+-sezon-\\d+-bolum/?$"), "")
         }
         val isMovie = path.contains("/film/")
-        val f = fetchSite(path, if (isMovie) 0 else 1)
+        val f = fetchSite(path, 1)
 
         if (f == null) {
             // Detay sayfası alınamadı (doğrulama / ağ). Film ise adresten basit bir sayfa kur,
