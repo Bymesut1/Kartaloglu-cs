@@ -1,6 +1,7 @@
 package com.bymesut1
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -40,6 +41,10 @@ class VkVideo : MainAPI() {
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = ""
         private const val DEVICE_ID = ""
+
+        private const val MOBILE_UA =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         private const val UA =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -516,12 +521,25 @@ class VkVideo : MainAPI() {
         return true
     }
 
+    // Sayfa yapısı/anahtar adı ne olursa olsun HTML içindeki medya adreslerini bulur
+    private suspend fun scanHtml(html: String, seen: HashSet<String>, callback: (ExtractorLink) -> Unit): Int {
+        val t = html.replace("\\/", "/").replace("\\u0026", "&").replace("&quot;", "\"").replace("&amp;", "&")
+        var n = 0
+        for (m in Regex("\"([A-Za-z0-9_]+)\"\\s*:\\s*\"(https?://[^\"\\s]+)\"").findAll(t)) {
+            if (isMedia(m.groupValues[2]) && emitMedia(m.groupValues[1], m.groupValues[2], seen, callback)) n++
+        }
+        for (m in Regex("https?://[^\\s\"'<>\\\\]+").findAll(t)) {
+            if (isMedia(m.value) && emitMedia("", m.value, seen, callback)) n++
+        }
+        return n
+    }
+
     // Yönlendirmeleri elle takip eder, çerezleri taşır (döngüyü kırar)
-    private suspend fun fetchFollow(url: String): String? {
+    private suspend fun fetchFollow(url: String, h: Map<String, String> = hdr): String? {
         var u = url
         var cookies = emptyMap<String, String>()
         repeat(10) {
-            val r = app.get(u, headers = hdr, cookies = cookies, allowRedirects = false)
+            val r = app.get(u, headers = h, cookies = cookies, allowRedirects = false)
             cookies = cookies + r.cookies
             val loc = r.headers["Location"]
             if (r.code in 300..399 && !loc.isNullOrBlank()) {
@@ -643,6 +661,15 @@ class VkVideo : MainAPI() {
                             n++
                         }
                     }
+                    val g = scanHtml(html, seen, callback)
+                    if (g > 0) {
+                        found = true
+                        n += g
+                    }
+                    debug.add(
+                        "ipucu=" + Regex("(?i)(m3u8|mpd|mp4|hls|dash)").findAll(html)
+                            .groupingBy { it.value.lowercase() }.eachCount()
+                    )
                     debug.add(
                         "embed len=${html.length} links=$n head=" +
                             html.take(80).replace("\n", " ")
@@ -650,6 +677,57 @@ class VkVideo : MainAPI() {
                 }
             } catch (e: Exception) {
                 debug.add("embed: ${e.message?.take(90)}")
+            }
+        }
+
+        // 3b) Farklı adresler / mobil sayfa (HTML'de oynatıcı verisi başka yerde olabilir)
+        if (!found) {
+            val hash = Regex("[?&]hash=([0-9a-zA-Z]+)").find(player)?.groupValues?.get(1)
+                ?: item.optString("access_key")
+            val mobileHdr = hdr + mapOf("User-Agent" to MOBILE_UA)
+            val cands = listOf(
+                player to mobileHdr,
+                ("https://vk.com/video_ext.php?oid=$oid&id=$vid" + (if (hash.isNotBlank()) "&hash=$hash" else "")) to hdr,
+                ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
+            )
+            for ((cu, ch) in cands) {
+                if (found) break
+                try {
+                    val html = fetchFollow(cu, ch) ?: continue
+                    val n = scanHtml(html, seen, callback)
+                    debug.add("alt ${cu.take(45)} len=${html.length} links=$n")
+                    if (n > 0) found = true
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    debug.add("alt: ${e.message?.take(70)}")
+                }
+            }
+        }
+
+        // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
+        if (!found) {
+            for (wu in listOf(player, "$mainUrl/video$data")) {
+                if (found) break
+                try {
+                    val r = app.get(
+                        wu,
+                        headers = hdr,
+                        referer = "$mainUrl/",
+                        interceptor = WebViewResolver(
+                            Regex("""(?i)\.m3u8|\.mpd|(vkvd|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4"""),
+                            userAgent = null,
+                            useOkhttp = false,
+                            timeout = 20_000L
+                        ),
+                        timeout = 30L
+                    )
+                    val cu = r.url
+                    debug.add("webview ${cu.take(70)}")
+                    if (cu != wu && isMedia(cu) && emitMedia("", cu, seen, callback)) found = true
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    debug.add("webview: ${e.message?.take(70)}")
+                }
             }
         }
 
