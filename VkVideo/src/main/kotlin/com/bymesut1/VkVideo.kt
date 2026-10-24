@@ -24,6 +24,18 @@ class VkVideo : MainAPI() {
         // true: açılan posteri olmayan kartlar listeden çıkarılır
         private const val REQUIRE_POSTER = true
 
+        // Bir sayfa boş çıkarsa (süzgeçten geçen video yoksa) en fazla kaç ham istek daha atılsın
+        private const val MAX_EMPTY_FETCHES = 4
+
+        // Aramaya videoları dahil edilecek en fazla kanal/topluluk sayısı
+        private const val MAX_CHANNELS = 6
+
+        // Her kanaldan sayfa başına çekilecek video sayısı
+        private const val CH_PAGE = 30
+
+        // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, bulunan kanallar) eklenir
+        private const val DEBUG_SEARCH = false
+
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = ""
@@ -183,17 +195,106 @@ class VkVideo : MainAPI() {
         return null
     }
 
-    // ---------- Arama ----------
+    // ---------- Arama (sayfalı + kanallar) ----------
 
-    private suspend fun searchVideos(q: String): List<SearchResponse> {
-        val r = api(
-            "catalog.getVideoSearchWeb2",
-            mapOf("q" to q, "count" to "30", "extended" to "1")
-        )
-        val found = LinkedHashMap<String, JSONObject>()
-        collectVideos(r, found)
-        val videos = found.values.filter { it.optInt("duration") >= MIN_DURATION }
-        return videos.amap { o ->
+    private class Cur(val next: String, val section: String?)
+
+    // "anahtar|sayfa" -> o sayfayı çekmek için gereken imleç
+    private val cursors = java.util.concurrent.ConcurrentHashMap<String, Cur>()
+    private val seenMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+    private val chanMap = java.util.concurrent.ConcurrentHashMap<String, LinkedHashMap<Long, String>>()
+
+    private fun findSectionId(root: Any?): String? {
+        val o = root as? JSONObject ?: return null
+        val s = o.optJSONObject("catalog")?.optJSONArray("sections")
+            ?.optJSONObject(0)?.optString("id")
+        return if (s.isNullOrBlank()) null else s
+    }
+
+    // Yanıttaki "next_from" imleçlerinden en çok video içereni seçer
+    private fun findCursor(root: Any?): Cur? {
+        var best: Cur? = null
+        var bestCount = -1
+        val sec = findSectionId(root)
+        fun walk(n: Any?) {
+            when (n) {
+                is JSONObject -> {
+                    val nf = n.optString("next_from")
+                    if (nf.isNotBlank()) {
+                        val tmp = LinkedHashMap<String, JSONObject>()
+                        collectVideos(n, tmp)
+                        if (tmp.size > bestCount) {
+                            bestCount = tmp.size
+                            best = Cur(nf, n.optString("section_id").ifBlank { sec })
+                        }
+                    }
+                    val ks = n.keys()
+                    while (ks.hasNext()) walk(n.opt(ks.next()))
+                }
+                is JSONArray -> for (i in 0 until n.length()) walk(n.opt(i))
+            }
+        }
+        walk(root)
+        return best
+    }
+
+    // Yanıttaki kanal/topluluk listesini toplar (extended=1 ile "groups" dizisi gelir)
+    private fun collectGroups(node: Any?, out: LinkedHashMap<Long, String>) {
+        when (node) {
+            is JSONObject -> {
+                val g = node.optJSONArray("groups")
+                if (g != null) {
+                    for (i in 0 until g.length()) {
+                        val o = g.optJSONObject(i) ?: continue
+                        val id = abs(o.optLong("id"))
+                        val nm = o.optString("name")
+                        if (id != 0L && nm.isNotBlank()) out.putIfAbsent(id, nm)
+                    }
+                }
+                val ks = node.keys()
+                while (ks.hasNext()) collectGroups(node.opt(ks.next()), out)
+            }
+            is JSONArray -> for (i in 0 until node.length()) collectGroups(node.opt(i), out)
+        }
+    }
+
+    private fun fold(s: String): String = s.lowercase()
+        .replace("\u0307", "")
+        .replace('ı', 'i').replace('ş', 's').replace('ğ', 'g')
+        .replace('ü', 'u').replace('ö', 'o').replace('ç', 'c')
+
+    // Kanal adı aramayla eşleşiyor mu? ("Filmizle" ~ "Film izle")
+    private fun channelMatches(q: String, name: String): Boolean {
+        val fq = fold(q)
+        val fn = fold(name)
+        if (fn.replace(" ", "").contains(fq.replace(" ", ""))) return true
+        val tokens = fq.split(" ").filter { it.length >= 2 }
+        return tokens.isNotEmpty() && tokens.all { fn.contains(it) }
+    }
+
+    private suspend fun channelVideos(gid: Long, offset: Int): Pair<List<JSONObject>, Boolean> {
+        return try {
+            val r = api(
+                "video.get",
+                mapOf(
+                    "owner_id" to "-$gid",
+                    "count" to "$CH_PAGE",
+                    "offset" to "$offset",
+                    "extended" to "1"
+                )
+            )
+            val m = LinkedHashMap<String, JSONObject>()
+            collectVideos(r, m)
+            val total = (r as? JSONObject)?.optInt("count") ?: 0
+            val more = if (total > 0) total > offset + CH_PAGE else m.size >= CH_PAGE
+            m.values.toList() to more
+        } catch (e: Exception) {
+            emptyList<JSONObject>() to false
+        }
+    }
+
+    private suspend fun toResponses(videos: Collection<JSONObject>): List<SearchResponse> {
+        return videos.toList().amap { o ->
             val p = workingPoster(o)
             if (p == null && REQUIRE_POSTER) {
                 null
@@ -207,6 +308,102 @@ class VkVideo : MainAPI() {
                 }
             }
         }.filterNotNull()
+    }
+
+    // Bir sayfa sonuç döndürür: (sonuçlar, devamı var mı)
+    private suspend fun searchPaged(
+        q: String,
+        page: Int,
+        withChannels: Boolean
+    ): Pair<List<SearchResponse>, Boolean> {
+        val ck = (if (withChannels) "S:" else "H:") + q
+        val seen = seenMap.getOrPut(ck) { java.util.Collections.synchronizedSet(HashSet()) }
+        if (page <= 1) {
+            seen.clear()
+            chanMap.remove(ck)
+            cursors.keys.removeAll { it.startsWith("$ck|") }
+        }
+        val chans = chanMap.getOrPut(ck) { LinkedHashMap() }
+
+        var cur: Cur? = if (page <= 1) null else cursors["$ck|$page"]
+        var searchMore = page <= 1 || cur != null
+        val fresh = LinkedHashMap<String, JSONObject>()
+        var firstShape: String? = null
+        var tries = 0
+
+        while (searchMore && tries < MAX_EMPTY_FETCHES) {
+            tries++
+            val params = mutableMapOf("q" to q, "count" to "30", "extended" to "1")
+            if (cur != null) params["start_from"] = cur.next
+            var resp: Any? = api("catalog.getVideoSearchWeb2", params)
+            var vids = LinkedHashMap<String, JSONObject>()
+            collectVideos(resp, vids)
+
+            // Arama imleci işe yaramadıysa bölüm (section) imleciyle dene
+            if (cur != null && cur.section != null && vids.keys.none { it !in seen }) {
+                try {
+                    val r2 = api(
+                        "catalog.getSection",
+                        mapOf(
+                            "section_id" to cur.section,
+                            "start_from" to cur.next,
+                            "count" to "30",
+                            "extended" to "1"
+                        )
+                    )
+                    val v2 = LinkedHashMap<String, JSONObject>()
+                    collectVideos(r2, v2)
+                    if (v2.keys.any { it !in seen }) {
+                        resp = r2
+                        vids = v2
+                    }
+                } catch (e: Exception) {
+                }
+            }
+
+            if (firstShape == null) firstShape = shape(resp)
+            if (withChannels) collectGroups(resp, chans)
+
+            val nxt = findCursor(resp)
+            cur = if (nxt != null && nxt.next != cur?.next) nxt else null
+
+            for ((k, v) in vids) {
+                if (v.optInt("duration") >= MIN_DURATION && seen.add(k)) fresh[k] = v
+            }
+            searchMore = cur != null
+            if (fresh.isNotEmpty()) break
+        }
+        cur?.let { cursors["$ck|${page + 1}"] = it }
+
+        // Kanallar / topluluklar: adı aramayla eşleşenlerin videoları
+        var chMore = false
+        var matched: List<Long> = emptyList()
+        if (withChannels) {
+            matched = chans.filter { channelMatches(q, it.value) }.keys.take(MAX_CHANNELS)
+            val res = matched.amap { gid -> channelVideos(gid, (maxOf(page, 1) - 1) * CH_PAGE) }
+            for ((list, more) in res) {
+                if (more) chMore = true
+                for (v in list) {
+                    if (v.optInt("duration") >= MIN_DURATION && seen.add(videoKey(v))) {
+                        fresh[videoKey(v)] = v
+                    }
+                }
+            }
+        }
+
+        val items = ArrayList<SearchResponse>()
+        if (DEBUG_SEARCH && page <= 1) {
+            items.add(
+                newMovieSearchResponse(
+                    "DEBUG ${firstShape ?: "-"} groups=${chans.size} matched=${matched.size} " +
+                        "names=${chans.values.take(6)}",
+                    "$mainUrl/video0_0",
+                    TvType.Movie
+                )
+            )
+        }
+        items.addAll(toResponses(fresh.values))
+        return items to (searchMore || chMore)
     }
 
     private suspend fun fetchItem(key: String): JSONObject {
@@ -339,12 +536,17 @@ class VkVideo : MainAPI() {
     // ---------- CloudStream ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val items = if (page == 1) searchVideos(request.data) else emptyList()
-        return newHomePageResponse(request.name, items, false)
+        val (items, more) = searchPaged(request.data, page, false)
+        return newHomePageResponse(request.name, items, more)
+    }
+
+    override suspend fun search(query: String, page: Int): SearchResponseList? {
+        val (items, more) = searchPaged(query, page, true)
+        return newSearchResponseList(items, more)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return searchVideos(query)
+        return searchPaged(query, 1, true).first
     }
 
     override suspend fun load(url: String): LoadResponse {
