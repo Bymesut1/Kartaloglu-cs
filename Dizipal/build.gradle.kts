@@ -1,5 +1,5 @@
 // Sürüm numarasını her değişiklikte 1 artır (CloudStream güncellemeyi bu sayıdan anlar)
-version = 8
+version = 9
 
 cloudstream {
     language = "tr"
