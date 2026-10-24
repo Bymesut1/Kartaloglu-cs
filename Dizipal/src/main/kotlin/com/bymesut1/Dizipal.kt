@@ -3,6 +3,7 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -43,6 +44,9 @@ class Dizipal : MainAPI() {
 
     @Volatile
     private var dbg = ""
+
+    @Volatile
+    private var chDbg = ""
 
     override val mainPage = mainPageOf(
         "home:Trend Diziler" to "Trend Diziler",
@@ -152,14 +156,15 @@ class Dizipal : MainAPI() {
         return !real
     }
 
-    // Hata ayıklama için doğrulama sayfasının script özeti
+    // Hata ayıklama için doğrulama sayfasının özeti
     private fun challengeInfo(t: String): String =
         try {
             val d = Jsoup.parse(t)
+            val srcs = d.select("script[src]").joinToString(",") { it.attr("src").take(70) }
             val sc = d.select("script").joinToString(" ") { it.data() }
                 .replace(Regex("\\s+"), " ").trim()
-            val body = d.body().text().replace(Regex("\\s+"), " ").trim()
-            "js=" + sc.take(450) + " txt=" + body.take(120)
+            val meta = d.select("meta[http-equiv]").joinToString(",") { it.attr("content").take(60) }
+            "src=[$srcs] meta=[$meta] js=" + sc.take(200)
         } catch (e: Exception) {
             ""
         }
@@ -170,15 +175,40 @@ class Dizipal : MainAPI() {
             "X-Requested-With" to "XMLHttpRequest",
             "Accept" to "application/json, text/plain, */*"
         )
+        // Sayfa script'i dışarıdaysa onu da oku
+        var all = text
+        var ext = ""
+        try {
+            val srcs = Jsoup.parse(text, base).select("script[src]").map { it.attr("abs:src") }
+                .filter { it.startsWith("http") && hostOf(it) == hostOf(base) }
+                .take(4)
+            for (u in srcs) {
+                val js = fetchText(u, hdr(pageUrl))
+                all += "\n" + js
+                if (ext.isEmpty() && js.isNotBlank()) {
+                    ext = "ext=" + js.replace(Regex("\\s+"), " ").trim().take(420)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        chDbg = ext
+
+        // "Birkaç saniye içinde yönlendirileceksiniz": sunucu bekleme süresi isteyebilir
+        delay(2500)
+
         val endpoints = LinkedHashSet<String>()
         endpoints.add("/ajax-token")
-        Regex("""(?:fetch|get|post)\(\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
-            .findAll(text).forEach { endpoints.add(it.groupValues[1]) }
+        Regex("""(?:fetch|get|post|getJSON)\(\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
+            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
+        Regex("""open\(\s*["'](?:GET|POST)["']\s*,\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""", RegexOption.IGNORE_CASE)
+            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
+        Regex("""url\s*:\s*["'](/[A-Za-z0-9_\-/.?=&]+)["']""")
+            .findAll(all).forEach { endpoints.add(it.groupValues[1]) }
         val names = LinkedHashSet<String>()
         names.add("_ct")
         Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=""")
-            .findAll(text).forEach { names.add(it.groupValues[1]) }
-        for (ep in endpoints.take(6)) {
+            .findAll(all).forEach { names.add(it.groupValues[1]) }
+        for (ep in endpoints.take(8)) {
             val r = try {
                 app.get(base + ep, headers = hdr(pageUrl, hx), cookies = sessionCookies.toMap())
             } catch (e: Exception) {
@@ -193,6 +223,17 @@ class Dizipal : MainAPI() {
                 null
             }
             if (tok != null) names.forEach { sessionCookies[it] = tok }
+        }
+
+        // Yönlendirme adresi varsa (location / meta refresh) o adrese de git
+        val redir = Regex("""location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.replace\(\s*["']([^"']+)["']|url=([^"'>\s]+)""", RegexOption.IGNORE_CASE)
+            .find(all)?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+        if (redir != null && !redir.startsWith("javascript", true)) {
+            try {
+                val r = app.get(resolveUrl(pageUrl, redir), headers = hdr(pageUrl), cookies = sessionCookies.toMap())
+                sessionCookies.putAll(r.cookies)
+            } catch (e: Exception) {
+            }
         }
     }
 
@@ -212,7 +253,7 @@ class Dizipal : MainAPI() {
                 }
                 val ch = isChallenge(r.text)
                 dbg = "${hostOf(b)} code=${r.code} len=${r.text.length} ch=$ch ck=${sessionCookies.keys.joinToString(",")} t=${titleOf(r.text).take(40)}"
-                if (ch) info = challengeInfo(r.text)
+                if (ch) info = challengeInfo(r.text) + " " + chDbg
                 if (r.code == 200 && r.text.isNotBlank() && !ch) {
                     mainUrl = b
                     return Fetched(b, r.text, sessionCookies.toMap())
@@ -525,7 +566,7 @@ class Dizipal : MainAPI() {
         if (f == null) {
             if (debug) {
                 callback(
-                    newExtractorLink(name, "DEBUG sayfa alinamadi: $dbg".take(700), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                    newExtractorLink(name, "DEBUG sayfa alinamadi: $dbg".take(1000), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
                         this.referer = ""
                         this.quality = Qualities.Unknown.value
                     }
@@ -590,7 +631,7 @@ class Dizipal : MainAPI() {
         if (!any && debug) {
             val info = "cfg=${cfg?.t ?: "yok"} embed=${embeds.size} ${embeds.firstOrNull()?.take(60) ?: ""} | $dbg"
             callback(
-                newExtractorLink(name, "DEBUG $info".take(700), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                newExtractorLink(name, "DEBUG $info".take(1000), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
                     this.referer = ""
                     this.quality = Qualities.Unknown.value
                 }
