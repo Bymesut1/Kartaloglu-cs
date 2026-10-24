@@ -182,15 +182,38 @@ class Dizipal : MainAPI() {
                 .filter { it.startsWith("http") && hostOf(it) == hostOf(base) }
                 .take(4)
             for (u in srcs) {
-                val js = fetchText(u, hdr(pageUrl))
+                // /_bcs?t=... doğrulama script'i: oturum çerezleriyle ve tarayıcı başlıklarıyla istenmeli
+                val rs = try {
+                    app.get(
+                        u,
+                        headers = hdr(
+                            pageUrl,
+                            mapOf(
+                                "Accept" to "*/*",
+                                "Sec-Fetch-Dest" to "script",
+                                "Sec-Fetch-Mode" to "no-cors",
+                                "Sec-Fetch-Site" to "same-origin"
+                            )
+                        ),
+                        cookies = sessionCookies.toMap()
+                    )
+                } catch (e: Exception) {
+                    null
+                }
+                if (rs != null) sessionCookies.putAll(rs.cookies)
+                val js = rs?.text ?: ""
                 all += "\n" + js
                 if (ext.isEmpty() && js.isNotBlank()) {
-                    ext = "ext=" + js.replace(Regex("\\s+"), " ").trim().take(420)
+                    ext = "ext[${rs?.code} ck=${rs?.cookies?.keys?.joinToString(",")}]=" +
+                        js.replace(Regex("\\s+"), " ").trim().take(420)
                 }
             }
         } catch (e: Exception) {
         }
         chDbg = ext
+        // Script içinde düz yazılmış çerez ataması varsa doğrudan uygula
+        Regex("""document\.cookie\s*=\s*["']([A-Za-z0-9_\-]+)=([^;"']+)""")
+            .findAll(all).forEach { sessionCookies[it.groupValues[1]] = it.groupValues[2] }
 
         // "Birkaç saniye içinde yönlendirileceksiniz": sunucu bekleme süresi isteyebilir
         try {
