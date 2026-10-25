@@ -59,8 +59,10 @@ class VkVideo : MainAPI() {
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
-        private const val CLIENT_SECRET = ""
-        private const val DEVICE_ID = ""
+        private const val CLIENT_SECRET = "o557NLIkAErNhakXrQ7A"
+        private const val APP_ID = "6287487"
+        private const val SCOPES = "audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous"
+        private const val DEVICE_ID = ""                    // tarayıcıdaki token isteğinde device_id yok; boş bırakılırsa gönderilmez
 
         private const val TMDB_KEY = "000316508321ce461cf81e7c6815eec7"
 
@@ -111,19 +113,20 @@ class VkVideo : MainAPI() {
 
     private suspend fun getToken(): String {
         token?.let { return it }
-        if (CLIENT_SECRET.isBlank() || DEVICE_ID.isBlank()) {
-            throw ErrorLoadingException("CLIENT_SECRET / DEVICE_ID boş: VkVideo.kt içine yaz (eski çalışan dosyadaki değerler)")
+        if (CLIENT_SECRET.isBlank()) {
+            throw ErrorLoadingException("CLIENT_SECRET boş: VkVideo.kt içine yaz")
         }
         val text = app.post(
             LOGIN,
             headers = hdr,
-            data = mapOf(
-                "client_id" to CLIENT_ID,
+            data = mutableMapOf(
                 "client_secret" to CLIENT_SECRET,
-                "app_id" to CLIENT_ID,
+                "client_id" to CLIENT_ID,
+                "scopes" to SCOPES,
+                "isApiOauthAnonymEnabled" to "false",
                 "version" to "1",
-                "device_id" to DEVICE_ID
-            )
+                "app_id" to APP_ID
+            ).also { if (DEVICE_ID.isNotBlank()) it["device_id"] = DEVICE_ID }
         ).text
         val t = JSONObject(text).optJSONObject("data")?.optString("access_token")
         if (t.isNullOrBlank()) throw ErrorLoadingException("Token alınamadı: $text")
