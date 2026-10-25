@@ -182,7 +182,7 @@ class VkVideo : MainAPI() {
             if (json == null) {
                 // JSON olmayan yanıt ("server ..." vb.) veya ağ hatası: bekleyip yeniden dene
                 if (attempt < 4) {
-                    kotlinx.coroutines.delay(700L * attempt)
+                    Thread.sleep(700L * attempt)
                     continue
                 }
                 throw ErrorLoadingException("VK yanıtı okunamadı ($method): $lastText")
@@ -196,7 +196,7 @@ class VkVideo : MainAPI() {
                 }
                 // 1 / 6 / 9 / 10: geçici sunucu ve çok sık istek hataları: bekleyip yeniden dene
                 if ((code == 1 || code == 6 || code == 9 || code == 10) && attempt < 4) {
-                    kotlinx.coroutines.delay(700L * attempt)
+                    Thread.sleep(700L * attempt)
                     continue
                 }
                 throw ErrorLoadingException("VK hata $code ($method): ${err.optString("error_msg")}")
