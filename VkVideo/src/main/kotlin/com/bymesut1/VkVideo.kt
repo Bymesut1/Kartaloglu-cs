@@ -42,6 +42,12 @@ class VkVideo : MainAPI() {
         // Aramada (1. sayfa) en fazla kaç sonuç gösterilsin (poster kontrolü yüzünden sınırlı)
         private const val MAX_RESULTS = 40
 
+        // Aşağı kaydırınca her yeni sayfada en az kaç sonuç hedeflensin (süzgeçten geçen yoksa arkadan yeni ham sayfa çekilir)
+        private const val PAGE_TARGET = 18
+
+        // Bir sayfayı doldurmak için en fazla kaç ham sayfa çekilsin
+        private const val MAX_PAGE_LOOPS = 5
+
         // Aramada etiketli sorgulardan (ad + "Türkçe Dublaj", "izle" ...) en fazla kaçı denensin
         private const val TAGGED_QUERIES = 12
 
@@ -55,7 +61,7 @@ class VkVideo : MainAPI() {
         private const val YANDEX_MIN = 600
 
         // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
-        private const val DEBUG_SEARCH = false
+        private const val DEBUG_SEARCH = true
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
@@ -605,6 +611,8 @@ class VkVideo : MainAPI() {
     private val chanMap = java.util.concurrent.ConcurrentHashMap<String, LinkedHashMap<Long, String>>()
     private val namesCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
     private val tmCache = java.util.concurrent.ConcurrentHashMap<String, ExpandRes>()
+    private val shownMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+    private val rawStart = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     private fun findSectionId(root: Any?): String? {
         val o = root as? JSONObject ?: return null
@@ -998,10 +1006,23 @@ class VkVideo : MainAPI() {
         }
         val (sq, noName) = baseQuery(q)                          // yazılan etiketler atılmış temiz sorgu
         if (page > 1) {
-            val raw = searchRaw(sq, page, true)
             val names = namesCache[q] ?: (if (noName) emptyList() else listOf(sq))
-            val ranked = rankAll(raw.videos.values, names, emptyMap())
-            return toResponses(ranked, tmCache[q]) to raw.more
+            val shown = shownMap.getOrPut(q) { java.util.Collections.synchronizedSet(HashSet<String>()) }
+            val out = ArrayList<SearchResponse>()
+            var r = rawStart["$q|$page"] ?: page                  // bu UI sayfasının başlayacağı ham sayfa
+            var hasMore = true
+            var loops = 0
+            // Süzgeçten yeterli sonuç geçmezse listenin durmaması için arkadan yeni ham sayfalar çekilir
+            while (hasMore && out.size < PAGE_TARGET && loops < MAX_PAGE_LOOPS) {
+                loops++
+                val raw = searchRaw(sq, r, true)
+                r++
+                hasMore = raw.more
+                val ranked = rankAll(raw.videos.values, names, emptyMap()).filter { shown.add(baseOf(it)) }
+                out.addAll(toResponses(ranked, tmCache[q]))
+            }
+            rawStart["$q|${page + 1}"] = r
+            return out to hasMore
         }
         val ex = if (noName) ExpandRes(emptyList(), emptyList(), null) else expandNames(sq)
         val names = ex.names                                      // ad süzgeci (boş = sadece etiket süzgeci)
@@ -1103,6 +1124,9 @@ class VkVideo : MainAPI() {
         // Yandex'in ilk sonuçları en üstte; süzgeç hepsini elediyse Yandex'in ilk 3 sonucu yine de gösterilir
         var ranked = rankAll(merged.values, names, yRank).take(MAX_RESULTS)
         if (ranked.isEmpty() && yOrdered.isNotEmpty()) ranked = yOrdered.take(3)
+
+        rawStart.keys.removeAll { it.startsWith("$q|") }
+        shownMap[q] = java.util.Collections.synchronizedSet(HashSet<String>(ranked.map { baseOf(it) }))
 
         lastDebug = "sorgu=$sq\nadlar=$names\ntoplam=${merged.size} aday=${ranked.size} tmdbPoster=${ex.poster != null}\n" +
             "$yStat\n$yLog\nvk: $dbgTxt"
