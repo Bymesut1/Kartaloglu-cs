@@ -63,6 +63,9 @@ class VkVideo : MainAPI() {
         // VK'nin kendi aramasından (site + video.search) adı uyan ilk kaç sonuç süzgeçten bağımsız gösterilsin
         private const val VK_FORCE = 3
 
+        // video.search ile sayfa başına çekilecek video sayısı (en fazla 200)
+        private const val CLASSIC_PAGE = 100
+
         // Yandex'ten gelen videolar için en kısa süre (saniye); normal MIN_DURATION'dan gevşek
         private const val YANDEX_MIN = 600
 
@@ -206,6 +209,10 @@ class VkVideo : MainAPI() {
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    // Boş "Original sound" kartları (açılmayan ses klipleri) listeye alınmaz
+    private fun isPlaceholder(o: JSONObject): Boolean =
+        o.optString("title").trim().equals("Original sound", ignoreCase = true)
 
     // ---------- Başlık analizi (JS sürümüyle aynı mantık) ----------
 
@@ -717,7 +724,7 @@ class VkVideo : MainAPI() {
         exempt: Set<String> = emptySet()
     ): List<SearchResponse> {
         val check = videos.size <= 60
-        return videos.toList().amap { o ->
+        return videos.toList().filter { !isPlaceholder(it) }.amap { o ->
             var p = if (check) workingPoster(o) else posterCandidates(o).firstOrNull()
             if (p == null && tm?.poster != null && tm.tmNames.isNotEmpty() &&
                 nameMatch(analyze(o.optString("title")), tm.tmNames) >= 0
@@ -1036,6 +1043,31 @@ class VkVideo : MainAPI() {
         return out
     }
 
+    // VK'nin klasik video.search yöntemi: sitedeki "Tüm videolar" bloğunu (uzun filmler dahil) yakalar; offset ile sayfa sayfa devam eder
+    private suspend fun vkClassicSearch(q: String, page: Int): Pair<List<JSONObject>, Boolean> {
+        return try {
+            val off = (maxOf(page, 1) - 1) * CLASSIC_PAGE
+            val r = api(
+                "video.search",
+                mapOf(
+                    "q" to q,
+                    "count" to "$CLASSIC_PAGE",
+                    "offset" to "$off",
+                    "extended" to "1",
+                    "adult" to "1"
+                )
+            )
+            val m = LinkedHashMap<String, JSONObject>()
+            collectVideos(r, m)
+            val total = (r as? JSONObject)?.optInt("count") ?: 0
+            val more = if (total > 0) total > off + CLASSIC_PAGE else m.size >= CLASSIC_PAGE
+            m.values.toList() to more
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            emptyList<JSONObject>() to false
+        }
+    }
+
     private fun taggedQueries(names: List<String>): List<String> {
         val qs = LinkedHashSet<String>()
         for (tag in TAGS) for (n in names) qs.add("$n $tag".trim())
@@ -1075,17 +1107,29 @@ class VkVideo : MainAPI() {
         }
         // Yalın arama: yazılan metin VK'ya aynen gider, süzgeç yok; aşağı indikçe sayfa sayfa devam eder
         val sq = q.trim()
-        if (page <= 1) rawStart.keys.removeAll { it.startsWith("$sq|") }
+        if (page <= 1) {
+            rawStart.keys.removeAll { it.startsWith("$sq|") }
+            shownMap[sq] = java.util.Collections.synchronizedSet(HashSet<String>())
+        }
+        val shownKeys = shownMap.getOrPut(sq) { java.util.Collections.synchronizedSet(HashSet<String>()) }
         var r = if (page <= 1) 1 else (rawStart["$sq|$page"] ?: page)
         val out = ArrayList<SearchResponse>()
         var hasMore = true
         var loops = 0
         while (hasMore && out.size < PAGE_TARGET && loops < MAX_PAGE_LOOPS) {
             loops++
-            val raw = searchRaw(sq, r, true)
+            val rr = r
+            var cl: Pair<List<JSONObject>, Boolean> = emptyList<JSONObject>() to false
+            var rawP = RawPage(LinkedHashMap(), false, "")
+            // İki kaynak paralel: video.search (Tüm videolar, uzun filmler dahil) + katalog araması (klipler, kanallar)
+            listOf(0, 1).amap { w ->
+                if (w == 0) cl = vkClassicSearch(sq, rr) else rawP = searchRaw(sq, rr, true)
+                0
+            }
             r++
-            hasMore = raw.more
-            out.addAll(toResponses(raw.videos.values))
+            hasMore = rawP.more || cl.second
+            val all = (cl.first + rawP.videos.values).filter { shownKeys.add(baseOf(it)) }
+            out.addAll(toResponses(all))
         }
         rawStart["$sq|${page + 1}"] = r
         return out to hasMore
