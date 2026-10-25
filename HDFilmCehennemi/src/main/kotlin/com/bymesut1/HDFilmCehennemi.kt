@@ -143,8 +143,12 @@ class HDFilmCehennemi : MainAPI() {
 
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
     // Doğrulama başarısız olursa cfCooldownMs boyunca CfCooldown fırlatılır (çağıranlar Exception yakalıyor).
-    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+    private suspend fun cfGet(url: String, headers0: Map<String, String>, timeout: Long = 30L): NiceResponse {
         if (!cfWarm && cfCoolingDown()) throw CfCooldown()
+        // cf_clearance çerezi WebView'in kendi User-Agent'ına bağlıdır; farklı UA gönderirsek Cloudflare reddeder.
+        // Bu yüzden burada UA'yı biz vermiyoruz, CloudflareKiller kendisi ekliyor.
+        val headers = headers0.filterKeys { !it.equals("User-Agent", true) }
+        val wasWarm = cfWarm
         val k = cfKiller
         val r: NiceResponse = try {
             var x: NiceResponse = if (cfWarm) {
@@ -158,7 +162,9 @@ class HDFilmCehennemi : MainAPI() {
                     cfLock.release()
                 }
             }
-            if (x.code == 403 || x.code == 503) {
+            // Eski (süresi dolmuş) çerezle 403 geldiyse bir kez sıfırlayıp yeniden çöz.
+            // Yeni çözümden sonra gelen 403'te tekrar denemiyoruz (2x60 sn bekleyip 120 sn zaman aşımına düşüyordu).
+            if ((x.code == 403 || x.code == 503) && wasWarm) {
                 log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
                 cfLock.acquire()
                 try {
@@ -182,6 +188,16 @@ class HDFilmCehennemi : MainAPI() {
         } catch (e: Exception) {
             cfFail("hata ${e.message?.take(60)}")
             throw e
+        }
+        // TANI: logcat'te "HDFilmCehennemi" etiketiyle filtreleyin
+        try {
+            val title = Regex("<title>(.*?)</title>", IC).find(r.text)?.groupValues?.get(1)?.take(60)
+            val ck = cfKiller.savedCookies.values.flatMap { it.keys }
+            log(
+                "CF TANI kod=${r.code} server=${r.headers["server"]} cf-mitigated=${r.headers["cf-mitigated"]} " +
+                    "cerezler=$ck baslik=$title url=${url.take(60)}"
+            )
+        } catch (_: Throwable) {
         }
         if (r.code in 200..299) {
             cfWarm = true
@@ -582,6 +598,11 @@ class HDFilmCehennemi : MainAPI() {
             } catch (e: Exception) {
                 null
             }
+            // TANI: düz isteğin sonucu (WARP / IP engeli kontrolü için)
+            log(
+                "DUZ TANI ${host.take(40)} desk=$desk kod=${r?.code} server=${r?.headers?.get("server")} " +
+                    "cf-mitigated=${r?.headers?.get("cf-mitigated")} len=${r?.text?.length}"
+            )
             if (!denied(r)) {
                 good = Pair(host, desk)
                 return r
