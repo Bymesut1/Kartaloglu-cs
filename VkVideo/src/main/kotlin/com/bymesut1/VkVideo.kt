@@ -51,6 +51,9 @@ class VkVideo : MainAPI() {
         private const val YANDEX_MS = 7000L
         private const val YANDEX_VERIFY = 24
 
+        // Yandex'ten gelen videolar için en kısa süre (saniye); normal MIN_DURATION'dan gevşek
+        private const val YANDEX_MIN = 600
+
         // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
         private const val DEBUG_SEARCH = true
 
@@ -95,6 +98,9 @@ class VkVideo : MainAPI() {
 
     private var token: String? = null
 
+    // DEBUG kartına dokununca gösterilen tam teşhis metni
+    private var lastDebug: String = ""
+
     override val mainPage = mainPageOf(
         "türkçe dublaj film" to "Türkçe Dublaj Filmler",
         "tr dublaj izle" to "TR Dublaj İzle",
@@ -105,6 +111,9 @@ class VkVideo : MainAPI() {
 
     private suspend fun getToken(): String {
         token?.let { return it }
+        if (CLIENT_SECRET.isBlank() || DEVICE_ID.isBlank()) {
+            throw ErrorLoadingException("CLIENT_SECRET / DEVICE_ID boş: VkVideo.kt içine yaz (eski çalışan dosyadaki değerler)")
+        }
         val text = app.post(
             LOGIN,
             headers = hdr,
@@ -366,11 +375,11 @@ class VkVideo : MainAPI() {
     }
 
     // Puan: null = ele. names boşsa ad kontrolü yapılmaz (ana sayfa kategorileri)
-    private fun rankVideo(o: JSONObject, names: List<String>): Int? {
+    private fun rankVideo(o: JSONObject, names: List<String>, yandex: Boolean = false): Int? {
         val title = o.optString("title")
         if (Regex("[\\u0400-\\u04FF]").containsMatchIn(title)) return null           // Rusça (Kiril) başlık
         val dur = o.optInt("duration")
-        if (dur < MIN_DURATION) return null
+        if (dur < (if (yandex) YANDEX_MIN else MIN_DURATION)) return null
         val info = analyze(title)
         var li = langInfo(info)
         if (!li.ok) {
@@ -379,6 +388,11 @@ class VkVideo : MainAPI() {
                 val l2 = langInfo(analyze(desc.take(300)))
                 if (l2.ok && l2.strength >= 3) li = l2
             }
+        }
+        if (!li.ok && yandex &&
+            !("altyazi" in info.tagset || "altyazili" in info.tagset || "sub" in info.tagset)
+        ) {
+            li = Lang(true, "Yandex", 1)
         }
         if (!li.ok) {
             if (REQUIRE_TAG) return null                                              // etiket YOKSA alma
@@ -400,12 +414,13 @@ class VkVideo : MainAPI() {
     private fun rankAll(
         vids: Collection<JSONObject>,
         names: List<String>,
-        yandexKeys: Set<String>
+        yandexRank: Map<String, Int>
     ): List<JSONObject> {
         val out = ArrayList<Pair<JSONObject, Int>>()
         for (o in vids) {
-            val s = rankVideo(o, names) ?: continue
-            out.add(o to (s + (if (baseOf(o) in yandexKeys) 1 else 0)))
+            val yi = yandexRank[baseOf(o)]
+            val s = rankVideo(o, names, yi != null) ?: continue
+            out.add(o to (s + (if (yi != null) 40 - min(yi, 30) else 0)))
         }
         return out.sortedByDescending { it.second }.map { it.first }
     }
@@ -679,7 +694,11 @@ class VkVideo : MainAPI() {
     }
 
     // VK önizlemesi açılmazsa ve başlık TMDB'deki filmle uyuşuyorsa TMDB posteri kullanılır; ikisi de yoksa (REQUIRE_POSTER) kart düşer
-    private suspend fun toResponses(videos: Collection<JSONObject>, tm: ExpandRes? = null): List<SearchResponse> {
+    private suspend fun toResponses(
+        videos: Collection<JSONObject>,
+        tm: ExpandRes? = null,
+        exempt: Set<String> = emptySet()
+    ): List<SearchResponse> {
         return videos.toList().amap { o ->
             var p = workingPoster(o)
             if (p == null && tm?.poster != null && tm.tmNames.isNotEmpty() &&
@@ -687,7 +706,9 @@ class VkVideo : MainAPI() {
             ) {
                 p = tm.poster
             }
-            if (p == null && REQUIRE_POSTER) {
+            val fromY = baseOf(o) in exempt
+            if (p == null && fromY && tm?.poster != null) p = tm.poster
+            if (p == null && REQUIRE_POSTER && !fromY) {
                 null
             } else {
                 newMovieSearchResponse(
@@ -796,9 +817,25 @@ class VkVideo : MainAPI() {
         .replace("&amp;", "&").replace("\\u002F", "/", true).replace("\\u0026", "&", true)
         .replace("\\/", "/")
 
+    // Bing sonuç adresleri "u=a1<base64>" olarak sarılır; çözüp metne eklenir
+    private fun decodeWrapped(h: String): String {
+        val sb = StringBuilder()
+        for (m in Regex("[?&;]u=a1([A-Za-z0-9_\\-]{16,})").findAll(h)) {
+            try {
+                var b = m.groupValues[1].replace('-', '+').replace('_', '/')
+                while (b.length % 4 != 0) b += "="
+                sb.append(' ').append(
+                    String(android.util.Base64.decode(b, android.util.Base64.DEFAULT), Charsets.UTF_8)
+                )
+            } catch (e: Exception) {
+            }
+        }
+        return sb.toString()
+    }
+
     // Sonuç sayfasındaki VK video numaraları: (erişimsiz anahtar, hash'li anahtar)
     private fun parseEngine(html: String): List<Pair<String, String>> {
-        val h = vkNorm(html)
+        val h = vkNorm(html + " " + decodeWrapped(html))
         val out = LinkedHashMap<String, String>()
         fun add(oid: String, id: String, hash: String) {
             if (oid.toLongOrNull() == null || id.toLongOrNull() == null) return
@@ -819,6 +856,17 @@ class VkVideo : MainAPI() {
         ).findAll(h)) {
             add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
         }
+        // "vkvideo.ru › video123_456" şeklinde gösterilen adresler
+        for (m in Regex(
+            "(?:vkvideo\\.ru|vk\\.com|vk\\.ru)\\s*(?:›|&rsaquo;|&#8250;|&gt;|>|/)\\s*(?:video|clip)(-?\\d+)_(\\d+)(?:_([0-9a-f]{8,}))?",
+            ic
+        ).findAll(h)) {
+            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
+        }
+        // Son çare: adres gibi görünen her video<oid>_<id> (VK API zaten doğrular)
+        for (m in Regex("(?<=[/=])(?:video|clip)(-?\\d{5,})_(\\d{5,})(?:_([0-9a-f]{8,}))?", ic).findAll(h)) {
+            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
+        }
         return out.entries.map { it.key to it.value }
     }
 
@@ -828,18 +876,26 @@ class VkVideo : MainAPI() {
             "https://yandex.com.tr/search/touch/?text=${e.replace("%20", "+")}&lr=11508",
             "https://yandex.com.tr/video/search?text=$e",
             "https://yandex.com/video/search?text=$e",
-            "https://yandex.com.tr/search/?text=$e"
+            "https://yandex.com.tr/search/?text=$e",
+            "https://www.bing.com/search?q=$e&setlang=tr&count=30",
+            "https://html.duckduckgo.com/html/?q=$e&kl=tr-tr"
         )
-        return if (qi < 2) all else all.take(2)
+        return if (qi < 2) all else listOf(all[0], all[4])
     }
 
-    private class YandexRes(val found: LinkedHashMap<String, String>, val captcha: Int, val fetched: Int)
+    private class YandexRes(
+        val found: LinkedHashMap<String, String>,
+        val captcha: Int,
+        val fetched: Int,
+        val log: String
+    )
 
-    // "ad tr dublaj izle vkvideo.ru" tarzı sorgularla Yandex'ten VK video numaraları toplar
+    // "ad tr dublaj izle vkvideo.ru" tarzı sorgularla Yandex'ten VK video numaraları toplar (sıra = sonuç sırası)
     private suspend fun yandexCollect(names: List<String>): YandexRes {
         val found = LinkedHashMap<String, String>()
         var captcha = 0
         var fetched = 0
+        val logs = ArrayList<String>()
         val cleaned = names.map { it.replace(Regex("[:!?,\"]+"), " ").replace(Regex("\\s+"), " ").trim() }
             .filter { it.isNotEmpty() }
         val qs = ArrayList<String>()
@@ -855,30 +911,49 @@ class VkVideo : MainAPI() {
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
             "Referer" to "https://yandex.com.tr/"
         )
+
+        // Önce ana sayfadan çerez al (captcha ihtimalini azaltır)
+        val warm: Map<String, String> = try {
+            app.get("https://yandex.com.tr/", headers = eh, timeout = 4L).cookies
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            emptyMap()
+        }
+        logs.add("cerez=${warm.size}")
+
         val deadline = System.currentTimeMillis() + YANDEX_MS
         for (chunk in tasks.chunked(4)) {
             if (System.currentTimeMillis() > deadline) break
-            val texts = chunk.amap { u ->
-                try {
-                    val r = app.get(u, headers = eh, timeout = 5L)
-                    if (r.code in 200..299) r.text else null
+            val res = chunk.amap { u ->
+                val host = hostOf(u).removePrefix("www.")
+                val lbl = host + u.substringAfter(hostOf(u)).substringBefore("?").take(14)
+                val pr: Pair<String, String?> = try {
+                    val r = app.get(u, headers = eh, cookies = warm, timeout = 5L)
+                    val t = if (r.code in 200..299) r.text else null
+                    "$lbl ${r.code}" to t
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
-                    null
+                    "$lbl HATA ${(e.message ?: "").take(30)}" to null
                 }
+                pr
             }
-            for (t in texts) {
-                if (t == null) continue
+            for ((lg, t) in res) {
+                if (t == null) {
+                    logs.add(lg)
+                    continue
+                }
                 fetched++
                 val ids = parseEngine(t)
-                if (ids.isEmpty() && t.contains("captcha", true)) captcha++
+                val cap = ids.isEmpty() && t.contains("captcha", true)
+                if (cap) captcha++
+                logs.add("$lg len=${t.length} id=${ids.size}${if (cap) " CAPTCHA" else ""}")
                 for ((k, vid) in ids) {
                     val old = found[k]
                     if (old == null || (old.split("_").size < 3 && vid.split("_").size > 2)) found[k] = vid
                 }
             }
         }
-        return YandexRes(found, captcha, fetched)
+        return YandexRes(found, captcha, fetched, logs.take(16).joinToString("\n"))
     }
 
     private fun taggedQueries(names: List<String>): List<String> {
@@ -888,12 +963,40 @@ class VkVideo : MainAPI() {
     }
 
     // Aramanın tamamı: düz arama + kanallar + etiketli sorgular + Yandex; sonra etiket/ad süzgeci ve puan sıralaması
+    private fun errorCard(msg: String): SearchResponse {
+        lastDebug = "HATA: $msg"
+        return newMovieSearchResponse("HATA (dokun): ${msg.take(120)}", "$mainUrl/video0_0", TvType.Movie)
+    }
+
+    private suspend fun safeSearch(q: String, page: Int): Pair<List<SearchResponse>, Boolean> {
+        return try {
+            smartSearch(q, page)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            listOf(errorCard(e.message ?: e.toString())) to false
+        }
+    }
+
     private suspend fun smartSearch(q: String, page: Int): Pair<List<SearchResponse>, Boolean> {
+        // Aramaya doğrudan VK adresi yapıştırılırsa (vkvideo.ru/video248307654_168039297) o video açılır
+        val direct = Regex("video(-?\\d+_\\d+(?:_[0-9a-zA-Z]+)?)").find(q)
+        if (direct != null && q.contains("vk", true)) {
+            if (page > 1) return emptyList<SearchResponse>() to false
+            val o = fetchItem(direct.groupValues[1])
+            val card = newMovieSearchResponse(
+                o.optString("title"),
+                "$mainUrl/video${videoKey(o)}",
+                TvType.Movie
+            ) {
+                this.posterUrl = workingPoster(o)
+            }
+            return listOf<SearchResponse>(card) to false
+        }
         val (sq, noName) = baseQuery(q)                          // yazılan etiketler atılmış temiz sorgu
         if (page > 1) {
             val raw = searchRaw(sq, page, true)
             val names = namesCache[q] ?: (if (noName) emptyList() else listOf(sq))
-            val ranked = rankAll(raw.videos.values, names, emptySet())
+            val ranked = rankAll(raw.videos.values, names, emptyMap())
             return toResponses(ranked, tmCache[q]) to raw.more
         }
         val ex = if (noName) ExpandRes(emptyList(), emptyList(), null) else expandNames(sq)
@@ -903,7 +1006,7 @@ class VkVideo : MainAPI() {
         tmCache[q] = ex
 
         val merged = LinkedHashMap<String, JSONObject>()
-        val yKeys = HashSet<String>()
+        val yRank = HashMap<String, Int>()
         var more = false
         var dbgTxt = ""
         var yRes: YandexRes? = null
@@ -939,47 +1042,79 @@ class VkVideo : MainAPI() {
             0
         }
 
-        var yStat = "yandex kapalı"
+        var yStat = "yandex kapali"
+        var yLog = ""
+        val yOrdered = ArrayList<JSONObject>()
         val y = yRes
         if (y != null) {
+            y.found.keys.forEachIndexed { i, k -> yRank[k] = i }                  // Yandex sonuç sırası
+            val apiErr: MutableList<String> = java.util.Collections.synchronizedList(ArrayList<String>())
+            val firstKeys = y.found.keys.take(6).toSet()
+
             // Yandex'ten gelen numaralar VK API'den doğrulanır (gerçek başlık + süre), 10'arlı toplu istek
             val need = y.found.entries.filter { it.key !in merged }.take(YANDEX_VERIFY)
             val objs = need.chunked(10).amap { ch ->
+                val m = LinkedHashMap<String, JSONObject>()
                 try {
                     val r = api("video.getByIds", mapOf("videos" to ch.joinToString(",") { it.value }))
-                    val m = LinkedHashMap<String, JSONObject>()
                     collectVideos(r, m)
-                    m.values.toList()
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
-                    emptyList<JSONObject>()
+                    apiErr.add("getByIds: ${e.message?.take(70)}")
                 }
+                // İlk sonuçlar getByIds'te boş döndüyse tek tek video.get ile dene
+                for (en in ch) {
+                    if (en.key !in firstKeys) continue
+                    if (m.values.any { baseOf(it) == en.key }) continue
+                    try {
+                        val r2 = api("video.get", mapOf("videos" to en.value))
+                        val m2 = LinkedHashMap<String, JSONObject>()
+                        collectVideos(r2, m2)
+                        for (v in m2.values) m.putIfAbsent(videoKey(v), v)
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        apiErr.add("get ${en.key}: ${e.message?.take(70)}")
+                    }
+                }
+                m.values.toList()
             }.flatten()
             for (o in objs) {
                 if (o.optString("access_key").isBlank()) {                       // API erişim anahtarı vermediyse Yandex adresindeki hash
                     val h = y.found[baseOf(o)]?.split("_")?.getOrNull(2)
                     if (!h.isNullOrBlank()) o.put("access_key", h)
                 }
-                if (o.optInt("duration") >= MIN_DURATION) {
-                    yKeys.add(baseOf(o))
-                    merged.putIfAbsent(baseOf(o), o)
-                }
+                if (o.optInt("duration") >= YANDEX_MIN) merged.putIfAbsent(baseOf(o), o)
+            }
+            for (k in y.found.keys) {
+                val o = merged[k]
+                if (o != null) yOrdered.add(o)
             }
             yStat = "yandex sayfa=${y.fetched} captcha=${y.captcha} numara=${y.found.size} dogrulanan=${objs.size}"
+            yLog = y.log +
+                (if (apiErr.isNotEmpty()) "\napiHata: " + apiErr.joinToString(" | ") else "") +
+                "\nyandexIlk: " + y.found.keys.take(5).joinToString(",") +
+                "\nyandexBasliklar: " + yOrdered.take(5).joinToString(" | ") { it.optString("title").take(50) }
         }
 
-        val ranked = rankAll(merged.values, names, yKeys).take(MAX_RESULTS)
+        // Yandex'in ilk sonuçları en üstte; süzgeç hepsini elediyse Yandex'in ilk 3 sonucu yine de gösterilir
+        var ranked = rankAll(merged.values, names, yRank).take(MAX_RESULTS)
+        if (ranked.isEmpty() && yOrdered.isNotEmpty()) ranked = yOrdered.take(3)
+
+        lastDebug = "sorgu=$sq\nadlar=$names\ntoplam=${merged.size} aday=${ranked.size} tmdbPoster=${ex.poster != null}\n" +
+            "$yStat\n$yLog\nvk: $dbgTxt"
+
         val items = ArrayList<SearchResponse>()
         if (DEBUG_SEARCH) {
+            // Karta dokununca tam teşhis metni açılır
             items.add(
                 newMovieSearchResponse(
-                    "DEBUG sorgu=$sq adlar=$names toplam=${merged.size} aday=${ranked.size} tmdbPoster=${ex.poster != null} $yStat | $dbgTxt",
+                    "DEBUG (dokun) y=${yRank.size} aday=${ranked.size}",
                     "$mainUrl/video0_0",
                     TvType.Movie
                 )
             )
         }
-        items.addAll(toResponses(ranked, ex))
+        items.addAll(toResponses(ranked, ex, yRank.keys.toSet()))
         return items to more
     }
 
@@ -1216,22 +1351,32 @@ class VkVideo : MainAPI() {
     // ---------- CloudStream ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val raw = searchRaw(request.data, page, false)
-        val ranked = rankAll(raw.videos.values, emptyList(), emptySet())
-        return newHomePageResponse(request.name, toResponses(ranked), raw.more)
+        return try {
+            val raw = searchRaw(request.data, page, false)
+            val ranked = rankAll(raw.videos.values, emptyList(), emptyMap())
+            newHomePageResponse(request.name, toResponses(ranked), raw.more)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            newHomePageResponse(request.name, listOf(errorCard(e.message ?: e.toString())), false)
+        }
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
-        val (items, more) = smartSearch(query, page)
+        val (items, more) = safeSearch(query, page)
         return newSearchResponseList(items, more)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return smartSearch(query, 1).first
+        return safeSearch(query, 1).first
     }
 
     override suspend fun load(url: String): LoadResponse {
         val key = url.substringAfter("/video").substringBefore("?")
+        if (key == "0_0") {
+            return newMovieLoadResponse("DEBUG", url, TvType.Movie, "debug") {
+                this.plot = lastDebug.ifBlank { "Henüz teşhis yok: önce bir arama yap, sonra DEBUG kartına dokun." }
+            }
+        }
         val item = fetchItem(key)
         val title = item.optString("title")
         val desc = item.optString("description")
@@ -1275,6 +1420,7 @@ class VkVideo : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        if (data == "debug") return false
         val item = fetchItem(data)
         val seen = HashSet<String>()
         val cands = ArrayList<Cand>()
