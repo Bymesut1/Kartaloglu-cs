@@ -3,9 +3,6 @@ package com.bymesut1
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
@@ -826,26 +823,26 @@ class VkVideo : MainAPI() {
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
             "Referer" to "https://yandex.com.tr/"
         )
-        withTimeoutOrNull(YANDEX_MS) {
-            for (chunk in tasks.chunked(4)) {
-                val texts = chunk.amap { u ->
-                    try {
-                        val r = app.get(u, headers = eh, timeout = 7L)
-                        if (r.code in 200..299) r.text else null
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        null
-                    }
+        val deadline = System.currentTimeMillis() + YANDEX_MS
+        for (chunk in tasks.chunked(4)) {
+            if (System.currentTimeMillis() > deadline) break
+            val texts = chunk.amap { u ->
+                try {
+                    val r = app.get(u, headers = eh, timeout = 5L)
+                    if (r.code in 200..299) r.text else null
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    null
                 }
-                for (t in texts) {
-                    if (t == null) continue
-                    fetched++
-                    val ids = parseEngine(t)
-                    if (ids.isEmpty() && t.contains("captcha", true)) captcha++
-                    for ((k, vid) in ids) {
-                        val old = found[k]
-                        if (old == null || (old.split("_").size < 3 && vid.split("_").size > 2)) found[k] = vid
-                    }
+            }
+            for (t in texts) {
+                if (t == null) continue
+                fetched++
+                val ids = parseEngine(t)
+                if (ids.isEmpty() && t.contains("captcha", true)) captcha++
+                for ((k, vid) in ids) {
+                    val old = found[k]
+                    if (old == null || (old.split("_").size < 3 && vid.split("_").size > 2)) found[k] = vid
                 }
             }
         }
@@ -873,55 +870,66 @@ class VkVideo : MainAPI() {
         val yKeys = HashSet<String>()
         var more = false
         var dbgTxt = ""
+        var yRes: YandexRes? = null
+
+        // 0: Yandex toplama, 1: VK aramaları (düz + kanallar + etiketli sorgular) — ikisi paralel
+        listOf(0, 1).amap { which ->
+            if (which == 0) {
+                if (YANDEX) {
+                    try {
+                        yRes = yandexCollect(names)
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                    }
+                }
+            } else {
+                val base = searchRaw(q, 1, true)
+                more = base.more
+                dbgTxt = base.debug
+                for (o in base.videos.values) merged.putIfAbsent(baseOf(o), o)
+
+                for (ch in taggedQueries(names).chunked(4)) {
+                    val raws = ch.amap { t ->
+                        try {
+                            searchRaw(t, 1, false)
+                        } catch (e: Exception) {
+                            if (e is java.util.concurrent.CancellationException) throw e
+                            RawPage(LinkedHashMap(), false, "")
+                        }
+                    }
+                    for (rp in raws) for (o in rp.videos.values) merged.putIfAbsent(baseOf(o), o)
+                }
+            }
+            0
+        }
+
         var yStat = "yandex kapalı"
-
-        coroutineScope {
-            val yJob = if (YANDEX) async { yandexCollect(names) } else null
-
-            val base = searchRaw(q, 1, true)
-            more = base.more
-            dbgTxt = base.debug
-            for (o in base.videos.values) merged.putIfAbsent(baseOf(o), o)
-
-            for (ch in taggedQueries(names).chunked(4)) {
-                val raws = ch.amap { t ->
-                    try {
-                        searchRaw(t, 1, false)
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        RawPage(LinkedHashMap(), false, "")
-                    }
+        val y = yRes
+        if (y != null) {
+            // Yandex'ten gelen numaralar VK API'den doğrulanır (gerçek başlık + süre), 10'arlı toplu istek
+            val need = y.found.entries.filter { it.key !in merged }.take(YANDEX_VERIFY)
+            val objs = need.chunked(10).amap { ch ->
+                try {
+                    val r = api("video.getByIds", mapOf("videos" to ch.joinToString(",") { it.value }))
+                    val m = LinkedHashMap<String, JSONObject>()
+                    collectVideos(r, m)
+                    m.values.toList()
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    emptyList<JSONObject>()
                 }
-                for (rp in raws) for (o in rp.videos.values) merged.putIfAbsent(baseOf(o), o)
-            }
-
-            val y = yJob?.await()
-            if (y != null) {
-                // Yandex'ten gelen numaralar VK API'den doğrulanır (gerçek başlık + süre), 10'arlı toplu istek
-                val need = y.found.entries.filter { it.key !in merged }.take(YANDEX_VERIFY)
-                val objs = need.chunked(10).amap { ch ->
-                    try {
-                        val r = api("video.getByIds", mapOf("videos" to ch.joinToString(",") { it.value }))
-                        val m = LinkedHashMap<String, JSONObject>()
-                        collectVideos(r, m)
-                        m.values.toList()
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        emptyList<JSONObject>()
-                    }
-                }.flatten()
-                for (o in objs) {
-                    if (o.optString("access_key").isBlank()) {                       // API erişim anahtarı vermediyse Yandex adresindeki hash
-                        val h = y.found[baseOf(o)]?.split("_")?.getOrNull(2)
-                        if (!h.isNullOrBlank()) o.put("access_key", h)
-                    }
-                    if (o.optInt("duration") >= MIN_DURATION) {
-                        yKeys.add(baseOf(o))
-                        merged.putIfAbsent(baseOf(o), o)
-                    }
+            }.flatten()
+            for (o in objs) {
+                if (o.optString("access_key").isBlank()) {                       // API erişim anahtarı vermediyse Yandex adresindeki hash
+                    val h = y.found[baseOf(o)]?.split("_")?.getOrNull(2)
+                    if (!h.isNullOrBlank()) o.put("access_key", h)
                 }
-                yStat = "yandex sayfa=${y.fetched} captcha=${y.captcha} numara=${y.found.size} dogrulanan=${objs.size}"
+                if (o.optInt("duration") >= MIN_DURATION) {
+                    yKeys.add(baseOf(o))
+                    merged.putIfAbsent(baseOf(o), o)
+                }
             }
+            yStat = "yandex sayfa=${y.fetched} captcha=${y.captcha} numara=${y.found.size} dogrulanan=${objs.size}"
         }
 
         val ranked = rankAll(merged.values, names, yKeys).take(MAX_RESULTS)
@@ -1041,12 +1049,14 @@ class VkVideo : MainAPI() {
         return n
     }
 
-    // Yönlendirmeleri elle takip eder, çerezleri taşır (döngüyü kırar)
-    private suspend fun fetchFollow(url: String, h: Map<String, String> = hdr): String? {
+    // Yönlendirmeleri elle takip eder, çerezleri taşır (döngüyü kırar). budgetMs dolunca null döner
+    private suspend fun fetchFollow(url: String, h: Map<String, String> = hdr, budgetMs: Long = 8000L): String? {
+        val end = System.currentTimeMillis() + budgetMs
         var u = url
         var cookies = emptyMap<String, String>()
         repeat(10) {
-            val r = app.get(u, headers = h, cookies = cookies, allowRedirects = false)
+            if (System.currentTimeMillis() > end) return null
+            val r = app.get(u, headers = h, cookies = cookies, allowRedirects = false, timeout = 5L)
             cookies = cookies + r.cookies
             val loc = r.headers["Location"]
             if (r.code in 300..399 && !loc.isNullOrBlank()) {
@@ -1282,7 +1292,7 @@ class VkVideo : MainAPI() {
                     (if (ak.isNotBlank()) "&hash=$ak" else "")
             }
             try {
-                val html = withTimeoutOrNull(6000L) { fetchFollow(player) }
+                val html = fetchFollow(player, hdr, 6000L)
                 if (html == null) {
                     debug.add("embed: yönlendirme döngüsü / zaman aşımı")
                 } else {
@@ -1310,7 +1320,7 @@ class VkVideo : MainAPI() {
             for ((cu, ch) in alts) {
                 if (cands.isNotEmpty()) break
                 try {
-                    val html = withTimeoutOrNull(5000L) { fetchFollow(cu, ch) } ?: continue
+                    val html = fetchFollow(cu, ch, 5000L) ?: continue
                     val n = scanHtml(html, cands, seen)
                     debug.add("alt ${cu.take(45)} len=${html.length} links=$n")
                 } catch (e: Exception) {
@@ -1352,7 +1362,7 @@ class VkVideo : MainAPI() {
             val mp4s = cands.filter { !isHls(it) && !isDash(it) }
                 .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
             val targets = mp4s.take(4) + cands.filter { isHls(it) }.take(1)
-            withTimeoutOrNull(12_000L) { targets.amap { probe(it) } }
+            targets.amap { probe(it) }
             debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
 
             val alive = cands.filter { !it.dead }
