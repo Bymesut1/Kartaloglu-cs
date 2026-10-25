@@ -1,1434 +1,1040 @@
 package com.bymesut1
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import kotlin.math.abs
-import kotlin.math.min
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
-class VkVideo : MainAPI() {
-    override var mainUrl = "https://vkvideo.ru"
-    override var name = "VK Video"
+class SezonlukDizi : MainAPI() {
+    override var mainUrl = "https://sezonlukdizi.cc"
+    override var name = "SezonlukDizi"
     override var lang = "tr"
     override val hasMainPage = true
-    override val supportedTypes = setOf(TvType.Movie)
+    override val hasQuickSearch = false
+    override val supportedTypes = setOf(TvType.TvSeries)
 
-    companion object {
-        private const val API = "https://api.vkvideo.ru/method"
-        private const val V = "5.289"
-        private const val CLIENT_ID = "52461373"
+    // CAPTCHA / Cloudflare "tarayıcı kontrolü" killer:
+    // Site bir kontrol sayfası döndürürse otomatik geçer, çerezi saklar ve sonraki isteklerde kullanır.
+    // Kontrol yoksa isteği olduğu gibi geçirir. Sitedeki TÜM isteklerde (liste, arama, ajax) kullanılıyor.
+    private val cf = CloudflareKiller()
 
-        // Bu süreden kısa videolar (klip vb.) listeden elenir (saniye). 0 = hiç eleme
-        private const val MIN_DURATION = 0
+    // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
+    // Her şey düzelince false yap.
+    private val debug = false
+    private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
+    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
+    private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
 
-        // true: başlıkta tr dublaj / türkçe dublaj / izle / film izle / filmi izle ... YOKSA video listeye girmez
-        private const val REQUIRE_TAG = false
+    private val ua =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
-        // true: açılan posteri olmayan kartlar listeden çıkarılır
-        private const val REQUIRE_POSTER = false
+    private val liste = "$mainUrl/diziler.asp"
 
-        // Bir sayfa boş çıkarsa (süzgeçten geçen video yoksa) en fazla kaç ham istek daha atılsın
-        private const val MAX_EMPTY_FETCHES = 4
+    // ---------------- TMDB (Türkçe bilgiler) ----------------
+    // TMDB API anahtarını buraya yaz. Boş ya da varsayılan bırakılırsa TMDB özellikleri kapalı kalır, eklenti eskisi gibi çalışır.
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+    private val tmdbOn: Boolean get() = tmdbKey.isNotBlank() && tmdbKey != "BURAYA_TMDB_API_KEY"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
+    private val posterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val reGenericEp = Regex("""(?iu)^\s*(bölüm|episode|ep\.?)\s*\d+\s*$""")
 
-        // Aramaya videoları dahil edilecek en fazla kanal/topluluk sayısı
-        private const val MAX_CHANNELS = 10
+    private fun norm(t: String): String = t.lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), "")
 
-        // Her kanaldan sayfa başına çekilecek video sayısı
-        private const val CH_PAGE = 100
-
-        // Aramada (1. sayfa) en fazla kaç sonuç gösterilsin (poster kontrolü yüzünden sınırlı)
-        private const val MAX_RESULTS = 40
-
-        // Aşağı kaydırınca her yeni sayfada en az kaç sonuç hedeflensin (süzgeçten geçen yoksa arkadan yeni ham sayfa çekilir)
-        private const val PAGE_TARGET = 18
-
-        // Bir sayfayı doldurmak için en fazla kaç ham sayfa çekilsin
-        private const val MAX_PAGE_LOOPS = 5
-
-        // Aramada etiketli sorgulardan (ad + "Türkçe Dublaj", "izle" ...) en fazla kaçı denensin
-        private const val TAGGED_QUERIES = 12
-
-        // Yandex yardımı: "ad tr dublaj izle vkvideo.ru" tarzı aramalardan VK video numaraları toplanır
-        private const val YANDEX = false
-        private const val YANDEX_QUERIES = 12
-        private const val YANDEX_MS = 9000L
-        private const val YANDEX_VERIFY = 24
-
-        // Yandex'in ilk kaç sonucu, süzgeç ne derse desin listenin en üstünde mutlaka gösterilsin
-        private const val YANDEX_FORCE = 3
-
-        // VK'nin kendi aramasından (site + video.search) adı uyan ilk kaç sonuç süzgeçten bağımsız gösterilsin
-        private const val VK_FORCE = 3
-
-        // video.search ile sayfa başına çekilecek video sayısı (en fazla 200)
-        private const val CLASSIC_PAGE = 100
-
-        // Yandex'ten gelen videolar için en kısa süre (saniye); normal MIN_DURATION'dan gevşek
-        private const val YANDEX_MIN = 600
-
-        // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
-        private const val DEBUG_SEARCH = true
-
-        // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
-        private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
-        private const val CLIENT_SECRET = "o557NLIkAErNhakXrQ7A"
-        private const val APP_ID = "6287487"
-        private const val SCOPES = "audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous"
-        private const val DEVICE_ID = ""                    // tarayıcıdaki token isteğinde device_id yok; boş bırakılırsa gönderilmez
-
-        private const val TMDB_KEY = "000316508321ce461cf81e7c6815eec7"
-
-        private const val MOBILE_UA =
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-
-        private const val UA =
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-
-        private const val UA_WIN =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-        // VK Video'nun kendi aramasında ad yanına eklenen etiketler (öncelik sırasıyla)
-        private val TAGS = listOf(
-            "Türkçe Dublaj", "TR Dublaj", "izle", "film izle", "filmi izle",
-            "tr izle", "tr dublaj izle", ""
-        )
-
-        // Yandex'te ad yanına eklenen etiketler
-        private val YANDEX_TAGS = listOf(
-            "türkçe dublaj izle vk", "tr dublaj izle vkvideo.ru", "Türkçe Dublaj film izle vkvideo.ru",
-            "filmi izle vkvideo.ru", "film izle vkvideo.ru"
-        )
+    private fun dateMs(s: String?): Long? = try {
+        if (s.isNullOrBlank()) null else java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).parse(s)?.time
+    } catch (e: Exception) {
+        null
     }
 
-    private val hdr = mapOf(
-        "User-Agent" to UA,
-        "Accept" to "*/*",
-        "Referer" to "https://vkvideo.ru/",
-        "Origin" to "https://vkvideo.ru"
-    )
-
-    private var token: String? = null
-
-    // DEBUG kartına dokununca gösterilen tam teşhis metni
-    private var lastDebug: String = ""
-
-    override val mainPage = mainPageOf(
-        "türkçe dublaj film" to "Türkçe Dublaj Filmler",
-        "tr dublaj izle" to "TR Dublaj İzle",
-        "yerli film izle" to "Yerli Filmler"
-    )
-
-    // ---------- API ----------
-
-    private suspend fun getToken(): String {
-        token?.let { return it }
-        if (CLIENT_SECRET.isBlank()) {
-            throw ErrorLoadingException("CLIENT_SECRET boş: VkVideo.kt içine yaz")
-        }
-        val text = app.post(
-            LOGIN,
-            headers = hdr,
-            data = mutableMapOf(
-                "client_secret" to CLIENT_SECRET,
-                "client_id" to CLIENT_ID,
-                "scopes" to SCOPES,
-                "isApiOauthAnonymEnabled" to "false",
-                "version" to "1",
-                "app_id" to APP_ID
-            ).also { if (DEVICE_ID.isNotBlank()) it["device_id"] = DEVICE_ID }
-        ).text
-        val t = JSONObject(text).optJSONObject("data")?.optString("access_token")
-        if (t.isNullOrBlank()) throw ErrorLoadingException("Token alınamadı: $text")
-        token = t
+    // Sitedeki bölüm bağlantı yazısını temizler: "9,5 1. Sezon 3. Bölüm The Krakken" -> "The Krakken"; "Cevapla" -> null
+    private fun cleanLabel(raw: String): String? {
+        var t = raw.trim()
+        t = t.replace(Regex("""^\d+[.,]\d+\s*"""), "")
+        t = t.replace(Regex("""(?iu)^\s*\d+\s*\.?\s*sezon\s*\d+\s*\.?\s*bölüm\s*"""), "")
+        t = t.replace(Regex("""(?iu)^\s*\d+\s*\.?\s*bölüm\s*"""), "")
+        t = t.trim(' ', '-', '–', ':', '.')
+        if (t.isBlank() || t.equals("cevapla", true)) return null
         return t
     }
 
-    private suspend fun api(
-        method: String,
-        params: Map<String, String>,
-        retry: Boolean = true
-    ): Any? {
-        val text = app.post(
-            "$API/$method?v=$V&client_id=$CLIENT_ID",
-            headers = hdr,
-            data = params + ("access_token" to getToken())
-        ).text
-        val json = JSONObject(text)
-        val err = json.optJSONObject("error")
-        if (err != null) {
-            val code = err.optInt("error_code")
-            if (retry && code == 5) {
-                token = null
-                return api(method, params, false)
-            }
-            throw ErrorLoadingException("VK hata $code ($method): ${err.optString("error_msg")}")
-        }
-        return json.opt("response")
+    private suspend fun tmdbSearch(q: String): List<TmdbTvResult> = try {
+        app.get(
+            "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(q, "UTF-8")}",
+            timeout = 15L
+        ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
+    } catch (e: Exception) {
+        emptyList()
     }
 
-    // ---------- Video listesi yardımcıları ----------
-
-    // Sadece gerçek videoları toplar (albüm/oynatma listesi gibi nesneler elenir)
-    private fun collectVideos(node: Any?, out: LinkedHashMap<String, JSONObject>) {
-        when (node) {
-            is JSONObject -> {
-                if (node.has("owner_id") && node.has("id") && node.has("title") &&
-                    node.has("duration") && node.optLong("id") != 0L &&
-                    node.optLong("owner_id") != 0L
-                ) {
-                    out.putIfAbsent(videoKey(node), node)
-                }
-                val ks = node.keys()
-                while (ks.hasNext()) collectVideos(node.opt(ks.next()), out)
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) collectVideos(node.opt(i), out)
-            }
-        }
-    }
-
-    private fun videoKey(o: JSONObject): String {
-        val k = "${o.optLong("owner_id")}_${o.optLong("id")}"
-        val ak = o.optString("access_key")
-        return if (ak.isNotBlank()) "${k}_$ak" else k
-    }
-
-    // Erişim anahtarsız anahtar: aynı video iki kaynaktan gelirse tek sayılsın
-    private fun baseOf(o: JSONObject): String = "${o.optLong("owner_id")}_${o.optLong("id")}"
-
-    private fun shape(r: Any?): String = when (r) {
-        is JSONObject -> "obj{" + r.keys().asSequence().joinToString(",").take(110) + "}"
-        is JSONArray -> "arr[${r.length()}]"
-        else -> r.toString().take(60)
-    }
-
-    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
-
-    // Boş "Original sound" kartları (açılmayan ses klipleri) listeye alınmaz
-    private fun isPlaceholder(o: JSONObject): Boolean =
-        o.optString("title").trim().equals("Original sound", ignoreCase = true)
-
-    // ---------- Başlık analizi (JS sürümüyle aynı mantık) ----------
-
-    private fun asciiLower(s: String): String = s.replace('İ', 'i').replace('I', 'i').lowercase()
-        .replace("\u0307", "")
-        .replace('ı', 'i').replace('ç', 'c').replace('ğ', 'g').replace('ö', 'o')
-        .replace('ş', 's').replace('ü', 'u').replace('â', 'a').replace('î', 'i').replace('û', 'u')
-
-    private fun norm(s: String): String = asciiLower(s).replace(Regex("[^a-z0-9]"), "")
-
-    private val STOP = setOf("the", "a", "an", "of", "and", "ve", "ile", "film", "filmi", "izle", "movie")
-
-    private val ROMAN = mapOf(
-        "ii" to 2, "iii" to 3, "iv" to 4, "v" to 5, "vi" to 6,
-        "vii" to 7, "viii" to 8, "ix" to 9, "x" to 10
-    )
-
-    private val NOISE = setOf(
-        "tr", "turkce", "turkish", "trk", "turk", "dublaj", "dublajli", "dub", "trdub", "trdublaj",
-        "izle", "film", "filmi", "filmler", "full", "hd", "fhd", "uhd", "bluray", "brrip", "bdrip",
-        "webrip", "webdl", "web", "dl", "hdrip", "hdtv", "dvdrip", "dvd", "x264", "x265", "h264",
-        "hevc", "aac", "ac3", "dts", "dual", "cift", "tek", "parca", "part", "kisim", "bolum",
-        "hdfilm", "filmizle", "fullizle", "yerli", "yabanci", "mp4", "mkv", "avi", "mov", "com",
-        "ru", "org", "net", "www", "vk", "vkvideo", "video", "izlesene", "altyazi", "altyazili",
-        "sub", "subs", "subtitle", "subtitles", "en", "eng", "english", "ingilizce", "imax",
-        "extended", "remastered", "nf", "amzn", "sansursuz", "tamami", "sinema", "yeni"
-    )
-
-    private class Info(
-        val years: List<Int>,
-        val res: Int,
-        val words: List<String>,
-        val nums: List<Int>,
-        val bag: List<String>,
-        val tagset: Set<String>
-    ) {
-        val joined: String = bag.joinToString("")
-    }
-
-    // "m1080ptr" -> 1080p tr | "filmizle" -> film izle | "2004tr" -> 2004 tr | "720pizle" -> 720p izle
-    private fun splitTok(t: String): List<String> {
-        if (Regex("^\\d{5,}$").matches(t)) return emptyList()
-        var m = Regex("^m?(2160|1080|720|480|360)p(tr|dual|dublaj|turkce|izle|hd|sub)?$").find(t)
-        if (m != null) {
-            return if (m.groupValues[2].isNotEmpty()) listOf(m.groupValues[1] + "p", m.groupValues[2])
-            else listOf(m.groupValues[1] + "p")
-        }
-        m = Regex("^((?:19|20)\\d{2})(tr|dublaj|izle|turkce|dual|hd)$").find(t)
-        if (m != null) return listOf(m.groupValues[1], m.groupValues[2])
-        m = Regex("^(tr|trdub|trdublaj|dublaj|dublajli|dual|turkce)(izle|hd|film|filmi)$").find(t)
-            ?: Regex("^(film|filmi|hd|full|tek|parca|bolum|tr|dublaj|turkce|\\d{3,4}p)(izle)$").find(t)
-            ?: Regex("^(izle)(tr|dublaj|turkce|hd)$").find(t)
-        if (m != null) return listOf(m.groupValues[1], m.groupValues[2])
-        m = Regex("^(tr|en|eng)(sub|subs|altyazi)$").find(t)
-        if (m != null) return listOf(m.groupValues[1], "sub")
-        return listOf(t)
-    }
-
-    private fun analyze(title: String): Info {
-        val raw = title
-            .replace(Regex("^\\s*\\d{1,3}\\s*[.)\\-–:]\\s+"), "")
-            .replace(Regex("\\s*[(\\[]\\s*\\d\\s*[)\\]]\\s*$"), "")
-            .replace(Regex("(^|[^0-9])[257][.,][01](?![0-9])"), "\$1")
-        val toks = ArrayList<String>()
-        for (t in asciiLower(raw).split(Regex("[^a-z0-9]+")).filter { it.isNotEmpty() }) {
-            toks.addAll(splitTok(t))
-        }
-        val years = ArrayList<Int>()
-        val words = ArrayList<String>()
-        val nums = ArrayList<Int>()
-        var res = 0
-        val tagset = HashSet<String>()
-        for (t in toks) {
-            tagset.add(t)
-            if (Regex("^(19|20)\\d{2}$").matches(t)) { years.add(t.toInt()); continue }
-            val rm = Regex("^(2160|1080|720|480|360)p$").find(t)
-            if (rm != null) { res = maxOf(res, rm.groupValues[1].toInt()); continue }
-            if (t == "4k") { res = maxOf(res, 2160); continue }
-            if (t in NOISE) continue
-            if (Regex("^\\d{1,2}$").matches(t)) { nums.add(t.toInt()); continue }
-            val rn = ROMAN[t]
-            if (rn != null) { nums.add(rn); continue }
-            if (t in STOP) continue
-            words.add(t)
-        }
-        return Info(years, res, words, nums, toks, tagset)
-    }
-
-    // Aranan addan anlamlı kelimeler ve sayılar. stripNoise: sorgudaki etiket kelimelerini (tr, dublaj, izle ...) at
-    private fun sigTokens(s: String, stripNoise: Boolean): Pair<List<String>, List<Int>> {
-        val words = ArrayList<String>()
-        val nums = ArrayList<Int>()
-        for (t in asciiLower(s).split(Regex("[^a-z0-9]+")).filter { it.isNotEmpty() }) {
-            if (Regex("^\\d{1,2}$").matches(t)) { nums.add(t.toInt()); continue }
-            val rn = ROMAN[t]
-            if (rn != null) { nums.add(rn); continue }
-            if (t in STOP) continue
-            if (stripNoise && t in NOISE) continue
-            words.add(t)
-        }
-        return words to nums
-    }
-
-    private fun lev(a: String, b: String): Int {
-        if (a == b) return 0
-        var prev = IntArray(b.length + 1) { it }
-        for (i in 1..a.length) {
-            val cur = IntArray(b.length + 1)
-            cur[0] = i
-            for (j in 1..b.length) {
-                cur[j] = minOf(
-                    prev[j] + 1,
-                    cur[j - 1] + 1,
-                    prev[j - 1] + (if (a[i - 1] == b[j - 1]) 0 else 1)
-                )
-            }
-            prev = cur
-        }
-        return prev[b.length]
-    }
-
-    private fun looseEq(a: String, b: String): Boolean {
-        if (a == b) return true
-        return a.length >= 5 && b.length >= 5 && abs(a.length - b.length) <= 1 && lev(a, b) <= 1
-    }
-
-    private val TR_SUF = Regex(
-        "^(i|u|a|e|s|n|si|su|in|un|an|en|ya|ye|yi|yu|da|de|ta|te|ler|lar|leri|lari|nin|nun|dan|den|tan|ten|nda|nde|ndan|nden|ni|na|ne|ndaki)$"
-    )
-
-    // Türkçe ek toleransı: "Bourneun" ~ "Bourne", "Yolcu" ~ "Yolcusu"
-    private fun sufEq(a: String, b: String): Boolean {
-        val s = if (a.length <= b.length) a else b
-        val l = if (a.length <= b.length) b else a
-        return s.length >= 4 && l.length > s.length && l.length - s.length <= 5 &&
-            l.startsWith(s) && TR_SUF.matches(l.substring(s.length))
-    }
-
-    private fun tokEq(w: String, b: String): Boolean = looseEq(w, b) || sufEq(w, b)
-
-    // Adlardan biri başlıkta tam geçiyorsa fazladan kaç kelime olduğunu döndürür, geçmiyorsa -1
-    private fun nameMatch(info: Info, names: List<String>): Int {
-        var best = -1
-        for (n in names) {
-            val clean = n.replace("'", "").replace("’", "").replace("`", "")
-            val (ww, nums) = sigTokens(clean, true)
-            if (ww.isEmpty()) continue
-            var covered = ww.all { w -> info.bag.any { b -> tokEq(w, b) } }
-            if (!covered) {
-                val wn = norm(clean)                                   // bitişik yazım: "YapayZeka" ~ "Yapay Zeka"
-                if (wn.length >= 6 && info.joined.contains(wn)) covered = true
-            }
-            if (!covered) continue
-            if (ww.size == 1 && ww[0].length <= 2 && info.words.size > 3) continue
-            if (nums.isNotEmpty() && !nums.all { it in info.nums }) continue
-            val extra = info.words.count { b -> ww.none { w -> tokEq(w, b) } }
-            if (best < 0 || extra < best) best = extra
-        }
-        return best
-    }
-
-    private class Lang(val ok: Boolean, val label: String, val strength: Int)
-
-    // TR dublaj / Türkçe dublaj / TR / izle ... etiketi (altyazılı ve yabancı dil etiketliler kabul edilmez)
-    private fun langInfo(info: Info): Lang {
-        val t = info.tagset
-        fun has(vararg k: String): Boolean = k.any { it in t }
-        val dub = has("dublaj", "dublajli", "dub", "trdub", "trdublaj")
-        val tr = has("tr", "turkce", "turkish", "trk", "turk", "turkiye", "trdub", "trdublaj")
-        val sub = has("altyazi", "altyazili", "sub", "subs", "subtitle", "subtitles")
-        val dual = has("dual", "cift")
-        val foreign = has(
-            "en", "eng", "english", "ingilizce", "rus", "russian", "rusca", "ger", "german",
-            "fre", "french", "vostfr", "arabic", "arapca", "hindi", "multi"
-        )
-        val izle = has("izle")
-        if (dub && !(foreign && !tr)) return Lang(true, if (tr) "TR Dublaj" else "Dublaj", if (tr) 4 else 3)
-        if (tr && dual) return Lang(true, "TR Dual", 2)
-        if (tr && !sub && !foreign) return Lang(true, "TR", 2)
-        if (izle && !tr && !sub && !foreign) return Lang(true, "TR İzle", 1)
-        return Lang(false, if (sub) "Altyazı" else "?", 0)
-    }
-
-    // Puan: null = ele. names boşsa ad kontrolü yapılmaz (ana sayfa kategorileri)
-    private fun rankVideo(o: JSONObject, names: List<String>, yandex: Boolean = false): Int? {
-        val title = o.optString("title")
-        if (Regex("[\\u0400-\\u04FF]").containsMatchIn(title)) return null           // Rusça (Kiril) başlık
-        val dur = o.optInt("duration")
-        if (dur < (if (yandex) YANDEX_MIN else MIN_DURATION)) return null
-        val info = analyze(title)
-        var li = langInfo(info)
-        if (!li.ok) {
-            val desc = o.optString("description")
-            if (desc.isNotBlank()) {
-                val l2 = langInfo(analyze(desc.take(300)))
-                if (l2.ok && l2.strength >= 3) li = l2
-            }
-        }
-        if (!li.ok && yandex &&
-            !("altyazi" in info.tagset || "altyazili" in info.tagset || "sub" in info.tagset)
-        ) {
-            li = Lang(true, "Yandex", 1)
-        }
-        if (!li.ok) {
-            if (REQUIRE_TAG) return null                                              // etiket YOKSA alma
-            if ("altyazi" in info.tagset || "altyazili" in info.tagset || "sub" in info.tagset) return null
-            li = Lang(true, "Dil ?", 0)
-        }
-        var extra = 0
-        if (names.isNotEmpty()) {
-            extra = nameMatch(info, names)
-            if (extra < 0) return null
-        }
-        var score = 50 + li.strength * 5
-        if (extra == 0) score += 10
-        score -= min(15, extra * 3)
-        if (info.res >= 1080) score += 3 else if (info.res >= 720) score += 2
-        return score
-    }
-
-    private fun rankAll(
-        vids: Collection<JSONObject>,
-        names: List<String>,
-        yandexRank: Map<String, Int>
-    ): List<JSONObject> {
-        val out = ArrayList<Pair<JSONObject, Int>>()
-        for (o in vids) {
-            val yi = yandexRank[baseOf(o)]
-            val s = rankVideo(o, names, yi != null) ?: continue
-            out.add(o to (s + (if (yi != null) 40 - min(yi, 30) else 0)))
-        }
-        return out.sortedByDescending { it.second }.map { it.first }
-    }
-
-    // ---------- Poster ----------
-
-    private fun posterCandidates(o: JSONObject): List<String> {
-        val raw = ArrayList<Pair<String, Int>>()
-        for (k in listOf("image", "first_frame")) {
-            val a = o.optJSONArray(k) ?: continue
-            for (i in 0 until a.length()) {
-                val e = a.optJSONObject(i) ?: continue
-                val u = e.optString("url")
-                if (u.isNotBlank()) raw.add(u to e.optInt("width"))
-            }
-        }
-        for (k in listOf("photo_800", "photo_640", "photo_320", "photo_130")) {
-            val u = o.optString(k)
-            if (u.isNotBlank()) raw.add(u to k.removePrefix("photo_").toInt())
-        }
-        // okcdn önizlemeleri sona, ~640px genişliğe en yakın olan öne
-        val sorted = raw.sortedWith(
-            compareBy<Pair<String, Int>>(
-                { it.first.contains("okcdn.ru") },
-                { abs(it.second - 640) }
-            )
-        )
-        val out = LinkedHashSet<String>()
-        for ((u, _) in sorted) {
-            if (u.contains("userapi.com")) out.add(u.replace("userapi.com", "vkuserphoto.ru"))
-            out.add(u)
-        }
-        return out.toList()
-    }
-
-    private suspend fun imageOk(u: String): Boolean {
-        return try {
-            val r = app.get(
-                u,
-                headers = mapOf(
-                    "User-Agent" to UA,
-                    "Accept" to "image/*",
-                    "Range" to "bytes=0-1023"
-                ),
-                timeout = 5L
-            )
-            val ct = r.headers["Content-Type"] ?: ""
-            r.code in 200..206 && (ct.isEmpty() || ct.startsWith("image"))
+    // Dizi ayrıntıları (Türkçe); özet Türkçe boşsa İngilizceden tamamlanır
+    private suspend fun tmdbDetails(id: Int): TmdbTvDetails? {
+        val tr = try {
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 15L)
+                .parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            false
-        }
-    }
-
-    // Gerçekten açılan ilk posteri döndürür, hiçbiri açılmazsa null
-    private suspend fun workingPoster(o: JSONObject): String? {
-        for (u in posterCandidates(o).take(4)) {
-            if (imageOk(u)) return u
-        }
-        return null
-    }
-
-    // ---------- TMDB: ad -> gerçek film (poster, özet, yıl) ----------
-
-    // "Zafere Kaçış 1981 Sylvester Stallon Türkçe Dublaj" -> "Zafere Kaçış Sylvester Stallon"
-    private fun cleanTitle(title: String): String {
-        val out = ArrayList<String>()
-        for (tok in title.split(Regex("[\\s._|\\-–—()\\[\\]]+")).filter { it.isNotEmpty() }) {
-            val parts = splitTok(asciiLower(tok))
-            val junk = parts.isEmpty() || parts.all {
-                it in NOISE || it in STOP ||
-                    Regex("^(19|20)\\d{2}$").matches(it) ||
-                    Regex("^m?(2160|1080|720|480|360)p$").matches(it)
-            }
-            if (!junk) out.add(tok)
-        }
-        return out.joinToString(" ").trim()
-    }
-
-    // Başlık + yıl + süre uyuyorsa TMDB kaydı (poster/özet için), yoksa null
-    private suspend fun tmdbLookup(title: String, durSec: Int): JSONObject? {
-        val clean = cleanTitle(title)
-        if (clean.length < 2) return null
-        val year = analyze(title).years.firstOrNull()
-        val url = "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_KEY&language=tr-TR&query=${enc(clean)}" +
-            (if (year != null) "&year=$year" else "")
-        val arr = JSONObject(app.get(url, timeout = 6L).text).optJSONArray("results") ?: return null
-        for (i in 0 until min(arr.length(), 5)) {
-            val r = arr.optJSONObject(i) ?: continue
-            val ry = r.optString("release_date").take(4).toIntOrNull()
-            if (year != null && ry != null && abs(ry - year) > 1) continue
-            val ok = nameMatch(analyze(r.optString("title")), listOf(clean)) >= 0 ||
-                nameMatch(analyze(r.optString("original_title")), listOf(clean)) >= 0
-            if (!ok) continue
-            val det = JSONObject(
-                app.get(
-                    "https://api.themoviedb.org/3/movie/${r.optInt("id")}?api_key=$TMDB_KEY&language=tr-TR",
-                    timeout = 6L
-                ).text
-            )
-            val rt = det.optInt("runtime")
-            if (rt > 0 && durSec > 0) {
-                val ratio = durSec / (rt * 60.0)
-                if (ratio < 0.6 || ratio > 1.7) continue                              // süre bambaşka: başka içerik
-            }
-            return det
-        }
-        return null
-    }
-
-    private class ExpandRes(val names: List<String>, val tmNames: List<String>, val poster: String?)
-
-    // Yazılan etiketleri (türkçe dublaj, izle, tr ...) atar: "zathura türkçe dublaj izle" -> "zathura"
-    private fun cleanQuery(q: String): String {
-        val out = ArrayList<String>()
-        for (tok in q.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
-            val a = asciiLower(tok).replace(Regex("[^a-z0-9]"), "")
-            if (a.isEmpty() || a in NOISE) continue
-            out.add(tok)
-        }
-        val base = out.joinToString(" ").trim()
-        return if (base.length >= 2) base else q.trim()
-    }
-
-    // Arama anahtarı: (VK'ya gidecek temiz sorgu, sadece etiket mi yazıldı?)
-    private fun baseQuery(q: String): Pair<String, Boolean> {
-        val qc = cleanQuery(q)
-        val noName = sigTokens(qc, true).first.isEmpty()
-        return (if (noName) q.trim() else qc) to noName
-    }
-
-    // Aranan ad Türkçe de olsa İngilizce de olsa her ikisiyle aranır: TMDB'den TR + EN + orijinal ad (+ poster)
-    private suspend fun expandNames(q: String): ExpandRes {
-        val out = LinkedHashSet<String>()
-        out.add(q.trim())
-        val tmNames = ArrayList<String>()
-        var poster: String? = null
-        try {
-            val txt = app.get(
-                "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_KEY&language=tr-TR&query=${enc(q)}",
-                timeout = 6L
-            ).text
-            val r = JSONObject(txt).optJSONArray("results")?.optJSONObject(0)
-            if (r != null) {
-                val tt = r.optString("title")
-                val ot = r.optString("original_title")
-                val related = nameMatch(analyze(tt), listOf(q)) >= 0 || nameMatch(analyze(ot), listOf(q)) >= 0
-                if (related) {
-                    if (tt.isNotBlank()) { out.add(tt); tmNames.add(tt) }
-                    if (ot.isNotBlank()) { out.add(ot); tmNames.add(ot) }
-                    val pp = r.optString("poster_path")
-                    if (pp.isNotBlank() && pp != "null") poster = "https://image.tmdb.org/t/p/w500$pp"
-                    try {
-                        val en = JSONObject(
-                            app.get(
-                                "https://api.themoviedb.org/3/movie/${r.optInt("id")}?api_key=$TMDB_KEY&language=en-US",
-                                timeout = 6L
-                            ).text
-                        ).optString("title")
-                        if (en.isNotBlank()) { out.add(en); tmNames.add(en) }
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                    }
-                }
-            }
+            null
+        } ?: return null
+        if (!tr.overview.isNullOrBlank()) return tr
+        val en = try {
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 15L).parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-        }
-        return ExpandRes(out.toList(), tmNames, poster)
-    }
-
-    // ---------- Arama (sayfalı + kanallar) ----------
-
-    private class Cur(val next: String, val section: String?)
-
-    // "anahtar|sayfa" -> o sayfayı çekmek için gereken imleç
-    private val cursors = java.util.concurrent.ConcurrentHashMap<String, Cur>()
-    private val seenMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
-    private val chanMap = java.util.concurrent.ConcurrentHashMap<String, LinkedHashMap<Long, String>>()
-    private val namesCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
-    private val tmCache = java.util.concurrent.ConcurrentHashMap<String, ExpandRes>()
-    private val shownMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
-    private val rawStart = java.util.concurrent.ConcurrentHashMap<String, Int>()
-
-    private fun findSectionId(root: Any?): String? {
-        val o = root as? JSONObject ?: return null
-        val s = o.optJSONObject("catalog")?.optJSONArray("sections")
-            ?.optJSONObject(0)?.optString("id")
-        return if (s.isNullOrBlank()) null else s
-    }
-
-    // Yanıttaki "next_from" imleçlerinden en çok video içereni seçer
-    private fun findCursor(root: Any?): Cur? {
-        var best: Cur? = null
-        var bestCount = -1
-        val sec = findSectionId(root)
-        fun walk(n: Any?) {
-            when (n) {
-                is JSONObject -> {
-                    val nf = n.optString("next_from")
-                    if (nf.isNotBlank()) {
-                        val tmp = LinkedHashMap<String, JSONObject>()
-                        collectVideos(n, tmp)
-                        if (tmp.size > bestCount) {
-                            bestCount = tmp.size
-                            best = Cur(nf, n.optString("section_id").ifBlank { sec })
-                        }
-                    }
-                    val ks = n.keys()
-                    while (ks.hasNext()) walk(n.opt(ks.next()))
-                }
-                is JSONArray -> for (i in 0 until n.length()) walk(n.opt(i))
-            }
-        }
-        walk(root)
-        return best
-    }
-
-    // Yanıttaki kanal/topluluk listesini toplar (extended=1 ile "groups" dizisi gelir)
-    private fun collectGroups(node: Any?, out: LinkedHashMap<Long, String>) {
-        when (node) {
-            is JSONObject -> {
-                val g = node.optJSONArray("groups")
-                if (g != null) {
-                    for (i in 0 until g.length()) {
-                        val o = g.optJSONObject(i) ?: continue
-                        val id = abs(o.optLong("id"))
-                        val nm = o.optString("name")
-                        if (id != 0L && nm.isNotBlank()) out.putIfAbsent(id, nm)
-                    }
-                }
-                val ks = node.keys()
-                while (ks.hasNext()) collectGroups(node.opt(ks.next()), out)
-            }
-            is JSONArray -> for (i in 0 until node.length()) collectGroups(node.opt(i), out)
-        }
-    }
-
-    private fun fold(s: String): String = s.lowercase()
-        .replace("\u0307", "")
-        .replace('ı', 'i').replace('ş', 's').replace('ğ', 'g')
-        .replace('ü', 'u').replace('ö', 'o').replace('ç', 'c')
-
-    // Kanal adı aramayla eşleşiyor mu? ("Filmizle" ~ "Film izle")
-    private fun channelMatches(q: String, name: String): Boolean {
-        val fq = fold(q)
-        val fn = fold(name)
-        if (fn.replace(" ", "").contains(fq.replace(" ", ""))) return true
-        val tokens = fq.split(" ").filter { it.length >= 2 }
-        return tokens.isNotEmpty() && tokens.all { fn.contains(it) }
-    }
-
-    private suspend fun channelVideos(gid: Long, offset: Int): Pair<List<JSONObject>, Boolean> {
-        return try {
-            val r = api(
-                "video.get",
-                mapOf(
-                    "owner_id" to "-$gid",
-                    "count" to "$CH_PAGE",
-                    "offset" to "$offset",
-                    "extended" to "1"
-                )
-            )
-            val m = LinkedHashMap<String, JSONObject>()
-            collectVideos(r, m)
-            val total = (r as? JSONObject)?.optInt("count") ?: 0
-            val more = if (total > 0) total > offset + CH_PAGE else m.size >= CH_PAGE
-            m.values.toList() to more
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            emptyList<JSONObject>() to false
-        }
-    }
-
-    // VK önizlemesi açılmazsa ve başlık TMDB'deki filmle uyuşuyorsa TMDB posteri kullanılır; ikisi de yoksa (REQUIRE_POSTER) kart düşer
-    private suspend fun toResponses(
-        videos: Collection<JSONObject>,
-        tm: ExpandRes? = null,
-        exempt: Set<String> = emptySet()
-    ): List<SearchResponse> {
-        val check = videos.size <= 60
-        return videos.toList().filter { !isPlaceholder(it) }.amap { o ->
-            var p = if (check) workingPoster(o) else posterCandidates(o).firstOrNull()
-            if (p == null && tm?.poster != null && tm.tmNames.isNotEmpty() &&
-                nameMatch(analyze(o.optString("title")), tm.tmNames) >= 0
-            ) {
-                p = tm.poster
-            }
-            val fromY = baseOf(o) in exempt
-            if (p == null && fromY && tm?.poster != null) p = tm.poster
-            if (p == null && REQUIRE_POSTER && !fromY) {
-                null
-            } else {
-                newMovieSearchResponse(
-                    o.optString("title"),
-                    "$mainUrl/video${videoKey(o)}",
-                    TvType.Movie
-                ) {
-                    this.posterUrl = p
-                }
-            }
-        }.filterNotNull()
-    }
-
-    private class RawPage(
-        val videos: LinkedHashMap<String, JSONObject>,
-        val more: Boolean,
-        val debug: String
-    )
-
-    // Bir sayfa HAM video döndürür (süre süzgeci uygulanmış). Sıralama/etiket süzgeci çağıranda
-    private suspend fun searchRaw(q: String, page: Int, withChannels: Boolean): RawPage {
-        val ck = (if (withChannels) "S:" else "H:") + q
-        val seen = seenMap.getOrPut(ck) { java.util.Collections.synchronizedSet(HashSet()) }
-        if (page <= 1) {
-            seen.clear()
-            chanMap.remove(ck)
-            cursors.keys.removeAll { it.startsWith("$ck|") }
-        }
-        val chans = chanMap.getOrPut(ck) { LinkedHashMap() }
-
-        var cur: Cur? = if (page <= 1) null else cursors["$ck|$page"]
-        var searchMore = page <= 1 || cur != null
-        val fresh = LinkedHashMap<String, JSONObject>()
-        var firstShape: String? = null
-        var tries = 0
-
-        while (searchMore && tries < MAX_EMPTY_FETCHES) {
-            tries++
-            val params = mutableMapOf("q" to q, "count" to "30", "extended" to "1")
-            if (cur != null) params["start_from"] = cur.next
-            var resp: Any? = api("catalog.getVideoSearchWeb2", params)
-            var vids = LinkedHashMap<String, JSONObject>()
-            collectVideos(resp, vids)
-
-            // Arama imleci işe yaramadıysa bölüm (section) imleciyle dene
-            if (cur != null && cur.section != null && vids.keys.none { it !in seen }) {
-                try {
-                    val r2 = api(
-                        "catalog.getSection",
-                        mapOf(
-                            "section_id" to cur.section,
-                            "start_from" to cur.next,
-                            "count" to "30",
-                            "extended" to "1"
-                        )
-                    )
-                    val v2 = LinkedHashMap<String, JSONObject>()
-                    collectVideos(r2, v2)
-                    if (v2.keys.any { it !in seen }) {
-                        resp = r2
-                        vids = v2
-                    }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                }
-            }
-
-            if (firstShape == null) firstShape = shape(resp)
-            if (withChannels) collectGroups(resp, chans)
-
-            val nxt = findCursor(resp)
-            cur = if (nxt != null && nxt.next != cur?.next) nxt else null
-
-            for ((k, v) in vids) {
-                if (v.optInt("duration") >= MIN_DURATION && seen.add(k)) fresh[k] = v
-            }
-            searchMore = cur != null
-            if (fresh.isNotEmpty()) break
-        }
-        cur?.let { cursors["$ck|${page + 1}"] = it }
-
-        // Kanallar / topluluklar: adı aramayla eşleşenlerin videoları
-        var chMore = false
-        var matched: List<Long> = emptyList()
-        if (withChannels) {
-            matched = chans.filter { channelMatches(q, it.value) }.keys.take(MAX_CHANNELS)
-            val res = matched.amap { gid -> channelVideos(gid, (maxOf(page, 1) - 1) * CH_PAGE) }
-            for ((list, more) in res) {
-                if (more) chMore = true
-                for (v in list) {
-                    if (v.optInt("duration") >= MIN_DURATION && seen.add(videoKey(v))) {
-                        fresh[videoKey(v)] = v
-                    }
-                }
-            }
-        }
-        val dbg = "${firstShape ?: "-"} groups=${chans.size} matched=${matched.size} names=${chans.values.take(6)}"
-        return RawPage(fresh, searchMore || chMore, dbg)
-    }
-
-    // ---------- Yandex yardımı ----------
-
-    private fun vkNorm(h: String): String = h
-        .replace("%252F", "/", true).replace("%2F", "/", true).replace("%3A", ":", true)
-        .replace("%3D", "=", true).replace("%3F", "?", true).replace("%26", "&", true)
-        .replace("&amp;", "&").replace("\\u002F", "/", true).replace("\\u0026", "&", true)
-        .replace("\\/", "/")
-
-    // Bing sonuç adresleri "u=a1<base64>" olarak sarılır; çözüp metne eklenir
-    private fun decodeWrapped(h: String): String {
-        val sb = StringBuilder()
-        for (m in Regex("[?&;]u=a1([A-Za-z0-9_\\-]{16,})").findAll(h)) {
-            try {
-                var b = m.groupValues[1].replace('-', '+').replace('_', '/')
-                while (b.length % 4 != 0) b += "="
-                sb.append(' ').append(
-                    String(android.util.Base64.decode(b, android.util.Base64.DEFAULT), Charsets.UTF_8)
-                )
-            } catch (e: Exception) {
-            }
-        }
-        return sb.toString()
-    }
-
-    // Sonuç sayfasındaki VK video numaraları: (erişimsiz anahtar, hash'li anahtar)
-    private fun parseEngine(html: String): List<Pair<String, String>> {
-        val h = vkNorm(html + " " + decodeWrapped(html))
-        val out = LinkedHashMap<String, String>()
-        fun add(oid: String, id: String, hash: String) {
-            if (oid.toLongOrNull() == null || id.toLongOrNull() == null) return
-            if (oid.toLong() == 0L || id.toLong() == 0L) return
-            val k = "${oid}_$id"
-            if (!out.containsKey(k)) out[k] = if (hash.isNotEmpty()) "${k}_$hash" else k
-        }
-        val ic = RegexOption.IGNORE_CASE
-        for (m in Regex("(?:vkvideo\\.ru|vk\\.com|vk\\.ru)/(?:video|clip)(-?\\d+)_(\\d+)(?:_([0-9a-f]{8,}))?", ic).findAll(h)) {
-            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
-        }
-        for (m in Regex("[?&]z=(?:video|clip)(-?\\d+)_(\\d+)", ic).findAll(h)) {
-            add(m.groupValues[1], m.groupValues[2], "")
-        }
-        for (m in Regex(
-            "video_ext\\.php\\?[^\"'\\s<>\\\\]*?oid=(-?\\d+)[^\"'\\s<>\\\\]*?&id=(\\d+)(?:[^\"'\\s<>\\\\]*?hash=([0-9a-f]{8,}))?",
-            ic
-        ).findAll(h)) {
-            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
-        }
-        // "vkvideo.ru › video123_456" şeklinde gösterilen adresler
-        for (m in Regex(
-            "(?:vkvideo\\.ru|vk\\.com|vk\\.ru)\\s*(?:›|&rsaquo;|&#8250;|&gt;|>|/)\\s*(?:video|clip)(-?\\d+)_(\\d+)(?:_([0-9a-f]{8,}))?",
-            ic
-        ).findAll(h)) {
-            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
-        }
-        // Son çare: adres gibi görünen her video<oid>_<id> (VK API zaten doğrular)
-        for (m in Regex("(?<=[/=])(?:video|clip)(-?\\d{5,})_(\\d{5,})(?:_([0-9a-f]{8,}))?", ic).findAll(h)) {
-            add(m.groupValues[1], m.groupValues[2], m.groupValues[3])
-        }
-        return out.entries.map { it.key to it.value }
-    }
-
-    private fun yandexUrls(q: String, qi: Int): List<String> {
-        val e = enc(q)
-        val all = listOf(
-            "https://yandex.com.tr/search/touch/?text=${e.replace("%20", "+")}&lr=11508",
-            "https://yandex.com.tr/video/search?text=$e",
-            "https://yandex.com/video/search?text=$e",
-            "https://yandex.com.tr/search/?text=$e",
-            "https://www.bing.com/search?q=$e&setlang=tr&count=30",
-            "https://html.duckduckgo.com/html/?q=$e&kl=tr-tr",
-            "https://www.google.com/search?q=$e&hl=tr&num=20"
-        )
-        return if (qi < 2) all else listOf(all[0], all[4])
-    }
-
-    private class YandexRes(
-        val found: LinkedHashMap<String, String>,
-        val captcha: Int,
-        val fetched: Int,
-        val log: String
-    )
-
-    // "ad tr dublaj izle vkvideo.ru" tarzı sorgularla Yandex'ten VK video numaraları toplar (sıra = sonuç sırası)
-    private suspend fun yandexCollect(names: List<String>): YandexRes {
-        val found = LinkedHashMap<String, String>()
-        var captcha = 0
-        var fetched = 0
-        val logs = ArrayList<String>()
-        val cleaned = names.map { it.replace(Regex("[:!?,\"]+"), " ").replace(Regex("\\s+"), " ").trim() }
-            .filter { it.isNotEmpty() }
-        val qs = ArrayList<String>()
-        // Elle aranınca işe yarayan biçim en başta: "ad tr vk", "ad vk"
-        cleaned.firstOrNull()?.let { qs.add("$it tr vk"); qs.add("$it vk") }
-        for (n in cleaned.drop(1)) qs.add("$n tr vk")
-        for (tag in YANDEX_TAGS) for (n in cleaned) qs.add("$n $tag")
-        for (n in cleaned) qs.add("site:vkvideo.ru $n izle")
-        val queries = qs.distinct().take(YANDEX_QUERIES)
-        val tasks = ArrayList<String>()
-        queries.forEachIndexed { qi, q -> tasks.addAll(yandexUrls(q, qi)) }
-
-        val eh = mapOf(
-            "User-Agent" to MOBILE_UA,
-            "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
-            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8",
-            "Referer" to "https://yandex.com.tr/"
-        )
-
-        // Önce ana sayfadan çerez al (captcha ihtimalini azaltır)
-        val warm: Map<String, String> = try {
-            app.get("https://yandex.com.tr/", headers = eh, timeout = 4L).cookies
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            emptyMap()
-        }
-        logs.add("cerez=${warm.size}")
-
-        val deadline = System.currentTimeMillis() + YANDEX_MS
-        for (chunk in tasks.chunked(4)) {
-            if (System.currentTimeMillis() > deadline) break
-            val res = chunk.amap { u ->
-                val host = hostOf(u).removePrefix("www.")
-                val lbl = host + u.substringAfter(hostOf(u)).substringBefore("?").take(14)
-                val pr: Pair<String, String?> = try {
-                    val r = app.get(u, headers = eh, cookies = warm, timeout = 5L)
-                    val t = if (r.code in 200..299) r.text else null
-                    "$lbl ${r.code}" to t
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    "$lbl HATA ${(e.message ?: "").take(30)}" to null
-                }
-                pr
-            }
-            for ((lg, t) in res) {
-                if (t == null) {
-                    logs.add(lg)
-                    continue
-                }
-                fetched++
-                val ids = parseEngine(t)
-                val cap = ids.isEmpty() && t.contains("captcha", true)
-                if (cap) captcha++
-                logs.add("$lg len=${t.length} id=${ids.size}${if (cap) " CAPTCHA" else ""}")
-                for ((k, vid) in ids) {
-                    val old = found[k]
-                    if (old == null || (old.split("_").size < 3 && vid.split("_").size > 2)) found[k] = vid
-                }
-            }
-        }
-        return YandexRes(found, captcha, fetched, logs.take(16).joinToString("\n"))
-    }
-
-    // VK'nin klasik video.search yöntemi: site aramasından (catalog) ayrı bir dizin, ek kaynak
-    private suspend fun vkApiSearch(names: List<String>): List<JSONObject> {
-        val qs = ArrayList<String>()
-        for (n in names.take(3)) {
-            qs.add(n)
-            qs.add("$n tr dublaj")
-            qs.add("$n izle")
-        }
-        val res = qs.distinct().take(8).amap { t ->
-            try {
-                val r = api(
-                    "video.search",
-                    mapOf("q" to t, "count" to "50", "extended" to "1", "adult" to "1")
-                )
-                val m = LinkedHashMap<String, JSONObject>()
-                collectVideos(r, m)
-                m.values.toList()
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                emptyList<JSONObject>()
-            }
-        }
-        return res.flatten()
-    }
-
-    // VK'nin kendi site arama sayfaları: video numaraları HTML'den okunur, VK API'den doğrulanır (sayfa JS ile çiziliyorsa boş dönebilir)
-    private suspend fun vkSiteSearch(names: List<String>): List<JSONObject> {
-        val urls = ArrayList<String>()
-        for (n in names.take(2)) {
-            val en = enc(n)
-            urls.add("https://vkvideo.ru/?q=$en")
-            urls.add("https://vk.com/video?q=$en")
-        }
-        val pages = urls.amap { u ->
-            try {
-                val r = app.get(u, headers = hdr, timeout = 6L)
-                if (r.code in 200..299) r.text else ""
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                ""
-            }
-        }
-        val ids = LinkedHashMap<String, String>()
-        for (t in pages) for ((k, v) in parseEngine(t)) if (!ids.containsKey(k)) ids[k] = v
-        val out = ArrayList<JSONObject>()
-        for (ch in ids.values.take(30).chunked(10)) {
-            try {
-                val r = api("video.getByIds", mapOf("videos" to ch.joinToString(",")))
-                val m = LinkedHashMap<String, JSONObject>()
-                collectVideos(r, m)
-                out.addAll(m.values)
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-            }
-        }
-        return out
-    }
-
-    // VK'nin klasik video.search yöntemi: sitedeki "Tüm videolar" bloğunu (uzun filmler dahil) yakalar; offset ile sayfa sayfa devam eder
-    private suspend fun vkClassicSearch(q: String, page: Int): Pair<List<JSONObject>, Boolean> {
-        return try {
-            val off = (maxOf(page, 1) - 1) * CLASSIC_PAGE
-            val r = api(
-                "video.search",
-                mapOf(
-                    "q" to q,
-                    "count" to "$CLASSIC_PAGE",
-                    "offset" to "$off",
-                    "extended" to "1",
-                    "adult" to "1"
-                )
-            )
-            val m = LinkedHashMap<String, JSONObject>()
-            collectVideos(r, m)
-            val total = (r as? JSONObject)?.optInt("count") ?: 0
-            val more = if (total > 0) total > off + CLASSIC_PAGE else m.size >= CLASSIC_PAGE
-            m.values.toList() to more
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            emptyList<JSONObject>() to false
-        }
-    }
-
-    private fun taggedQueries(names: List<String>): List<String> {
-        val qs = LinkedHashSet<String>()
-        for (tag in TAGS) for (n in names) qs.add("$n $tag".trim())
-        return qs.filter { it.length >= 3 }.take(TAGGED_QUERIES)
-    }
-
-    // Aramanın tamamı: düz arama + kanallar + etiketli sorgular + Yandex; sonra etiket/ad süzgeci ve puan sıralaması
-    private fun errorCard(msg: String): SearchResponse {
-        lastDebug = "HATA: $msg"
-        return newMovieSearchResponse("HATA (dokun): ${msg.take(120)}", "$mainUrl/video0_0", TvType.Movie)
-    }
-
-    private suspend fun safeSearch(q: String, page: Int): Pair<List<SearchResponse>, Boolean> {
-        return try {
-            smartSearch(q, page)
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            listOf(errorCard(e.message ?: e.toString())) to false
-        }
-    }
-
-    private suspend fun smartSearch(q: String, page: Int): Pair<List<SearchResponse>, Boolean> {
-        // Aramaya doğrudan VK adresi yapıştırılırsa (vkvideo.ru/video248307654_168039297) o video açılır
-        val direct = Regex("video(-?\\d+_\\d+(?:_[0-9a-zA-Z]+)?)").find(q)
-        if (direct != null && q.contains("vk", true)) {
-            if (page > 1) return emptyList<SearchResponse>() to false
-            val o = fetchItem(direct.groupValues[1])
-            val directPoster = workingPoster(o)
-            val card = newMovieSearchResponse(
-                o.optString("title"),
-                "$mainUrl/video${videoKey(o)}",
-                TvType.Movie
-            ) {
-                this.posterUrl = directPoster
-            }
-            return listOf<SearchResponse>(card) to false
-        }
-        // Yalın arama: yazılan metin VK'ya aynen gider, süzgeç yok; aşağı indikçe sayfa sayfa devam eder
-        val sq = q.trim()
-        if (page <= 1) {
-            rawStart.keys.removeAll { it.startsWith("$sq|") }
-            shownMap[sq] = java.util.Collections.synchronizedSet(HashSet<String>())
-        }
-        val shownKeys = shownMap.getOrPut(sq) { java.util.Collections.synchronizedSet(HashSet<String>()) }
-        var r = if (page <= 1) 1 else (rawStart["$sq|$page"] ?: page)
-        val out = ArrayList<SearchResponse>()
-        var hasMore = true
-        var loops = 0
-        while (hasMore && out.size < PAGE_TARGET && loops < MAX_PAGE_LOOPS) {
-            loops++
-            val rr = r
-            var cl: Pair<List<JSONObject>, Boolean> = emptyList<JSONObject>() to false
-            var rawP = RawPage(LinkedHashMap(), false, "")
-            // İki kaynak paralel: video.search (Tüm videolar, uzun filmler dahil) + katalog araması (klipler, kanallar)
-            listOf(0, 1).amap { w ->
-                if (w == 0) cl = vkClassicSearch(sq, rr) else rawP = searchRaw(sq, rr, true)
-                0
-            }
-            r++
-            hasMore = rawP.more || cl.second
-            val all = (cl.first + rawP.videos.values).filter { shownKeys.add(baseOf(it)) }
-            out.addAll(toResponses(all))
-        }
-        rawStart["$sq|${page + 1}"] = r
-        return out to hasMore
-    }
-
-    private suspend fun fetchItem(key: String): JSONObject {
-        val r = try {
-            api("video.getByIds", mapOf("videos" to key))
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            api("video.get", mapOf("videos" to key))
-        }
-        val found = LinkedHashMap<String, JSONObject>()
-        collectVideos(r, found)
-        return found.values.firstOrNull()
-            ?: throw ErrorLoadingException("Video bilgisi bulunamadı: $key")
-    }
-
-    // ---------- Link yardımcıları ----------
-
-    private fun isImage(u: String): Boolean {
-        if (u.contains(".mp4") || u.contains(".m3u8") || u.contains(".mpd")) return false
-        return u.contains(".jpg") || u.contains(".jpeg") || u.contains(".png") ||
-            u.contains(".webp") || u.contains("getVideoPreview") ||
-            u.contains("userapi.com") || u.contains("vkuserphoto")
-    }
-
-    private fun hostOf(u: String): String =
-        Regex("^https?://([^/?#]+)", RegexOption.IGNORE_CASE).find(u)?.groupValues?.get(1) ?: ""
-
-    private fun isMedia(u: String): Boolean {
-        if (isImage(u)) return false
-        if (u.contains("video_ext.php")) return false
-        val host = hostOf(u)
-        if (Regex("(^|\\.)(vkvideo\\.ru|vk\\.com|vk\\.ru|m\\.vk\\.com)$", RegexOption.IGNORE_CASE).containsMatchIn(host)) return false
-        return u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") ||
-            u.contains("okcdn.ru") ||
-            Regex("(mycdn\\.me|vkuservideo\\.(net|ru)|vkvd\\d*\\.)", RegexOption.IGNORE_CASE).containsMatchIn(host) ||
-            Regex("[?&]type=\\d").containsMatchIn(u)
-    }
-
-    // JSON içinde nerede olursa olsun http ile başlayan metinleri bulur
-    private fun scanUrls(node: Any?, hint: String, out: MutableList<Pair<String, String>>) {
-        when (node) {
-            is JSONObject -> {
-                val ks = node.keys()
-                while (ks.hasNext()) {
-                    val k = ks.next()
-                    if (k == "image" || k == "first_frame" || k.startsWith("photo_")) continue
-                    scanUrls(node.opt(k), k, out)
-                }
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) scanUrls(node.opt(i), hint, out)
-            }
-            is String -> {
-                if (node.startsWith("http")) out.add(hint to node)
-            }
-        }
-    }
-
-    private fun qualityOf(hint: String, u: String): Int? {
-        Regex("(\\d{3,4})").find(hint)?.value?.toIntOrNull()?.let { return it }
-        val t = Regex("[?&]type=(\\d+)").find(u)?.groupValues?.get(1)?.toIntOrNull()
-        return when (t) {
-            0 -> 144
-            1 -> 240
-            2 -> 360
-            3 -> 480
-            4 -> 720
-            5 -> 1080
-            6 -> 1440
-            7 -> 2160
-            else -> null
-        }
-    }
-
-    // Bağlantı adayı: hangi başlık takımının kabul edildiği (headers) ve ölü olup olmadığı (dead) test edilir
-    private class Cand(val hint: String, val url: String) {
-        var headers: Map<String, String>? = null
-        var dead = false
-        var diag = ""
-    }
-
-    private fun isHls(c: Cand) = c.url.contains(".m3u8") || c.hint.contains("hls", true)
-    private fun isDash(c: Cand) = c.url.contains(".mpd") || c.hint.contains("dash", true)
-
-    private fun addCand(list: MutableList<Cand>, seen: HashSet<String>, hint: String, raw: String): Boolean {
-        val u = raw.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
-        if (!isMedia(u) || !seen.add(u)) return false
-        list.add(Cand(hint, u))
-        return true
-    }
-
-    // Sayfa yapısı/anahtar adı ne olursa olsun HTML içindeki medya adreslerini bulur
-    private fun scanHtml(html: String, list: MutableList<Cand>, seen: HashSet<String>): Int {
-        val t = html.replace("\\/", "/").replace("\\u0026", "&").replace("&quot;", "\"").replace("&amp;", "&")
-        var n = 0
-        for (m in Regex("\"([A-Za-z0-9_]+)\"\\s*:\\s*\"(https?://[^\"\\s]+)\"").findAll(t)) {
-            if (addCand(list, seen, m.groupValues[1], m.groupValues[2])) n++
-        }
-        for (m in Regex("https?://[^\\s\"'<>\\\\]+").findAll(t)) {
-            if (addCand(list, seen, "", m.value)) n++
-        }
-        return n
-    }
-
-    // Yönlendirmeleri elle takip eder, çerezleri taşır (döngüyü kırar). budgetMs dolunca null döner
-    private suspend fun fetchFollow(url: String, h: Map<String, String> = hdr, budgetMs: Long = 8000L): String? {
-        val end = System.currentTimeMillis() + budgetMs
-        var u = url
-        var cookies = emptyMap<String, String>()
-        repeat(10) {
-            if (System.currentTimeMillis() > end) return null
-            val r = app.get(u, headers = h, cookies = cookies, allowRedirects = false, timeout = 5L)
-            cookies = cookies + r.cookies
-            val loc = r.headers["Location"]
-            if (r.code in 300..399 && !loc.isNullOrBlank()) {
-                u = java.net.URI(u).resolve(loc).toString()
-            } else {
-                return r.text
-            }
-        }
-        return null
-    }
-
-    // Adreste srcAg=CHROME_LINUX gibi bir değer varsa adres o tarayıcı kimliğine bağlıdır: önce ona uyan UA denenir
-    private fun uaForUrl(u: String): String {
-        val m = Regex("[?&]srcAg=([^&]+)").find(u) ?: return ""
-        val a = m.groupValues[1].uppercase()
-        return when {
-            Regex("ANDROID|MOBILE").containsMatchIn(a) -> MOBILE_UA
-            a.contains("WINDOWS") -> UA_WIN
-            a.contains("LINUX") -> UA
-            else -> ""
-        }
-    }
-
-    private fun hdrList(url: String): List<Map<String, String>> {
-        val out = ArrayList<Map<String, String>>()
-        fun add(h: Map<String, String>) {
-            if (h !in out) out.add(h)
-        }
-        val ref = "$mainUrl/"
-        val ua = uaForUrl(url)
-        if (ua.isNotEmpty()) {
-            add(mapOf("User-Agent" to ua, "Referer" to ref, "Origin" to mainUrl))
-            add(mapOf("User-Agent" to ua))
-        }
-        add(mapOf("User-Agent" to UA, "Referer" to ref, "Origin" to mainUrl))
-        add(mapOf("User-Agent" to MOBILE_UA, "Referer" to ref, "Origin" to mainUrl))
-        add(mapOf("User-Agent" to UA))
-        add(emptyMap())
-        add(mapOf("User-Agent" to UA, "Referer" to ref))
-        add(mapOf("User-Agent" to MOBILE_UA))
-        return out
-    }
-
-    // Her bağlantı ayrı denenir: önce ilk 3 başlık takımı, tutmazsa kalanlar. Kabul edilen takım c.headers, kesin ölü ise c.dead
-    private suspend fun probe(c: Cand) {
-        val isH = isHls(c)
-        val hv = hdrList(c.url)
-
-        // 1 = çalışıyor, -1 = çalışmıyor, 0 = belirsiz (ağ hatası)
-        suspend fun one(i: Int): Pair<Int, Int> {
-            val h = hv[i].toMutableMap()
-            if (!isH) h["Range"] = "bytes=0-1"
-            return try {
-                val r = app.get(c.url, headers = h, timeout = 4L)
-                val ct = r.headers["Content-Type"] ?: ""
-                val st = if (isH) {
-                    if (r.code in 200..299 && r.text.trimStart().startsWith("#EXTM3U")) 1 else -1
-                } else {
-                    if ((r.code == 200 || r.code == 206) &&
-                        !Regex("(?i)text/html|json").containsMatchIn(ct)
-                    ) 1 else -1
-                }
-                st to r.code
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                0 to 0
-            }
-        }
-
-        val first = (0 until min(3, hv.size)).toList().amap { one(it) }
-        val all = if (first.any { it.first == 1 } || hv.size <= 3) first
-        else first + (3 until hv.size).toList().amap { one(it) }
-
-        val okIdx = all.indexOfFirst { it.first == 1 }
-        val unknown = all.any { it.first == 0 }
-        c.diag = all.mapIndexed { i, p -> "V$i:${p.second}" }.joinToString(" ")
-        if (okIdx >= 0) c.headers = hv[okIdx]
-        else if (!unknown) c.dead = true
-    }
-
-    private suspend fun emitCand(c: Cand, lang: String, callback: (ExtractorLink) -> Unit) {
-        val ref = "$mainUrl/"
-        val hdrs = c.headers ?: hdrList(c.url).first()
-        val src = if (lang.isNotBlank()) "$name $lang" else name
-        when {
-            isHls(c) -> {
-                try {
-                    M3u8Helper.generateM3u8(src, c.url, ref, headers = hdrs).forEach(callback)
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    callback(
-                        newExtractorLink(src, "$src HLS", c.url, ExtractorLinkType.M3U8) {
-                            this.referer = ref
-                            this.headers = hdrs
-                        }
-                    )
-                }
-            }
-            isDash(c) -> {
-                callback(
-                    newExtractorLink(src, "$src DASH", c.url, ExtractorLinkType.DASH) {
-                        this.referer = ref
-                        this.headers = hdrs
-                    }
-                )
-            }
-            else -> {
-                val q = qualityOf(c.hint, c.url)
-                val label = if (q != null) "${q}p" else c.hint.ifBlank { "MP4" }
-                if (label.equals("MP4", ignoreCase = true)) return            // "MP4" etiketli (kalitesi bilinmeyen) kaynaklar çalışmıyor: gösterme
-                callback(
-                    newExtractorLink(src, "$src $label", c.url) {
-                        this.referer = ref
-                        this.headers = hdrs
-                        this.quality = q ?: Qualities.Unknown.value
-                    }
-                )
-            }
-        }
-    }
-
-    // ---------- CloudStream ----------
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return try {
-            val raw = searchRaw(request.data, page, false)
-            newHomePageResponse(request.name, toResponses(raw.videos.values), raw.more)
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            newHomePageResponse(request.name, listOf(errorCard(e.message ?: e.toString())), false)
-        }
-    }
-
-    override suspend fun search(query: String, page: Int): SearchResponseList? {
-        val (items, more) = safeSearch(query, page)
-        return newSearchResponseList(items, more)
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        return safeSearch(query, 1).first
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        val key = url.substringAfter("/video").substringBefore("?")
-        if (key == "0_0") {
-            return newMovieLoadResponse("DEBUG", url, TvType.Movie, "debug") {
-                this.plot = lastDebug.ifBlank { "Henüz teşhis yok: önce bir arama yap, sonra DEBUG kartına dokun." }
-            }
-        }
-        val item = fetchItem(key)
-        val title = item.optString("title")
-        val desc = item.optString("description")
-        val durSec = item.optInt("duration")
-        val vkPoster = workingPoster(item)
-
-        // Başlık + yıl + süre uyuyorsa TMDB'deki gerçek film kaydından poster / özet / yıl al
-        val tm = try {
-            tmdbLookup(title, durSec)
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
             null
         }
-        val tmPoster = tm?.optString("poster_path")?.takeIf { it.isNotBlank() && it != "null" }
-            ?.let { "https://image.tmdb.org/t/p/w500$it" }
-        val tmBack = tm?.optString("backdrop_path")?.takeIf { it.isNotBlank() && it != "null" }
-            ?.let { "https://image.tmdb.org/t/p/w1280$it" }
-        val tmPlot = tm?.optString("overview")?.takeIf { it.isNotBlank() }
-        val tmYear = tm?.optString("release_date")?.take(4)?.toIntOrNull()
-        val tmTags = ArrayList<String>()
-        tm?.optJSONArray("genres")?.let { g ->
-            for (i in 0 until g.length()) {
-                val n = g.optJSONObject(i)?.optString("name")
-                if (!n.isNullOrBlank()) tmTags.add(n)
+        return if (en?.overview.isNullOrBlank()) tr else tr.copy(overview = en?.overview)
+    }
+
+    // Sitedeki diziyi TMDB'deki doğru diziyle eşler. Aynı adlı birden fazla dizi varsa (ör. Ben 10 2005 / 2016)
+    // sitedeki sezon başına bölüm sayısına en yakın olan seçilir.
+    private suspend fun tmdbMatch(title: String, siteCounts: Map<Int, Int>): TmdbTvDetails? {
+        if (!tmdbOn) return null
+        val key = norm(title)
+        if (key.isEmpty()) return null
+        val results = tmdbSearch(title)
+        if (results.isEmpty()) return null
+        val exact = results.filter {
+            norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key
+        }
+        val cands = if (exact.isNotEmpty()) exact.take(3) else listOfNotNull(
+            results.firstOrNull {
+                val n = norm(it.name.orEmpty())
+                n.isNotEmpty() && (n.contains(key) || key.contains(n))
+            }
+        )
+        if (cands.isEmpty()) return null
+        if (cands.size == 1) return cands[0].id?.let { tmdbDetails(it) }
+        val details = cands.amap { c -> c.id?.let { tmdbDetails(it) } }.filterNotNull()
+        if (details.isEmpty()) return null
+        return details.minByOrNull { d ->
+            val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
+            var score = 0
+            for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
+            score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
+        }
+    }
+
+    private suspend fun tmdbSeason(id: Int, sn: Int, lang: String): Map<Int, TmdbEpisode> = try {
+        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 15L)
+            .parsedSafe<TmdbSeasonDetails>()?.episodes.orEmpty()
+            .mapNotNull { e -> e.episode_number?.let { it to e } }.toMap()
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    // Arama kartı için TMDB afişi (sadece adı birebir eşleşen dizi); bulunamazsa null (sitenin afişi kalır)
+    // Hız için kısa zaman aşımı (2 sn): TMDB yavaşsa beklemeden sitenin afişi kullanılır; başarısız sonuç önbelleğe yazılmaz.
+    private suspend fun tmdbPosterFor(title: String): String? {
+        val key = norm(title)
+        if (key.isEmpty()) return null
+        posterCache[key]?.let { return it.ifBlank { null } }
+        val res = try {
+            app.get(
+                "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(title, "UTF-8")}",
+                timeout = 2L
+            ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
+        } catch (e: Exception) {
+            return null
+        }
+        val best = res
+            .filter {
+                !it.poster_path.isNullOrBlank() &&
+                    (norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key)
+            }
+            .maxByOrNull { it.popularity ?: 0.0 }
+        val url = best?.poster_path?.let { "$tmdbImg/w500$it" }.orEmpty()
+        posterCache[key] = url
+        return url.ifBlank { null }
+    }
+
+    // data alanı: "soncikan" / "populer" (ana sayfa) ya da sayfalanabilir liste adresi (sonuna &s=<sayfa> eklenir)
+    override val mainPage = mainPageOf(
+        "soncikan" to "Son Çıkan Bölümler",
+        "populer" to "Popüler Diziler",
+        "$liste?dil=0&siralama_tipi=id&siralama_turu=desc" to "Türkçe Dublaj Diziler",
+        "$liste?siralama_tipi=id&siralama_turu=desc" to "Yeni Eklenenler",
+        "$liste?kat=1&siralama_tipi=imdb&siralama_turu=desc" to "Yabancı Diziler (IMDb)",
+        "$liste?kat=2&siralama_tipi=imdb&siralama_turu=desc" to "Yerli Diziler",
+        "$liste?kat=4&siralama_tipi=imdb&siralama_turu=desc" to "Animasyonlar",
+        "$liste?kat=5&siralama_tipi=imdb&siralama_turu=desc" to "Animeler"
+    )
+
+    // ---------------- Yardımcılar ----------------
+
+    private fun hdr(): Map<String, String> = mapOf("User-Agent" to ua)
+
+    private fun ajaxHdr(referer: String): Map<String, String> = hdr() + mapOf(
+        "X-Requested-With" to "XMLHttpRequest",
+        "Referer" to referer
+    )
+
+    // Önce düz istek atılır (hızlı, WebView açmaz). Sadece Cloudflare kontrol sayfası gelirse CloudflareKiller devreye girer.
+    // Eskiden her istek CloudflareKiller'dan geçiyordu; kontrol sayfasında WebView sonsuz bekleyip arama/oynatmayı donduruyordu.
+    private fun isChallenge(code: Int, body: String): Boolean =
+        code == 403 || code == 503 ||
+            body.contains("<title>Just a moment", true) ||
+            body.contains("cf-browser-verification", true) ||
+            body.contains("/cdn-cgi/challenge-platform/h/b/orchestrate", true)
+
+    // Site Cloudflare kontrolü istediyse bir sonraki istekler boşuna düz denenmeden doğrudan CloudflareKiller ile atılır
+    @Volatile private var needCf = false
+
+    private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 15L) =
+        try {
+            if (needCf) throw Exception("cf")
+            val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
+            if (isChallenge(r.code, r.text)) {
+                needCf = true
+                throw Exception("cf")
+            }
+            r
+        } catch (e: Exception) {
+            app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
+        }
+
+    // Daha önce çalışan kaynakların adı / sırası: sonraki bölümlerde önce onlar denenir (hız için)
+    private val goodKeys: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    // Sayfadan ve ajax yanıtlarından gelen oturum çerezleri (ASP oturumu) sonraki ajax isteklerine eklenir
+    @Volatile private var sessionCookies: Map<String, String> = emptyMap()
+
+    private suspend fun post(url: String, form: Map<String, String>, referer: String, t: Long = 15L) =
+        try {
+            val r = app.post(url, data = form, headers = ajaxHdr(referer), cookies = sessionCookies, timeout = t)
+            if (isChallenge(r.code, r.text)) throw Exception("cf")
+            if (r.cookies.isNotEmpty()) sessionCookies = sessionCookies + r.cookies
+            r
+        } catch (e: Exception) {
+            app.post(url, data = form, headers = ajaxHdr(referer), interceptor = cf, timeout = t)
+        }
+
+    private fun abs(u: String): String = if (u.startsWith("http")) u else fixUrl(u)
+
+    // Site windows-1254 kullanıyor; Türkçe harfli aramalar için aynı kodlama denenir
+    private fun encQ(q: String): String = try {
+        URLEncoder.encode(q, "windows-1254")
+    } catch (e: Exception) {
+        URLEncoder.encode(q, "UTF-8")
+    }
+
+    // /diziler/mobland.html
+    private val reSeries = Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?(/diziler/[^/?#]+\.html)$""")
+
+    // /mobland/2-sezon-5-bolum.html  veya  /mobland/dublaj/2-sezon-5-bolum.html
+    private val reEp =
+        Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?/([a-z0-9-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
+
+    // 2-sezon-5-bolum.html (başında dizi adı olmayan göreli bağlantı)
+    private val reEpBare = Regex("""^(?:\./)?(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
+
+    private fun slugOf(seriesUrl: String): String =
+        Regex("""/diziler/([^/?#]+)\.html""").find(seriesUrl)?.groupValues?.get(1)?.removeSuffix("-izle") ?: ""
+
+    private fun cleanTitle(t: String): String =
+        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*Sezonluk\s*Dizi.*$""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+izle$""", RegexOption.IGNORE_CASE), "")
+            .trim()
+
+    // Listelerde resim "data-src" içinde (src sadece boş yer tutucu); ana sayfada doğrudan src
+    private fun posterOf(img: Element): String? {
+        val ds = img.attr("data-src").trim()
+        val s = img.attr("src").trim()
+        val u = when {
+            ds.isNotBlank() -> ds
+            s.isNotBlank() && !s.startsWith("data:") -> s
+            else -> return null
+        }
+        return abs(u)
+    }
+
+    // Sayfadaki dizi kartları (poster + bağlantı). Ana sayfadaki "bölüm" kartları bölüm adresiyle kalır,
+    // gerçek dizi sayfası load() sırasında bölüm sayfasından bulunur.
+    private fun cards(root: Element?): List<SearchResponse> {
+        if (root == null) return emptyList()
+        val out = LinkedHashMap<String, SearchResponse>()
+        for (a in root.select("a[href]")) {
+            val href = a.attr("href").trim()
+            val img = a.selectFirst("img") ?: continue
+            val epm = reEp.find(href)
+            val key: String
+            val link: String
+            when {
+                reSeries.containsMatchIn(href) -> {
+                    link = mainUrl + reSeries.find(href)!!.groupValues[1]
+                    key = "s:" + slugOf(link)
+                }
+                epm != null -> {
+                    link = abs(href)
+                    key = "s:" + epm.groupValues[1]
+                }
+                else -> continue
+            }
+            if (out.containsKey(key)) continue
+            val title = listOf(
+                a.selectFirst(".box-title .title")?.text(),
+                a.selectFirst(".description")?.text(),
+                a.selectFirst(".title")?.text(),
+                cleanTitle(a.attr("title")),
+                img.attr("alt")
+            ).firstOrNull { !it.isNullOrBlank() }?.trim() ?: continue
+            out[key] = newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
+                this.posterUrl = posterOf(img)
+            }
+        }
+        return out.values.toList()
+    }
+
+    // Sayfalama çubuğundaki en büyük sayfa numarası
+    private fun maxPage(doc: Document): Int =
+        doc.select("#filtresayfalama a.item").mapNotNull { it.text().trim().toIntOrNull() }.maxOrNull() ?: 1
+
+    // ---------------- Ana sayfa ----------------
+
+    private fun homeOf(title: String, list: List<SearchResponse>, hasNext: Boolean): HomePageResponse =
+        newHomePageResponse(
+            list = HomePageList(name = title, list = list, isHorizontalImages = false),
+            hasNext = hasNext
+        )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val key = request.data
+        if (key == "soncikan" || key == "populer") {
+            if (page > 1) return homeOf(request.name, emptyList(), false)
+            val doc = get(mainUrl).document
+            val list = if (key == "soncikan") {
+                cards(doc.selectFirst("#soncikan"))
+            } else {
+                cards(doc.selectFirst("#enler .active.tab") ?: doc.selectFirst("#enler"))
+            }
+            return homeOf(request.name, list, false)
+        }
+        val doc = get("$key&s=$page").document
+        val list = cards(doc.selectFirst(".afis") ?: doc.body())
+        return homeOf(request.name, list, list.isNotEmpty() && page < maxPage(doc))
+    }
+
+    // ---------------- Arama ----------------
+
+    // Aynı aramayı tekrar yapınca anında göstermek için önbellek
+    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, SearchResponseList>()
+
+    override suspend fun search(query: String, page: Int): SearchResponseList {
+        val q = query.trim()
+        if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
+        val cacheKey = q.lowercase() + "|" + page
+        searchCache[cacheKey]?.let { return it }
+        dbg.clear()
+        val sfx = if (page > 1) "&s=$page" else ""
+        val urls = listOf(
+            "$liste?adi=${encQ(q)}$sfx",
+            "$liste?adi=${URLEncoder.encode(q, "UTF-8")}$sfx"
+        ).distinct()
+        val responses = urls.amap { u ->
+            try {
+                get(u, t = 10L)
+            } catch (e: Exception) {
+                d("istek hatası ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+        }
+        for (r in responses) {
+            if (r == null) continue
+            val doc = r.document
+            val list = cards(doc.selectFirst(".afis") ?: doc.body())
+            d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
+            if (list.isNotEmpty()) {
+                if (tmdbOn) {
+                    // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
+                    list.take(12).amap { c ->
+                        val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
+                        if (!tp.isNullOrBlank()) c.posterUrl = tp
+                        c
+                    }
+                }
+                val out = newSearchResponseList(list, page < maxPage(doc))
+                if (searchCache.size > 30) searchCache.clear()
+                searchCache[cacheKey] = out
+                return out
+            }
+        }
+        if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
+        return newSearchResponseList(emptyList(), false)
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
+
+    // ---------------- Dizi sayfası ----------------
+
+    // Bölüm adresinden gerçek dizi sayfasını bulur (dizi adresi bölüm adresindeki addan farklı olabilir)
+    private suspend fun resolveSeriesUrl(url: String): String {
+        reSeries.find(url)?.let { return mainUrl + it.groupValues[1] }
+        if (reEp.containsMatchIn(url)) {
+            val doc = try { get(abs(url)).document } catch (e: Exception) { null }
+            val href = doc?.selectFirst("h1 a[href*=\"/diziler/\"]")?.attr("href")
+                ?: doc?.selectFirst("a[href^=\"/diziler/\"][href$=\".html\"]")?.attr("href")
+            if (!href.isNullOrBlank()) reSeries.find(href)?.let { return mainUrl + it.groupValues[1] }
+            val slug = reEp.find(url)!!.groupValues[1]
+            return "$mainUrl/diziler/$slug.html"
+        }
+        return url
+    }
+
+    // Bulunan bölüm bağlantısı sayısını döndürür (sezon dolu mu boş mu anlamak için)
+    private fun parseEpisodes(doc: Document, into: MutableMap<String, Episode>, slugHint: String): Int {
+        var matched = 0
+        for (a in doc.select("a[href]")) {
+            val href = a.attr("href").trim()
+            val slug: String
+            val s: Int
+            val e: Int
+            val m = reEp.find(href)
+            if (m != null) {
+                slug = m.groupValues[1]
+                s = m.groupValues[2].toIntOrNull() ?: continue
+                e = m.groupValues[3].toIntOrNull() ?: continue
+            } else {
+                val b = reEpBare.find(href) ?: continue
+                slug = slugHint
+                s = b.groupValues[1].toIntOrNull() ?: continue
+                e = b.groupValues[2].toIntOrNull() ?: continue
+            }
+            matched++
+            val key = "$s-$e"
+            val epUrl = "$mainUrl/$slug/$s-sezon-$e-bolum.html"   // dublaj bağlantısı olsa da normal adrese çevrilir
+            val label = cleanLabel(a.text().trim().ifBlank { a.attr("title").trim() })
+            val old = into[key]
+            // Aynı bölüme giden birden fazla bağlantı olabilir ("Cevapla" gibi); ilk iyi yazıyı koru
+            if (old != null && !(old.name.isNullOrBlank() && label != null)) continue
+            into[key] = newEpisode(epUrl) {
+                this.season = s
+                this.episode = e
+                this.name = label
+            }
+        }
+        return matched
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val seriesUrl = resolveSeriesUrl(url)
+        val res = get(seriesUrl)
+        val html = res.text
+        val doc = res.document
+        val hint = slugOf(seriesUrl)
+
+        val title = (doc.selectFirst("h1")?.text()?.let { cleanTitle(it) }?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.let { cleanTitle(it) }
+            ?: cleanTitle(doc.title())).ifBlank { return null }
+
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("img[src*=\"/i/dizi/\"]")?.attr("src")
+        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+
+        val eps = LinkedHashMap<String, Episode>()
+        parseEpisodes(doc, eps, hint)
+
+        // Dizi numarası (did): sayfadaki did özelliği ya da poster adresinden (/i/dizi/y/b/2595.jpg)
+        val did = Regex("""did\s*[=:]\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
+            ?: Regex("""/i/dizi/(?:[a-z]/)+(\d+)\.jpg""").find(html)?.groupValues?.get(1)
+
+        if (did != null) {
+            val endpoint = Regex("""/ajax/dataIzleBolumler\w*\.asp""").find(html)?.value
+                ?: "/ajax/dataIzleBolumler.asp"
+
+            suspend fun season(sno: Int): Document? = try {
+                post(mainUrl + endpoint, mapOf("did" to did, "sno" to sno.toString()), seriesUrl).document
+            } catch (e: Exception) {
+                null
+            }
+
+            // Sezonlar 8'erli gruplar halinde paralel denenir; grubun son sezonu boşsa durulur
+            var start = 1
+            while (start <= 40) {
+                val chunk = (start until start + 8).toList()
+                val docs = chunk.amap { season(it) }
+                var lastCount = 0
+                docs.forEachIndexed { i, d ->
+                    if (d != null) {
+                        val c = parseEpisodes(d, eps, hint)
+                        if (i == chunk.lastIndex) lastCount = c
+                    }
+                }
+                if (lastCount == 0) break
+                start += 8
             }
         }
 
-        return newMovieLoadResponse(tm?.optString("title")?.takeIf { it.isNotBlank() } ?: title, url, TvType.Movie, key) {
-            this.posterUrl = tmPoster ?: vkPoster
-            this.backgroundPosterUrl = tmBack
-            this.plot = tmPlot ?: desc.ifBlank { null }
-            this.year = tmYear
-            this.duration = durSec / 60
-            if (tmTags.isNotEmpty()) this.tags = tmTags
+        // Liste SADECE sitede yayınlanmış bölümlerden oluşur; yeni bölüm sitede çıkınca listeye kendiliğinden eklenir.
+        val siteEps = eps.values.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+
+        var tm: TmdbTvDetails? = null
+        var trMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
+        var enMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
+        if (tmdbOn && siteEps.isNotEmpty()) {
+            try {
+                val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
+                tm = tmdbMatch(title, counts)
+                val tid = tm?.id
+                if (tid != null) {
+                    val rows = counts.keys.filter { it > 0 }.amap { sn ->
+                        Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+                    }
+                    trMap = rows.associate { it.first to it.second }
+                    enMap = rows.associate { it.first to it.third }
+                }
+            } catch (e: Exception) {
+            }
         }
+
+        // Henüz yayınlanmamış bölümler (TMDB yayın tarihi bugünden sonra ya da belli değil) listeden çıkarılır
+        val now = System.currentTimeMillis()
+        val lastSeason = siteEps.maxOfOrNull { it.season ?: 0 } ?: 0
+        val list0 = siteEps.mapNotNull { old ->
+            val sn = old.season ?: 0
+            val en = old.episode ?: 0
+            val tr = trMap[sn]?.get(en)
+            val us = enMap[sn]?.get(en)
+            // Türkçe ad yoksa ("Bölüm 3" gibi) İngilizce ad, o da yoksa sitenin temizlenmiş yazısı
+            val epName = tr?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: us?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: old.name
+            val overview = tr?.overview?.takeIf { it.isNotBlank() } ?: us?.overview?.takeIf { it.isNotBlank() }
+            val still = (tr?.still_path ?: us?.still_path)?.let { "$tmdbImg/w500$it" }
+            val runtime = tr?.runtime ?: us?.runtime
+            val airMs = dateMs(tr?.air_date ?: us?.air_date)
+            // Bölüm TMDB'de varsa: tarihi gelecekteyse gizle; tarihi hiç yoksa sadece son sezonda gizle
+            if (tm != null && (tr != null || us != null)) {
+                if (airMs != null && airMs > now) return@mapNotNull null
+                if (airMs == null && sn == lastSeason) return@mapNotNull null
+            }
+            if (tm == null) old else newEpisode(old.data) {
+                this.season = old.season
+                this.episode = old.episode
+                this.name = epName
+                this.description = overview
+                this.posterUrl = still
+                if (runtime != null && runtime > 0) this.runTime = runtime
+                if (airMs != null) this.date = airMs
+            }
+        }
+        // Güvenlik: hepsi elenirse (TMDB hatalıysa) sitedeki tüm bölümler gösterilir
+        val list = list0.ifEmpty { siteEps }
+
+        val t = tm
+        val tPoster = t?.poster_path?.let { "$tmdbImg/w500$it" }
+        val tBack = t?.backdrop_path?.let { "$tmdbImg/w1280$it" }
+        val tPlot = t?.overview?.takeIf { it.isNotBlank() }
+        val tYear = t?.first_air_date?.take(4)?.toIntOrNull()
+        val tTags = t?.genres.orEmpty().mapNotNull { it.name }.takeIf { it.isNotEmpty() }
+        val tActors = t?.credits?.cast.orEmpty().filter { !it.name.isNullOrBlank() }.take(15)
+            .map { c -> Actor(c.name.orEmpty(), c.profile_path?.let { p -> "$tmdbImg/w185$p" }) }
+
+        return newTvSeriesLoadResponse(title, seriesUrl, TvType.TvSeries, list) {
+            this.posterUrl = tPoster ?: poster?.let { abs(it) }
+            this.backgroundPosterUrl = tBack
+            this.plot = tPlot ?: plot
+            if (tYear != null) this.year = tYear
+            if (tTags != null) this.tags = tTags
+            // addActors yeni CloudStream sürümlerinde kaldırıldı; actors doğrudan atanır
+            if (tActors.isNotEmpty()) this.actors = tActors.map { ActorData(actor = it) }
+        }
+    }
+
+    // ---------------- Oynatma ----------------
+
+    private val reIframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+
+    private var altEndpoints: List<String>? = null
+    private var embedEndpoints: List<String>? = null
+
+    // Sitenin ajax servis adları zamanla değişiyor (dataAlternatif3, dataAlternatif22 ...).
+    // Adları sayfadaki ve site.min.js içindeki kodlardan okuyup kullanıyoruz.
+    private suspend fun discoverEndpoints(doc: Document, html: String) {
+        if (altEndpoints != null && embedEndpoints != null) return
+        val sb = StringBuilder(html)
+        doc.select("script[src]").map { it.attr("src") }.filter { it.contains("site") }.take(3).forEach { src ->
+            try {
+                sb.append('\n').append(get(abs(src)).text)
+            } catch (e: Exception) {
+            }
+        }
+        val all = sb.toString()
+        altEndpoints = Regex("""/ajax/dataAlternatif\w*\.asp""").findAll(all).map { it.value }.distinct().toList()
+            .ifEmpty { listOf("/ajax/dataAlternatif3.asp") }
+        embedEndpoints = Regex("""/ajax/dataEmbed\w*\.asp""").findAll(all).map { it.value }.distinct().toList()
+            .ifEmpty { listOf("/ajax/dataEmbed.asp") }
+    }
+
+    // Alternatif listesi: JSON ({"data":[{"id":..,"baslik":..}]}) ya da HTML (data-id'li öğeler)
+    private fun altList(txt: String): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val t = txt.trim()
+        try {
+            val arr: JSONArray? = when {
+                t.startsWith("[") -> JSONArray(t)
+                t.startsWith("{") -> {
+                    val o = JSONObject(t)
+                    o.optJSONArray("data") ?: o.optJSONArray("veri") ?: o.optJSONArray("list")
+                }
+                else -> null
+            }
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val id = o.optString("id")
+                    val nm = o.optString("baslik").ifBlank { o.optString("name") }
+                    if (id.isNotBlank()) out.add(id to nm)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (out.isEmpty()) {
+            Regex("""data-id=["'](\d+)["'][^>]*>([^<]*)<""").findAll(t)
+                .forEach { out.add(it.groupValues[1] to it.groupValues[2].trim()) }
+        }
+        return out
+    }
+
+    private val reAsset = Regex(""".*\.(js|css|png|jpe?g|gif|svg|ico|woff2?)(\?.*)?$""", RegexOption.IGNORE_CASE)
+
+    private fun embedOf(txt0: String): String? {
+        val txt = txt0.replace("\\/", "/")
+        reIframe.find(txt)?.let { return it.groupValues[1] }
+        // iframe yoksa src / data-src / file gibi alanlardaki adresler (göreli olanlar dahil)
+        Regex("""(?:src|data-src|file|source|url)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .findAll(txt).map { it.groupValues[1] }
+            .firstOrNull { (it.startsWith("http") || it.startsWith("/")) && !reAsset.matches(it) }
+            ?.let { return it }
+        return Regex("""(?:https?:)?//[^"'\\\s<>]+""").findAll(txt)
+            .map { it.value }.firstOrNull { !it.contains("sezonlukdizi") && !reAsset.matches(it) }
+    }
+
+    // WebView yedeği yavaş olduğu için bir bölümde en fazla bu kadar kaynakta denenir
+    private val webviewLeft = AtomicInteger(0)
+
+    // Byse'ye ek olarak Vidmoly bağlantısı da verilsin (site bu kaynağı Turnstile kapısının arkasında tutuyor).
+    // İstemezsen false yap; o zaman Vidmoly sadece Byse çalışmazsa yedek olarak denenir.
+    private val vidmolyExtra = true
+
+    // Turnstile kapısı: doğrulanmış oturum çerezleri bir süre saklanır, çözülemezse kısa bir süre tekrar denenmez
+    @Volatile private var gateCookies: Map<String, String> = emptyMap()
+    @Volatile private var gateOkUntil = 0L
+    @Volatile private var gateFailUntil = 0L
+
+    // Captcha kapı sayfası bölüm başına yalnızca bir kez incelenir (hız için)
+    private val gateProbed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun originOf(u: String): String =
+        Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
+
+    // https://filemoon.sx/e/abc -> "Filemoon"
+    private fun hostLabel(u: String): String {
+        val h = Regex("""^https?://(?:www\.)?([^./]+)""").find(u)?.groupValues?.get(1) ?: return "Player"
+        return h.replaceFirstChar { it.uppercase() }
+    }
+
+    // Dil adını kaynak adının önüne ekler: "Dublaj - Filemoon (1080p)"
+    private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
+        newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
+            this.referer = l.referer
+            this.quality = l.quality
+            this.headers = l.headers
+        }
+
+    // CDN bağlantıları (SprintCDN vb.) Referer/Origin olmadan, süresi dolunca ya da başka IP'den açılınca
+    // 404 verir. Bu yüzden oynatıcıya gömülü sayfanın Referer ve Origin'i ile verilir.
+    private suspend fun emitM3u8(
+        m3u8: String,
+        label: String,
+        embed: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val origin = originOf(embed)
+        callback(
+            newExtractorLink(name, "$label - ${hostLabel(embed)}", m3u8, ExtractorLinkType.M3U8) {
+                this.referer = "$origin/"
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to "$origin/",
+                    "Origin" to origin
+                )
+            }
+        )
+    }
+
+    // ---- bysejikuar.com (Byse) oynatıcısı: API şifreli (AES-256-GCM) JSON döndürür ----
+    private fun b64u(s: String): ByteArray {
+        var t = s.trim().replace('-', '+').replace('_', '/')
+        while (t.length % 4 != 0) t += "="
+        return android.util.Base64.decode(t, android.util.Base64.DEFAULT)
+    }
+
+    private suspend fun extractBysejikuar(
+        embed: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val origin = originOf(embed)
+        val id = embed.substringAfterLast("/e/").substringBefore("?").substringBefore("/")
+        if (id.isBlank() || !embed.contains("/e/")) {
+            d("byse id bulunamadı: $embed")
+            return false
+        }
+
+        // Çalışan eklentideki gibi: sadece UA + Referer
+        val h = mapOf("User-Agent" to ua, "Referer" to embed)
+        val txt = try {
+            app.get("$origin/api/videos/$id", headers = h, timeout = 15L).text
+        } catch (e: Exception) {
+            d("byse api hata: ${e.message}")
+            return false
+        }
+        val p = try {
+            JSONObject(txt).optJSONObject("playback")
+        } catch (e: Exception) {
+            null
+        }
+        if (p == null) {
+            d("byse playback yok: ${txt.take(120)}")
+            return false
+        }
+
+        val arr = p.optJSONArray("key_parts")
+        if (arr == null || arr.length() < 1) {
+            d("byse key_parts yok, alanlar=${p.keys().asSequence().toList()}")
+            return false
+        }
+        val parts = (0 until arr.length()).map { b64u(arr.getString(it)) }
+        d("byse version=${p.optInt("version")} parça=${parts.size}")
+
+        // Anahtar: 30 parçadan sadece ikisi gerçek anahtar (iki adet 16 baytlık parça, toplam 32 bayt = AES-256).
+        // Loglarda gözlenen: parts[version-1] ve parts[n-version]. Emin olmak için geçerli boy veren tüm ikili
+        // kombinasyonlar denenir; GCM etiketi doğru anahtarı kendiliğinden doğrular.
+        val v = p.optInt("version")
+        val n = parts.size
+        val valid = intArrayOf(16, 24, 32)
+        val cands = ArrayList<ByteArray>()
+        if (v in 1..n && (n - v) in 0 until n && v - 1 != n - v) cands.add(parts[v - 1] + parts[n - v])
+        for (i in parts.indices) for (j in parts.indices) {
+            if (i != j && (parts[i].size + parts[j].size) in valid) cands.add(parts[i] + parts[j])
+        }
+        parts.forEach { if (it.size in valid) cands.add(it) }
+        val keys = cands.distinctBy { it.toList() }
+        if (keys.isEmpty()) {
+            d("byse geçerli anahtar boyu yok")
+            return false
+        }
+
+        val ivEnc = try {
+            Pair(b64u(p.getString("iv")), b64u(p.getString("payload")))
+        } catch (e: Exception) {
+            d("byse iv/payload yok: ${e.message}")
+            return false
+        }
+        val iv = ivEnc.first
+        val enc = ivEnc.second
+
+        var json: JSONObject? = null
+        var failed = 0
+        for (key in keys) {
+            try {
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+                val o = JSONObject(String(cipher.doFinal(enc), Charsets.UTF_8))
+                if (o.optJSONArray("sources") != null) {
+                    json = o
+                    break
+                }
+            } catch (e: Exception) {
+                failed++
+            }
+        }
+        val srcs = json?.optJSONArray("sources")
+        if (srcs == null) {
+            d("byse çözülemedi, denenen anahtar=${keys.size} hatalı=$failed")
+            return false
+        }
+
+        val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+        var ok = false
+        for (i in 0 until srcs.length()) {
+            val o = srcs.optJSONObject(i) ?: continue
+            val url = o.optString("url").replace("\\/", "/")
+            if (!url.startsWith("http")) continue
+            val ql = o.optString("label").ifBlank { "1080p" }
+            val tag = "$label ($ql)"
+            val mime = o.optString("mime_type")
+            if (url.contains(".m3u8") || mime.contains("mpegurl", true)) {
+                val links = try {
+                    M3u8Helper.generateM3u8(name, url, "$origin/", headers = headers)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                if (links.isNotEmpty()) links.forEach { callback(relabel(it, tag)) }
+                else emitM3u8(url, tag, embed, callback)
+            } else {
+                callback(
+                    newExtractorLink(name, "$tag - Byse", url, ExtractorLinkType.VIDEO) {
+                        this.referer = "$origin/"
+                        this.quality = getQualityFromName(ql)
+                        this.headers = headers
+                    }
+                )
+            }
+            ok = true
+        }
+        d("byse kaynak sayısı=${srcs.length()} ok=$ok")
+        return ok
+    }
+
+    // ---- Vidmoly (vidmoly.biz / .to / .me / .net): oynatıcı sayfasında açık .m3u8 var ----
+    // Örnek adres: https://vidmoly.biz/embed-m90baavtu9m6.html
+    private suspend fun extractVidmoly(
+        embed: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val host0 = Regex("""^https?://([^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
+        val id = Regex("""(?:embed-|/w/|/e/|/embed/)([A-Za-z0-9]{6,})""").find(embed)?.groupValues?.get(1)
+        // Alan adı sık değişir: önce gelen adres, olmazsa aynı kimlikle diğer alan adları denenir
+        val hosts = (listOf(host0) + listOf("vidmoly.biz", "vidmoly.to", "vidmoly.me", "vidmoly.net")).distinct()
+
+        for (host in hosts) {
+            val url = when {
+                host == host0 -> embed
+                id != null -> "https://$host/embed-$id.html"
+                else -> continue
+            }
+            val origin = "https://$host"
+            val html = try {
+                app.get(
+                    url,
+                    referer = "$mainUrl/",
+                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
+                    timeout = 12L
+                ).text
+            } catch (e: Exception) {
+                d("vidmoly $host hata: ${e.javaClass.simpleName}")
+                continue
+            }
+            val clean = html.replace("\\/", "/")
+            val m3u8 = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(clean)?.groupValues?.get(1)
+                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(clean)?.groupValues?.get(1)
+            if (m3u8.isNullOrBlank()) {
+                d("vidmoly $host m3u8 yok uzunluk=${html.length} '${html.replace(Regex("""\s+"""), " ").take(60)}'")
+                continue
+            }
+            val link = m3u8.replace("&amp;", "&")
+            val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+            // Sayfada: label: "720p HD"
+            val q = Regex("""label\s*:\s*["'](\d{3,4})p""").find(clean)?.groupValues?.get(1)
+            val tag = if (q != null) "$label ${q}p" else label
+
+            // Ana (master) liste: oynatıcı kaliteyi kendi seçer
+            emitM3u8(link, tag, "$origin/", callback)
+            // Kalite adlarını (720p vb.) görebilmek için alt listeler de eklenir
+            try {
+                M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
+                    .forEach { callback(relabel(it, label)) }
+            } catch (e: Exception) {
+            }
+            d("vidmoly $host tamam")
+            return true
+        }
+        return false
+    }
+
+    // Bir gömülü oynatıcı adresini çözer. Sırayla:
+    // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
+    // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
+    // 3) Görünmez WebView ile sayfayı çalıştırıp ağdan geçen .m3u8'i yakalamak
+    private suspend fun emitEmbed(
+        embed: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val u = when {
+            embed.startsWith("//") -> "https:$embed"
+            embed.startsWith("/") -> mainUrl + embed
+            else -> embed
+        }
+        if (!u.startsWith("http")) return false
+
+        // 0) Byse (bysejikuar.com): CloudStream'de hazır çözücü yok, kendi çözücümüz
+        if (u.contains("byse", ignoreCase = true)) {
+            val okByse = try {
+                extractBysejikuar(u, label, callback)
+            } catch (e: Exception) {
+                d("byse istisna ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            if (okByse) return true
+        }
+
+        // 0b) Vidmoly: kendi çözücümüz; olmazsa aşağıdaki hazır çözücüye düşer
+        if (u.contains("vidmoly", ignoreCase = true)) {
+            val okVm = try {
+                extractVidmoly(u, label, callback)
+            } catch (e: Exception) {
+                d("vidmoly istisna ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            if (okVm) return true
+        }
+
+        // 1) hazır çözücüler
+        val tmp = ArrayList<ExtractorLink>()
+        try {
+            loadExtractor(u, "$mainUrl/", subtitleCallback) { synchronized(tmp) { tmp.add(it) } }
+        } catch (e: Exception) {
+        }
+        if (tmp.isNotEmpty()) {
+            tmp.forEach { callback(relabel(it, label)) }
+            return true
+        }
+
+        // 2) CloudflareKiller ile sayfayı aç, .m3u8 ara
+        try {
+            val page = app.get(u, referer = "$mainUrl/", timeout = 10L)
+                .text.replace("\\/", "/")
+            val m = Regex("""https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*""").find(page)
+            if (m != null) {
+                emitM3u8(m.value.replace("&amp;", "&"), label, u, callback)
+                return true
+            }
+        } catch (e: Exception) {
+        }
+
+        // 3) WebView ile yakala
+        if (webviewLeft.getAndDecrement() > 0) {
+            try {
+                val r = app.get(
+                    u,
+                    referer = "$mainUrl/",
+                    interceptor = WebViewResolver(Regex("""\.m3u8"""), timeout = 15_000L)
+                )
+                if (r.url.contains(".m3u8")) {
+                    emitM3u8(r.url, label, u, callback)
+                    return true
+                }
+            } catch (e: Exception) {
+            }
+        }
+        return false
+    }
+
+    // Sayfadaki oynatıcı adresleri (öncelik sırasıyla). iframe src yerine data-src de olabilir;
+    // hiç gerçek oynatıcı yoksa sayfa kaynağında Byse adresi ve diğer iframe'ler de aranır.
+    private fun pageEmbeds(doc: Document, html: String): List<String> {
+        val out = LinkedHashSet<String>()
+        for (e in doc.select("iframe#hs, #embed iframe")) {
+            listOf(e.attr("src"), e.attr("data-src")).forEach { if (it.isNotBlank()) out.add(it.trim()) }
+        }
+        if (out.none { !it.contains("reCAPTCHA", true) }) {
+            Regex("""(?:https?:)?//[^"'\\\s<>]*byse[^"'\\\s<>]*/e/[^"'\\\s<>]+""", RegexOption.IGNORE_CASE)
+                .findAll(html.replace("\\/", "/")).forEach { out.add(it.value) }
+            for (e in doc.select("iframe")) {
+                val u = listOf(e.attr("src"), e.attr("data-src")).firstOrNull { it.isNotBlank() }?.trim() ?: continue
+                if (u.startsWith("about:")) continue
+                if (listOf("google", "facebook", "youtube", "doubleclick", "histats").any { u.contains(it, true) }) continue
+                out.add(u)
+            }
+        }
+        return out.toList().take(3)
+    }
+
+    // Kapı sayfası (/ajax/reCAPTCHADATA.asp) Cloudflare Turnstile yükler; token çözülünce
+    // $.post("/ajax/reCAPTCHA.asp", {'cf-turnstile-response': token}) ile oturumu doğrular.
+    // Kapı adresi (dataEmbed'in döndürdüğü tam adres) görünmez WebView'de açılır ve kendi kendine çözmesi için süre tanınır.
+    // ÖNEMLİ: useOkhttp = false. WebView kendi ağ yığınını ve çerez yöneticisini kullanır; böylece Turnstile
+    // gerçek tarayıcı gibi çalışır ve doğrulama çerezi WebView'in CookieManager'ına yazılır.
+    // Oturum çerezleri WebView'e verilir, sonra WebView'in çerezleri geri alınır. Sonucu çağıran taraf,
+    // aynı kaynağı yeniden isteyerek doğrular.
+    private suspend fun solveGate(ref: String, gateUrl: String? = null) {
+        val gate = gateUrl?.let { g ->
+            when {
+                g.startsWith("//") -> "https:$g"
+                g.startsWith("/") -> mainUrl + g
+                else -> g
+            }
+        } ?: "$mainUrl/ajax/reCAPTCHADATA.asp"
+        val cm = try { android.webkit.CookieManager.getInstance() } catch (e: Throwable) { null }
+        try {
+            cm?.setAcceptCookie(true)
+            sessionCookies.forEach { (k, v) -> cm?.setCookie(mainUrl, "$k=$v; Path=/") }
+            cm?.flush()
+        } catch (e: Throwable) {
+            d("captcha çerez hata ${e.javaClass.simpleName}")
+        }
+        d("captcha kapı=${gate.take(140)}")
+        val t0 = System.currentTimeMillis()
+        try {
+            app.get(
+                gate,
+                headers = hdr(),
+                referer = ref,
+                cookies = sessionCookies,
+                interceptor = WebViewResolver(
+                    Regex("""zz-asla-eslesmez-zz"""),
+                    userAgent = null,      // eskiden: ua
+                    useOkhttp = false,
+                    timeout = 12_000L      // eskiden: 18_000L
+                )
+            )
+        } catch (e: Exception) {
+            d("captcha webview ${e.javaClass.simpleName}")
+        }
+        try {
+            val before = sessionCookies.size
+            cm?.getCookie(mainUrl)?.split(";")?.forEach { c ->
+                val kv = c.trim().split("=", limit = 2)
+                if (kv.size == 2 && kv[0].isNotBlank()) sessionCookies = sessionCookies + (kv[0] to kv[1])
+            }
+            d("captcha çözüm denendi süre=${System.currentTimeMillis() - t0}ms çerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",").take(80)}")
+        } catch (e: Throwable) {
+            d("captcha çerez geri alma hata ${e.javaClass.simpleName}")
+        }
+    }
+
+    // reCAPTCHA kapısı dönen adresin içinde ya da (oturum çerezleriyle açılan) sayfasında gerçek oynatıcı adresi var mı bakar
+    private suspend fun captchaInner(u: String, ref: String, force: Boolean = false): String? {
+        val full = when {
+            u.startsWith("//") -> "https:$u"
+            u.startsWith("/") -> mainUrl + u
+            else -> u
+        }
+        val dec = try { java.net.URLDecoder.decode(full, "UTF-8") } catch (e: Exception) { full }
+        Regex("""https?://[^\s"'&<>]+""").findAll(dec.substringAfter("?", "")).map { it.value }
+            .firstOrNull { !it.contains("sezonlukdizi", true) && !it.contains("recaptcha", true) }
+            ?.let { return it }
+        // Kapı sayfasını bölüm başına BİR kez açıp yapısını hata ayıklamaya yazar; gerçek oynatıcı adresi
+        // sayfada açıkça yazıyorsa (Vidmoly vb.) onu kullanır.
+        if (force || gateProbed.compareAndSet(false, true)) {
+            try {
+                val h = app.get(full, headers = hdr(), referer = ref, cookies = sessionCookies, timeout = 10L).text
+                val ajax = Regex("""/ajax/[A-Za-z0-9_]+\.asp""").findAll(h).map { it.value }.distinct().take(6).toList()
+                val key = Regex("""sitekey["']?\s*[:=]\s*["']([^"']+)""").find(h)?.groupValues?.get(1)
+                val post = Regex("""\$\.(?:post|ajax)\([^;]{0,150}""").find(h)?.value?.replace(Regex("""\s+"""), " ")
+                d("captcha sayfa uzunluk=${h.length} ajax=$ajax sitekey=$key post=$post")
+                d("captcha sayfa başı='${h.replace(Regex("""\s+"""), " ").take(110)}'")
+                Regex("""https?://[^\s"'<>\\]*(?:vidmoly|embed-)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
+                    .find(h.replace("\\/", "/"))?.value?.let { return it }
+            } catch (e: Exception) {
+                d("captcha sayfa hata ${e.javaClass.simpleName}")
+            }
+        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -1437,146 +1043,425 @@ class VkVideo : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        if (data == "debug") return false
-        val item = fetchItem(data)
+        webviewLeft.set(2)
+        gateProbed.set(false)
+        dbg.clear()
+        sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
+
+        fun dilName(x: String) = if (x == "0") "Dublaj" else "Altyazı"
+        var any = false
         val seen = HashSet<String>()
-        val cands = ArrayList<Cand>()
-        val debug: MutableList<String> = java.util.Collections.synchronizedList(ArrayList<String>())
+        val captchaSeen = HashSet<String>()
+        val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
+        val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
+        val emitted = HashSet<String>()        // bağlantısı listeye verilen diller (dil başına tek bağlantı)
+        val okCnt = HashMap<String, Int>()     // dil başına çalışan kaynak sayısı
+        val srcLog = ArrayList<String>()       // kaynak başına kısa sonuç (hata ayıklama)
+        val pageLog = ArrayList<String>()
 
-        val lang = langInfo(analyze(item.optString("title"))).let { if (it.ok) it.label else "" }
+        fun short(x: String?, n: Int = 50): String =
+            (x ?: "").replace(Regex("""\s+"""), " ").trim().take(n)
 
-        val parts = data.split("_")
-        val oid = parts.getOrNull(0) ?: ""
-        val vid = parts.getOrNull(1) ?: ""
-
-        debug.add(
-            "info type=${item.optString("type")} srv=${item.optString("server")} " +
-                "ovp=${item.optString("ov_provider_id")} h=${item.optInt("height")}"
-        )
-
-        // 1) getByIds / get yanıtı içindeki linkler
-        val urls1 = ArrayList<Pair<String, String>>()
-        scanUrls(item, "", urls1)
-        for ((k, u) in urls1) addCand(cands, seen, k, u)
-        debug.add("item links=${cands.size}")
-
-        // 2) Sitenin kendi oynatma metodları (paralel)
-        val playParams = mapOf(
-            "videos" to data,
-            "video" to data,
-            "owner_id" to oid,
-            "video_id" to vid,
-            "id" to vid
-        )
-        val playRes = listOf("video.getForPlay", "video.getPlayerConfig").amap { m ->
-            val list = ArrayList<Pair<String, String>>()
-            try {
-                val r = api(m, playParams)
-                scanUrls(r, "", list)
-                debug.add("$m urls=${list.size} ${shape(r)}")
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                debug.add("$m: ${e.message?.take(90)}")
-            }
-            list
-        }
-        for (l in playRes) for ((k, u) in l) addCand(cands, seen, k, u)
-
-        // 3) Yedek: oynatıcı (embed) sayfası — takılırsa 6 sn'de bırakılır
-        var player = item.optString("player")
-        if (cands.isEmpty()) {
-            if (player.isBlank()) {
-                val ak = item.optString("access_key")
-                player = "$mainUrl/video_ext.php?oid=$oid&id=$vid" +
-                    (if (ak.isNotBlank()) "&hash=$ak" else "")
-            }
-            try {
-                val html = fetchFollow(player, hdr, 6000L)
-                if (html == null) {
-                    debug.add("embed: yönlendirme döngüsü / zaman aşımı")
-                } else {
-                    val n = scanHtml(html, cands, seen)
-                    debug.add(
-                        "embed len=${html.length} links=$n head=" + html.take(80).replace("\n", " ")
-                    )
+        // Bir kaynağın topladığımız bağlantılarından dil başına TEK, temiz adlı bağlantı verir:
+        // "Türkçe Dublaj (720p)" / "Türkçe Altyazı (720p)". Dublaj üstte çıksın diye kalitesi biraz yüksek tutulur.
+        suspend fun flush(dil: String, buf: List<ExtractorLink>): Boolean {
+            if (buf.isEmpty()) return false
+            if (dil in emitted) return true
+            val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
+                ?: buf.maxByOrNull { it.quality }
+                ?: buf.first()
+            val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
+                .maxOrNull()
+            val linkName = "Türkçe ${dilName(dil)}" + (res?.let { " (${it}p)" } ?: "")
+            callback(
+                newExtractorLink(pick.source, linkName, pick.url, pick.type) {
+                    this.referer = pick.referer
+                    this.quality = if (dil == "0") Qualities.P1080.value else Qualities.P720.value
+                    this.headers = pick.headers
                 }
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                debug.add("embed: ${e.message?.take(90)}")
-            }
-        }
-
-        // 3b) Farklı adresler / mobil sayfa (HTML'de oynatıcı verisi başka yerde olabilir)
-        if (cands.isEmpty()) {
-            val hash = Regex("[?&]hash=([0-9a-zA-Z]+)").find(player)?.groupValues?.get(1)
-                ?: item.optString("access_key")
-            val mobileHdr = hdr + mapOf("User-Agent" to MOBILE_UA)
-            val alts = listOf(
-                player to mobileHdr,
-                ("https://vk.com/video_ext.php?oid=$oid&id=$vid" + (if (hash.isNotBlank()) "&hash=$hash" else "")) to hdr,
-                ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
             )
-            for ((cu, ch) in alts) {
-                if (cands.isNotEmpty()) break
-                try {
-                    val html = fetchFollow(cu, ch, 5000L) ?: continue
-                    val n = scanHtml(html, cands, seen)
-                    debug.add("alt ${cu.take(45)} len=${html.length} links=$n")
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    debug.add("alt: ${e.message?.take(70)}")
-                }
-            }
-        }
-
-        // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
-        if (cands.isEmpty()) {
-            for (wu in listOf(player, "$mainUrl/video$data")) {
-                if (cands.isNotEmpty()) break
-                try {
-                    val r = app.get(
-                        wu,
-                        headers = hdr,
-                        referer = "$mainUrl/",
-                        interceptor = WebViewResolver(
-                            Regex("""(?i)\.m3u8|\.mpd|(vkvd|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4"""),
-                            userAgent = null,
-                            useOkhttp = false,
-                            timeout = 20_000L
-                        ),
-                        timeout = 30L
-                    )
-                    val cu = r.url
-                    debug.add("webview ${cu.take(70)}")
-                    if (cu != wu) addCand(cands, seen, "", cu)
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    debug.add("webview: ${e.message?.take(70)}")
-                }
-            }
-        }
-
-        // 4) Bağlantı testi: en iyi 4 mp4 + 1 HLS için hangi başlık takımının çalıştığı bulunur, ölüler sona atılır
-        if (cands.isNotEmpty()) {
-            val mp4s = cands.filter { !isHls(it) && !isDash(it) }
-                .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
-            val targets = mp4s.take(4) + cands.filter { isHls(it) }.take(1)
-            targets.amap { probe(it) }
-            debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
-
-            val alive = cands.filter { !it.dead }
-            val toEmit = if (alive.isNotEmpty()) alive else cands            // hepsi ölüyse yine de ver
-            for (c in toEmit) emitCand(c, lang, callback)
+            emitted.add(dil)
             return true
         }
 
-        // 5) Hiçbiri olmadıysa teşhis satırları göster (her satırın adresi benzersiz)
-        debug.add("player=" + player.take(70))
-        debug.forEachIndexed { i, d ->
-            callback(
-                newExtractorLink(name, "DEBUG $d", "https://debug.invalid/$i") { }
-            )
+        // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
+        suspend fun emit(dil: String, embed0: String): Boolean {
+            var embed = embed0
+            if (embed.isBlank()) return false
+            if (embed.contains("reCAPTCHA", true)) {
+                if (!captchaSeen.add(embed)) return false
+                val inner = try { captchaInner(embed, "$mainUrl/") } catch (e: Exception) { null }
+                d("captcha iç=$inner")
+                if (inner.isNullOrBlank()) return false
+                embed = inner
+            }
+            if (!seen.add(embed)) return false
+            val buf = ArrayList<ExtractorLink>()
+            val collect: (ExtractorLink) -> Unit = { l -> synchronized(buf) { buf.add(l) } }
+            val ok: Boolean
+            // Doğrudan .m3u8 adresi verilmişse hazır çözücüye gerek yok
+            if (Regex("""\.m3u8(\?|$)""").containsMatchIn(embed)) {
+                val full = abs(embed)
+                emitM3u8(full, dilName(dil), full, collect)
+                ok = flush(dil, buf)
+            } else {
+                val r = emitEmbed(embed, dilName(dil), subtitleCallback, collect)
+                ok = r && flush(dil, buf)
+            }
+            d("kaynak ${dilName(dil)} $embed -> $ok")
+            if (ok) {
+                any = true
+                got.add(dil)
+                okCnt[dil] = (okCnt[dil] ?: 0) + 1
+            }
+            return ok
         }
-        return true
+
+        // Cloudflare hız sınırı ("error code: 1015") yanıtı mı?
+        fun rl(x: String) = x.contains("1015") || x.contains("rate limit", true) || x.contains("too many", true)
+
+        // Hız sınırında beklemek için toplam süre bütçesi (ms)
+        var waitBudget = 40_000L
+
+        // Kaynak id'sinden gömülü oynatıcı adresini ister: (adres, ham yanıt).
+        // Cloudflare 1015 dönerse bekleyip aynı kaynağı tekrar dener.
+        suspend fun fetchEmbed(id: String, ref: String): Pair<String?, String> {
+            var found: String? = null
+            var raw = ""
+            for (attempt in 0..2) {
+                for (ep in embedEndpoints.orEmpty()) {
+                    val r = try {
+                        post(mainUrl + ep, mapOf("id" to id), ref).text
+                    } catch (e: Exception) {
+                        "HATA ${e.javaClass.simpleName}"
+                    }
+                    raw = r
+                    found = embedOf(r)
+                    if (found != null) break
+                }
+                if (found != null || !rl(raw) || waitBudget <= 0) break
+                val w = 5000L + attempt * 3000L
+                waitBudget -= w
+                d("hız sınırı id=$id bekle=${w}ms")
+                try { Thread.sleep(w) } catch (e: Exception) { }
+            }
+            return Pair(found, raw)
+        }
+
+        // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
+        var gatedSeen = false
+        var lastGateUrl: String? = null
+        suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
+            val (f, raw) = fetchEmbed(id, ref)
+            val tag = "$tagPrefix$dil:$id"
+            if (f.isNullOrBlank()) {
+                srcLog.add("$tag BOŞ[${short(raw)}]")
+                retryQ.add(Triple(dil, id, ref))
+                return
+            }
+            val cap = f.contains("reCAPTCHA", true)
+            val host = if (cap) "CAPTCHA" else (Regex("""^(?:https?:)?//([^/]+)""").find(f)?.groupValues?.get(1)
+                ?: short(f, 25))
+            if (cap) {
+                gatedSeen = true
+                lastGateUrl = f
+            }
+            val ok = emit(dil, f)
+            if (cap && !ok) retryQ.add(Triple(dil, id, ref))
+            if (ok) {
+                if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
+                if (idx >= 0) goodKeys.add("i:$dil:$idx")
+            }
+            srcLog.add("$tag $host ${if (ok) "OK" else "yok"}")
+        }
+
+        // 1) Hem normal (altyazı) hem /dublaj/ bölüm sayfası açılır; her ikisindeki açık oynatıcı kendi diliyle eklenir.
+        val m = reEp.find(data)
+        val pageUrls = if (m != null) {
+            val slug = m.groupValues[1]
+            val s = m.groupValues[2]
+            val e = m.groupValues[3]
+            listOf(
+                "$mainUrl/$slug/$s-sezon-$e-bolum.html",
+                "$mainUrl/$slug/dublaj/$s-sezon-$e-bolum.html"
+            )
+        } else listOf(data)
+
+        val pages = ArrayList<Triple<String, String, String>>()   // (sayfa adresi, bid, aktif dil)
+        // İki sayfa aynı anda istenir (hız için)
+        val fetched = pageUrls.amap { pu ->
+            try {
+                Pair(pu, get(pu))
+            } catch (e: Exception) {
+                d("sayfa hata ${pu.takeLast(40)} ${e.javaClass.simpleName}: ${e.message}")
+                null
+            }
+        }
+        for (item in fetched) {
+            if (item == null) {
+                pageLog.add("HATA")
+                continue
+            }
+            val pu = item.first
+            val res = item.second
+            if (res.code !in 200..299) {
+                d("sayfa kod=${res.code} $pu")
+                pageLog.add("kod=${res.code}")
+                continue
+            }
+            if (res.cookies.isNotEmpty()) sessionCookies = sessionCookies + res.cookies
+            val doc = res.document
+            val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
+            val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil")
+                ?.takeIf { it == "0" || it == "1" }
+                ?: if (res.url.contains("/dublaj/")) "0" else "1"
+            discoverEndpoints(doc, res.text)
+            val embeds = pageEmbeds(doc, res.text)
+            d("sayfa kod=${res.code} bid='$bid' dil=$activeDil açık=${embeds.size}")
+            pageLog.add("dil=$activeDil bid=$bid açık=${embeds.size} çerez=${sessionCookies.size}")
+            pages.add(Triple(pu, bid, activeDil))
+            for (f in embeds) emit(activeDil, f)
+            try { Thread.sleep(250) } catch (e: Exception) { }
+        }
+
+        // 2) Alternatif kaynak listeleri alınır. Çalışan kaynaklar (Byse / daha önce çalışanlar) öne alınır,
+        //    sonra iki dil sırayla (altyazı, dublaj, altyazı, dublaj ...) denenir; bir dilde kaynak bulununca o dil durur.
+        //    Böylece iki dil de çabuk gelir ve Cloudflare hız sınırına takılmaz.
+        fun prio(dil: String, idx: Int, nm: String): Int {
+            val n = nm.trim().lowercase()
+            return when {
+                n.contains("byse") || n.contains("filemoon") -> 0
+                "i:$dil:$idx" in goodKeys -> 1
+                n.isNotBlank() && "n:$n" in goodKeys -> 2
+                else -> 3
+            }
+        }
+
+        val queues = HashMap<String, List<Triple<String, String, Int>>>()
+        val refs = HashMap<String, String>()
+        for (dil in listOf("0", "1")) {
+            val refUrl = pages.map { it.first }.firstOrNull { (dil == "0") == it.contains("/dublaj/") }
+                ?: pages.firstOrNull()?.first ?: data
+            val bid = pages.firstOrNull { it.first == refUrl }?.second?.takeIf { it.isNotBlank() }
+                ?: pages.map { it.second }.firstOrNull { it.isNotBlank() }
+                ?: continue
+
+            var alts: List<Pair<String, String>> = emptyList()
+            for (ep in altEndpoints.orEmpty()) {
+                var txt = ""
+                for (att in 0..2) {
+                    txt = try {
+                        post(mainUrl + ep, mapOf("bid" to bid, "dil" to dil), refUrl).text
+                    } catch (e: Exception) {
+                        ""
+                    }
+                    if (!rl(txt) || waitBudget <= 0) break
+                    waitBudget -= 5000L
+                    try { Thread.sleep(5000L) } catch (e: Exception) { }
+                }
+                alts = altList(txt)
+                if (alts.isEmpty()) d("alt boş dil=$dil yanıt='${short(txt, 60)}'")
+                if (alts.isNotEmpty()) break
+            }
+            d("bid=$bid dil=$dil alt=${alts.size} adlar=${alts.joinToString(",") { short(it.second, 12) }}")
+            srcLog.add("$dil: alt=${alts.size} adlar=${alts.joinToString(",") { short(it.second, 12) }}")
+            refs[dil] = refUrl
+            queues[dil] = alts.mapIndexed { i, a -> Triple(a.first, a.second, i) }
+                .sortedWith(compareBy({ prio(dil, it.third, it.second) }, { it.third }))
+        }
+
+        val pos = HashMap<String, Int>()
+        var more = true
+        while (more) {
+            more = false
+            for (dil in listOf("0", "1")) {
+                if (dil in got) continue
+                val q = queues[dil] ?: continue
+                val i = pos[dil] ?: 0
+                if (i >= q.size) continue
+                pos[dil] = i + 1
+                more = true
+                val cand = q[i]
+                tryId(dil, cand.first, refs[dil] ?: data, "", cand.second, cand.third)
+                try { Thread.sleep(400) } catch (e: Exception) { }
+            }
+        }
+
+        // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir
+        if (gatedSeen && listOf("0", "1").any { it !in got } && System.currentTimeMillis() >= gateFailUntil) {
+            solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
+        }
+        for (dil in listOf("0", "1")) {
+            if (dil in got) continue
+            val todo = retryQ.filter { it.first == dil }.take(4)
+            for (attempt in 1..2) {
+                if (dil in got) break
+                for ((_, id, ref) in todo) {
+                    if (dil in got) break
+                    try { Thread.sleep(1500L * attempt) } catch (e: Exception) { }
+                    tryId(dil, id, ref, "R$attempt ")
+                }
+            }
+        }
+
+        // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa:
+        //    (a) kapı adresinin içinde / kapı sayfasında gerçek adres aranır,
+        //    (b) olmazsa kapının tam adresi WebView'de açılıp çözülür (useOkhttp = false), adres yeniden istenir.
+        if (vidmolyExtra) {
+            for (dil in listOf("0", "1")) {
+                val cand = queues[dil]?.firstOrNull { it.second.contains("vidmoly", true) } ?: continue
+                val ref = refs[dil] ?: data
+                var f = fetchEmbed(cand.first, ref).first
+                if (f != null && f.contains("reCAPTCHA", true)) {
+                    val gateUrl: String = f
+                    d("vidmoly kapı url=${short(gateUrl, 170)}")
+                    // (a) adresin içinde / sayfasında gerçek adres var mı
+                    var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
+                    if (inner.isNullOrBlank()) {
+                        if (System.currentTimeMillis() < gateFailUntil) {
+                            d("vidmoly dil=$dil kapı yakın zamanda çözülemedi, atlandı")
+                            continue
+                        }
+                        // (b) kapıyı WebView'de çöz, adresi yeniden iste
+                        solveGate(ref, gateUrl)
+                        val f2 = fetchEmbed(cand.first, ref).first
+                        d("vidmoly kapı sonrası url=${short(f2, 170)}")
+                        inner = if (f2 != null && !f2.contains("reCAPTCHA", true)) f2
+                        else try { captchaInner(f2 ?: gateUrl, ref, true) } catch (e: Exception) { null }
+                        if (inner.isNullOrBlank()) {
+                            gateFailUntil = System.currentTimeMillis() + 90_000L
+                            d("vidmoly dil=$dil kapı çözülemedi")
+                            continue
+                        }
+                        gateCookies = sessionCookies
+                        gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+                        d("vidmoly dil=$dil kapı çözüldü")
+                    } else {
+                        d("vidmoly dil=$dil gerçek adres kapıdan çıkarıldı")
+                    }
+                    f = inner
+                }
+                if (f.isNullOrBlank() || f.contains("reCAPTCHA", true) || f in seen) continue
+                val buf = ArrayList<ExtractorLink>()
+                val ok = try {
+                    emitEmbed(abs(f), "Türkçe ${dilName(dil)}", subtitleCallback) { l -> synchronized(buf) { buf.add(l) } }
+                } catch (e: Exception) {
+                    false
+                }
+                d("vidmoly dil=$dil ${short(f, 40)} -> $ok")
+                if (ok && buf.isNotEmpty()) {
+                    val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
+                        ?: buf.maxByOrNull { it.quality }
+                        ?: buf.first()
+                    val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
+                        .maxOrNull()
+                    callback(
+                        newExtractorLink(pick.source, "Türkçe ${dilName(dil)} - Vidmoly" + (res?.let { " (${it}p)" } ?: ""), pick.url, pick.type) {
+                            this.referer = pick.referer
+                            this.quality = Qualities.P720.value
+                            this.headers = pick.headers
+                        }
+                    )
+                    any = true
+                }
+            }
+        }
+
+        val missing = listOf("0", "1").filter { it !in got }
+        d("özet dublaj=${"0" in got} altyazı=${"1" in got}")
+
+        // Hata ayıklama: bir dil eksik kalırsa sebebi kaynak listesinde kısa "DEBUG" satırları olarak gösterilir
+        if (debug && any && missing.isNotEmpty()) {
+            val eksik = missing.joinToString("+") { dilName(it) }
+            val lines = listOf(
+                "sayfalar: " + pageLog.joinToString(" | "),
+                "dublaj: " + srcLog.filter { it.contains("0:") && !it.contains("1:") }.joinToString(" ; "),
+                "altyazı: " + srcLog.filter { it.contains("1:") }.joinToString(" ; "),
+                "byse: " + dbg.filter { it.startsWith("byse") }.takeLast(4).joinToString(" / "),
+                "kapı: " + dbg.filter { it.startsWith("captcha") || it.startsWith("vidmoly") }.takeLast(10).joinToString(" / ")
+            )
+            for ((i, line) in lines.withIndex()) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        "DEBUG ${i + 1} [$eksik yok] " + line.take(520),
+                        "https://debug.invalid/$i",
+                        ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+        }
+
+        if (!any && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
+        return any
     }
 }
+
+// ---------------- TMDB JSON veri sınıfları ----------------
+// Alan adları TMDB'nin JSON adlarıyla birebir aynıdır (JsonProperty kullanılmaz).
+data class TmdbTvResult(
+    val id: Int? = null,
+    val name: String? = null,
+    val original_name: String? = null,
+    val first_air_date: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val overview: String? = null,
+    val popularity: Double? = null
+)
+
+data class TmdbSearchResponse(
+    val results: List<TmdbTvResult>? = null
+)
+
+data class TmdbGenre(
+    val id: Int? = null,
+    val name: String? = null
+)
+
+data class TmdbSeasonInfo(
+    val season_number: Int? = null,
+    val episode_count: Int? = null
+)
+
+data class TmdbCast(
+    val name: String? = null,
+    val character: String? = null,
+    val profile_path: String? = null
+)
+
+data class TmdbCredits(
+    val cast: List<TmdbCast>? = null
+)
+
+data class TmdbTvDetails(
+    val id: Int? = null,
+    val name: String? = null,
+    val original_name: String? = null,
+    val overview: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val first_air_date: String? = null,
+    val popularity: Double? = null,
+    val genres: List<TmdbGenre>? = null,
+    val seasons: List<TmdbSeasonInfo>? = null,
+    val credits: TmdbCredits? = null
+)
+
+data class TmdbEpisode(
+    val episode_number: Int? = null,
+    val season_number: Int? = null,
+    val name: String? = null,
+    val overview: String? = null,
+    val still_path: String? = null,
+    val runtime: Int? = null,
+    val air_date: String? = null,
+    val vote_average: Double? = null
+)
+
+data class TmdbSeasonDetails(
+    val episodes: List<TmdbEpisode>? = null
+)
