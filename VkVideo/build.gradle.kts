@@ -1,11 +1,11 @@
-version = 9
+version = 10
 
 android {
     namespace = "com.bymesut1.vkvideo"
 }
 
 cloudstream {
-    description = "VK Video - vkvideo.ru'daki Türkçe dublaj ve altyazılı filmler"
+    description = "VK Video - vkvideo.ru'daki Türkçe dublajlı filmler (tr dublaj / izle etiketli). Yandex yardımlı arama, TMDB posteri"
     authors = listOf("Bymesut1")
 
     status = 1
