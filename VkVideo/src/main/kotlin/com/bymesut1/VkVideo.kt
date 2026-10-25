@@ -53,15 +53,21 @@ class VkVideo : MainAPI() {
 
         // Yandex yardımı: "ad tr dublaj izle vkvideo.ru" tarzı aramalardan VK video numaraları toplanır
         private const val YANDEX = true
-        private const val YANDEX_QUERIES = 9
-        private const val YANDEX_MS = 7000L
+        private const val YANDEX_QUERIES = 12
+        private const val YANDEX_MS = 9000L
         private const val YANDEX_VERIFY = 24
+
+        // Yandex'in ilk kaç sonucu, süzgeç ne derse desin listenin en üstünde mutlaka gösterilsin
+        private const val YANDEX_FORCE = 3
+
+        // VK'nin kendi aramasından (site + video.search) adı uyan ilk kaç sonuç süzgeçten bağımsız gösterilsin
+        private const val VK_FORCE = 3
 
         // Yandex'ten gelen videolar için en kısa süre (saniye); normal MIN_DURATION'dan gevşek
         private const val YANDEX_MIN = 600
 
         // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
-        private const val DEBUG_SEARCH = false
+        private const val DEBUG_SEARCH = true
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
@@ -889,7 +895,8 @@ class VkVideo : MainAPI() {
             "https://yandex.com/video/search?text=$e",
             "https://yandex.com.tr/search/?text=$e",
             "https://www.bing.com/search?q=$e&setlang=tr&count=30",
-            "https://html.duckduckgo.com/html/?q=$e&kl=tr-tr"
+            "https://html.duckduckgo.com/html/?q=$e&kl=tr-tr",
+            "https://www.google.com/search?q=$e&hl=tr&num=20"
         )
         return if (qi < 2) all else listOf(all[0], all[4])
     }
@@ -910,6 +917,9 @@ class VkVideo : MainAPI() {
         val cleaned = names.map { it.replace(Regex("[:!?,\"]+"), " ").replace(Regex("\\s+"), " ").trim() }
             .filter { it.isNotEmpty() }
         val qs = ArrayList<String>()
+        // Elle aranınca işe yarayan biçim en başta: "ad tr vk", "ad vk"
+        cleaned.firstOrNull()?.let { qs.add("$it tr vk"); qs.add("$it vk") }
+        for (n in cleaned.drop(1)) qs.add("$n tr vk")
         for (tag in YANDEX_TAGS) for (n in cleaned) qs.add("$n $tag")
         for (n in cleaned) qs.add("site:vkvideo.ru $n izle")
         val queries = qs.distinct().take(YANDEX_QUERIES)
@@ -965,6 +975,64 @@ class VkVideo : MainAPI() {
             }
         }
         return YandexRes(found, captcha, fetched, logs.take(16).joinToString("\n"))
+    }
+
+    // VK'nin klasik video.search yöntemi: site aramasından (catalog) ayrı bir dizin, ek kaynak
+    private suspend fun vkApiSearch(names: List<String>): List<JSONObject> {
+        val qs = ArrayList<String>()
+        for (n in names.take(3)) {
+            qs.add(n)
+            qs.add("$n tr dublaj")
+            qs.add("$n izle")
+        }
+        val res = qs.distinct().take(8).amap { t ->
+            try {
+                val r = api(
+                    "video.search",
+                    mapOf("q" to t, "count" to "50", "extended" to "1", "adult" to "1")
+                )
+                val m = LinkedHashMap<String, JSONObject>()
+                collectVideos(r, m)
+                m.values.toList()
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                emptyList<JSONObject>()
+            }
+        }
+        return res.flatten()
+    }
+
+    // VK'nin kendi site arama sayfaları: video numaraları HTML'den okunur, VK API'den doğrulanır (sayfa JS ile çiziliyorsa boş dönebilir)
+    private suspend fun vkSiteSearch(names: List<String>): List<JSONObject> {
+        val urls = ArrayList<String>()
+        for (n in names.take(2)) {
+            val en = enc(n)
+            urls.add("https://vkvideo.ru/?q=$en")
+            urls.add("https://vk.com/video?q=$en")
+        }
+        val pages = urls.amap { u ->
+            try {
+                val r = app.get(u, headers = hdr, timeout = 6L)
+                if (r.code in 200..299) r.text else ""
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ""
+            }
+        }
+        val ids = LinkedHashMap<String, String>()
+        for (t in pages) for ((k, v) in parseEngine(t)) if (!ids.containsKey(k)) ids[k] = v
+        val out = ArrayList<JSONObject>()
+        for (ch in ids.values.take(30).chunked(10)) {
+            try {
+                val r = api("video.getByIds", mapOf("videos" to ch.joinToString(",")))
+                val m = LinkedHashMap<String, JSONObject>()
+                collectVideos(r, m)
+                out.addAll(m.values)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        return out
     }
 
     private fun taggedQueries(names: List<String>): List<String> {
@@ -1035,9 +1103,11 @@ class VkVideo : MainAPI() {
         var more = false
         var dbgTxt = ""
         var yRes: YandexRes? = null
+        val vkTop: MutableList<JSONObject> = java.util.Collections.synchronizedList(ArrayList<JSONObject>())
+        val vkExtra: MutableList<JSONObject> = java.util.Collections.synchronizedList(ArrayList<JSONObject>())
 
-        // 0: Yandex toplama, 1: VK aramaları (düz + kanallar + etiketli sorgular) — ikisi paralel
-        listOf(0, 1).amap { which ->
+        // 0: Yandex toplama, 1: VK aramaları (düz + kanallar + etiketli sorgular), 2: VK ek kaynakları (video.search + site sayfaları) — üçü paralel
+        listOf(0, 1, 2).amap { which ->
             if (which == 0) {
                 if (YANDEX) {
                     try {
@@ -1046,10 +1116,11 @@ class VkVideo : MainAPI() {
                         if (e is java.util.concurrent.CancellationException) throw e
                     }
                 }
-            } else {
+            } else if (which == 1) {
                 val base = searchRaw(sq, 1, true)
                 more = base.more
                 dbgTxt = base.debug
+                vkTop.addAll(base.videos.values)
                 for (o in base.videos.values) merged.putIfAbsent(baseOf(o), o)
 
                 for (ch in taggedQueries(qNames).chunked(4)) {
@@ -1063,9 +1134,21 @@ class VkVideo : MainAPI() {
                     }
                     for (rp in raws) for (o in rp.videos.values) merged.putIfAbsent(baseOf(o), o)
                 }
+            } else {
+                try {
+                    vkExtra.addAll(vkApiSearch(qNames))
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
+                try {
+                    vkExtra.addAll(vkSiteSearch(qNames))
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                }
             }
             0
         }
+        for (o in vkExtra) if (o.optInt("duration") >= MIN_DURATION) merged.putIfAbsent(baseOf(o), o)
 
         var yStat = "yandex kapali"
         var yLog = ""
@@ -1125,11 +1208,31 @@ class VkVideo : MainAPI() {
         var ranked = rankAll(merged.values, names, yRank).take(MAX_RESULTS)
         if (ranked.isEmpty() && yOrdered.isNotEmpty()) ranked = yOrdered.take(3)
 
-        rawStart.keys.removeAll { it.startsWith("$q|") }
-        shownMap[q] = java.util.Collections.synchronizedSet(HashSet<String>(ranked.map { baseOf(it) }))
+        // Yandex'in ilk sonuçları + VK'nin kendi aramasından adı uyan ilk sonuçlar, süzgeçten geçmese bile en üstte yer alır
+        val cyr = Regex("[\\u0400-\\u04FF]")
+        val forced = LinkedHashMap<String, JSONObject>()
+        for (o in yOrdered) {
+            if (forced.size >= YANDEX_FORCE) break
+            if (!cyr.containsMatchIn(o.optString("title"))) forced.putIfAbsent(baseOf(o), o)
+        }
+        if (!noName) {
+            var vkCount = 0
+            for (o in vkTop + vkExtra) {
+                if (vkCount >= VK_FORCE) break
+                val t = o.optString("title")
+                if (cyr.containsMatchIn(t) || o.optInt("duration") < MIN_DURATION) continue
+                val inf = analyze(t)
+                if ("altyazi" in inf.tagset || "altyazili" in inf.tagset || "sub" in inf.tagset) continue
+                if (nameMatch(inf, names) < 0) continue
+                if (forced.putIfAbsent(baseOf(o), o) == null) vkCount++
+            }
+        }
+        if (forced.isNotEmpty()) {
+            ranked = (forced.values + ranked.filter { baseOf(it) !in forced }).take(MAX_RESULTS)
+        }
 
         lastDebug = "sorgu=$sq\nadlar=$names\ntoplam=${merged.size} aday=${ranked.size} tmdbPoster=${ex.poster != null}\n" +
-            "$yStat\n$yLog\nvk: $dbgTxt"
+            "$yStat\n$yLog\nvk: $dbgTxt extra=${vkExtra.size}"
 
         val items = ArrayList<SearchResponse>()
         if (DEBUG_SEARCH) {
@@ -1142,7 +1245,7 @@ class VkVideo : MainAPI() {
                 )
             )
         }
-        items.addAll(toResponses(ranked, ex, yRank.keys.toSet()))
+        items.addAll(toResponses(ranked, ex, yRank.keys.toSet() + forced.keys))
         return items to more
     }
 
