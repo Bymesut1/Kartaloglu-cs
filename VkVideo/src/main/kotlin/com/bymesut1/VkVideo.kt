@@ -983,12 +983,13 @@ class VkVideo : MainAPI() {
         if (direct != null && q.contains("vk", true)) {
             if (page > 1) return emptyList<SearchResponse>() to false
             val o = fetchItem(direct.groupValues[1])
+            val directPoster = workingPoster(o)
             val card = newMovieSearchResponse(
                 o.optString("title"),
                 "$mainUrl/video${videoKey(o)}",
                 TvType.Movie
             ) {
-                this.posterUrl = workingPoster(o)
+                this.posterUrl = directPoster
             }
             return listOf<SearchResponse>(card) to false
         }
