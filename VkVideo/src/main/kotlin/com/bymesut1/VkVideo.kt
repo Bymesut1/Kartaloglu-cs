@@ -143,7 +143,11 @@ class VkVideo : MainAPI() {
                 "app_id" to APP_ID
             ).also { if (DEVICE_ID.isNotBlank()) it["device_id"] = DEVICE_ID }
         ).text
-        val t = JSONObject(text).optJSONObject("data")?.optString("access_token")
+        val t = try {
+            JSONObject(text).optJSONObject("data")?.optString("access_token")
+        } catch (e: Exception) {
+            null
+        }
         if (t.isNullOrBlank()) throw ErrorLoadingException("Token alınamadı: $text")
         token = t
         return t
@@ -154,22 +158,51 @@ class VkVideo : MainAPI() {
         params: Map<String, String>,
         retry: Boolean = true
     ): Any? {
-        val text = app.post(
-            "$API/$method?v=$V&client_id=$CLIENT_ID",
-            headers = hdr,
-            data = params + ("access_token" to getToken())
-        ).text
-        val json = JSONObject(text)
-        val err = json.optJSONObject("error")
-        if (err != null) {
-            val code = err.optInt("error_code")
-            if (retry && code == 5) {
-                token = null
-                return api(method, params, false)
+        var attempt = 0
+        var lastText = ""
+        while (true) {
+            attempt++
+            var text: String? = null
+            try {
+                text = app.post(
+                    "$API/$method?v=$V&client_id=$CLIENT_ID",
+                    headers = hdr,
+                    data = params + ("access_token" to getToken())
+                ).text
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                lastText = e.message ?: ""
             }
-            throw ErrorLoadingException("VK hata $code ($method): ${err.optString("error_msg")}")
+            val json: JSONObject? = try {
+                if (text != null) JSONObject(text) else null
+            } catch (e: Exception) {
+                lastText = text?.take(80) ?: ""
+                null
+            }
+            if (json == null) {
+                // JSON olmayan yanıt ("server ..." vb.) veya ağ hatası: bekleyip yeniden dene
+                if (attempt < 4) {
+                    kotlinx.coroutines.delay(700L * attempt)
+                    continue
+                }
+                throw ErrorLoadingException("VK yanıtı okunamadı ($method): $lastText")
+            }
+            val err = json.optJSONObject("error")
+            if (err != null) {
+                val code = err.optInt("error_code")
+                if (retry && code == 5) {
+                    token = null
+                    return api(method, params, false)
+                }
+                // 1 / 6 / 9 / 10: geçici sunucu ve çok sık istek hataları: bekleyip yeniden dene
+                if ((code == 1 || code == 6 || code == 9 || code == 10) && attempt < 4) {
+                    kotlinx.coroutines.delay(700L * attempt)
+                    continue
+                }
+                throw ErrorLoadingException("VK hata $code ($method): ${err.optString("error_msg")}")
+            }
+            return json.opt("response")
         }
-        return json.opt("response")
     }
 
     // ---------- Video listesi yardımcıları ----------
@@ -774,7 +807,13 @@ class VkVideo : MainAPI() {
             tries++
             val params = mutableMapOf("q" to q, "count" to "30", "extended" to "1")
             if (cur != null) params["start_from"] = cur.next
-            var resp: Any? = api("catalog.getVideoSearchWeb2", params)
+            var resp: Any? = try {
+                api("catalog.getVideoSearchWeb2", params)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                if (cur == null) throw e          // ilk sayfa: hatayı göster
+                break                             // sonraki sayfalar: imleç korunur, bir sonraki kaydırmada yeniden denenir
+            }
             var vids = LinkedHashMap<String, JSONObject>()
             collectVideos(resp, vids)
 
@@ -1085,6 +1124,7 @@ class VkVideo : MainAPI() {
             smartSearch(q, page)
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
+            if (page > 1) return emptyList<SearchResponse>() to true     // kaydırırken hata: listeyi kesme, sonraki kaydırmada yeniden dene
             listOf(errorCard(e.message ?: e.toString())) to false
         }
     }
