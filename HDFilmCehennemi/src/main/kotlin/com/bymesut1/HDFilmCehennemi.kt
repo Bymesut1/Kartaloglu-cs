@@ -58,7 +58,6 @@ class HDFilmCehennemi : MainAPI() {
     @Volatile
     private var cfBlockedUntil = 0L
     private val cfCooldownMs = 60L * 1000
-    private val cfSolveTimeoutMs = 50L * 1000
 
     private fun cfCoolingDown(): Boolean = System.currentTimeMillis() < cfBlockedUntil
 
@@ -129,11 +128,10 @@ class HDFilmCehennemi : MainAPI() {
                 userAgent = uaMobile,
                 useOkhttp = true
             )
-            kotlinx.coroutines.withTimeoutOrNull(cfSolveTimeoutMs) {
-                resolver.resolveUsingWebView(url, siteBase() + "/") { _ ->
-                    val c = try { cm.getCookie(url) } catch (_: Throwable) { null }
-                    c != null && c.contains("cf_clearance")
-                }
+            // WebViewResolver kendi 60 sn zaman aşımını uygular
+            resolver.resolveUsingWebView(url, siteBase() + "/") { _ ->
+                val c = try { cm.getCookie(url) } catch (_: Throwable) { null }
+                c != null && c.contains("cf_clearance")
             }
             val c = try { cm.getCookie(url) } catch (_: Throwable) { null }
             val names = c?.split(";")?.map { it.substringBefore("=").trim() }
