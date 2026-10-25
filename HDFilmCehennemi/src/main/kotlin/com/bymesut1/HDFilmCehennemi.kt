@@ -3,7 +3,6 @@ package com.bymesut1
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
@@ -45,20 +44,21 @@ class HDFilmCehennemi : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     // ---------------- Cloudflare çerezi (kalıcı) ----------------
-    // Site bazen Cloudflare doğrulaması (403/503) istiyor; WebView ile çözüp çerezi diske kaydeder.
-    // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
-    // bu yüzden 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
-    @Volatile
-    private var cfKiller = CloudflareKiller()
+    // CloudflareKiller WebView'i istekleri OkHttp'siz (yerel) yükler; bu durumda WebView her isteğe
+    // "X-Requested-With: <paket adı>" ekler ve site bunu tamamen engelliyordu (doğrulama sayfası bile gelmiyordu).
+    // Burada WebView'in istekleri OkHttp üzerinden (Chrome başlıklarıyla) gider; çözülünce cf_clearance
+    // çerezi CookieManager'dan alınır, diske kaydedilir ve aynı User-Agent ile kullanılır.
     private val cfLock = Semaphore(1)
     @Volatile
     private var cfWarm = false
+    @Volatile
+    private var cfCookie = ""
 
-    // Doğrulama başarısız olunca bir süre yeniden denenmez; böylece onlarca istek tek tek 20-30 sn
-    // beklemez ve CloudStream'in 120 sn zaman aşımına takılmaz.
+    // Doğrulama başarısız olunca bir süre yeniden denenmez; böylece onlarca istek tek tek beklemez.
     @Volatile
     private var cfBlockedUntil = 0L
     private val cfCooldownMs = 60L * 1000
+    private val cfSolveTimeoutMs = 50L * 1000
 
     private fun cfCoolingDown(): Boolean = System.currentTimeMillis() < cfBlockedUntil
 
@@ -67,14 +67,10 @@ class HDFilmCehennemi : MainAPI() {
         log("CF doğrulaması geçilemedi ($why), ${cfCooldownMs / 1000} sn beklenecek")
     }
 
-    // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
-    // Her eklentinin dosya adı farklı olmalı (aynı klasörü paylaşıyorlar).
     private val cfFile by lazy {
-        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "hdfilmcehennemi_cf.txt")
+        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "hdfilmcehennemi_cf2.txt")
     }
     private val cfMaxAgeMs = 12L * 60 * 60 * 1000 // bundan eski kayıt kullanılmaz, yeniden çözülür
-    @Volatile
-    private var cfSavedSig = ""
 
     private fun log(msg: String) {
         try {
@@ -92,25 +88,11 @@ class HDFilmCehennemi : MainAPI() {
                 cfFile.delete()
                 return
             }
-            var n = 0
-            for (ln in lines.drop(1)) {
-                val tab = ln.indexOf('\t')
-                if (tab <= 0) continue
-                val host = ln.substring(0, tab)
-                val map = LinkedHashMap<String, String>()
-                for (p in ln.substring(tab + 1).split(";")) {
-                    val i = p.indexOf('=')
-                    if (i > 0) map[p.substring(0, i).trim()] = p.substring(i + 1).trim()
-                }
-                if (map.isNotEmpty()) {
-                    cfKiller.savedCookies[host] = map
-                    n++
-                }
-            }
-            if (n > 0) {
+            val c = lines.getOrNull(1)?.trim().orEmpty()
+            if (c.contains("cf_clearance")) {
+                cfCookie = c
                 cfWarm = true
-                cfSavedSig = lines.drop(1).joinToString("\n")
-                log("CF çerez diskten yüklendi host=$n")
+                log("CF çerez diskten yüklendi")
             }
         } catch (e: Throwable) {
             log("CF restore hata ${e.message?.take(60)}")
@@ -119,14 +101,8 @@ class HDFilmCehennemi : MainAPI() {
 
     private fun cfSave() {
         try {
-            val entries = cfKiller.savedCookies.entries.toList().filter { it.value.isNotEmpty() }
-            if (entries.isEmpty()) return
-            val body = entries.joinToString("\n") { en ->
-                en.key + "\t" + en.value.entries.joinToString(";") { "${it.key}=${it.value}" }
-            }
-            if (body == cfSavedSig) return // değişmediyse zaman damgasını yenileme
-            cfSavedSig = body
-            cfFile.writeText("${System.currentTimeMillis()}\n$body")
+            if (cfCookie.isEmpty()) return
+            cfFile.writeText("${System.currentTimeMillis()}\n$cfCookie")
             log("CF çerez diske kaydedildi")
         } catch (e: Throwable) {
             log("CF save hata ${e.message?.take(60)}")
@@ -135,74 +111,100 @@ class HDFilmCehennemi : MainAPI() {
 
     private fun cfClear() {
         try {
-            cfSavedSig = ""
+            cfCookie = ""
+            cfWarm = false
             if (cfFile.exists()) cfFile.delete()
         } catch (_: Throwable) {
         }
     }
 
-    // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
-    // Doğrulama başarısız olursa cfCooldownMs boyunca CfCooldown fırlatılır (çağıranlar Exception yakalıyor).
-    private suspend fun cfGet(url: String, headers0: Map<String, String>, timeout: Long = 30L): NiceResponse {
-        if (!cfWarm && cfCoolingDown()) throw CfCooldown()
-        // cf_clearance çerezi WebView'in kendi User-Agent'ına bağlıdır; farklı UA gönderirsek Cloudflare reddeder.
-        // Bu yüzden burada UA'yı biz vermiyoruz, CloudflareKiller kendisi ekliyor.
-        val headers = headers0.filterKeys { !it.equals("User-Agent", true) }
-        val wasWarm = cfWarm
-        val k = cfKiller
-        val r: NiceResponse = try {
-            var x: NiceResponse = if (cfWarm) {
-                app.get(url, headers = headers, interceptor = k, timeout = timeout)
+    // WebView'i (OkHttp üzerinden, Chrome UA ile) açıp cf_clearance çerezini bekler
+    private suspend fun cfSolve(url: String): Boolean {
+        return try {
+            val cm = android.webkit.CookieManager.getInstance()
+            log("CF WebView çözümü başlıyor ${url.take(70)}")
+            val resolver = WebViewResolver(
+                Regex(".^"),
+                additionalUrls = listOf(Regex(".")),
+                userAgent = uaMobile,
+                useOkhttp = true
+            )
+            kotlinx.coroutines.withTimeoutOrNull(cfSolveTimeoutMs) {
+                resolver.resolveUsingWebView(url, siteBase() + "/") { _ ->
+                    val c = try { cm.getCookie(url) } catch (_: Throwable) { null }
+                    c != null && c.contains("cf_clearance")
+                }
+            }
+            val c = try { cm.getCookie(url) } catch (_: Throwable) { null }
+            val names = c?.split(";")?.map { it.substringBefore("=").trim() }
+            log("CF WebView bitti cerezler=$names")
+            if (c != null && c.contains("cf_clearance")) {
+                cfCookie = c
+                cfWarm = true
+                cfSave()
+                true
             } else {
-                cfLock.acquire()
-                try {
-                    if (!cfWarm && cfCoolingDown()) throw CfCooldown()
-                    app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
-                } finally {
-                    cfLock.release()
-                }
+                false
             }
-            // Eski (süresi dolmuş) çerezle 403 geldiyse bir kez sıfırlayıp yeniden çöz.
-            // Yeni çözümden sonra gelen 403'te tekrar denemiyoruz (2x60 sn bekleyip 120 sn zaman aşımına düşüyordu).
-            if ((x.code == 403 || x.code == 503) && wasWarm) {
-                log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
-                cfLock.acquire()
-                try {
-                    if (!cfCoolingDown()) {
-                        if (cfKiller === k) {
-                            cfKiller = CloudflareKiller()
-                            cfWarm = false
-                            cfClear()
-                        }
-                        x = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
-                    }
-                } finally {
-                    cfLock.release()
-                }
-            }
-            x
-        } catch (e: CfCooldown) {
-            throw e
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
-        } catch (e: Exception) {
-            cfFail("hata ${e.message?.take(60)}")
-            throw e
+        } catch (e: Throwable) {
+            log("CF WebView hata ${e.message?.take(80)}")
+            false
         }
+    }
+
+    // Site adresleri için: çerez + sabit mobil UA ile istek; 403/503 gelirse WebView ile çöz ve bir kez daha dene.
+    // Diğer (oynatıcı) adresleri için yalnızca düz istek.
+    private suspend fun cfGet(url: String, headers0: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        if (!url.contains("hdfilmcehennemi.", true)) {
+            return app.get(url, headers = headers0, timeout = timeout)
+        }
+        if (!cfWarm && cfCoolingDown()) throw CfCooldown()
+        val base = headers0.filterKeys {
+            !it.equals("User-Agent", true) && !it.equals("Cookie", true)
+        } + mapOf("User-Agent" to uaMobile)
+
+        suspend fun fetch(): NiceResponse {
+            val h = if (cfCookie.isNotEmpty()) base + mapOf("Cookie" to cfCookie) else base
+            return app.get(url, headers = h, timeout = timeout)
+        }
+
+        val used = cfCookie
+        var x: NiceResponse? = if (cfWarm) fetch() else null
+        if (x == null || x.code == 403 || x.code == 503) {
+            cfLock.acquire()
+            try {
+                if (cfWarm && cfCookie != used) {
+                    // başka bir istek bu arada çözdü
+                    x = fetch()
+                } else if (cfCoolingDown()) {
+                    if (x == null) throw CfCooldown()
+                } else {
+                    if (cfWarm) cfClear()
+                    if (cfSolve(url)) {
+                        x = fetch()
+                    } else {
+                        cfFail("çerez alınamadı")
+                        if (x == null) throw CfCooldown()
+                    }
+                }
+            } finally {
+                cfLock.release()
+            }
+        }
+        val r: NiceResponse = x ?: throw CfCooldown()
         // TANI: logcat'te "HDFilmCehennemi" etiketiyle filtreleyin
         try {
             val title = Regex("<title>(.*?)</title>", IC).find(r.text)?.groupValues?.get(1)?.take(60)
-            val ck = cfKiller.savedCookies.values.flatMap { it.keys }
             log(
                 "CF TANI kod=${r.code} server=${r.headers["server"]} cf-mitigated=${r.headers["cf-mitigated"]} " +
-                    "cerezler=$ck baslik=$title url=${url.take(60)}"
+                    "baslik=$title url=${url.take(60)}"
             )
         } catch (_: Throwable) {
         }
         if (r.code in 200..299) {
-            cfWarm = true
             cfBlockedUntil = 0L
-            cfSave()
         } else if (r.code == 403 || r.code == 503) {
             cfFail("kod=${r.code}")
         }
