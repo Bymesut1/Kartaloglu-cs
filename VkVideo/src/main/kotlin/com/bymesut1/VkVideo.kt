@@ -52,7 +52,7 @@ class VkVideo : MainAPI() {
         private const val YANDEX_VERIFY = 24
 
         // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
-        private const val DEBUG_SEARCH = false
+        private const val DEBUG_SEARCH = true
 
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
