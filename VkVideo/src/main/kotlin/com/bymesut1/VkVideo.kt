@@ -47,7 +47,7 @@ class VkVideo : MainAPI() {
 
         // Yandex yardımı: "ad tr dublaj izle vkvideo.ru" tarzı aramalardan VK video numaraları toplanır
         private const val YANDEX = true
-        private const val YANDEX_QUERIES = 8
+        private const val YANDEX_QUERIES = 9
         private const val YANDEX_MS = 7000L
         private const val YANDEX_VERIFY = 24
 
@@ -81,7 +81,7 @@ class VkVideo : MainAPI() {
 
         // Yandex'te ad yanına eklenen etiketler
         private val YANDEX_TAGS = listOf(
-            "tr dublaj izle vkvideo.ru", "Türkçe Dublaj film izle vkvideo.ru",
+            "türkçe dublaj izle vk", "tr dublaj izle vkvideo.ru", "Türkçe Dublaj film izle vkvideo.ru",
             "filmi izle vkvideo.ru", "film izle vkvideo.ru"
         )
     }
@@ -516,10 +516,33 @@ class VkVideo : MainAPI() {
         return null
     }
 
-    // Aranan ad Türkçe de olsa İngilizce de olsa her ikisiyle aranır: TMDB'den TR + EN + orijinal ad
-    private suspend fun expandNames(q: String): List<String> {
+    private class ExpandRes(val names: List<String>, val tmNames: List<String>, val poster: String?)
+
+    // Yazılan etiketleri (türkçe dublaj, izle, tr ...) atar: "zathura türkçe dublaj izle" -> "zathura"
+    private fun cleanQuery(q: String): String {
+        val out = ArrayList<String>()
+        for (tok in q.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
+            val a = asciiLower(tok).replace(Regex("[^a-z0-9]"), "")
+            if (a.isEmpty() || a in NOISE) continue
+            out.add(tok)
+        }
+        val base = out.joinToString(" ").trim()
+        return if (base.length >= 2) base else q.trim()
+    }
+
+    // Arama anahtarı: (VK'ya gidecek temiz sorgu, sadece etiket mi yazıldı?)
+    private fun baseQuery(q: String): Pair<String, Boolean> {
+        val qc = cleanQuery(q)
+        val noName = sigTokens(qc, true).first.isEmpty()
+        return (if (noName) q.trim() else qc) to noName
+    }
+
+    // Aranan ad Türkçe de olsa İngilizce de olsa her ikisiyle aranır: TMDB'den TR + EN + orijinal ad (+ poster)
+    private suspend fun expandNames(q: String): ExpandRes {
         val out = LinkedHashSet<String>()
         out.add(q.trim())
+        val tmNames = ArrayList<String>()
+        var poster: String? = null
         try {
             val txt = app.get(
                 "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_KEY&language=tr-TR&query=${enc(q)}",
@@ -531,8 +554,10 @@ class VkVideo : MainAPI() {
                 val ot = r.optString("original_title")
                 val related = nameMatch(analyze(tt), listOf(q)) >= 0 || nameMatch(analyze(ot), listOf(q)) >= 0
                 if (related) {
-                    if (tt.isNotBlank()) out.add(tt)
-                    if (ot.isNotBlank()) out.add(ot)
+                    if (tt.isNotBlank()) { out.add(tt); tmNames.add(tt) }
+                    if (ot.isNotBlank()) { out.add(ot); tmNames.add(ot) }
+                    val pp = r.optString("poster_path")
+                    if (pp.isNotBlank() && pp != "null") poster = "https://image.tmdb.org/t/p/w500$pp"
                     try {
                         val en = JSONObject(
                             app.get(
@@ -540,7 +565,7 @@ class VkVideo : MainAPI() {
                                 timeout = 6L
                             ).text
                         ).optString("title")
-                        if (en.isNotBlank()) out.add(en)
+                        if (en.isNotBlank()) { out.add(en); tmNames.add(en) }
                     } catch (e: Exception) {
                         if (e is java.util.concurrent.CancellationException) throw e
                     }
@@ -549,7 +574,7 @@ class VkVideo : MainAPI() {
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
         }
-        return out.toList()
+        return ExpandRes(out.toList(), tmNames, poster)
     }
 
     // ---------- Arama (sayfalı + kanallar) ----------
@@ -561,6 +586,7 @@ class VkVideo : MainAPI() {
     private val seenMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
     private val chanMap = java.util.concurrent.ConcurrentHashMap<String, LinkedHashMap<Long, String>>()
     private val namesCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    private val tmCache = java.util.concurrent.ConcurrentHashMap<String, ExpandRes>()
 
     private fun findSectionId(root: Any?): String? {
         val o = root as? JSONObject ?: return null
@@ -652,9 +678,15 @@ class VkVideo : MainAPI() {
         }
     }
 
-    private suspend fun toResponses(videos: Collection<JSONObject>): List<SearchResponse> {
+    // VK önizlemesi açılmazsa ve başlık TMDB'deki filmle uyuşuyorsa TMDB posteri kullanılır; ikisi de yoksa (REQUIRE_POSTER) kart düşer
+    private suspend fun toResponses(videos: Collection<JSONObject>, tm: ExpandRes? = null): List<SearchResponse> {
         return videos.toList().amap { o ->
-            val p = workingPoster(o)
+            var p = workingPoster(o)
+            if (p == null && tm?.poster != null && tm.tmNames.isNotEmpty() &&
+                nameMatch(analyze(o.optString("title")), tm.tmNames) >= 0
+            ) {
+                p = tm.poster
+            }
             if (p == null && REQUIRE_POSTER) {
                 null
             } else {
@@ -793,8 +825,8 @@ class VkVideo : MainAPI() {
     private fun yandexUrls(q: String, qi: Int): List<String> {
         val e = enc(q)
         val all = listOf(
-            "https://yandex.com.tr/video/search?text=$e",
             "https://yandex.com.tr/search/touch/?text=${e.replace("%20", "+")}&lr=11508",
+            "https://yandex.com.tr/video/search?text=$e",
             "https://yandex.com/video/search?text=$e",
             "https://yandex.com.tr/search/?text=$e"
         )
@@ -857,14 +889,18 @@ class VkVideo : MainAPI() {
 
     // Aramanın tamamı: düz arama + kanallar + etiketli sorgular + Yandex; sonra etiket/ad süzgeci ve puan sıralaması
     private suspend fun smartSearch(q: String, page: Int): Pair<List<SearchResponse>, Boolean> {
+        val (sq, noName) = baseQuery(q)                          // yazılan etiketler atılmış temiz sorgu
         if (page > 1) {
-            val raw = searchRaw(q, page, true)
-            val names = namesCache[q] ?: listOf(q)
+            val raw = searchRaw(sq, page, true)
+            val names = namesCache[q] ?: (if (noName) emptyList() else listOf(sq))
             val ranked = rankAll(raw.videos.values, names, emptySet())
-            return toResponses(ranked) to raw.more
+            return toResponses(ranked, tmCache[q]) to raw.more
         }
-        val names = expandNames(q)
+        val ex = if (noName) ExpandRes(emptyList(), emptyList(), null) else expandNames(sq)
+        val names = ex.names                                      // ad süzgeci (boş = sadece etiket süzgeci)
+        val qNames = if (noName) listOf(sq) else names            // VK / Yandex sorgularında kullanılacak adlar
         namesCache[q] = names
+        tmCache[q] = ex
 
         val merged = LinkedHashMap<String, JSONObject>()
         val yKeys = HashSet<String>()
@@ -877,18 +913,18 @@ class VkVideo : MainAPI() {
             if (which == 0) {
                 if (YANDEX) {
                     try {
-                        yRes = yandexCollect(names)
+                        yRes = yandexCollect(qNames)
                     } catch (e: Exception) {
                         if (e is java.util.concurrent.CancellationException) throw e
                     }
                 }
             } else {
-                val base = searchRaw(q, 1, true)
+                val base = searchRaw(sq, 1, true)
                 more = base.more
                 dbgTxt = base.debug
                 for (o in base.videos.values) merged.putIfAbsent(baseOf(o), o)
 
-                for (ch in taggedQueries(names).chunked(4)) {
+                for (ch in taggedQueries(qNames).chunked(4)) {
                     val raws = ch.amap { t ->
                         try {
                             searchRaw(t, 1, false)
@@ -937,13 +973,13 @@ class VkVideo : MainAPI() {
         if (DEBUG_SEARCH) {
             items.add(
                 newMovieSearchResponse(
-                    "DEBUG names=$names toplam=${merged.size} aday=${ranked.size} $yStat | $dbgTxt",
+                    "DEBUG sorgu=$sq adlar=$names toplam=${merged.size} aday=${ranked.size} tmdbPoster=${ex.poster != null} $yStat | $dbgTxt",
                     "$mainUrl/video0_0",
                     TvType.Movie
                 )
             )
         }
-        items.addAll(toResponses(ranked))
+        items.addAll(toResponses(ranked, ex))
         return items to more
     }
 
