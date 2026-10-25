@@ -35,6 +35,7 @@ private data class EmbedResult(
     val keys: List<Pair<String, String>> = emptyList()   // /srt/<no>/<code>_Turkish.vtt anahtarları
 )
 private data class Verified(val ok: Boolean, val headers: Map<String, String>, val text: String = "")
+private class CfCooldown : RuntimeException("CF doğrulaması kısa süre önce başarısız oldu, bekleniyor")
 
 class HDFilmCehennemi : MainAPI() {
     override var mainUrl = "https://hdfilmcehennemi.nl"
@@ -52,6 +53,19 @@ class HDFilmCehennemi : MainAPI() {
     private val cfLock = Semaphore(1)
     @Volatile
     private var cfWarm = false
+
+    // Doğrulama başarısız olunca bir süre yeniden denenmez; böylece onlarca istek tek tek 20-30 sn
+    // beklemez ve CloudStream'in 120 sn zaman aşımına takılmaz.
+    @Volatile
+    private var cfBlockedUntil = 0L
+    private val cfCooldownMs = 60L * 1000
+
+    private fun cfCoolingDown(): Boolean = System.currentTimeMillis() < cfBlockedUntil
+
+    private fun cfFail(why: String) {
+        cfBlockedUntil = System.currentTimeMillis() + cfCooldownMs
+        log("CF doğrulaması geçilemedi ($why), ${cfCooldownMs / 1000} sn beklenecek")
+    }
 
     // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
     // Her eklentinin dosya adı farklı olmalı (aynı klasörü paylaşıyorlar).
@@ -128,35 +142,53 @@ class HDFilmCehennemi : MainAPI() {
     }
 
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
+    // Doğrulama başarısız olursa cfCooldownMs boyunca CfCooldown fırlatılır (çağıranlar Exception yakalıyor).
     private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        if (!cfWarm && cfCoolingDown()) throw CfCooldown()
         val k = cfKiller
-        var r = if (cfWarm) {
-            app.get(url, headers = headers, interceptor = k, timeout = timeout)
-        } else {
-            cfLock.acquire()
-            try {
-                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
-            } finally {
-                cfLock.release()
-            }
-        }
-        if (r.code == 403 || r.code == 503) {
-            log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
-            cfLock.acquire()
-            try {
-                if (cfKiller === k) {
-                    cfKiller = CloudflareKiller()
-                    cfWarm = false
-                    cfClear()
+        val r: NiceResponse = try {
+            var x: NiceResponse = if (cfWarm) {
+                app.get(url, headers = headers, interceptor = k, timeout = timeout)
+            } else {
+                cfLock.acquire()
+                try {
+                    if (!cfWarm && cfCoolingDown()) throw CfCooldown()
+                    app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+                } finally {
+                    cfLock.release()
                 }
-                r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
-            } finally {
-                cfLock.release()
             }
+            if (x.code == 403 || x.code == 503) {
+                log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
+                cfLock.acquire()
+                try {
+                    if (!cfCoolingDown()) {
+                        if (cfKiller === k) {
+                            cfKiller = CloudflareKiller()
+                            cfWarm = false
+                            cfClear()
+                        }
+                        x = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+                    }
+                } finally {
+                    cfLock.release()
+                }
+            }
+            x
+        } catch (e: CfCooldown) {
+            throw e
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            cfFail("hata ${e.message?.take(60)}")
+            throw e
         }
         if (r.code in 200..299) {
             cfWarm = true
+            cfBlockedUntil = 0L
             cfSave()
+        } else if (r.code == 403 || r.code == 503) {
+            cfFail("kod=${r.code}")
         }
         return r
     }
