@@ -3,8 +3,10 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -32,14 +34,16 @@ class Zdizi : MainAPI() {
     @Volatile
     private var dbg = ""
 
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
+
     @Volatile
     private var cfKiller: CloudflareKiller? = null
 
     override val mainPage = mainPageOf(
         "/" to "Ana Sayfa",
-        "/trendler" to "Trendler",
-        "/dizi-izle" to "Diziler",
-        "/yabanci-film-izle" to "Filmler"
+        "/trendler" to "Trendler"
     )
 
     // ------------------------------------------------------------------
@@ -130,14 +134,49 @@ class Zdizi : MainAPI() {
             .replace(Regex("\\s+izle$", RegexOption.IGNORE_CASE), "")
             .trim()
 
+    // WordPress küçük resim ekini (-300x450) kaldırıp orijinal (net) boyutu kullanır
+    private fun upsize(u: String): String =
+        if (u.contains("/wp-content/uploads/", true))
+            u.replace(Regex("-\\d{2,4}x\\d{2,4}(\\.(?:jpe?g|png|webp))", RegexOption.IGNORE_CASE), "$1")
+        else u
+
+    private fun fullUrl(s: String): String? = when {
+        s.isBlank() || s.startsWith("data:", true) -> null
+        s.startsWith("http", true) -> s
+        s.startsWith("//") -> "https:$s"
+        s.startsWith("/") -> mainUrl + s
+        else -> null
+    }
+
     private fun imgUrl(img: Element?): String? {
         if (img == null) return null
-        val s = img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }.trim()
-        return when {
-            s.startsWith("http", true) -> s
-            s.startsWith("//") -> "https:$s"
-            else -> null
+        // srcset varsa en geniş olanı
+        val srcset = img.attr("data-srcset").ifBlank { img.attr("srcset") }.trim()
+        var s = ""
+        if (srcset.isNotBlank()) {
+            s = srcset.split(",")
+                .map { it.trim().split(Regex("\\s+")) }
+                .filter { it.isNotEmpty() && it[0].isNotBlank() }
+                .maxByOrNull { it.getOrNull(1)?.removeSuffix("w")?.toIntOrNull() ?: 0 }
+                ?.firstOrNull().orEmpty()
         }
+        var u = fullUrl(s)
+        if (u == null) {
+            for (k in listOf("data-src", "data-lazy-src", "data-original", "data-lazy", "src")) {
+                u = fullUrl(img.attr(k).trim())
+                if (u != null) break
+            }
+        }
+        return u?.let { upsize(it) }
+    }
+
+    // <div style="background-image:url(...)"> biçimindeki kapaklar
+    private fun bgImage(el: Element?): String? {
+        if (el == null) return null
+        val st = (listOf(el) + el.select("[style*=url]")).map { it.attr("style") }.firstOrNull { it.contains("url(") }
+            ?: return null
+        val m = Regex("url\\(['\"]?([^'\")]+)['\"]?\\)").find(st)?.groupValues?.get(1) ?: return null
+        return fullUrl(m.trim())?.let { upsize(it) }
     }
 
     private fun fixText(s: String): String =
@@ -174,6 +213,7 @@ class Zdizi : MainAPI() {
             )
             if (title.isBlank()) continue
             val poster = imgUrl(a.selectFirst("img") ?: a.parent()?.selectFirst("img"))
+                ?: bgImage(a) ?: bgImage(a.parent())
             if (kind == 2) {
                 out.add(newMovieSearchResponse(title, url, TvType.Movie) { this.posterUrl = poster })
             } else {
@@ -233,6 +273,75 @@ class Zdizi : MainAPI() {
             }
         }
         return out
+    }
+
+    // ------------------------------------------------------------------
+    // TMDB: Türkçe bölüm adı / açıklama / bölüm görseli
+    // ------------------------------------------------------------------
+    private class TEp(val name: String, val overview: String, val still: String?, val runtime: Int?, val air: String?)
+
+    private class TShow(
+        val poster: String?,
+        val backdrop: String?,
+        val overview: String?,
+        val eps: Map<String, TEp>
+    )
+
+    private suspend fun tmdbJson(url: String): JSONObject? = try {
+        JSONObject(app.get(url, timeout = 15L).text)
+    } catch (e: Exception) {
+        if (e is java.util.concurrent.CancellationException) throw e
+        null
+    }
+
+    private suspend fun tmdbShow(title: String, year: Int?, seasons: List<Int>): TShow? {
+        val q = URLEncoder.encode(title, "UTF-8")
+        val urls = ArrayList<String>()
+        if (year != null) urls.add("$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q&first_air_date_year=$year")
+        urls.add("$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q")
+        var show: JSONObject? = null
+        for (u in urls) {
+            val arr = tmdbJson(u)?.optJSONArray("results")
+            if (arr != null && arr.length() > 0) {
+                show = arr.optJSONObject(0)
+                break
+            }
+        }
+        val sh = show ?: return null
+        val id = sh.optInt("id")
+        if (id == 0) return null
+
+        val map = java.util.concurrent.ConcurrentHashMap<String, TEp>()
+        seasons.filter { it > 0 }.amap { sn ->
+            val tr = tmdbJson("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=tr-TR")?.optJSONArray("episodes")
+            val en = tmdbJson("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=en-US")?.optJSONArray("episodes")
+            val enBy = HashMap<Int, JSONObject>()
+            if (en != null) for (i in 0 until en.length()) {
+                val o = en.optJSONObject(i) ?: continue
+                enBy[o.optInt("episode_number")] = o
+            }
+            val src = tr ?: en
+            if (src != null) for (i in 0 until src.length()) {
+                val o = src.optJSONObject(i) ?: continue
+                val n = o.optInt("episode_number")
+                val e = enBy[n]
+                val name = o.optString("name").ifBlank { e?.optString("name").orEmpty() }
+                val ov = o.optString("overview").ifBlank { e?.optString("overview").orEmpty() }
+                val still = o.optString("still_path").ifBlank { e?.optString("still_path").orEmpty() }
+                    .takeIf { it.isNotBlank() && it != "null" }
+                val rt = o.optInt("runtime", 0).takeIf { it > 0 }
+                val air = o.optString("air_date").takeIf { it.isNotBlank() && it != "null" }
+                map["${sn}_$n"] = TEp(name, ov, still?.let { "$tmdbImg/w780$it" }, rt, air)
+            }
+        }
+        val pp = sh.optString("poster_path").takeIf { it.isNotBlank() && it != "null" }
+        val bp = sh.optString("backdrop_path").takeIf { it.isNotBlank() && it != "null" }
+        return TShow(
+            pp?.let { "$tmdbImg/w780$it" },
+            bp?.let { "$tmdbImg/w1280$it" },
+            sh.optString("overview").takeIf { it.isNotBlank() },
+            map
+        )
     }
 
     // ------------------------------------------------------------------
@@ -342,10 +451,34 @@ class Zdizi : MainAPI() {
         }
         eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
+        // TMDB: Türkçe bölüm adı, açıklama, bölüm görseli, süre
+        val tm = try {
+            tmdbShow(title, year, eps.mapNotNull { it.season }.distinct())
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            null
+        }
+        if (tm != null) {
+            val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            for (ep in eps) {
+                val t = tm.eps["${ep.season}_${ep.episode}"] ?: continue
+                if (t.name.isNotBlank()) ep.name = t.name
+                if (t.overview.isNotBlank()) ep.description = t.overview
+                if (t.still != null) ep.posterUrl = t.still
+                if (t.runtime != null) ep.runTime = t.runtime
+                if (ep.date == null && t.air != null) {
+                    try {
+                        ep.date = df2.parse(t.air)?.time
+                    } catch (ex: Exception) {
+                    }
+                }
+            }
+        }
+
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, eps) {
-            this.posterUrl = poster
-            this.backgroundPosterUrl = cover
-            this.plot = plot
+            this.posterUrl = tm?.poster ?: poster
+            this.backgroundPosterUrl = tm?.backdrop ?: cover
+            this.plot = plot ?: tm?.overview
             this.tags = tags
             this.year = year
         }
@@ -423,6 +556,16 @@ class Zdizi : MainAPI() {
             }
         }
 
+        // Sayfadan adres çıkmadıysa: oynatıcıyı gerçek WebView'da açıp m3u / m3u8 / mp4 isteğini yakala
+        if (!any) {
+            for (entry in embeds.entries.take(2)) {
+                if (resolveEmbed(entry.key, entry.value, hints.take(4), subtitleCallback, callback, true)) {
+                    any = true
+                    break
+                }
+            }
+        }
+
         if (!any && debug) {
             debugLink(callback, "embed=${embeds.size} ${embeds.keys.firstOrNull()?.take(60) ?: ""} | $dbg")
             return true
@@ -436,7 +579,8 @@ class Zdizi : MainAPI() {
         label: String,
         hints: List<Pair<String, String>>,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        allowWeb: Boolean = false
     ): Boolean {
         val origin = originOf(embedUrl)
         val er = fetch(
@@ -485,9 +629,32 @@ class Zdizi : MainAPI() {
             }
         }
 
+        if (allowWeb && found.hls.isEmpty() && found.mp4.isEmpty()) {
+            val wv = webCapture(embedUrl)
+            if (wv != null) {
+                if (Regex("\\.mp4", RegexOption.IGNORE_CASE).containsMatchIn(wv)) found.mp4.add(wv) else found.hls.add(wv)
+                // WebView oturum çerezlerini de oynatıcıya ver
+                try {
+                    val cm = android.webkit.CookieManager.getInstance()
+                    for (cu in listOf(wv, embedUrl)) {
+                        cm.getCookie(cu)?.split(";")?.forEach { kv ->
+                            val k = kv.substringBefore("=").trim()
+                            val v = kv.substringAfter("=", "").trim()
+                            if (k.isNotBlank() && v.isNotBlank()) cookies[k] = v
+                        }
+                    }
+                } catch (e: Exception) {
+                }
+            }
+        }
+
         if (found.hls.isEmpty() && found.mp4.isEmpty()) {
-            dbg = "kod=${er.code} len=${html.length} ck=${cookies.keys.joinToString(",")} " +
-                html.replace(Regex("\\s+"), " ").take(220)
+            val kw = Regex("(?i)(m3u|atob|eval\\(|fetch\\(|XMLHttpRequest|jwplayer|player|iframe|\\.mp4)")
+                .findAll(html).groupingBy { it.value.lowercase() }.eachCount()
+            val refs = Regex("[\"'](https?:)?//[A-Za-z0-9._\\-]+\\.[a-z]{2,}[^\"'\\s]{0,60}[\"']|[\"']/[A-Za-z0-9_./\\-]{4,60}[\"']")
+                .findAll(html).map { it.value.trim('"', '\'') }.distinct().take(10).toList()
+            dbg = "kod=${er.code} len=${html.length} ck=${cookies.keys.joinToString(",")} ipucu=$kw refs=$refs " +
+                html.replace(Regex("\\s+"), " ").take(120)
             return false
         }
 
@@ -520,6 +687,32 @@ class Zdizi : MainAPI() {
             )
         }
         return true
+    }
+
+    private val mediaRe = Regex("""(?i)/m3u/[A-Za-z0-9+/=_%.\-]{24,}|\.m3u8|\.mp4(\?|$)""")
+
+    // Oynatıcı sayfasını WebView'da açar, oynatıcının istediği medya adresini yakalar
+    private suspend fun webCapture(embedUrl: String): String? {
+        return try {
+            val r = app.get(
+                embedUrl,
+                headers = hdr("$mainUrl/"),
+                referer = "$mainUrl/",
+                interceptor = WebViewResolver(
+                    mediaRe,
+                    userAgent = null,
+                    useOkhttp = false,
+                    timeout = 25_000L
+                ),
+                timeout = 40L
+            )
+            val u = r.url
+            if (u != embedUrl && mediaRe.containsMatchIn(u)) u else null
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            dbg = "webview: ${e.message?.take(60)} $dbg"
+            null
+        }
     }
 
     // Metin içinden m3u / m3u8 / mp4 / altyazı adreslerini topla
