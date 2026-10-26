@@ -131,7 +131,7 @@ class Zdizi : MainAPI() {
     private fun cleanTitle(t: String): String =
         t.replace(Regex("\\s*[-|–]\\s*Zdizi.*$", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s*:?\\s*\\d+\\.\\s*Sezon.*$", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\s+izle$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s+izle(\\s*\\(\\d{4}\\))?(\\s*izle)?$", RegexOption.IGNORE_CASE), "")
             .trim()
 
     // WordPress küçük resim ekini (-300x450) kaldırıp orijinal (net) boyutu kullanır
@@ -226,10 +226,28 @@ class Zdizi : MainAPI() {
     // ------------------------------------------------------------------
     // Ana sayfa / arama
     // ------------------------------------------------------------------
+    // Sitede resmi çıkmayan kartlara TMDB'den poster bulur
+    private suspend fun fillPosters(list: List<SearchResponse>) {
+        list.filter { it.posterUrl.isNullOrBlank() }.take(30).amap { r ->
+            try {
+                val isMovie = r.type == TvType.Movie
+                val nm = r.name.replace(Regex("(?i)\\bizle\\b"), "").replace(Regex("\\(\\d{4}\\)"), "")
+                    .replace(Regex("\\s+"), " ").trim()
+                val q = URLEncoder.encode(nm, "UTF-8")
+                val j = tmdbJson("$tmdbApi/search/${if (isMovie) "movie" else "tv"}?api_key=$tmdbKey&language=tr-TR&query=$q")
+                val pp = j?.optJSONArray("results")?.optJSONObject(0)?.optString("poster_path").orEmpty()
+                if (pp.isNotBlank() && pp != "null") r.posterUrl = "$tmdbImg/w500$pp"
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
         val p = fetch(mainUrl + request.data, "$mainUrl/", true)
         val items = if (p != null && p.code == 200) cards(Jsoup.parse(p.text, mainUrl)) else emptyList()
+        fillPosters(items)
         return newHomePageResponse(request.name, items, false)
     }
 
@@ -651,10 +669,9 @@ class Zdizi : MainAPI() {
         if (found.hls.isEmpty() && found.mp4.isEmpty()) {
             val kw = Regex("(?i)(m3u|atob|eval\\(|fetch\\(|XMLHttpRequest|jwplayer|player|iframe|\\.mp4)")
                 .findAll(html).groupingBy { it.value.lowercase() }.eachCount()
-            val refs = Regex("[\"'](https?:)?//[A-Za-z0-9._\\-]+\\.[a-z]{2,}[^\"'\\s]{0,60}[\"']|[\"']/[A-Za-z0-9_./\\-]{4,60}[\"']")
-                .findAll(html).map { it.value.trim('"', '\'') }.distinct().take(10).toList()
-            dbg = "kod=${er.code} len=${html.length} ck=${cookies.keys.joinToString(",")} ipucu=$kw refs=$refs " +
-                html.replace(Regex("\\s+"), " ").take(120)
+            val si = html.indexOf("setup(")
+            val setup = if (si >= 0) html.substring(si, minOf(html.length, si + 400)).replace(Regex("\\s+"), " ") else "yok"
+            dbg = "kod=${er.code} len=${html.length} ipucu=$kw setup=$setup | $dbg"
             return false
         }
 
@@ -691,9 +708,30 @@ class Zdizi : MainAPI() {
 
     private val mediaRe = Regex("""(?i)/m3u/[A-Za-z0-9+/=_%.\-]{24,}|\.m3u8|\.mp4(\?|$)""")
 
-    // Oynatıcı sayfasını WebView'da açar, oynatıcının istediği medya adresini yakalar
+    // Sayfa yüklenince çalışır: jwplayer oynatma listesi hazırsa JSON olarak döndürür, değilse oynatmayı başlatır
+    private val playScript = """
+        (function(){
+          try{
+            var p=jwplayer();
+            var pl=p.getPlaylist();
+            if(pl&&pl.length){return JSON.stringify(pl);}
+          }catch(e){}
+          var n=0;
+          var t=setInterval(function(){
+            n++;
+            try{var q=jwplayer();if(q&&q.play){q.play(true);}}catch(e){}
+            try{var el=document.querySelector('.jw-icon-display,.jw-display-icon-container');if(el){el.click();}}catch(e){}
+            if(n>20){clearInterval(t);}
+          },700);
+          return '';
+        })()
+    """.trimIndent()
+
+    // Oynatıcı sayfasını WebView'da açar: ya oynatıcının istediği medya adresini yakalar ya da jwplayer listesinden okur
     private suspend fun webCapture(embedUrl: String): String? {
-        return try {
+        var plist = ""
+        var hit: String? = null
+        try {
             val r = app.get(
                 embedUrl,
                 headers = hdr("$mainUrl/"),
@@ -702,17 +740,38 @@ class Zdizi : MainAPI() {
                     mediaRe,
                     userAgent = null,
                     useOkhttp = false,
-                    timeout = 25_000L
+                    script = playScript,
+                    scriptCallback = { res -> plist = res },
+                    timeout = 15_000L
                 ),
-                timeout = 40L
+                timeout = 30L
             )
             val u = r.url
-            if (u != embedUrl && mediaRe.containsMatchIn(u)) u else null
+            if (u != embedUrl && mediaRe.containsMatchIn(u)) hit = u
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             dbg = "webview: ${e.message?.take(60)} $dbg"
-            null
         }
+        if (hit != null) return hit
+        // evaluateJavascript sonucu JSON metni olarak gelir: önce dışındaki tırnağı aç
+        val txt = try {
+            (org.json.JSONTokener(plist).nextValue() as? String).orEmpty()
+        } catch (e: Exception) {
+            plist
+        }
+        val origin = originOf(embedUrl)
+        for (m in Regex("\"file\"\\s*:\\s*\"([^\"]+)\"").findAll(fixText(txt))) {
+            val v = m.groupValues[1]
+            if (Regex("\\.(vtt|srt|jpe?g|png|webp|gif)(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(v)) continue
+            return when {
+                v.startsWith("http", true) -> v
+                v.startsWith("//") -> "https:$v"
+                v.startsWith("/") -> origin + v
+                else -> continue
+            }
+        }
+        dbg = "playlist=${plist.take(160)} $dbg"
+        return null
     }
 
     // Metin içinden m3u / m3u8 / mp4 / altyazı adreslerini topla
@@ -729,6 +788,18 @@ class Zdizi : MainAPI() {
             .findAll(t).forEach { f.hls.add(origin + it.groupValues[1]) }
         Regex("https?://[^\\s\"'<>\\\\)]+?\\.mp4(?:\\?[^\\s\"'<>\\\\)]*)?", RegexOption.IGNORE_CASE)
             .findAll(t).forEach { f.mp4.add(it.value) }
+        // jwplayer: file: "..." / "file":"..." (altyazı ve görseller hariç)
+        Regex("[\"']?file[\"']?\\s*:\\s*[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE).findAll(t).forEach { m ->
+            val v = m.groupValues[1]
+            if (Regex("\\.(vtt|srt|jpe?g|png|webp|gif|css|js)(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(v)) return@forEach
+            val u = when {
+                v.startsWith("http", true) -> v
+                v.startsWith("//") -> "https:$v"
+                v.startsWith("/") -> origin + v
+                else -> return@forEach
+            }
+            if (u.contains(".mp4", true)) f.mp4.add(u) else f.hls.add(u)
+        }
         Regex("https?://[^\\s\"'<>\\\\)]+?\\.(?:vtt|srt)(?:\\?[^\\s\"'<>\\\\)]*)?", RegexOption.IGNORE_CASE)
             .findAll(t).forEach { m ->
                 if (Regex("thumb|sprite|chapter", RegexOption.IGNORE_CASE).containsMatchIn(m.value)) return@forEach
