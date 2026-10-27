@@ -386,7 +386,16 @@ class Zdizi : MainAPI() {
     // ------------------------------------------------------------------
     // TMDB: Türkçe bölüm adı / açıklama / bölüm görseli
     // ------------------------------------------------------------------
-    private class TEp(val name: String, val overview: String, val still: String?, val runtime: Int?, val air: String?)
+    // nameTr / ovTr: ad / açıklama TMDB'de gerçekten Türkçe mi (değilse sonradan Türkçeye çevrilir)
+    private class TEp(
+        val name: String,
+        val overview: String,
+        val still: String?,
+        val runtime: Int?,
+        val air: String?,
+        val nameTr: Boolean,
+        val ovTr: Boolean
+    )
 
     private class TShow(
         val poster: String?,
@@ -444,13 +453,20 @@ class Zdizi : MainAPI() {
                 val o = src.optJSONObject(i) ?: continue
                 val n = o.optInt("episode_number")
                 val e = enBy[n]
-                val name = o.optString("name").ifBlank { e?.optString("name").orEmpty() }
-                val ov = o.optString("overview").ifBlank { e?.optString("overview").orEmpty() }
+                val trName = if (tr != null) o.optString("name") else ""
+                val enName = e?.optString("name").orEmpty()
+                val name = trName.ifBlank { enName.ifBlank { o.optString("name") } }
+                // Türkçe karşılığı yoksa TMDB aynı (İngilizce) adı döndürür
+                val nameTr = trName.isNotBlank() && !trName.equals(enName, true)
+                val trOv = if (tr != null) o.optString("overview") else ""
+                val enOv = e?.optString("overview").orEmpty()
+                val ov = trOv.ifBlank { enOv.ifBlank { o.optString("overview") } }
+                val ovTr = trOv.isNotBlank()
                 val still = o.optString("still_path").ifBlank { e?.optString("still_path").orEmpty() }
                     .takeIf { it.isNotBlank() && it != "null" }
                 val rt = o.optInt("runtime", 0).takeIf { it > 0 }
                 val air = o.optString("air_date").takeIf { it.isNotBlank() && it != "null" }
-                map["${sn}_$n"] = TEp(name, ov, still?.let { "$tmdbImg/w780$it" }, rt, air)
+                map["${sn}_$n"] = TEp(name, ov, still?.let { "$tmdbImg/w780$it" }, rt, air, nameTr, ovTr)
             }
         }
         val pp = sh.optString("poster_path").takeIf { it.isNotBlank() && it != "null" }
@@ -461,6 +477,53 @@ class Zdizi : MainAPI() {
             sh.optString("overview").takeIf { it.isNotBlank() },
             map
         )
+    }
+
+    // ------------------------------------------------------------------
+    // Türkçeye çeviri (TMDB'de Türkçe karşılığı olmayan bölüm adı / açıklaması için)
+    // ------------------------------------------------------------------
+    private val trCache = ConcurrentHashMap<String, String>()
+
+    private suspend fun gtr(text: String): String? {
+        return try {
+            val r = app.post(
+                "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=tr&dt=t",
+                data = mapOf("q" to text),
+                timeout = 20L
+            ).text
+            val a0 = JSONArray(r).optJSONArray(0)
+            val sb = StringBuilder()
+            if (a0 != null) for (i in 0 until a0.length()) sb.append(a0.optJSONArray(i)?.optString(0).orEmpty())
+            sb.toString().ifBlank { null }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            null
+        }
+    }
+
+    // Metinleri toplu çevirir (chunk adet metin tek istekte); sonuç: özgün metin -> Türkçe
+    private suspend fun trMany(list: List<String>, chunk: Int): Map<String, String> {
+        val sep = "\n###\n"
+        val todo = list.filter { it.isNotBlank() && !trCache.containsKey(it) }.distinct()
+        for (ch in todo.chunked(chunk)) {
+            var done = false
+            if (ch.size > 1) {
+                val r = gtr(ch.joinToString(sep))
+                if (r != null) {
+                    val parts = r.split(Regex("\\s*###\\s*")).map { it.trim() }
+                    if (parts.size == ch.size) {
+                        ch.forEachIndexed { i, s -> trCache[s] = parts[i].ifBlank { s } }
+                        done = true
+                    }
+                }
+            }
+            if (!done) {
+                ch.amap { s -> gtr(s)?.let { trCache[s] = it } }
+            }
+        }
+        val out = HashMap<String, String>()
+        for (s in list) out[s] = trCache[s] ?: s
+        return out
     }
 
     // Bölüm sayfası gerçekten var mı (oynatıcı seçeneği içeriyor mu)?
@@ -701,12 +764,22 @@ class Zdizi : MainAPI() {
                 eps.count { tm.eps.containsKey("${it.season}_${it.episode}") }.toDouble() / eps.size >= 0.6)
         ) tm else null
 
-        if (tmUse != null) {
-            val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            for (ep in eps) {
-                val t = tmUse.eps["${ep.season}_${ep.episode}"] ?: continue
-                if (!isGenericName(t.name)) ep.name = t.name
-                if (t.overview.isNotBlank()) ep.description = t.overview
+        // Bölüm adı / açıklaması: TMDB'de Türkçe olanlar aynen, olmayanlar Türkçeye çevrilir
+        val trNames = ArrayList<Pair<Episode, String>>()
+        val trDescs = ArrayList<Pair<Episode, String>>()
+        val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        for (ep in eps) {
+            val t = tmUse?.eps?.get("${ep.season}_${ep.episode}")
+            if (t != null) {
+                if (!isGenericName(t.name)) {
+                    if (t.nameTr) ep.name = t.name else trNames.add(ep to t.name)
+                } else {
+                    val cur = ep.name
+                    if (!cur.isNullOrBlank()) trNames.add(ep to cur)
+                }
+                if (t.overview.isNotBlank()) {
+                    if (t.ovTr) ep.description = t.overview else trDescs.add(ep to t.overview)
+                }
                 if (t.still != null) ep.posterUrl = t.still
                 if (t.runtime != null) ep.runTime = t.runtime
                 if (t.air != null) {
@@ -715,7 +788,19 @@ class Zdizi : MainAPI() {
                     } catch (ex: Exception) {
                     }
                 }
+            } else {
+                // TMDB'de karşılığı yok: sitenin kendi (çoğunlukla İngilizce) adını Türkçeleştir
+                val cur = ep.name
+                if (!cur.isNullOrBlank()) trNames.add(ep to cur)
             }
+        }
+        if (trNames.isNotEmpty()) {
+            val m = trMany(trNames.map { it.second }.take(300), 25)
+            for ((ep, src) in trNames) ep.name = m[src] ?: src
+        }
+        if (trDescs.isNotEmpty()) {
+            val m = trMany(trDescs.map { it.second }.take(120), 6)
+            for ((ep, src) in trDescs) ep.description = m[src] ?: src
         }
 
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, eps) {
@@ -770,7 +855,7 @@ class Zdizi : MainAPI() {
             if (!embeds.containsKey(u)) embeds[u] = "Player"
         }
 
-        // Altyazı klasörü için yıl/ay ipuçları (bölüm görselinin yüklendiği ay + yakın aylar)
+        // Altyazı klasörü için yıl/ay ipuçları (bölüm görselinin yüklendiği ay + son 48 ay)
         val hints = ArrayList<Pair<String, String>>()
         val rx = Regex("/wp-content/uploads/(\\d{4})/(\\d{2})/episodes/")
         rx.findAll(p.text).forEach { m ->
@@ -778,7 +863,7 @@ class Zdizi : MainAPI() {
             if (!hints.contains(pr)) hints.add(pr)
         }
         val cal = Calendar.getInstance()
-        for (i in 0 until 3) {
+        for (i in 0 until 48) {
             val pr = cal.get(Calendar.YEAR).toString() to String.format(Locale.US, "%02d", cal.get(Calendar.MONTH) + 1)
             if (!hints.contains(pr)) hints.add(pr)
             cal.add(Calendar.MONTH, -1)
@@ -788,7 +873,7 @@ class Zdizi : MainAPI() {
         for (entry in embeds.entries.take(5)) {
             val embedUrl = entry.key
             val label = entry.value
-            if (resolveEmbed(embedUrl, label, hints.take(4), subtitleCallback, callback)) {
+            if (resolveEmbed(embedUrl, label, hints, subtitleCallback, callback)) {
                 any = true
             } else {
                 // son çare: CloudStream'in hazır çıkarıcıları
@@ -802,7 +887,7 @@ class Zdizi : MainAPI() {
         // Sayfadan adres çıkmadıysa: oynatıcıyı gerçek WebView'da açıp m3u / m3u8 / mp4 isteğini yakala
         if (!any) {
             for (entry in embeds.entries.take(2)) {
-                if (resolveEmbed(entry.key, entry.value, hints.take(4), subtitleCallback, callback, true)) {
+                if (resolveEmbed(entry.key, entry.value, hints, subtitleCallback, callback, true)) {
                     any = true
                     break
                 }
@@ -853,6 +938,16 @@ class Zdizi : MainAPI() {
         val found = Found()
         texts.forEach { scan(it, origin, found) }
 
+        // Oynatıcı sayfasında geçen yükleme klasörü (yıl/ay) en güvenilir altyazı ipucudur: başa koy
+        val hints2 = ArrayList<Pair<String, String>>()
+        texts.forEach { tx ->
+            Regex("/upload/videos/(\\d{4})/(\\d{2})/").findAll(fixText(tx)).forEach { m ->
+                val pr = m.groupValues[1] to m.groupValues[2]
+                if (!hints2.contains(pr)) hints2.add(pr)
+            }
+        }
+        for (h in hints) if (!hints2.contains(h)) hints2.add(h)
+
         // Adres sayfada yoksa: sayfadaki player / api / ajax uç noktalarını dene
         if (found.hls.isEmpty() && found.mp4.isEmpty()) {
             val ends = LinkedHashSet<String>()
@@ -875,7 +970,7 @@ class Zdizi : MainAPI() {
         // Adres JavaScript ile üretiliyor ve TEK KULLANIMLIK: kendi WebView'ımızda açıp m3u isteklerini
         // biz çekeriz (WebView'a aynı yanıtı veririz), içeriği saklar ve yerel sunucudan oynatıcıya sunarız.
         if (found.hls.isEmpty() && found.mp4.isEmpty()) {
-            if (captureAndServe(embedUrl, label, origin, hints, cookies, subtitleCallback, callback)) return true
+            if (captureAndServe(embedUrl, label, origin, hints2, cookies, found, subtitleCallback, callback)) return true
         }
 
         if (allowWeb && found.hls.isEmpty() && found.mp4.isEmpty()) {
@@ -906,7 +1001,7 @@ class Zdizi : MainAPI() {
             return false
         }
 
-        emitSubs(found, embedUrl, origin, hints, cookies, subtitleCallback)
+        emitSubs(found, embedUrl, origin, hints2, cookies, subtitleCallback)
 
         val ck = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         val hd = LinkedHashMap<String, String>()
@@ -953,16 +1048,65 @@ class Zdizi : MainAPI() {
 
     private val capRe = Regex("(?i)/(m3u|list|hls|playlist|manifest|master|stream|source)s?/|\\.m3u8|\\.m3u(\\?|$)")
 
+    private val subReq = Regex("(?i)\\.(vtt|srt)(\\?|$)")
+
+    // jwplayer'ın oynatma listesindeki altyazı parçalarını JSON olarak verir
+    private val trackScript = """
+        (function(){
+          try{
+            var p=jwplayer();
+            var pl=p.getPlaylist();
+            var out=[];
+            if(pl&&pl.length){
+              var tr=pl[0].tracks||[];
+              for(var i=0;i<tr.length;i++){out.push({f:tr[i].file,l:tr[i].label,k:tr[i].kind});}
+            }
+            return JSON.stringify(out);
+          }catch(e){return '[]';}
+        })()
+    """.trimIndent()
+
+    // evaluateJavascript(trackScript) sonucunu okuyup altyazı adreslerini toplar
+    private fun parseTracks(res: String?, origin: String, out: ConcurrentHashMap<String, String>) {
+        try {
+            if (res.isNullOrBlank() || res == "null") return
+            val txt = (org.json.JSONTokener(res).nextValue() as? String) ?: return
+            val arr = JSONArray(txt)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val f = o.optString("f").trim()
+                val k = o.optString("k").trim()
+                if (f.isBlank()) continue
+                if (k.isNotBlank() && !k.equals("captions", true) && !k.equals("subtitles", true)) continue
+                if (k.isBlank() && !subReq.containsMatchIn(f)) continue
+                val u = when {
+                    f.startsWith("http", true) -> f
+                    f.startsWith("//") -> "https:$f"
+                    f.startsWith("/") -> origin + f
+                    else -> continue
+                }
+                out.putIfAbsent(u, o.optString("l"))
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
     // Oynatıcı sayfasını kendi WebView'ımızda açar. m3u / list isteklerini OkHttp ile BİZ çeker
     // (tek kullanımlık jeton bizde harcanır), aynı yanıtı WebView'a da verir ve içeriği saklar.
     // Oynatıcının kendiliğinden çekmediği alt listeleri (ör. ikinci ses / ikinci video) sayfanın
     // içinden fetch() ile tarayıcı gibi çektirir; böylece her ses / video parçası kullanılabilir olur.
-    private fun ownWebCapture(embedUrl: String, timeoutMs: Long): LinkedHashMap<String, CapBody> {
+    // Altyazı adresleri (jwplayer parça listesi + .vtt / .srt istekleri) subOut'a toplanır.
+    private fun ownWebCapture(
+        embedUrl: String,
+        timeoutMs: Long,
+        subOut: ConcurrentHashMap<String, String>
+    ): LinkedHashMap<String, CapBody> {
         val result = LinkedHashMap<String, CapBody>()
         val ctx = appCtx() ?: run {
             dbg = "context yok ($dbg)"
             return result
         }
+        val origin = originOf(embedUrl)
         val caps = ConcurrentHashMap<String, CapBody>()
         val order = java.util.Collections.synchronizedList(ArrayList<String>())
         val holder = arrayOfNulls<WebView>(1)
@@ -999,6 +1143,13 @@ class Zdizi : MainAPI() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         if (request == null) return null
                         val u = request.url.toString()
+                        // Altyazı dosyası isteği: adresi not al, isteği olduğu gibi bırak
+                        if (subReq.containsMatchIn(u)) {
+                            if (!u.contains("thumb", true) && !u.contains("sprite", true) && !u.contains("chapter", true)) {
+                                subOut.putIfAbsent(u, "")
+                            }
+                            return null
+                        }
                         if (request.method != "GET" || !capRe.containsMatchIn(u)) return null
                         if (u.contains("googletagmanager", true) || u.contains("google-analytics", true) ||
                             u.contains("cloudfront.net", true) || u.contains("cdn.jsdelivr", true)
@@ -1073,6 +1224,7 @@ class Zdizi : MainAPI() {
         val end = System.currentTimeMillis() + timeoutMs
         var firstHit = 0L
         var jsAt = 0L
+        var lastTrk = 0L
         while (System.currentTimeMillis() < end) {
             try {
                 Thread.sleep(250)
@@ -1080,6 +1232,18 @@ class Zdizi : MainAPI() {
                 break
             }
             val now = System.currentTimeMillis()
+
+            // altyazı parçalarını oynatıcıdan (jwplayer) düzenli olarak oku
+            if (now - lastTrk > 1000) {
+                lastTrk = now
+                main.post {
+                    try {
+                        holder[0]?.evaluateJavascript(trackScript) { res -> parseTracks(res, origin, subOut) }
+                    } catch (e: Throwable) {
+                    }
+                }
+            }
+
             val has = synchronized(order) { order.any { u -> caps[u]?.let { it.code in 200..299 && looksM3u(it.bytes) } == true } }
             if (!has) continue
             if (firstHit == 0L) firstHit = now
@@ -1106,6 +1270,17 @@ class Zdizi : MainAPI() {
                 if (now - jsAt > 7000) break
             }
         }
+        // son bir kez altyazı parçalarını oku
+        main.post {
+            try {
+                holder[0]?.evaluateJavascript(trackScript) { res -> parseTracks(res, origin, subOut) }
+            } catch (e: Throwable) {
+            }
+        }
+        try {
+            Thread.sleep(400)
+        } catch (e: InterruptedException) {
+        }
         main.post {
             try {
                 holder[0]?.stopLoading()
@@ -1123,11 +1298,13 @@ class Zdizi : MainAPI() {
         origin: String,
         hints: List<Pair<String, String>>,
         cookies: Map<String, String>,
+        found0: Found,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val subOut = ConcurrentHashMap<String, String>()
         val caps = try {
-            ownWebCapture(embedUrl, 20_000L)
+            ownWebCapture(embedUrl, 20_000L, subOut)
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             dbg = "wv yakalama hata ${e.javaClass.simpleName} ($dbg)"
@@ -1142,6 +1319,15 @@ class Zdizi : MainAPI() {
         if (!HlsProxy.ensure()) {
             dbg = "yerel sunucu baslamadi | $dbg"
             return false
+        }
+
+        // Altyazı adreslerini topla: oynatıcı parça listesi, .vtt/.srt istekleri ve oynatma listelerinin içi
+        for ((u, lb) in subOut) if (!found0.subs.containsKey(u)) found0.subs[u] = lb
+        try {
+            val tmp = Found()
+            for ((_, b) in lists) scan(String(b.bytes, Charsets.UTF_8), origin, tmp)
+            for ((u, lb) in tmp.subs) if (!found0.subs.containsKey(u)) found0.subs[u] = lb
+        } catch (e: Exception) {
         }
 
         // WebView oturum çerezleri (m3u / parça adresleri oturuma bağlı olabilir)
@@ -1174,7 +1360,7 @@ class Zdizi : MainAPI() {
         // hâlâ alınamamış alt listeleri (kalite / ses listeleri) hemen çekip sakla: jeton süresi dolmadan
         for (u in tops) HlsProxy.prefetchRefs(String(lists[u]!!.bytes, Charsets.UTF_8), u, hd)
 
-        emitSubs(Found(), embedUrl, origin, hints, cookies, subtitleCallback)
+        emitSubs(found0, embedUrl, origin, hints, cookies, subtitleCallback)
 
         var n = 0
         for (u in tops.take(3)) {
@@ -1315,7 +1501,11 @@ class Zdizi : MainAPI() {
         }
     }
 
-    // Sayfada altyazı adresi yoksa: /upload/videos/<yıl>/<ay>/<id>/altyazi/tur_sub.vtt adreslerini yoklar
+    private fun isVtt(s: String): Boolean =
+        s.trimStart('\uFEFF', ' ', '\n', '\r', '\t').startsWith("WEBVTT")
+
+    // Bulunan altyazıları verir. Türkçe yoksa /upload/videos/<yıl>/<ay>/<id>/altyazi/tur_sub.vtt klasörünü
+    // olası yıl/ay'larda (12'şerli gruplar halinde, ilk bulunana kadar) yoklar.
     private suspend fun emitSubs(
         found: Found,
         embedUrl: String,
@@ -1325,22 +1515,37 @@ class Zdizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
         val done = HashSet<String>()
+        var hasTr = false
         for ((u, lb) in found.subs) {
-            if (done.add(u)) subtitleCallback(SubtitleFile(subName(lb, u), u))
+            if (!done.add(u)) continue
+            val nm = subName(lb, u)
+            if (nm == "Türkçe") hasTr = true
+            subtitleCallback(SubtitleFile(nm, u))
         }
-        if (found.subs.isNotEmpty()) return
+        if (hasTr) return
         val id = Regex("/embed/([A-Za-z0-9_-]+)").find(embedUrl)?.groupValues?.get(1) ?: return
         val cands = ArrayList<String>()
-        for (h in hints) {
-            for (nm in listOf("tur_sub", "eng_sub")) {
-                cands.add("$origin/upload/videos/${h.first}/${h.second}/$id/altyazi/$nm.vtt")
+        for (h in hints) cands.add("$origin/upload/videos/${h.first}/${h.second}/$id/altyazi/tur_sub.vtt")
+        var folder: String? = null
+        for (ch in cands.distinct().chunked(12)) {
+            val ok = ch.amap { c ->
+                val r = fetch(c, embedUrl, false, cookies = cookies)
+                if (r != null && r.code == 200 && isVtt(r.text)) c else null
+            }.filterNotNull()
+            if (ok.isNotEmpty()) {
+                ok.forEach { if (done.add(it)) subtitleCallback(SubtitleFile("Türkçe", it)) }
+                folder = ok[0].substringBeforeLast("/")
+                break
             }
         }
-        val ok = cands.take(8).amap { c ->
-            val r = fetch(c, embedUrl, false, cookies = cookies)
-            if (r != null && r.code == 200 && r.text.trimStart().startsWith("WEBVTT")) c else null
-        }.filterNotNull()
-        ok.forEach { if (done.add(it)) subtitleCallback(SubtitleFile(subName(null, it), it)) }
+        // Aynı klasörde İngilizce altyazı da olabilir
+        if (folder != null) {
+            val en = "$folder/eng_sub.vtt"
+            val r = fetch(en, embedUrl, false, cookies = cookies)
+            if (r != null && r.code == 200 && isVtt(r.text) && done.add(en)) {
+                subtitleCallback(SubtitleFile("İngilizce", en))
+            }
+        }
     }
 
     private fun b64bin(s: String): ByteArray {
