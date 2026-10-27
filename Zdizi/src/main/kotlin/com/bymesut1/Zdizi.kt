@@ -77,6 +77,16 @@ class Zdizi : MainAPI() {
         val subs = LinkedHashMap<String, String>() // adres -> etiket
     }
 
+    // Sitenin kendi bölüm bilgisi (bölüm sayfasındaki / dizi sayfasındaki liste)
+    private class SEp(
+        val season: Int,
+        val episode: Int,
+        val url: String,
+        val slug: String,
+        val name: String,
+        val date: Long?
+    )
+
     private val epRe = Regex("^/(.+)-(\\d+)-sezon-(\\d+)-bolum-izle/?$")
 
     private fun hdr(ref: String?, extra: Map<String, String> = emptyMap()): Map<String, String> {
@@ -157,6 +167,11 @@ class Zdizi : MainAPI() {
     private fun slugTitle(path: String): String =
         path.substringAfterLast("/").removeSuffix("-izle").split("-").filter { it.isNotBlank() }
             .joinToString(" ") { w -> w.replaceFirstChar { c -> c.uppercase() } }
+
+    // "7. Bölüm", "Bölüm 7", "Episode 7" gibi genel (anlamsız) bölüm adları
+    private fun isGenericName(n: String): Boolean =
+        n.isBlank() || Regex("^(?:\\d+\\s*\\.?\\s*)?(?:B[öo]l[üu]m|Episode)(?:\\s*\\d+)?$", RegexOption.IGNORE_CASE)
+            .matches(n.trim())
 
     // WordPress küçük resim ekini (-300x450) kaldırıp orijinal (net) boyutu kullanır
     private fun upsize(u: String): String =
@@ -249,6 +264,48 @@ class Zdizi : MainAPI() {
             if (title.isBlank()) continue
             val poster = posters[url]
             out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster })
+        }
+        return out
+    }
+
+    // Bir sayfadaki bölüm bağlantılarını (ad + tarih dahil) toplar. Slug'ı eşleşmeyen diziler alınmaz.
+    private fun collectEps(doc: Document, slugNorm: String, df: SimpleDateFormat): LinkedHashMap<String, SEp> {
+        val out = LinkedHashMap<String, SEp>()
+        for (a in doc.select("a[href]")) {
+            val raw = a.attr("href").trim()
+            if (raw.startsWith("http", true) && !raw.contains("zdizi.com", true)) continue
+            val ep = pathOf(raw)
+            val m = epRe.find(ep) ?: continue
+            if (m.groupValues[1].removeSuffix("-izle") != slugNorm) continue
+            val s = m.groupValues[2].toIntOrNull() ?: continue
+            val e = m.groupValues[3].toIntOrNull() ?: continue
+            val key = "${s}_$e"
+
+            var rest = a.text().trim()
+            var dateText = a.selectFirst("date")?.text()?.trim().orEmpty()
+            val dm = Regex("(\\d{1,2}\\s+\\p{L}+\\s+\\d{4})\\s*$").find(rest)
+            if (dm != null) {
+                if (dateText.isBlank()) dateText = dm.groupValues[1]
+                rest = rest.substring(0, dm.range.first).trim()
+            }
+            var epName = a.selectFirst("small, .truncate")?.text()?.trim().orEmpty()
+            if (epName.isBlank()) {
+                epName = Regex("^\\d+\\s*\\.\\s*B[öo]l[üu]m\\s*(.*)$", RegexOption.IGNORE_CASE)
+                    .find(rest)?.groupValues?.get(1)?.trim().orEmpty()
+            }
+            epName = epName.replace(Regex("\\s*\\d{4,}\\s*$"), "").trim()
+            if (isGenericName(epName)) epName = ""
+
+            var millis: Long? = null
+            if (dateText.isNotBlank()) {
+                try {
+                    millis = df.parse(dateText)?.time
+                } catch (ex: Exception) {
+                }
+            }
+            val old = out[key]
+            if (old != null && (old.name.isNotBlank() || epName.isBlank())) continue
+            out[key] = SEp(s, e, mainUrl + ep, m.groupValues[1], epName, millis ?: old?.date)
         }
         return out
     }
@@ -362,7 +419,7 @@ class Zdizi : MainAPI() {
         val id = sh.optInt("id")
         if (id == 0) return null
 
-        // Dizinin TÜM sezonlarını TMDB'den öğren (sitede eksik sezonları tamamlamak için)
+        // Dizinin TÜM sezonlarını TMDB'den öğren
         val allSeasons = ArrayList<Int>()
         allSeasons.addAll(seasons)
         val detail = tmdbJson("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR")
@@ -515,52 +572,52 @@ class Zdizi : MainAPI() {
 
         val today = Date()
         val df = SimpleDateFormat("d MMMM yyyy", Locale("tr", "TR"))
+        val slugNorm = slug.removeSuffix("-izle")
+
+        // 1) Dizi sayfasındaki (çoğu zaman eksik) bölüm listesi
+        val pageMap = collectEps(doc, slugNorm, df)
+
+        // 2) Sitenin kendi TAM listesi: herhangi bir bölüm sayfası dizinin bütün sezon / bölümlerini listeler
+        var full: LinkedHashMap<String, SEp>? = null
+        val seedUrl = pageMap.values.minWithOrNull(compareBy<SEp>({ it.season }, { it.episode }))?.url
+            ?: "$mainUrl/$slugNorm-1-sezon-1-bolum-izle"
+        val sr = fetch(seedUrl, pageUrl, true)
+        if (sr != null && sr.code == 200) {
+            val fm = collectEps(Jsoup.parse(sr.text, mainUrl), slugNorm, df)
+            if (fm.isNotEmpty()) full = fm
+        }
+        val siteComplete = full != null
+
+        // Birleştir: tam liste temel, dizi sayfasındaki bilgiler eksikleri tamamlar
+        val merged = LinkedHashMap<String, SEp>()
+        if (full != null) merged.putAll(full)
+        for ((k, v) in pageMap) {
+            val o = merged[k]
+            if (o == null) {
+                merged[k] = v
+            } else if (o.name.isBlank() && v.name.isNotBlank()) {
+                merged[k] = SEp(o.season, o.episode, o.url, o.slug, v.name, o.date ?: v.date)
+            }
+        }
+        var epSlug: String? = merged.values.firstOrNull()?.slug
+
         val seen = HashSet<String>()
         val eps = ArrayList<Episode>()
-        // Sitedeki bölüm adreslerinde kullanılan gerçek slug (sayfa slug'ından farklı olabilir)
-        var epSlug: String? = null
-        val slugNorm = slug.removeSuffix("-izle")
-        for (a in doc.select("a[href]")) {
-            val raw = a.attr("href").trim()
-            if (raw.startsWith("http", true) && !raw.contains("zdizi.com", true)) continue
-            val ep = pathOf(raw)
-            val m = epRe.find(ep) ?: continue
-            val gs = m.groupValues[1].removeSuffix("-izle")
-            if (gs != slugNorm) continue
-            if (epSlug == null) epSlug = m.groupValues[1]
-            val epUrl = mainUrl + ep
-            if (!seen.add(epUrl)) continue
-            val s = m.groupValues[2].toIntOrNull() ?: continue
-            val e = m.groupValues[3].toIntOrNull() ?: continue
-
-            var epName = a.selectFirst("small, .truncate")?.text()?.trim().orEmpty()
-            if (epName.isBlank()) {
-                epName = Regex("\\d+\\.\\s*Bölüm\\s*(.*)$", RegexOption.IGNORE_CASE)
-                    .find(a.text().trim())?.groupValues?.get(1)?.trim().orEmpty()
-                epName = epName.replace(Regex("\\s*\\d{4,}\\s*$"), "").trim()
-            }
-            // "7. Bölüm" gibi genel adlar boş bırakılır (uygulama zaten numarayı kendisi yazıyor: "7. 7. Bölüm" olmasın)
-            if (Regex("^\\d+\\s*\\.?\\s*B[öo]l[üu]m$", RegexOption.IGNORE_CASE).containsMatchIn(epName)) epName = ""
-            val dateText = a.selectFirst("date")?.text()?.trim().orEmpty()
-            var millis: Long? = null
-            if (dateText.isNotBlank()) {
-                try {
-                    millis = df.parse(dateText)?.time
-                } catch (ex: Exception) {
-                }
-            }
+        for (v in merged.values.sortedWith(compareBy<SEp>({ it.season }, { it.episode }))) {
+            val dt = v.date
             // Gelecek tarihli bölümler listeye eklenmez
-            if (millis != null && millis > today.time) continue
-
-            eps.add(newEpisode(epUrl) {
-                this.season = s
-                this.episode = e
-                if (epName.isNotBlank()) this.name = epName
-                if (millis != null) this.date = millis
+            if (dt != null && dt > today.time) continue
+            if (!seen.add(v.url)) continue
+            val nm = if (isGenericName(v.name)) "" else v.name
+            eps.add(newEpisode(v.url) {
+                this.season = v.season
+                this.episode = v.episode
+                if (nm.isNotBlank()) this.name = nm
+                if (dt != null) this.date = dt
             })
         }
 
-        // TMDB: Türkçe bölüm adı, açıklama, bölüm görseli, süre (+ tüm sezon listesi)
+        // TMDB: Türkçe bölüm adı, açıklama, bölüm görseli, süre
         val tm = try {
             tmdbShow(title, year, eps.mapNotNull { it.season }.distinct())
         } catch (e: Exception) {
@@ -568,95 +625,93 @@ class Zdizi : MainAPI() {
             null
         }
 
-        // Sitedeki dizi sayfasında listelenmeyen sezon / bölümleri tamamla:
-        // TMDB'de yayınlanmış ama sayfada olmayan bölümler varsa (ilk ve son eksik bölümün sayfası
-        // sitede açılıyorsa) o sezonun eksik bütün bölümlerini ekle. Tamamen eksik sezonlar da dahil.
-        if (tm != null) {
-            val baseSlug = epSlug ?: slugNorm
-            val haveKeys = eps.map { "${it.season}_${it.episode}" }.toHashSet()
-            val df3 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            val tmSeasons = tm.eps.keys.mapNotNull { it.substringBefore("_").toIntOrNull() }
-                .distinct().filter { it > 0 }.sorted()
-            val filled = tmSeasons.amap { sn ->
-                val nums = tm.eps.keys.filter { it.startsWith("${sn}_") }
-                    .mapNotNull { it.substringAfter("_").toIntOrNull() }.sorted()
-                // sayfada olmayan ve yayınlanmış (gelecek tarihli olmayan) bölümler
-                val missing = nums.filter { n ->
-                    if ("${sn}_$n" in haveKeys) return@filter false
-                    val airMillis = try {
-                        tm.eps["${sn}_$n"]?.air?.let { df3.parse(it)?.time }
-                    } catch (ex: Exception) {
-                        null
+        // Sitenin tam listesi alınamadıysa (yedek yöntem): TMDB + sitede yoklama ile eksikleri tamamla
+        if (!siteComplete) {
+            if (tm != null) {
+                val baseSlug = epSlug ?: slugNorm
+                val haveKeys = eps.map { "${it.season}_${it.episode}" }.toHashSet()
+                val df3 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                val tmSeasons = tm.eps.keys.mapNotNull { it.substringBefore("_").toIntOrNull() }
+                    .distinct().filter { it > 0 }.sorted()
+                val filled = tmSeasons.amap { sn ->
+                    val nums = tm.eps.keys.filter { it.startsWith("${sn}_") }
+                        .mapNotNull { it.substringAfter("_").toIntOrNull() }.sorted()
+                    val missing = nums.filter { n ->
+                        if ("${sn}_$n" in haveKeys) return@filter false
+                        val airMillis = try {
+                            tm.eps["${sn}_$n"]?.air?.let { df3.parse(it)?.time }
+                        } catch (ex: Exception) {
+                            null
+                        }
+                        airMillis == null || airMillis <= today.time
                     }
-                    airMillis == null || airMillis <= today.time
-                }
-                if (missing.isEmpty()) return@amap null
-                var ok = false
-                for (probe in listOf(missing.first(), missing.last()).distinct()) {
-                    if (epPageExists("$mainUrl/$baseSlug-$sn-sezon-$probe-bolum-izle")) {
-                        ok = true
-                        break
+                    if (missing.isEmpty()) return@amap null
+                    var ok = false
+                    for (probe in listOf(missing.first(), missing.last()).distinct()) {
+                        if (epPageExists("$mainUrl/$baseSlug-$sn-sezon-$probe-bolum-izle")) {
+                            ok = true
+                            break
+                        }
                     }
-                }
-                if (ok) sn to missing else null
-            }.filterNotNull()
-            for ((sn, nums) in filled) {
-                for (n in nums) {
-                    val epUrl = "$mainUrl/$baseSlug-$sn-sezon-$n-bolum-izle"
-                    if (!seen.add(epUrl)) continue
-                    eps.add(newEpisode(epUrl) {
-                        this.season = sn
-                        this.episode = n
-                    })
+                    if (ok) sn to missing else null
+                }.filterNotNull()
+                for ((sn, nums) in filled) {
+                    for (n in nums) {
+                        val epUrl = "$mainUrl/$baseSlug-$sn-sezon-$n-bolum-izle"
+                        if (!seen.add(epUrl)) continue
+                        eps.add(newEpisode(epUrl) {
+                            this.season = sn
+                            this.episode = n
+                        })
+                    }
                 }
             }
-        }
 
-        // Sitenin kendisinden yoklama (TMDB'nin bilmediği / yanlış eşleştirdiği diziler için):
-        // 1) her sezonda aradaki eksik bölümler (1 ... en büyük bölüm)
-        // 2) son sezonun devamındaki yeni bölümler
-        // 3) listede hiç olmayan sezonlar (1 ... son sezon + 1)
-        run {
-            // eps burada yalnızca okunur; yeni eklemeler aşağıda yapılır
-        }
-        val baseSlug2 = epSlug ?: slugNorm
-        val bySeason = HashMap<Int, MutableSet<Int>>()
-        for (e in eps) {
-            val s = e.season ?: continue
-            val n = e.episode ?: continue
-            bySeason.getOrPut(s) { HashSet() }.add(n)
-        }
-        if (bySeason.isNotEmpty()) {
-            for ((sn, set) in bySeason.toList()) {
-                val mx = set.maxOrNull() ?: continue
-                val gaps = (1..mx).filter { it !in set }
-                if (gaps.isEmpty()) continue
-                addProbed(eps, seen, bySeason, baseSlug2, sn, probeEps(baseSlug2, sn, gaps.take(60)))
+            // Sitenin kendisinden yoklama: aradaki eksikler, son sezonun devamı, listede olmayan sezonlar
+            val baseSlug2 = epSlug ?: slugNorm
+            val bySeason = HashMap<Int, MutableSet<Int>>()
+            for (e in eps) {
+                val s = e.season ?: continue
+                val n = e.episode ?: continue
+                bySeason.getOrPut(s) { HashSet() }.add(n)
             }
-            val maxS = bySeason.keys.maxOrNull() ?: 0
-            if (maxS > 0) {
-                val mxLast = bySeason[maxS]?.maxOrNull() ?: 0
-                addProbed(eps, seen, bySeason, baseSlug2, maxS, extendFrom(baseSlug2, maxS, mxLast + 1, 30))
-                for (sn in 1..(maxS + 1)) {
-                    if (bySeason.containsKey(sn)) continue
-                    addProbed(eps, seen, bySeason, baseSlug2, sn, extendFrom(baseSlug2, sn, 1, 80))
+            if (bySeason.isNotEmpty()) {
+                for ((sn, set) in bySeason.toList()) {
+                    val mx = set.maxOrNull() ?: continue
+                    val gaps = (1..mx).filter { it !in set }
+                    if (gaps.isEmpty()) continue
+                    addProbed(eps, seen, bySeason, baseSlug2, sn, probeEps(baseSlug2, sn, gaps.take(60)))
+                }
+                val maxS = bySeason.keys.maxOrNull() ?: 0
+                if (maxS > 0) {
+                    val mxLast = bySeason[maxS]?.maxOrNull() ?: 0
+                    addProbed(eps, seen, bySeason, baseSlug2, maxS, extendFrom(baseSlug2, maxS, mxLast + 1, 30))
+                    for (sn in 1..(maxS + 1)) {
+                        if (bySeason.containsKey(sn)) continue
+                        addProbed(eps, seen, bySeason, baseSlug2, sn, extendFrom(baseSlug2, sn, 1, 80))
+                    }
                 }
             }
         }
 
         eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
-        if (tm != null) {
+        // TMDB eşleşmesi tutarlı mı? (site bölümlerinin en az %60'ı TMDB'de varsa). Tutarsızsa TMDB hiç kullanılmaz.
+        val tmUse: TShow? = if (tm != null && (eps.isEmpty() ||
+                eps.count { tm.eps.containsKey("${it.season}_${it.episode}") }.toDouble() / eps.size >= 0.6)
+        ) tm else null
+
+        if (tmUse != null) {
             val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
             for (ep in eps) {
-                val t = tm.eps["${ep.season}_${ep.episode}"] ?: continue
-                if (t.name.isNotBlank()) ep.name = t.name
+                val t = tmUse.eps["${ep.season}_${ep.episode}"] ?: continue
+                if (!isGenericName(t.name)) ep.name = t.name
                 if (t.overview.isNotBlank()) ep.description = t.overview
                 if (t.still != null) ep.posterUrl = t.still
                 if (t.runtime != null) ep.runTime = t.runtime
-                if (ep.date == null && t.air != null) {
+                if (t.air != null) {
                     try {
-                        ep.date = df2.parse(t.air)?.time
+                        df2.parse(t.air)?.time?.let { ep.date = it }
                     } catch (ex: Exception) {
                     }
                 }
@@ -664,9 +719,9 @@ class Zdizi : MainAPI() {
         }
 
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, eps) {
-            this.posterUrl = tm?.poster ?: poster
-            this.backgroundPosterUrl = tm?.backdrop ?: cover
-            this.plot = plot ?: tm?.overview
+            this.posterUrl = tmUse?.poster ?: poster
+            this.backgroundPosterUrl = tmUse?.backdrop ?: cover
+            this.plot = plot ?: tmUse?.overview
             this.tags = tags
             this.year = year
         }
@@ -900,6 +955,8 @@ class Zdizi : MainAPI() {
 
     // Oynatıcı sayfasını kendi WebView'ımızda açar. m3u / list isteklerini OkHttp ile BİZ çeker
     // (tek kullanımlık jeton bizde harcanır), aynı yanıtı WebView'a da verir ve içeriği saklar.
+    // Oynatıcının kendiliğinden çekmediği alt listeleri (ör. ikinci ses / ikinci video) sayfanın
+    // içinden fetch() ile tarayıcı gibi çektirir; böylece her ses / video parçası kullanılabilir olur.
     private fun ownWebCapture(embedUrl: String, timeoutMs: Long): LinkedHashMap<String, CapBody> {
         val result = LinkedHashMap<String, CapBody>()
         val ctx = appCtx() ?: run {
@@ -946,6 +1003,15 @@ class Zdizi : MainAPI() {
                         if (u.contains("googletagmanager", true) || u.contains("google-analytics", true) ||
                             u.contains("cloudfront.net", true) || u.contains("cdn.jsdelivr", true)
                         ) return null
+                        // Daha önce başarıyla alınmış adres tek kullanımlık olabilir: tekrar istemeden saklanan içeriği ver
+                        val cached = caps[u]
+                        if (cached != null && cached.code in 200..299) {
+                            val hc = HashMap<String, String>()
+                            hc["Access-Control-Allow-Origin"] = "*"
+                            return WebResourceResponse(
+                                cached.mime, "utf-8", cached.code, "OK", hc, ByteArrayInputStream(cached.bytes)
+                            )
+                        }
                         return try {
                             val rb = okhttp3.Request.Builder().url(u)
                             for ((k, v) in request.requestHeaders) {
@@ -990,19 +1056,54 @@ class Zdizi : MainAPI() {
         } catch (e: Exception) {
         }
 
+        // Alınan listelerin içinde adı geçen ama henüz hiç istenmemiş alt listeler (ses / video)
+        fun pending(): List<String> {
+            val out = ArrayList<String>()
+            val snap = synchronized(order) { order.toList() }
+            for (u in snap) {
+                val b = caps[u] ?: continue
+                if (b.code !in 200..299 || !looksM3u(b.bytes)) continue
+                for (r in HlsProxy.refsOf(String(b.bytes, Charsets.UTF_8), u)) {
+                    if (!caps.containsKey(r) && r !in out) out.add(r)
+                }
+            }
+            return out
+        }
+
         val end = System.currentTimeMillis() + timeoutMs
         var firstHit = 0L
+        var jsAt = 0L
         while (System.currentTimeMillis() < end) {
             try {
                 Thread.sleep(250)
             } catch (e: InterruptedException) {
                 break
             }
+            val now = System.currentTimeMillis()
             val has = synchronized(order) { order.any { u -> caps[u]?.let { it.code in 200..299 && looksM3u(it.bytes) } == true } }
-            if (has) {
-                if (firstHit == 0L) firstHit = System.currentTimeMillis()
-                // ikinci jeton (kalite) ve alt listeler de gelsin diye kısa bekle
-                if (System.currentTimeMillis() - firstHit > 2500) break
+            if (!has) continue
+            if (firstHit == 0L) firstHit = now
+            if (jsAt == 0L) {
+                // oynatıcının kendi isteklerinin bitmesi için kısa bekle, sonra eksik alt listeleri sayfadan çektir
+                if (now - firstHit > 2500) {
+                    val missing = pending()
+                    if (missing.isEmpty()) break
+                    jsAt = now
+                    val arr = JSONArray()
+                    missing.forEach { arr.put(it) }
+                    val js = "(function(us){us.forEach(function(u){try{fetch(u).then(function(r){return r.text();}).catch(function(){});}catch(e){}});})(" +
+                        arr.toString() + ")"
+                    d("js ile ${missing.size} alt liste cekiliyor")
+                    main.post {
+                        try {
+                            holder[0]?.evaluateJavascript(js, null)
+                        } catch (e: Throwable) {
+                        }
+                    }
+                }
+            } else {
+                if (pending().isEmpty() && now - jsAt > 1200) break
+                if (now - jsAt > 7000) break
             }
         }
         main.post {
@@ -1070,7 +1171,7 @@ class Zdizi : MainAPI() {
         for ((u, b) in lists) HlsProxy.register(u, hd, b.bytes)
         var tops = lists.keys.filter { it !in referenced }
         if (tops.isEmpty()) tops = lists.keys.toList()
-        // alt listeleri (kalite listeleri) hemen çekip saklar: jeton süresi dolmadan
+        // hâlâ alınamamış alt listeleri (kalite / ses listeleri) hemen çekip sakla: jeton süresi dolmadan
         for (u in tops) HlsProxy.prefetchRefs(String(lists[u]!!.bytes, Charsets.UTF_8), u, hd)
 
         emitSubs(Found(), embedUrl, origin, hints, cookies, subtitleCallback)
@@ -1332,6 +1433,13 @@ private object HlsProxy {
     @Volatile
     private var port = 0
 
+    private fun log(m: String) {
+        try {
+            android.util.Log.d("ZdiziDbg", m.replace("\n", " ").take(500))
+        } catch (e: Throwable) {
+        }
+    }
+
     @Synchronized
     fun ensure(): Boolean {
         val cur = server
@@ -1432,9 +1540,15 @@ private object HlsProxy {
         val rb = okhttp3.Request.Builder().url(url)
         for ((k, v) in hdr) rb.header(k, v)
         client.newCall(rb.build()).execute().use { r ->
-            if (r.code in 200..299) r.body?.bytes() else null
+            if (r.code in 200..299) {
+                r.body?.bytes()
+            } else {
+                log("proxy fetch ${r.code} ${url.takeLast(30)}")
+                null
+            }
         }
     } catch (e: Exception) {
+        log("proxy fetch hata ${e.javaClass.simpleName} ${url.takeLast(30)}")
         null
     }
 
@@ -1512,6 +1626,7 @@ private object HlsProxy {
             val body = if (e != null) bodyOf(e) else null
             if (e == null || body == null) {
                 val code = if (e == null) "404 Not Found" else "502 Bad Gateway"
+                log("proxy $code ${e?.url?.takeLast(30) ?: id}")
                 os.write("HTTP/1.1 $code\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                 os.flush()
                 return
