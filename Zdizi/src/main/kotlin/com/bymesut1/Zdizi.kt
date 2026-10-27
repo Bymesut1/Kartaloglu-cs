@@ -518,44 +518,46 @@ class Zdizi : MainAPI() {
             null
         }
 
-        // Sitedeki dizi sayfasında listelenmeyen sezonları tamamla:
-        // TMDB'de var, sayfada yok -> o sezonun 1. bölüm sayfası sitede açılıyorsa tüm bölümleri ekle
+        // Sitedeki dizi sayfasında listelenmeyen sezon / bölümleri tamamla:
+        // TMDB'de yayınlanmış ama sayfada olmayan bölümler varsa (ilk ve son eksik bölümün sayfası
+        // sitede açılıyorsa) o sezonun eksik bütün bölümlerini ekle. Tamamen eksik sezonlar da dahil.
         if (tm != null) {
-            val have = eps.mapNotNull { it.season }.toSet()
-            val tmSeasons = tm.eps.keys.mapNotNull { it.substringBefore("_").toIntOrNull() }
-                .distinct().filter { it > 0 && it !in have }.sorted()
             val baseSlug = epSlug ?: slugNorm
-            if (tmSeasons.isNotEmpty()) {
-                val found = tmSeasons.amap { sn ->
-                    val nums = tm.eps.keys.filter { it.startsWith("${sn}_") }
-                        .mapNotNull { it.substringAfter("_").toIntOrNull() }.sorted()
-                    if (nums.isEmpty()) return@amap null
-                    var ok = false
-                    for (probe in nums.take(2)) {
-                        if (epPageExists("$mainUrl/$baseSlug-$sn-sezon-$probe-bolum-izle")) {
-                            ok = true
-                            break
-                        }
+            val haveKeys = eps.map { "${it.season}_${it.episode}" }.toHashSet()
+            val df3 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            val tmSeasons = tm.eps.keys.mapNotNull { it.substringBefore("_").toIntOrNull() }
+                .distinct().filter { it > 0 }.sorted()
+            val filled = tmSeasons.amap { sn ->
+                val nums = tm.eps.keys.filter { it.startsWith("${sn}_") }
+                    .mapNotNull { it.substringAfter("_").toIntOrNull() }.sorted()
+                // sayfada olmayan ve yayınlanmış (gelecek tarihli olmayan) bölümler
+                val missing = nums.filter { n ->
+                    if ("${sn}_$n" in haveKeys) return@filter false
+                    val airMillis = try {
+                        tm.eps["${sn}_$n"]?.air?.let { df3.parse(it)?.time }
+                    } catch (ex: Exception) {
+                        null
                     }
-                    if (ok) sn to nums else null
-                }.filterNotNull()
-                for ((sn, nums) in found) {
-                    for (n in nums) {
-                        val t = tm.eps["${sn}_$n"]
-                        // Yayınlanmamış (gelecek tarihli) bölümleri ekleme
-                        val airMillis = try {
-                            t?.air?.let { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(it)?.time }
-                        } catch (ex: Exception) {
-                            null
-                        }
-                        if (airMillis != null && airMillis > today.time) continue
-                        val epUrl = "$mainUrl/$baseSlug-$sn-sezon-$n-bolum-izle"
-                        if (!seen.add(epUrl)) continue
-                        eps.add(newEpisode(epUrl) {
-                            this.season = sn
-                            this.episode = n
-                        })
+                    airMillis == null || airMillis <= today.time
+                }
+                if (missing.isEmpty()) return@amap null
+                var ok = false
+                for (probe in listOf(missing.first(), missing.last()).distinct()) {
+                    if (epPageExists("$mainUrl/$baseSlug-$sn-sezon-$probe-bolum-izle")) {
+                        ok = true
+                        break
                     }
+                }
+                if (ok) sn to missing else null
+            }.filterNotNull()
+            for ((sn, nums) in filled) {
+                for (n in nums) {
+                    val epUrl = "$mainUrl/$baseSlug-$sn-sezon-$n-bolum-izle"
+                    if (!seen.add(epUrl)) continue
+                    eps.add(newEpisode(epUrl) {
+                        this.season = sn
+                        this.episode = n
+                    })
                 }
             }
         }
