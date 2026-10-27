@@ -349,8 +349,19 @@ class Zdizi : MainAPI() {
         val id = sh.optInt("id")
         if (id == 0) return null
 
+        // Dizinin TÜM sezonlarını TMDB'den öğren (sitede eksik sezonları tamamlamak için)
+        val allSeasons = ArrayList<Int>()
+        allSeasons.addAll(seasons)
+        val detail = tmdbJson("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR")
+        val sArr = detail?.optJSONArray("seasons")
+        if (sArr != null) for (i in 0 until sArr.length()) {
+            val sn = sArr.optJSONObject(i)?.optInt("season_number", 0) ?: 0
+            if (sn > 0) allSeasons.add(sn)
+        }
+        val seasonList = allSeasons.filter { it > 0 }.distinct().sorted()
+
         val map = java.util.concurrent.ConcurrentHashMap<String, TEp>()
-        seasons.filter { it > 0 }.amap { sn ->
+        seasonList.amap { sn ->
             val tr = tmdbJson("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=tr-TR")?.optJSONArray("episodes")
             val en = tmdbJson("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=en-US")?.optJSONArray("episodes")
             val enBy = HashMap<Int, JSONObject>()
@@ -380,6 +391,12 @@ class Zdizi : MainAPI() {
             sh.optString("overview").takeIf { it.isNotBlank() },
             map
         )
+    }
+
+    // Bölüm sayfası gerçekten var mı (oynatıcı seçeneği içeriyor mu)?
+    private suspend fun epPageExists(url: String): Boolean {
+        val r = fetch(url, "$mainUrl/", true) ?: return false
+        return r.code == 200 && (r.text.contains("data-frame") || r.text.contains("srcframe") || r.text.contains("playercont"))
     }
 
     // ------------------------------------------------------------------
@@ -452,12 +469,17 @@ class Zdizi : MainAPI() {
         val df = SimpleDateFormat("d MMMM yyyy", Locale("tr", "TR"))
         val seen = HashSet<String>()
         val eps = ArrayList<Episode>()
+        // Sitedeki bölüm adreslerinde kullanılan gerçek slug (sayfa slug'ından farklı olabilir)
+        var epSlug: String? = null
+        val slugNorm = slug.removeSuffix("-izle")
         for (a in doc.select("a[href]")) {
             val raw = a.attr("href").trim()
             if (raw.startsWith("http", true) && !raw.contains("zdizi.com", true)) continue
             val ep = pathOf(raw)
             val m = epRe.find(ep) ?: continue
-            if (m.groupValues[1] != slug) continue
+            val gs = m.groupValues[1].removeSuffix("-izle")
+            if (gs != slugNorm) continue
+            if (epSlug == null) epSlug = m.groupValues[1]
             val epUrl = mainUrl + ep
             if (!seen.add(epUrl)) continue
             val s = m.groupValues[2].toIntOrNull() ?: continue
@@ -487,15 +509,59 @@ class Zdizi : MainAPI() {
                 if (millis != null) this.date = millis
             })
         }
-        eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
-        // TMDB: Türkçe bölüm adı, açıklama, bölüm görseli, süre
+        // TMDB: Türkçe bölüm adı, açıklama, bölüm görseli, süre (+ tüm sezon listesi)
         val tm = try {
             tmdbShow(title, year, eps.mapNotNull { it.season }.distinct())
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             null
         }
+
+        // Sitedeki dizi sayfasında listelenmeyen sezonları tamamla:
+        // TMDB'de var, sayfada yok -> o sezonun 1. bölüm sayfası sitede açılıyorsa tüm bölümleri ekle
+        if (tm != null) {
+            val have = eps.mapNotNull { it.season }.toSet()
+            val tmSeasons = tm.eps.keys.mapNotNull { it.substringBefore("_").toIntOrNull() }
+                .distinct().filter { it > 0 && it !in have }.sorted()
+            val baseSlug = epSlug ?: slugNorm
+            if (tmSeasons.isNotEmpty()) {
+                val found = tmSeasons.amap { sn ->
+                    val nums = tm.eps.keys.filter { it.startsWith("${sn}_") }
+                        .mapNotNull { it.substringAfter("_").toIntOrNull() }.sorted()
+                    if (nums.isEmpty()) return@amap null
+                    var ok = false
+                    for (probe in nums.take(2)) {
+                        if (epPageExists("$mainUrl/$baseSlug-$sn-sezon-$probe-bolum-izle")) {
+                            ok = true
+                            break
+                        }
+                    }
+                    if (ok) sn to nums else null
+                }.filterNotNull()
+                for ((sn, nums) in found) {
+                    for (n in nums) {
+                        val t = tm.eps["${sn}_$n"]
+                        // Yayınlanmamış (gelecek tarihli) bölümleri ekleme
+                        val airMillis = try {
+                            t?.air?.let { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(it)?.time }
+                        } catch (ex: Exception) {
+                            null
+                        }
+                        if (airMillis != null && airMillis > today.time) continue
+                        val epUrl = "$mainUrl/$baseSlug-$sn-sezon-$n-bolum-izle"
+                        if (!seen.add(epUrl)) continue
+                        eps.add(newEpisode(epUrl) {
+                            this.season = sn
+                            this.episode = n
+                        })
+                    }
+                }
+            }
+        }
+
+        eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+
         if (tm != null) {
             val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
             for (ep in eps) {
