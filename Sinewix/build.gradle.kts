@@ -1,6 +1,10 @@
 // Her güncellemede 1 artır
 version = 18
 
+android {
+    namespace = "com.bymesut1"
+}
+
 cloudstream {
     description = "Sinewix - dizi ve film"
     authors = listOf("Bymesut1")
