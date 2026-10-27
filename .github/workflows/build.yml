@@ -31,7 +31,6 @@ jobs:
           mkdir out
           cp Wfilmizle/build/*.cs3 out/
           cp MailRu/build/*.cs3 out/
-          cp Dizidad/build/*.cs3 out/
           cp Filmmakinesi/build/*.cs3 out/
           cp FilmDozu/build/*.cs3 out/
           cp CizgiMax/build/*.cs3 out/
