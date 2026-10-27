@@ -25,7 +25,7 @@ class HDFilmIzle : MainAPI() {
     @Volatile private var needCf = false
 
     private val ua =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 
     // Tanı kayıtları logcat'e "HDFDbg" etiketiyle yazılır
     private fun d(m: String) {
@@ -279,19 +279,44 @@ class HDFilmIzle : MainAPI() {
         return true
     }
 
+    // Oynatıcıda otomatik "oynat" tıklaması yapan betik (video isteği ancak oynatınca atılıyor)
+    private val clickScript = """
+        (function(){
+          var n = 0;
+          var t = setInterval(function(){
+            try {
+              var sels = ['.jw-icon-display','.jw-display-icon-container','.vjs-big-play-button',
+                '.plyr__control--overlaid','button[aria-label*="Play"]','.play-button','#play','.play',
+                '[class*="play"]','[id*="play"]','video'];
+              sels.forEach(function(s){
+                document.querySelectorAll(s).forEach(function(e){ try { e.click(); } catch(x){} });
+              });
+              document.querySelectorAll('video').forEach(function(v){ try { v.muted = true; v.play(); } catch(x){} });
+              var ev = new MouseEvent('click', {bubbles:true, cancelable:true, view:window,
+                clientX: window.innerWidth/2, clientY: window.innerHeight/2});
+              var el = document.elementFromPoint(window.innerWidth/2, window.innerHeight/2);
+              if (el) el.dispatchEvent(ev);
+              if (document.body) document.body.click();
+            } catch(e) {}
+            if (++n > 20) clearInterval(t);
+          }, 1000);
+        })();
+    """.trimIndent()
+
     // Hiçbir çözücü sonuç vermezse: oynatıcı sayfası görünmez bir WebView'de açılır, ağdan video adresi yakalanır
     private suspend fun webViewVideo(u: String, label: String, src: String, cb: (ExtractorLink) -> Unit): Boolean {
         val cap = try {
             app.get(
                 u,
                 interceptor = WebViewResolver(
-                    Regex("""(?i)\.(m3u8|mp4)(\?|$)"""),
+                    Regex("""(?i)(\.m3u8|\.mp4|/master\.txt|/playlist\.txt)"""),
                     userAgent = null,
                     useOkhttp = false,
-                    timeout = 20_000L
+                    script = clickScript,
+                    timeout = 25_000L
                 ),
                 referer = "$mainUrl/",
-                timeout = 30L
+                timeout = 35L
             ).url.takeIf { it != u }
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
@@ -299,7 +324,9 @@ class HDFilmIzle : MainAPI() {
             null
         } ?: return false
         d("webview yakalama: ${cap.take(120)}")
-        return if (cap.contains(".m3u8", true)) emitHls(cap, label, src, originOf(u), cb) else emitMp4(cap, label, src, cb)
+        // WebView'in gördüğü adres gerçekten oynatıcının kullandığı adrestir; canlılık testi uygulanmaz
+        return if (cap.contains(".mp4", true) && !cap.contains(".m3u8", true)) emitMp4(cap, label, src, cb)
+        else emitHls(cap, label, src, originOf(u), cb, probe = false)
     }
 
     // Bir kaynağı adresine göre uygun çözücüyle açar
@@ -309,11 +336,13 @@ class HDFilmIzle : MainAPI() {
         cb: (ExtractorLink) -> Unit
     ): Boolean {
         var u = p.url
+        val isVidrame = p.name.equals("Vidrame", true) || u.contains("vidrame", true)
         // VidRame oynatıcısı otomatik oynatma parametresiyle (ap=1) açılır
-        if (p.name.equals("Vidrame", true) || u.contains("vidrame", true)) {
+        if (isVidrame) {
             if (!u.contains("ap=1")) u = if (u.contains("?")) "$u&ap=1" else "$u?ap=1"
         }
         return when {
+            isVidrame -> extractVidrame(u, p.lang, subCb, cb) || webViewVideo(u, p.lang, p.name, cb)
             u.contains("vidmoly", true) || u.contains("moly", true) -> extractVidmoly(u, p.lang, cb)
             u.contains("ok.ru", true) -> extractOkRu(u, p.lang, cb) || viaExtractor(u, p.lang, subCb, cb)
             u.contains(".m3u8", true) -> emitHls(u, p.lang, p.name, originOf(u), cb)
@@ -373,9 +402,197 @@ class HDFilmIzle : MainAPI() {
         return oks.any { it }
     }
 
+    // ---- Vidrame (vidrame.live / vidrame.pro ...) ----
+    // Oynatıcı sayfasındaki "sources: [{ file: ... }]" XOR ile gizlenmiş:
+    //   file: (function(d,k){...})([sayılar], "anahtar")
+    // Eski sürümde ise: file: EE.dd("...") (base64 + ROT13 + ters çevirme)
+    // Altyazılar "configs.tracks" içinde aynı XOR yöntemiyle gizli.
+
+    // Sayı dizisini anahtarla çözer: karakter = veri xor anahtar[i % uzunluk] xor ((i*17 + 13) and 255)
+    private fun vrDecodeXor(data: List<Int>, key: String): String {
+        val sb = StringBuilder(data.size)
+        data.forEachIndexed { i, v ->
+            val k = key[i % key.length].code
+            sb.append(((v xor k) xor ((i * 17 + 13) and 255)).toChar())
+        }
+        return sb.toString()
+    }
+
+    // Eski biçim: URL-safe base64 -> UTF-8 metin -> ROT13 -> ters çevir
+    private fun vrDecodeOld(s: String): String {
+        var t = s.replace('-', '+').replace('_', '/')
+        while (t.length % 4 != 0) t += "="
+        val raw = String(android.util.Base64.decode(t, android.util.Base64.DEFAULT), Charsets.UTF_8)
+        val rot = StringBuilder(raw.length)
+        for (c in raw) {
+            rot.append(
+                when (c) {
+                    in 'a'..'z' -> (((c - 'a') + 13) % 26 + 'a'.code).toChar()
+                    in 'A'..'Z' -> (((c - 'A') + 13) % 26 + 'A'.code).toChar()
+                    else -> c
+                }
+            )
+        }
+        return rot.toString().reversed()
+    }
+
+    private fun vrParseXor(script: String): String? {
+        val m = Regex(
+            """file:\s*\(function\(d,k\).*?\}\)\(\s*\[([0-9,\s]+)\]\s*,\s*"([^"]+)"\s*\)""",
+            RegexOption.DOT_MATCHES_ALL
+        ).find(script) ?: return null
+        val nums = m.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() }
+        val key = m.groupValues[2]
+        if (nums.isEmpty() || key.isEmpty()) return null
+        return vrDecodeXor(nums, key)
+    }
+
+    private fun vrSubtitles(script: String, subCb: (SubtitleFile) -> Unit) {
+        val tracks = Regex("""configs\.tracks\s*=\s*(\[[\s\S]*?\]);""").find(script)?.groupValues?.get(1) ?: return
+        val re = Regex(
+            """"kind"\s*:\s*"captions"\s*,\s*"label"\s*:\s*"([^"]*)"\s*,\s*"language"\s*:\s*"([^"]*)"\s*,\s*"fx"\s*:\s*\{\s*"d"\s*:\s*\[([^\]]*)\]\s*,\s*"k"\s*:\s*"([^"]+)""""
+        )
+        for (m in re.findAll(tracks)) {
+            try {
+                val label = m.groupValues[1]
+                val language = m.groupValues[2]
+                val nums = m.groupValues[3].split(",").mapNotNull { it.trim().toIntOrNull() }
+                val key = m.groupValues[4]
+                if (nums.isEmpty() || key.isEmpty()) continue
+                val url = vrDecodeXor(nums, key)
+                if (url.startsWith("http")) {
+                    subCb(SubtitleFile(label.ifBlank { language }, url))
+                }
+            } catch (e: Exception) {
+                d("vidrame altyazı hatası: ${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun vrFromScript(script: String, subCb: (SubtitleFile) -> Unit): String? {
+        try { vrSubtitles(script, subCb) } catch (e: Throwable) { }
+        val xor = try { vrParseXor(script) } catch (e: Throwable) { null }
+        if (xor != null && xor.startsWith("http")) return xor
+        val old = Regex("""file:\s*EE\.dd\("([^"]+)"\)""").find(script)?.groupValues?.get(1)
+        if (old != null) {
+            val dec = try { vrDecodeOld(old) } catch (e: Throwable) { null }
+            if (dec != null && dec.startsWith("http")) return dec
+        }
+        return null
+    }
+
+    private suspend fun extractVidrame(
+        u: String,
+        label: String,
+        subCb: (SubtitleFile) -> Unit,
+        cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        val origin = originOf(u)
+        val vh = mapOf(
+            "User-Agent" to ua,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.8"
+        )
+        // Sayfa önce film sitesinin Referer'i ile, olmazsa oynatıcının kendi adresiyle istenir
+        var html: String? = null
+        for (ref in listOf("$mainUrl/", "$origin/")) {
+            html = try {
+                app.get(u, headers = vh, referer = ref, timeout = 15L).text
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("vidrame sayfa hata ${e.javaClass.simpleName} ref=$ref")
+                null
+            }
+            if (html != null && html.contains("sources:") && html.contains("file:")) break
+        }
+        if (html.isNullOrBlank()) return false
+
+        val doc = org.jsoup.Jsoup.parse(html)
+        val script = doc.select("script").map { it.data() }
+            .firstOrNull { it.contains("sources:") && it.contains("file:") }
+        if (script == null) {
+            d("vidrame kaynak betiği yok uzunluk=${html.length}")
+            return false
+        }
+        val m3u8 = vrFromScript(script, subCb)
+        if (m3u8.isNullOrBlank()) {
+            d("vidrame m3u8 çözülemedi betik=${script.replace(Regex("""\s+"""), " ").take(300)}")
+            return false
+        }
+        d("vidrame m3u8: ${m3u8.take(120)}")
+
+        // Bağlantı hangi Referer ile canlıysa o verilir; hiçbiri doğrulanamazsa oynatıcı adresiyle yine de verilir
+        for (o in listOf(origin, mainUrl)) {
+            if (emitHls(m3u8, label, "Vidrame", o, cb)) return true
+        }
+        return emitHls(m3u8, label, "Vidrame", origin, cb, probe = false)
+    }
+
+    // ---- Gizlenmiş adresleri açan yardımcılar ----
+
+    // \xHH, \uHHHH kaçışlarını ve \/ işaretlerini düzeltir
+    private fun deobf(s: String): String {
+        var t = s.replace("\\/", "/").replace("&amp;", "&")
+        t = Regex("""\\x([0-9a-fA-F]{2})""").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
+        t = Regex("""\\u([0-9a-fA-F]{4})""").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
+        return t.replace("\\/", "/")
+    }
+
+    // Tırnak içindeki uzun base64 metinleri çözer; içinde http geçenleri geri verir
+    private fun b64Candidates(s: String): String {
+        val sb = StringBuilder()
+        var n = 0
+        for (m in Regex("""["']([A-Za-z0-9+/_\-]{40,}={0,2})["']""").findAll(s)) {
+            if (n++ > 60) break
+            try {
+                val dec = String(b64u(m.groupValues[1]), Charsets.UTF_8)
+                if (dec.contains("http", true) || dec.contains(".m3u8", true) || dec.contains(".mp4", true)) {
+                    sb.append(dec).append('\n')
+                }
+            } catch (e: Throwable) { }
+        }
+        // atob("...") çağrıları
+        for (m in Regex("""atob\(\s*["']([^"']+)["']\s*\)""").findAll(s)) {
+            try {
+                sb.append(String(b64u(m.groupValues[1]), Charsets.UTF_8)).append('\n')
+            } catch (e: Throwable) { }
+        }
+        return sb.toString()
+    }
+
+    private fun absUrl(u: String, origin: String): String = when {
+        u.startsWith("//") -> "https:$u"
+        u.startsWith("/") -> origin + u
+        else -> u
+    }
+
+    private fun findM3u8(h: String, origin: String): String? {
+        val r = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(h)?.groupValues?.get(1)
+            ?: Regex("""["'](https?:(?://|\\/\\/)[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(h)?.groupValues?.get(1)
+            ?: Regex("""["'](/[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(h)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)""").find(h)?.groupValues?.get(1)
+        return r?.let { absUrl(it, origin) }
+    }
+
+    // Uzantısı olmayan ama anahtar adından anlaşılan akış adresleri (probe ile doğrulanır)
+    private fun findKeyedStream(h: String, origin: String): String? {
+        val r = Regex(
+            """["']?(?:hls|hlsUrl|hls_url|m3u8|stream_url|streaming_url|streamUrl|video_url|videoUrl|playlist)["']?\s*[:=]\s*["']((?:https?:)?//[^"'\s<>]+|/[^"'\s<>]+)["']""",
+            RegexOption.IGNORE_CASE
+        ).find(h)?.groupValues?.get(1)
+        return r?.let { absUrl(it, origin) }
+    }
+
+    private fun findMp4(h: String, origin: String): String? {
+        val r = Regex("""(?:file|src|source|video_url|videoUrl)["']?\s*[:=]\s*["']((?:https?:)?//[^"'\s<>]+\.mp4[^"'\s<>]*)["']""").find(h)?.groupValues?.get(1)
+            ?: Regex("""["'](https?://[^"'\s<>]+\.mp4[^"'\s<>]*)["']""").find(h)?.groupValues?.get(1)
+        return r?.let { absUrl(it, origin) }
+    }
+
     // Tanınmayan oynatıcılar: sayfada .m3u8 / .mp4 ya da iç iframe aranır
     private suspend fun extractGeneric(u: String, label: String, src: String, depth: Int, cb: (ExtractorLink) -> Unit): Boolean {
         if (depth > 2) return false
+        val origin = originOf(u)
         val html = try {
             app.get(u, headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"), referer = "$mainUrl/", timeout = 12L).text
         } catch (e: Exception) {
@@ -388,32 +605,38 @@ class HDFilmIzle : MainAPI() {
         } catch (e: Throwable) {
             ""
         }
-        val hay = (unp + "\n" + html).replace("\\/", "/").replace("&amp;", "&")
-        val m3u8 = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(hay)?.groupValues?.get(1)
-            ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(hay)?.groupValues?.get(1)
-        if (!m3u8.isNullOrBlank() && emitHls(m3u8, label, src, originOf(u), cb)) return true
+        val b64 = try { b64Candidates(html + "\n" + unp) } catch (e: Throwable) { "" }
+        val hay = deobf(unp + "\n" + html + "\n" + b64)
 
-        val mp4 = Regex("""(?:file|src|source)["']?\s*[:=]\s*["'](https?://[^"'\s<>]+\.mp4[^"'\s<>]*)["']""").find(hay)?.groupValues?.get(1)
-        if (!mp4.isNullOrBlank()) {
-            val h = mapOf("User-Agent" to ua, "Referer" to "${originOf(u)}/")
-            cb(
-                newExtractorLink(name, "$label - $src", mp4, ExtractorLinkType.VIDEO) {
-                    this.referer = "${originOf(u)}/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = h
-                }
-            )
-            return true
+        val m3u8 = findM3u8(hay, origin)
+        if (!m3u8.isNullOrBlank() && emitHls(m3u8, label, src, origin, cb)) return true
+
+        val mp4 = findMp4(hay, origin)
+        if (!mp4.isNullOrBlank()) return emitMp4(mp4, label, src, cb)
+
+        val keyed = findKeyedStream(hay, origin)
+        if (!keyed.isNullOrBlank() && emitHls(keyed, label, src, origin, cb)) return true
+
+        val inner = reIframe.find(hay)?.groupValues?.get(1)
+        if (inner != null) {
+            val fu = when {
+                inner.startsWith("//") -> "https:$inner"
+                inner.startsWith("/") -> origin + inner
+                else -> inner
+            }
+            if (fu != u && fu.startsWith("http")) {
+                if (extractGeneric(fu, label, src, depth + 1, cb)) return true
+            }
         }
 
-        val inner = reIframe.find(hay)?.groupValues?.get(1) ?: return false
-        val fu = when {
-            inner.startsWith("//") -> "https:$inner"
-            inner.startsWith("/") -> originOf(u) + inner
-            else -> inner
+        // Bulunamadıysa kesin çözüm için sayfanın özetini logla
+        val flat = html.replace(Regex("""\s+"""), " ")
+        d("generic yok $u uzunluk=${html.length} baş='${flat.take(200)}'")
+        for (k in listOf("m3u8", "mp4", "atob", "eval(", "sources", "file:", "fetch(", "/api/", "player")) {
+            val i = flat.indexOf(k, ignoreCase = true)
+            if (i >= 0) d("generic ipucu [$k] ...${flat.substring(maxOf(0, i - 60), minOf(flat.length, i + 140))}")
         }
-        if (fu == u || !fu.startsWith("http")) return false
-        return extractGeneric(fu, label, src, depth + 1, cb)
+        return false
     }
 
     private fun heightOf(w: Int): Int = when {
@@ -463,16 +686,18 @@ class HDFilmIzle : MainAPI() {
 
     // CDN bağlantıları Referer/Origin olmadan, süresi dolunca ya da başka ağdan açılınca 404 verir.
     // Bu yüzden oynatıcı sayfasının Referer ve Origin'i ile verilir. Ölü bağlantı verilmez (false döner).
+    // probe=false ise (WebView'in yakaladığı ya da çözülen adres) test başarısız olsa bile bağlantı verilir.
     private suspend fun emitHls(
         m3u8: String,
         label: String,
         src: String,
         origin: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        probe: Boolean = true
     ): Boolean {
         val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
         val (alive, q) = probeHls(m3u8, headers)
-        if (!alive) {
+        if (!alive && probe) {
             d("$src ölü bağlantı atlandı: ${m3u8.take(100)}")
             return false
         }
