@@ -738,7 +738,8 @@ class Zdizi : MainAPI() {
                 referer = "$mainUrl/",
                 interceptor = WebViewResolver(
                     mediaRe,
-                    userAgent = null,
+                    // m3u adresi (token) sayfayı açan tarayıcının UA'sına bağlı olabilir: oynatıcıya verilen UA ile AYNI olsun
+                    userAgent = ua,
                     useOkhttp = false,
                     script = playScript,
                     scriptCallback = { res -> plist = res },
