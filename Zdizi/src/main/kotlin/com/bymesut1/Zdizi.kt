@@ -36,13 +36,13 @@ class Zdizi : MainAPI() {
     override val hasMainPage = true
     override var lang = "tr"
     override val hasQuickSearch = false
-    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
+    override val supportedTypes = setOf(TvType.TvSeries)
 
     private val ua =
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 
     // Bağlantı bulunamazsa kaynak listesine "DEBUG ..." satırı ekler (sorun bitince false yap)
-    private val debug = true
+    private val debug = false
 
     @Volatile
     private var dbg = ""
@@ -78,11 +78,6 @@ class Zdizi : MainAPI() {
     }
 
     private val epRe = Regex("^/(.+)-(\\d+)-sezon-(\\d+)-bolum-izle/?$")
-
-    private val skipNames = setOf(
-        "dizi", "yabanci-film", "film", "kesfet", "trendler", "takvim", "forumlar",
-        "istek-listesi", "iletisim", "forum", "arsiv"
-    )
 
     private fun hdr(ref: String?, extra: Map<String, String> = emptyMap()): Map<String, String> {
         val h = LinkedHashMap<String, String>()
@@ -133,13 +128,10 @@ class Zdizi : MainAPI() {
         return if (p.length > 1) p.trimEnd('/') else p
     }
 
-    // 1 = dizi, 2 = film, 3 = bölüm, 0 = diğer
+    // 1 = dizi, 3 = bölüm, 0 = diğer (filmler desteklenmiyor)
     private fun kindOf(path: String): Int {
         if (Regex("^/diziler/[^/]+$").matches(path)) return 1
         if (epRe.containsMatchIn(path)) return 3
-        if (Regex("^/(?:film|filmler|filmi)/[^/]+$").matches(path)) return 2
-        val m = Regex("^/([^/]+)-izle$").find(path)
-        if (m != null && m.groupValues[1] !in skipNames) return 2
         return 0
     }
 
@@ -153,6 +145,18 @@ class Zdizi : MainAPI() {
             .replace(Regex("\\s*:?\\s*\\d+\\.\\s*Sezon.*$", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s+izle(\\s*\\(\\d{4}\\))?(\\s*izle)?$", RegexOption.IGNORE_CASE), "")
             .trim()
+
+    // "Gibi 7.1 2022" gibi sonuna yapışan puan / yıl metnini siler
+    private fun stripMeta(s: String): String =
+        s.replace(Regex("\\s*%?\\s*\\d+(?:[.,]\\d+)?\\s+(?:19|20)\\d{2}\\s*$"), "").trim()
+
+    private fun looksTitle(s: String): Boolean =
+        s.isNotBlank() && Regex("\\p{L}").containsMatchIn(s)
+
+    // Sitede isim bulunamazsa adresten üretir: /diziler/la-casa-de-papel-izle -> La Casa De Papel
+    private fun slugTitle(path: String): String =
+        path.substringAfterLast("/").removeSuffix("-izle").split("-").filter { it.isNotBlank() }
+            .joinToString(" ") { w -> w.replaceFirstChar { c -> c.uppercase() } }
 
     // WordPress küçük resim ekini (-300x450) kaldırıp orijinal (net) boyutu kullanır
     private fun upsize(u: String): String =
@@ -205,10 +209,10 @@ class Zdizi : MainAPI() {
             .replace("\\/", "/")
             .replace("&amp;", "&")
 
-    // Sayfadaki dizi / film kartları (yan menü, üst menü ve alt bilgi alanı hariç)
+    // Sayfadaki dizi kartları (yan menü, üst menü ve alt bilgi alanı hariç). Filmler alınmaz.
     private fun cards(doc: Document): List<SearchResponse> {
-        val out = ArrayList<SearchResponse>()
-        val seen = HashSet<String>()
+        val titles = LinkedHashMap<String, String>()
+        val posters = HashMap<String, String>()
         val scope = doc.selectFirst("#content") ?: doc
         for (a in scope.select("a[href]")) {
             if (a.parents().any { it.tagName() == "aside" || it.tagName() == "footer" || it.tagName() == "header" }) continue
@@ -216,29 +220,35 @@ class Zdizi : MainAPI() {
             if (raw.isBlank() || raw.startsWith("#") || raw.startsWith("javascript", true)) continue
             if (raw.startsWith("http", true) && !raw.contains("zdizi.com", true)) continue
             var path = pathOf(raw)
-            var kind = kindOf(path)
-            if (kind == 3) {
-                path = epToSeries(path)
-                kind = 1
-            }
-            if (kind == 0) continue
+            val k0 = kindOf(path)
+            if (k0 == 0) continue
+            val isEp = k0 == 3
+            if (isEp) path = epToSeries(path)
             val url = mainUrl + path
-            if (!seen.add(url)) continue
-            val title = cleanTitle(
-                a.attr("title").ifBlank {
-                    a.selectFirst("h1,h2,h3,h4,h5,.title,.name")?.text().orEmpty()
-                }.ifBlank {
-                    a.selectFirst("img")?.attr("alt").orEmpty()
-                }.ifBlank { a.text() }
-            )
-            if (title.isBlank()) continue
-            val poster = imgUrl(a.selectFirst("img") ?: a.parent()?.selectFirst("img"))
-                ?: bgImage(a) ?: bgImage(a.parent())
-            if (kind == 2) {
-                out.add(newMovieSearchResponse(title, url, TvType.Movie) { this.posterUrl = poster })
-            } else {
-                out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster })
+            if (!titles.containsKey(url)) titles[url] = ""
+
+            // Başlık: sitedeki asıl isim (puan / yıl metinleri isim sayılmaz). Bölüm bağlantılarından alınmaz.
+            if (!isEp && titles[url].isNullOrBlank()) {
+                val cand = listOf(
+                    a.attr("title"),
+                    a.selectFirst("h1,h2,h3,h4,h5,.title,.name")?.text().orEmpty(),
+                    a.selectFirst("img")?.attr("alt").orEmpty(),
+                    a.text()
+                ).map { cleanTitle(stripMeta(it)) }.firstOrNull { looksTitle(it) }
+                if (cand != null) titles[url] = cand
             }
+            if (!posters.containsKey(url)) {
+                val poster = imgUrl(a.selectFirst("img") ?: a.parent()?.selectFirst("img"))
+                    ?: bgImage(a) ?: bgImage(a.parent())
+                if (poster != null) posters[url] = poster
+            }
+        }
+        val out = ArrayList<SearchResponse>()
+        for ((url, t) in titles) {
+            val title = if (t.isNotBlank()) t else slugTitle(pathOf(url))
+            if (title.isBlank()) continue
+            val poster = posters[url]
+            out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster })
         }
         return out
     }
@@ -250,11 +260,10 @@ class Zdizi : MainAPI() {
     private suspend fun fillPosters(list: List<SearchResponse>) {
         list.filter { it.posterUrl.isNullOrBlank() }.take(30).amap { r ->
             try {
-                val isMovie = r.type == TvType.Movie
                 val nm = r.name.replace(Regex("(?i)\\bizle\\b"), "").replace(Regex("\\(\\d{4}\\)"), "")
                     .replace(Regex("\\s+"), " ").trim()
                 val q = URLEncoder.encode(nm, "UTF-8")
-                val j = tmdbJson("$tmdbApi/search/${if (isMovie) "movie" else "tv"}?api_key=$tmdbKey&language=tr-TR&query=$q")
+                val j = tmdbJson("$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&query=$q")
                 val pp = j?.optJSONArray("results")?.optJSONObject(0)?.optString("poster_path").orEmpty()
                 if (pp.isNotBlank() && pp != "null") r.posterUrl = "$tmdbImg/w500$pp"
             } catch (e: Exception) {
@@ -277,7 +286,10 @@ class Zdizi : MainAPI() {
         val p = fetch("$mainUrl/?s=$q", "$mainUrl/", true)
         if (p != null && p.code == 200) {
             val r = cards(Jsoup.parse(p.text, mainUrl))
-            if (r.isNotEmpty()) return r
+            if (r.isNotEmpty()) {
+                fillPosters(r)
+                return r
+            }
         }
         // 2) Yedek: WordPress REST araması
         val j = fetch(
@@ -299,17 +311,18 @@ class Zdizi : MainAPI() {
                         path = epToSeries(path)
                         kind = 1
                     }
-                    if (kind == 0) continue
+                    if (kind != 1) continue
                     val url = mainUrl + path
                     if (!seen.add(url)) continue
-                    val title = cleanTitle(Jsoup.parse(o.optString("title", "")).text())
+                    var title = cleanTitle(stripMeta(Jsoup.parse(o.optString("title", "")).text()))
+                    if (!looksTitle(title)) title = slugTitle(path)
                     if (title.isBlank()) continue
-                    if (kind == 2) out.add(newMovieSearchResponse(title, url, TvType.Movie) { })
-                    else out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { })
+                    out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { })
                 }
             } catch (e: Exception) {
             }
         }
+        fillPosters(out)
         return out
     }
 
@@ -399,6 +412,51 @@ class Zdizi : MainAPI() {
         return r.code == 200 && (r.text.contains("data-frame") || r.text.contains("srcframe") || r.text.contains("playercont"))
     }
 
+    // Verilen bölüm numaralarından sitede gerçekten açılanları döndürür (6'şarlı gruplar halinde)
+    private suspend fun probeEps(base: String, sn: Int, nums: List<Int>): List<Int> {
+        val out = ArrayList<Int>()
+        for (ch in nums.chunked(6)) {
+            val r = ch.amap { n ->
+                if (epPageExists("$mainUrl/$base-$sn-sezon-$n-bolum-izle")) n else null
+            }
+            r.filterNotNull().forEach { out.add(it) }
+        }
+        return out
+    }
+
+    // start'tan başlayıp 5'erli gruplarla ilerler; bir grupta hiç bölüm bulunmazsa durur
+    private suspend fun extendFrom(base: String, sn: Int, start: Int, limit: Int): List<Int> {
+        val out = ArrayList<Int>()
+        var n = start
+        while (n < start + limit) {
+            val hit = probeEps(base, sn, (n until n + 5).toList())
+            if (hit.isEmpty()) break
+            out.addAll(hit)
+            n += 5
+        }
+        return out
+    }
+
+    private suspend fun addProbed(
+        eps: ArrayList<Episode>,
+        seen: HashSet<String>,
+        have: HashMap<Int, MutableSet<Int>>,
+        base: String,
+        sn: Int,
+        nums: List<Int>
+    ) {
+        for (n in nums) {
+            val set = have.getOrPut(sn) { HashSet() }
+            if (!set.add(n)) continue
+            val u = "$mainUrl/$base-$sn-sezon-$n-bolum-izle"
+            if (!seen.add(u)) continue
+            eps.add(newEpisode(u) {
+                this.season = sn
+                this.episode = n
+            })
+        }
+    }
+
     // ------------------------------------------------------------------
     // Detay sayfası
     // ------------------------------------------------------------------
@@ -406,7 +464,7 @@ class Zdizi : MainAPI() {
         var path = pathOf(url)
         if (kindOf(path) == 3) path = epToSeries(path)
         val kind = kindOf(path)
-        if (kind == 0) return null
+        if (kind != 1) return null
         val pageUrl = mainUrl + path
         val p = fetch(pageUrl, "$mainUrl/", true) ?: return null
         if (p.code != 200) return null
@@ -455,16 +513,6 @@ class Zdizi : MainAPI() {
 
         val tags = doc.select("a[href*=/tur/]").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
 
-        if (kind == 2) {
-            return newMovieLoadResponse(title, pageUrl, TvType.Movie, pageUrl) {
-                this.posterUrl = poster
-                this.backgroundPosterUrl = cover
-                this.plot = plot
-                this.tags = tags
-                this.year = year
-            }
-        }
-
         val today = Date()
         val df = SimpleDateFormat("d MMMM yyyy", Locale("tr", "TR"))
         val seen = HashSet<String>()
@@ -491,6 +539,8 @@ class Zdizi : MainAPI() {
                     .find(a.text().trim())?.groupValues?.get(1)?.trim().orEmpty()
                 epName = epName.replace(Regex("\\s*\\d{4,}\\s*$"), "").trim()
             }
+            // "7. Bölüm" gibi genel adlar boş bırakılır (uygulama zaten numarayı kendisi yazıyor: "7. 7. Bölüm" olmasın)
+            if (Regex("^\\d+\\s*\\.?\\s*B[öo]l[üu]m$", RegexOption.IGNORE_CASE).containsMatchIn(epName)) epName = ""
             val dateText = a.selectFirst("date")?.text()?.trim().orEmpty()
             var millis: Long? = null
             if (dateText.isNotBlank()) {
@@ -558,6 +608,38 @@ class Zdizi : MainAPI() {
                         this.season = sn
                         this.episode = n
                     })
+                }
+            }
+        }
+
+        // Sitenin kendisinden yoklama (TMDB'nin bilmediği / yanlış eşleştirdiği diziler için):
+        // 1) her sezonda aradaki eksik bölümler (1 ... en büyük bölüm)
+        // 2) son sezonun devamındaki yeni bölümler
+        // 3) listede hiç olmayan sezonlar (1 ... son sezon + 1)
+        run {
+            // eps burada yalnızca okunur; yeni eklemeler aşağıda yapılır
+        }
+        val baseSlug2 = epSlug ?: slugNorm
+        val bySeason = HashMap<Int, MutableSet<Int>>()
+        for (e in eps) {
+            val s = e.season ?: continue
+            val n = e.episode ?: continue
+            bySeason.getOrPut(s) { HashSet() }.add(n)
+        }
+        if (bySeason.isNotEmpty()) {
+            for ((sn, set) in bySeason.toList()) {
+                val mx = set.maxOrNull() ?: continue
+                val gaps = (1..mx).filter { it !in set }
+                if (gaps.isEmpty()) continue
+                addProbed(eps, seen, bySeason, baseSlug2, sn, probeEps(baseSlug2, sn, gaps.take(60)))
+            }
+            val maxS = bySeason.keys.maxOrNull() ?: 0
+            if (maxS > 0) {
+                val mxLast = bySeason[maxS]?.maxOrNull() ?: 0
+                addProbed(eps, seen, bySeason, baseSlug2, maxS, extendFrom(baseSlug2, maxS, mxLast + 1, 30))
+                for (sn in 1..(maxS + 1)) {
+                    if (bySeason.containsKey(sn)) continue
+                    addProbed(eps, seen, bySeason, baseSlug2, sn, extendFrom(baseSlug2, sn, 1, 80))
                 }
             }
         }
@@ -988,7 +1070,7 @@ class Zdizi : MainAPI() {
         for ((u, b) in lists) HlsProxy.register(u, hd, b.bytes)
         var tops = lists.keys.filter { it !in referenced }
         if (tops.isEmpty()) tops = lists.keys.toList()
-        // alt listeleri (kalite listeleri) hemen çekip sakla: jeton süresi dolmadan
+        // alt listeleri (kalite listeleri) hemen çekip saklar: jeton süresi dolmadan
         for (u in tops) HlsProxy.prefetchRefs(String(lists[u]!!.bytes, Charsets.UTF_8), u, hd)
 
         emitSubs(Found(), embedUrl, origin, hints, cookies, subtitleCallback)
