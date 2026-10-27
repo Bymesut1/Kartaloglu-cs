@@ -8,7 +8,7 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class Dizidad : MainAPI() {
-    override var mainUrl        = "https://www.dizidad.com"
+    override var mainUrl        = "https://ddizimom.net"
     override var name           = "Dizidad"
     override val hasMainPage    = true
     override var lang           = "tr"
