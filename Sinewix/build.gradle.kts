@@ -1,8 +1,28 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+
 // Her güncellemede 1 artır
 version = 18
 
 android {
     namespace = "com.bymesut1"
+
+    // CloudStream kütüphanesi JVM 11 ile derli (parseJson için gerekli)
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+}
+
+tasks.withType<KotlinJvmCompile> {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_11)
+    }
+}
+
+dependencies {
+    // @JsonProperty için (sadece bu modülde)
+    add("implementation", "com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
 }
 
 cloudstream {
