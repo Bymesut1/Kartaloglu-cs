@@ -1,6 +1,13 @@
 package com.bymesut1
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
@@ -10,12 +17,18 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 
 class Zdizi : MainAPI() {
     override var mainUrl = "https://zdizi.com"
@@ -33,6 +46,13 @@ class Zdizi : MainAPI() {
 
     @Volatile
     private var dbg = ""
+
+    private fun d(m: String) {
+        try {
+            android.util.Log.d("ZdiziDbg", m.replace("\n", " ").take(900))
+        } catch (e: Throwable) {
+        }
+    }
 
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
     private val tmdbApi = "https://api.themoviedb.org/3"
@@ -647,6 +667,12 @@ class Zdizi : MainAPI() {
             }
         }
 
+        // Adres JavaScript ile üretiliyor ve TEK KULLANIMLIK: kendi WebView'ımızda açıp m3u isteklerini
+        // biz çekeriz (WebView'a aynı yanıtı veririz), içeriği saklar ve yerel sunucudan oynatıcıya sunarız.
+        if (found.hls.isEmpty() && found.mp4.isEmpty()) {
+            if (captureAndServe(embedUrl, label, origin, hints, cookies, subtitleCallback, callback)) return true
+        }
+
         if (allowWeb && found.hls.isEmpty() && found.mp4.isEmpty()) {
             val wv = webCapture(embedUrl)
             if (wv != null) {
@@ -704,6 +730,216 @@ class Zdizi : MainAPI() {
             )
         }
         return true
+    }
+
+    // ------------------------------------------------------------------
+    // Kendi WebView'ımız + yerel HLS sunucusu (tek kullanımlık m3u adresleri için)
+    // ------------------------------------------------------------------
+    private class CapBody(val code: Int, val mime: String, val bytes: ByteArray)
+
+    private fun looksM3u(b: ByteArray): Boolean =
+        String(b, 0, minOf(b.size, 40), Charsets.ISO_8859_1).trimStart().startsWith("#EXTM3U")
+
+    private fun appCtx(): android.content.Context? = try {
+        Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? android.app.Application
+    } catch (e: Throwable) {
+        null
+    }
+
+    private val capRe = Regex("(?i)/(m3u|list|hls|playlist|manifest|master|stream|source)s?/|\\.m3u8|\\.m3u(\\?|$)")
+
+    // Oynatıcı sayfasını kendi WebView'ımızda açar. m3u / list isteklerini OkHttp ile BİZ çeker
+    // (tek kullanımlık jeton bizde harcanır), aynı yanıtı WebView'a da verir ve içeriği saklar.
+    private fun ownWebCapture(embedUrl: String, timeoutMs: Long): LinkedHashMap<String, CapBody> {
+        val result = LinkedHashMap<String, CapBody>()
+        val ctx = appCtx() ?: run {
+            dbg = "context yok ($dbg)"
+            return result
+        }
+        val caps = ConcurrentHashMap<String, CapBody>()
+        val order = java.util.Collections.synchronizedList(ArrayList<String>())
+        val holder = arrayOfNulls<WebView>(1)
+        val created = CountDownLatch(1)
+        val main = Handler(Looper.getMainLooper())
+        val client = okhttp3.OkHttpClient.Builder().followRedirects(true).followSslRedirects(true).build()
+
+        main.post {
+            try {
+                val wv = WebView(ctx)
+                holder[0] = wv
+                val st = wv.settings
+                st.javaScriptEnabled = true
+                st.domStorageEnabled = true
+                st.mediaPlaybackRequiresUserGesture = false
+                st.userAgentString = ua
+                try {
+                    st.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                } catch (e: Throwable) {
+                }
+                try {
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                } catch (e: Throwable) {
+                }
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        try {
+                            view?.evaluateJavascript(playScript, null)
+                        } catch (e: Throwable) {
+                        }
+                    }
+
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        if (request == null) return null
+                        val u = request.url.toString()
+                        if (request.method != "GET" || !capRe.containsMatchIn(u)) return null
+                        if (u.contains("googletagmanager", true) || u.contains("google-analytics", true) ||
+                            u.contains("cloudfront.net", true) || u.contains("cdn.jsdelivr", true)
+                        ) return null
+                        return try {
+                            val rb = okhttp3.Request.Builder().url(u)
+                            for ((k, v) in request.requestHeaders) {
+                                if (k.equals("Accept-Encoding", true) || k.equals("Range", true) ||
+                                    k.equals("Host", true) || k.equals("Connection", true)
+                                ) continue
+                                rb.header(k, v)
+                            }
+                            val ck = CookieManager.getInstance().getCookie(u)
+                            if (!ck.isNullOrBlank()) rb.header("Cookie", ck)
+                            client.newCall(rb.build()).execute().use { resp ->
+                                val bytes = resp.body?.bytes() ?: ByteArray(0)
+                                var mime = resp.header("Content-Type")?.substringBefore(";")?.trim().orEmpty()
+                                if (looksM3u(bytes)) mime = "application/vnd.apple.mpegurl"
+                                if (mime.isBlank()) mime = "application/octet-stream"
+                                caps[u] = CapBody(resp.code, mime, bytes)
+                                order.add(u)
+                                d("capture ${resp.code} ${bytes.size}b m3u=${looksM3u(bytes)} ${u.takeLast(40)}")
+                                val hd = HashMap<String, String>()
+                                hd["Access-Control-Allow-Origin"] = "*"
+                                val code = if (resp.code in 200..299 || resp.code in 400..599) resp.code else 200
+                                WebResourceResponse(
+                                    mime, "utf-8", code,
+                                    resp.message.ifBlank { "OK" }, hd, ByteArrayInputStream(bytes)
+                                )
+                            }
+                        } catch (e: Exception) {
+                            d("capture hata ${e.javaClass.simpleName} ${u.takeLast(40)}")
+                            null
+                        }
+                    }
+                }
+                wv.loadUrl(embedUrl, mapOf("Referer" to "$mainUrl/"))
+            } catch (e: Throwable) {
+                d("webview olusturulamadi ${e.javaClass.simpleName} ${e.message}")
+            } finally {
+                created.countDown()
+            }
+        }
+        try {
+            created.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {
+        }
+
+        val end = System.currentTimeMillis() + timeoutMs
+        var firstHit = 0L
+        while (System.currentTimeMillis() < end) {
+            try {
+                Thread.sleep(250)
+            } catch (e: InterruptedException) {
+                break
+            }
+            val has = synchronized(order) { order.any { u -> caps[u]?.let { it.code in 200..299 && looksM3u(it.bytes) } == true } }
+            if (has) {
+                if (firstHit == 0L) firstHit = System.currentTimeMillis()
+                // ikinci jeton (kalite) ve alt listeler de gelsin diye kısa bekle
+                if (System.currentTimeMillis() - firstHit > 2500) break
+            }
+        }
+        main.post {
+            try {
+                holder[0]?.stopLoading()
+                holder[0]?.destroy()
+            } catch (e: Throwable) {
+            }
+        }
+        synchronized(order) { order.toList() }.forEach { u -> caps[u]?.let { result[u] = it } }
+        return result
+    }
+
+    private suspend fun captureAndServe(
+        embedUrl: String,
+        label: String,
+        origin: String,
+        hints: List<Pair<String, String>>,
+        cookies: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val caps = try {
+            ownWebCapture(embedUrl, 20_000L)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            dbg = "wv yakalama hata ${e.javaClass.simpleName} ($dbg)"
+            return false
+        }
+        val lists = LinkedHashMap<String, CapBody>()
+        for ((u, b) in caps) if (b.code in 200..299 && looksM3u(b.bytes)) lists[u] = b
+        if (lists.isEmpty()) {
+            dbg = "wv: m3u yok, istek=${caps.keys.map { it.takeLast(24) }} | $dbg"
+            return false
+        }
+        if (!HlsProxy.ensure()) {
+            dbg = "yerel sunucu baslamadi | $dbg"
+            return false
+        }
+
+        // WebView oturum çerezleri (m3u / parça adresleri oturuma bağlı olabilir)
+        val ckMap = LinkedHashMap<String, String>()
+        ckMap.putAll(cookies)
+        try {
+            val cm = CookieManager.getInstance()
+            for (cu in listOf(embedUrl, origin)) {
+                cm.getCookie(cu)?.split(";")?.forEach { kv ->
+                    val k = kv.substringBefore("=").trim()
+                    val v = kv.substringAfter("=", "").trim()
+                    if (k.isNotBlank() && v.isNotBlank()) ckMap[k] = v
+                }
+            }
+        } catch (e: Exception) {
+        }
+        val ck = ckMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val hd = LinkedHashMap<String, String>()
+        hd["User-Agent"] = ua
+        hd["Referer"] = embedUrl
+        hd["Origin"] = origin
+        if (ck.isNotBlank()) hd["Cookie"] = ck
+
+        // Yakalanan içerikleri sunucuya kaydet; başka bir listenin içinden çağrılanları "alt liste" say
+        val referenced = HashSet<String>()
+        for ((u, b) in lists) HlsProxy.refsOf(String(b.bytes, Charsets.UTF_8), u).forEach { referenced.add(it) }
+        for ((u, b) in lists) HlsProxy.register(u, hd, b.bytes)
+        var tops = lists.keys.filter { it !in referenced }
+        if (tops.isEmpty()) tops = lists.keys.toList()
+        // alt listeleri (kalite listeleri) hemen çekip sakla: jeton süresi dolmadan
+        for (u in tops) HlsProxy.prefetchRefs(String(lists[u]!!.bytes, Charsets.UTF_8), u, hd)
+
+        emitSubs(Found(), embedUrl, origin, hints, cookies, subtitleCallback)
+
+        var n = 0
+        for (u in tops.take(3)) {
+            val pu = HlsProxy.urlFor(u, hd, null)
+            val nm = if (n == 0) label else "$label ${n + 1}"
+            d("yerel sunucu $nm -> $pu (${u.takeLast(30)})")
+            callback(
+                newExtractorLink(name, nm, pu, ExtractorLinkType.M3U8) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.Unknown.value
+                    this.headers = hd
+                }
+            )
+            n++
+        }
+        return n > 0
     }
 
     private val mediaRe = Regex("""(?i)/m3u/[A-Za-z0-9+/=_%.\-]{24,}|\.m3u8|\.mp4(\?|$)""")
@@ -919,5 +1155,228 @@ class Zdizi : MainAPI() {
             }
         }
         return out
+    }
+}
+
+// ----------------------------------------------------------------------
+// Yerel HLS sunucusu: 127.0.0.1 üzerinde, tek kullanımlık m3u içeriklerini saklayıp oynatıcıya
+// (ve CloudStream'in önizleme yükleyicisine) istediği kadar kez sunar. Liste içindeki adresleri
+// mutlak adrese çevirir; alt listeleri / anahtarları yine bu sunucudan geçirir.
+// ----------------------------------------------------------------------
+private object HlsProxy {
+    private class Entry(val url: String, val hdr: Map<String, String>, @Volatile var raw: ByteArray?) {
+        @Volatile
+        var out: ByteArray? = null
+
+        @Volatile
+        var mime: String = "application/vnd.apple.mpegurl"
+    }
+
+    private val store = ConcurrentHashMap<String, Entry>()
+    private val byUrl = ConcurrentHashMap<String, String>()
+    private val client = okhttp3.OkHttpClient.Builder().followRedirects(true).followSslRedirects(true).build()
+
+    @Volatile
+    private var server: ServerSocket? = null
+
+    @Volatile
+    private var port = 0
+
+    @Synchronized
+    fun ensure(): Boolean {
+        val cur = server
+        if (cur != null && !cur.isClosed) return true
+        return try {
+            val s = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+            server = s
+            port = s.localPort
+            val t = Thread {
+                while (!s.isClosed) {
+                    try {
+                        val c = s.accept()
+                        val w = Thread { serve(c) }
+                        w.isDaemon = true
+                        w.start()
+                    } catch (e: Exception) {
+                        if (s.isClosed) break
+                    }
+                }
+            }
+            t.isDaemon = true
+            t.name = "zdizi-hls-proxy"
+            t.start()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun idFor(real: String, hdr: Map<String, String>, raw: ByteArray?): String {
+        val id = byUrl.getOrPut(real) {
+            val n = java.lang.Long.toString(System.nanoTime(), 36)
+            store[n] = Entry(real, hdr, raw)
+            n
+        }
+        if (raw != null) store[id]?.let { if (it.raw == null) it.raw = raw }
+        return id
+    }
+
+    fun register(real: String, hdr: Map<String, String>, raw: ByteArray) {
+        idFor(real, hdr, raw)
+    }
+
+    fun urlFor(real: String, hdr: Map<String, String>, raw: ByteArray?): String =
+        "http://127.0.0.1:$port/p/${idFor(real, hdr, raw)}"
+
+    private fun resolve(base: String, ref: String): String {
+        if (ref.startsWith("http://", true) || ref.startsWith("https://", true)) return ref
+        return try {
+            java.net.URI(base).resolve(ref).toString()
+        } catch (e: Exception) {
+            val origin = Regex("^(https?://[^/]+)").find(base)?.groupValues?.get(1) ?: ""
+            when {
+                ref.startsWith("//") -> "https:$ref"
+                ref.startsWith("/") -> origin + ref
+                else -> base.substringBeforeLast('/') + "/" + ref
+            }
+        }
+    }
+
+    private val uriRe = Regex("URI=\"([^\"]+)\"")
+
+    // Bir ana listedeki alt liste / ses / anahtar adresleri (mutlak)
+    fun refsOf(text: String, base: String): List<String> {
+        val out = ArrayList<String>()
+        var next = false
+        for (ln in text.lines()) {
+            val t = ln.trim()
+            if (t.startsWith("#EXT-X-STREAM-INF")) {
+                next = true
+                continue
+            }
+            if (t.startsWith("#")) {
+                if (t.startsWith("#EXT-X-MEDIA")) {
+                    uriRe.find(t)?.let { out.add(resolve(base, it.groupValues[1])) }
+                }
+                continue
+            }
+            if (t.isEmpty()) continue
+            if (next) out.add(resolve(base, t))
+            next = false
+        }
+        return out
+    }
+
+    // Alt listeleri jeton süresi dolmadan hemen çekip saklar
+    fun prefetchRefs(text: String, base: String, hdr: Map<String, String>) {
+        for (u in refsOf(text, base)) {
+            val id = byUrl[u]
+            val e = id?.let { store[it] }
+            if (e != null && e.raw != null) continue
+            val b = fetchBytes(u, hdr) ?: continue
+            idFor(u, hdr, b)
+        }
+    }
+
+    private fun fetchBytes(url: String, hdr: Map<String, String>): ByteArray? = try {
+        val rb = okhttp3.Request.Builder().url(url)
+        for ((k, v) in hdr) rb.header(k, v)
+        client.newCall(rb.build()).execute().use { r ->
+            if (r.code in 200..299) r.body?.bytes() else null
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun looksM3u(b: ByteArray): Boolean =
+        String(b, 0, minOf(b.size, 40), Charsets.ISO_8859_1).trimStart().startsWith("#EXTM3U")
+
+    private fun rewrite(text: String, base: String, hdr: Map<String, String>): String {
+        val sb = StringBuilder()
+        var next = false
+        for (ln in text.lines()) {
+            val t = ln.trim()
+            if (t.startsWith("#EXT-X-STREAM-INF")) {
+                next = true
+                sb.append(ln).append('\n')
+                continue
+            }
+            if (t.startsWith("#")) {
+                if (t.contains("URI=\"")) {
+                    val viaProxy = t.startsWith("#EXT-X-MEDIA") || t.startsWith("#EXT-X-KEY")
+                    val nl = uriRe.replace(ln) { m ->
+                        val a = resolve(base, m.groupValues[1])
+                        "URI=\"" + (if (viaProxy) urlFor(a, hdr, null) else a) + "\""
+                    }
+                    sb.append(nl).append('\n')
+                } else sb.append(ln).append('\n')
+                continue
+            }
+            if (t.isEmpty()) {
+                sb.append(ln).append('\n')
+                continue
+            }
+            val a = resolve(base, t)
+            if (next) sb.append(urlFor(a, hdr, null)).append('\n') else sb.append(a).append('\n')
+            next = false
+        }
+        return sb.toString()
+    }
+
+    private fun bodyOf(e: Entry): ByteArray? {
+        e.out?.let { return it }
+        synchronized(e) {
+            e.out?.let { return it }
+            var raw = e.raw
+            if (raw == null) {
+                raw = fetchBytes(e.url, e.hdr)
+                if (raw != null) e.raw = raw
+            }
+            if (raw == null) return null
+            if (looksM3u(raw)) {
+                e.mime = "application/vnd.apple.mpegurl"
+                e.out = rewrite(String(raw, Charsets.UTF_8), e.url, e.hdr).toByteArray(Charsets.UTF_8)
+            } else {
+                e.mime = "application/octet-stream"
+                e.out = raw
+            }
+            return e.out
+        }
+    }
+
+    private fun serve(sock: Socket) {
+        try {
+            sock.soTimeout = 30_000
+            val inp = sock.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+            val reqLine = inp.readLine() ?: return
+            while (true) {
+                val l = inp.readLine() ?: break
+                if (l.isEmpty()) break
+            }
+            val parts = reqLine.split(" ")
+            val method = parts.getOrNull(0) ?: "GET"
+            val path = parts.getOrNull(1) ?: "/"
+            val id = path.removePrefix("/p/").substringBefore("?")
+            val os = sock.getOutputStream()
+            val e = store[id]
+            val body = if (e != null) bodyOf(e) else null
+            if (e == null || body == null) {
+                val code = if (e == null) "404 Not Found" else "502 Bad Gateway"
+                os.write("HTTP/1.1 $code\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                os.flush()
+                return
+            }
+            val head = "HTTP/1.1 200 OK\r\nContent-Type: ${e.mime}\r\nContent-Length: ${body.size}\r\n" +
+                "Cache-Control: no-store\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n"
+            os.write(head.toByteArray())
+            if (method != "HEAD") os.write(body)
+            os.flush()
+        } catch (ex: Exception) {
+        } finally {
+            try {
+                sock.close()
+            } catch (ex: Exception) {
+            }
+        }
     }
 }
