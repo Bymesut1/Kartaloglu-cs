@@ -386,7 +386,7 @@ class Zdizi : MainAPI() {
     // ------------------------------------------------------------------
     // TMDB: Türkçe bölüm adı / açıklama / bölüm görseli
     // ------------------------------------------------------------------
-    // nameTr / ovTr: ad / açıklama TMDB'de gerçekten Türkçe mi (değilse sonradan Türkçeye çevrilir)
+    // nameTr / ovTr: ad / açıklama TMDB'de gerçekten Türkçe mi
     private class TEp(
         val name: String,
         val overview: String,
@@ -480,7 +480,7 @@ class Zdizi : MainAPI() {
     }
 
     // ------------------------------------------------------------------
-    // Türkçeye çeviri (TMDB'de Türkçe karşılığı olmayan bölüm adı / açıklaması için)
+    // (Artık kullanılmıyor) Türkçeye çeviri yardımcıları
     // ------------------------------------------------------------------
     private val trCache = ConcurrentHashMap<String, String>()
 
@@ -764,43 +764,20 @@ class Zdizi : MainAPI() {
                 eps.count { tm.eps.containsKey("${it.season}_${it.episode}") }.toDouble() / eps.size >= 0.6)
         ) tm else null
 
-        // Bölüm adı / açıklaması: TMDB'de Türkçe olanlar aynen, olmayanlar Türkçeye çevrilir
-        val trNames = ArrayList<Pair<Episode, String>>()
-        val trDescs = ArrayList<Pair<Episode, String>>()
+        // Bölüm adı / açıklaması: TMDB'de Türkçe varsa Türkçe, yoksa TMDB'nin İngilizcesi (çeviri yok, hızlı)
         val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         for (ep in eps) {
-            val t = tmUse?.eps?.get("${ep.season}_${ep.episode}")
-            if (t != null) {
-                if (!isGenericName(t.name)) {
-                    if (t.nameTr) ep.name = t.name else trNames.add(ep to t.name)
-                } else {
-                    val cur = ep.name
-                    if (!cur.isNullOrBlank()) trNames.add(ep to cur)
+            val t = tmUse?.eps?.get("${ep.season}_${ep.episode}") ?: continue
+            if (!isGenericName(t.name)) ep.name = t.name
+            if (t.overview.isNotBlank()) ep.description = t.overview
+            if (t.still != null) ep.posterUrl = t.still
+            if (t.runtime != null) ep.runTime = t.runtime
+            if (t.air != null) {
+                try {
+                    df2.parse(t.air)?.time?.let { ep.date = it }
+                } catch (ex: Exception) {
                 }
-                if (t.overview.isNotBlank()) {
-                    if (t.ovTr) ep.description = t.overview else trDescs.add(ep to t.overview)
-                }
-                if (t.still != null) ep.posterUrl = t.still
-                if (t.runtime != null) ep.runTime = t.runtime
-                if (t.air != null) {
-                    try {
-                        df2.parse(t.air)?.time?.let { ep.date = it }
-                    } catch (ex: Exception) {
-                    }
-                }
-            } else {
-                // TMDB'de karşılığı yok: sitenin kendi (çoğunlukla İngilizce) adını Türkçeleştir
-                val cur = ep.name
-                if (!cur.isNullOrBlank()) trNames.add(ep to cur)
             }
-        }
-        if (trNames.isNotEmpty()) {
-            val m = trMany(trNames.map { it.second }.take(300), 25)
-            for ((ep, src) in trNames) ep.name = m[src] ?: src
-        }
-        if (trDescs.isNotEmpty()) {
-            val m = trMany(trDescs.map { it.second }.take(120), 6)
-            for ((ep, src) in trDescs) ep.description = m[src] ?: src
         }
 
         return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, eps) {
