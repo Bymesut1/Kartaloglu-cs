@@ -840,7 +840,7 @@ class Zdizi : MainAPI() {
             if (!hints.contains(pr)) hints.add(pr)
         }
         val cal = Calendar.getInstance()
-        for (i in 0 until 48) {
+        for (i in 0 until 120) {
             val pr = cal.get(Calendar.YEAR).toString() to String.format(Locale.US, "%02d", cal.get(Calendar.MONTH) + 1)
             if (!hints.contains(pr)) hints.add(pr)
             cal.add(Calendar.MONTH, -1)
@@ -1478,11 +1478,14 @@ class Zdizi : MainAPI() {
         }
     }
 
-    private fun isVtt(s: String): Boolean =
-        s.trimStart('\uFEFF', ' ', '\n', '\r', '\t').startsWith("WEBVTT")
+    private fun isSub(s: String): Boolean {
+        val t = s.trimStart('\uFEFF', ' ', '\n', '\r', '\t')
+        return t.startsWith("WEBVTT") || (t.length > 20 && t.contains("-->"))
+    }
 
-    // Bulunan altyazıları verir. Türkçe yoksa /upload/videos/<yıl>/<ay>/<id>/altyazi/tur_sub.vtt klasörünü
-    // olası yıl/ay'larda (12'şerli gruplar halinde, ilk bulunana kadar) yoklar.
+    // Altyazıları verir. Her altyazıyı BİZ indirip doğrularız (Referer / çerez ile), sonra yerel sunucudan
+    // başlıksız, doğrudan açılan bir adresle oynatıcıya sunarız; böylece "seçtim ama çıkmıyor" olmaz.
+    // Türkçe / İngilizce eksikse /upload/videos/<yıl>/<ay>/<id>/altyazi/ klasöründe tur_sub / eng_sub aranır.
     private suspend fun emitSubs(
         found: Found,
         embedUrl: String,
@@ -1491,36 +1494,75 @@ class Zdizi : MainAPI() {
         cookies: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
+        val ck = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val hd = LinkedHashMap<String, String>()
+        hd["User-Agent"] = ua
+        hd["Referer"] = embedUrl
+        hd["Origin"] = origin
+        if (ck.isNotBlank()) hd["Cookie"] = ck
+        val proxyOk = HlsProxy.ensure()
+
         val done = HashSet<String>()
         var hasTr = false
-        for ((u, lb) in found.subs) {
-            if (!done.add(u)) continue
-            val nm = subName(lb, u)
-            if (nm == "Türkçe") hasTr = true
-            subtitleCallback(SubtitleFile(nm, u))
-        }
-        if (hasTr) return
-        val id = Regex("/embed/([A-Za-z0-9_-]+)").find(embedUrl)?.groupValues?.get(1) ?: return
-        val cands = ArrayList<String>()
-        for (h in hints) cands.add("$origin/upload/videos/${h.first}/${h.second}/$id/altyazi/tur_sub.vtt")
+        var hasEn = false
         var folder: String? = null
-        for (ch in cands.distinct().chunked(12)) {
-            val ok = ch.amap { c ->
-                val r = fetch(c, embedUrl, false, cookies = cookies)
-                if (r != null && r.code == 200 && isVtt(r.text)) c else null
-            }.filterNotNull()
-            if (ok.isNotEmpty()) {
-                ok.forEach { if (done.add(it)) subtitleCallback(SubtitleFile("Türkçe", it)) }
-                folder = ok[0].substringBeforeLast("/")
-                break
+
+        fun give(name: String, u: String, text: String?) {
+            if (!done.add(u)) return
+            if (text != null) {
+                if (name == "Türkçe") hasTr = true
+                if (name == "İngilizce") hasEn = true
+            }
+            if (text != null && proxyOk) {
+                val ext = if (u.substringBefore("?").lowercase().endsWith(".srt")) "srt" else "vtt"
+                val pu = HlsProxy.subUrl(u, hd, text.trimStart('\uFEFF').toByteArray(Charsets.UTF_8), ext)
+                subtitleCallback(SubtitleFile(name, pu))
+            } else {
+                subtitleCallback(SubtitleFile(name, u))
             }
         }
-        // Aynı klasörde İngilizce altyazı da olabilir
-        if (folder != null) {
-            val en = "$folder/eng_sub.vtt"
-            val r = fetch(en, embedUrl, false, cookies = cookies)
-            if (r != null && r.code == 200 && isVtt(r.text) && done.add(en)) {
-                subtitleCallback(SubtitleFile("İngilizce", en))
+
+        // 1) Sayfadan / oynatıcıdan bulunanlar: indir, doğrula, ver
+        val checked = found.subs.entries.toList().amap { en ->
+            val r = fetch(en.key, embedUrl, false, cookies = cookies)
+            Triple(en.key, en.value, if (r != null && r.code == 200 && isSub(r.text)) r.text else null)
+        }
+        for ((u, lb, tx) in checked) {
+            give(subName(lb, u), u, tx)
+            if (tx != null && folder == null) folder = u.substringBeforeLast("/")
+        }
+
+        // 2) Türkçe hâlâ yoksa klasörü yıl / ay ipuçlarıyla ara
+        if (!hasTr && folder == null) {
+            val id = Regex("/embed/([A-Za-z0-9_-]+)").find(embedUrl)?.groupValues?.get(1)
+            val cands = ArrayList<String>()
+            for (u in found.subs.keys) cands.add(u.substringBeforeLast("/") + "/tur_sub.vtt")
+            if (id != null) for (h in hints) cands.add("$origin/upload/videos/${h.first}/${h.second}/$id/altyazi/tur_sub.vtt")
+            for (ch in cands.distinct().filter { it !in done }.chunked(12)) {
+                val ok = ch.amap { c ->
+                    val r = fetch(c, embedUrl, false, cookies = cookies)
+                    if (r != null && r.code == 200 && isSub(r.text)) c to r.text else null
+                }.filterNotNull()
+                if (ok.isNotEmpty()) {
+                    ok.forEach { give("Türkçe", it.first, it.second) }
+                    folder = ok[0].first.substringBeforeLast("/")
+                    break
+                }
+            }
+        }
+
+        // 3) Klasör biliniyorsa eksik olan Türkçe / İngilizce dosyayı da dene
+        val f = folder
+        if (f != null) {
+            if (!hasTr) {
+                val u = "$f/tur_sub.vtt"
+                val r = fetch(u, embedUrl, false, cookies = cookies)
+                if (r != null && r.code == 200 && isSub(r.text)) give("Türkçe", u, r.text)
+            }
+            if (!hasEn) {
+                val u = "$f/eng_sub.vtt"
+                val r = fetch(u, embedUrl, false, cookies = cookies)
+                if (r != null && r.code == 200 && isSub(r.text)) give("İngilizce", u, r.text)
             }
         }
     }
@@ -1668,6 +1710,10 @@ private object HlsProxy {
     fun urlFor(real: String, hdr: Map<String, String>, raw: ByteArray?): String =
         "http://127.0.0.1:$port/p/${idFor(real, hdr, raw)}"
 
+    // Altyazı içeriğini sunucuya koyar; sonu .vtt / .srt biten, başlık gerektirmeyen yerel adres verir
+    fun subUrl(real: String, hdr: Map<String, String>, raw: ByteArray, ext: String): String =
+        "http://127.0.0.1:$port/p/${idFor(real, hdr, raw)}/sub.$ext"
+
     private fun resolve(base: String, ref: String): String {
         if (ref.startsWith("http://", true) || ref.startsWith("https://", true)) return ref
         return try {
@@ -1783,7 +1829,12 @@ private object HlsProxy {
                 e.mime = "application/vnd.apple.mpegurl"
                 e.out = rewrite(String(raw, Charsets.UTF_8), e.url, e.hdr).toByteArray(Charsets.UTF_8)
             } else {
-                e.mime = "application/octet-stream"
+                val low = e.url.substringBefore("?").lowercase()
+                e.mime = when {
+                    low.endsWith(".vtt") -> "text/vtt; charset=utf-8"
+                    low.endsWith(".srt") -> "application/x-subrip; charset=utf-8"
+                    else -> "application/octet-stream"
+                }
                 e.out = raw
             }
             return e.out
@@ -1802,7 +1853,7 @@ private object HlsProxy {
             val parts = reqLine.split(" ")
             val method = parts.getOrNull(0) ?: "GET"
             val path = parts.getOrNull(1) ?: "/"
-            val id = path.removePrefix("/p/").substringBefore("?")
+            val id = path.removePrefix("/p/").substringBefore("?").substringBefore("/")
             val os = sock.getOutputStream()
             val e = store[id]
             val body = if (e != null) bodyOf(e) else null
