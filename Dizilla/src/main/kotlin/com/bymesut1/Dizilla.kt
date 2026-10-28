@@ -1123,6 +1123,25 @@ class Dizilla : MainAPI() {
         }
         videoOk = false
         if (got) npDone = true
+
+        // HIZLI YOL: NP_CONFIG yoksa (Kaynak 1 tarzı değilse) CloudStream'in hazır çıkarıcısını hemen çalıştır.
+        // Link gelirse yavaş adımlar (ek altyazı uç noktaları, four.pichive denemesi, tahminler, WebView) atlanır.
+        if (!got) {
+            val fast = ArrayList<ExtractorLink>()
+            try {
+                loadExtractor(f, "$mainUrl/", subtitleCallback) { l -> fast.add(l) }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("hizli cikarici hata ${e.javaClass.simpleName}")
+            }
+            d("$label hizli cikarici link=${fast.size}")
+            if (fast.isNotEmpty()) {
+                for (l in fast) callback(l)
+                info.append("[${origin.removePrefix("https://").removePrefix("http://").take(22)} hizli=${fast.size}] ")
+                return true
+            }
+        }
+
         try {
             if (emitPlaylist(texts, origin, label, sent, callback)) got = true
         } catch (e: Exception) {
@@ -1243,21 +1262,6 @@ class Dizilla : MainAPI() {
                     got = true
                 }
             }
-        }
-
-        // 4b) CloudStream'in hazır çıkarıcıları: m.php gelirse oynatıcının yaptığı gibi master.m3u8'e çevrilir
-        if (!got) {
-            val seen = ArrayList<ExtractorLink>()
-            try {
-                loadExtractor(f, "$mainUrl/", subtitleCallback) { l -> seen.add(l) }
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-            }
-            for (l in seen) {
-                callback(l)
-                got = true
-            }
-            d("$label hazir cikarici link=${seen.size}")
         }
 
         // 4c) hâlâ altyazı yoksa: gerçek WebView'da oynatıcıyı çalıştır, istediği altyazı adresini yakala
