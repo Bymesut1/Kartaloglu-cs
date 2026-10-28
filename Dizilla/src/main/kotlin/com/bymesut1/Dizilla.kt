@@ -679,6 +679,23 @@ class Dizilla : MainAPI() {
             if (subWordRe.containsMatchIn(u) && !assetRe.containsMatchIn(u) && u.length < 120) ends.add(u)
         }
         val cand = LinkedHashSet<String>()
+        // oynatıcı ayarındaki "subs", "subtitle:", "ttList" çevresinde geçen adresler (uzantısız olanlar dahil)
+        val skipRe = Regex("""(?i)\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|m3u8|mp4)(?:\?|$)|/iframe\.php|/m\.php|/l\.php""")
+        val urlInWin = Regex("""["'`]((?:https?:)?//[^"'`\s<>\\]+|/[A-Za-z0-9_\-./]+(?:\?[^"'`\s<>\\]*)?)["'`]""")
+        for (a in Regex("""(?i)\bsubs\b|subtitle\s*:|\bttList\b""").findAll(js).take(12)) {
+            val w = js.substring(maxOf(0, a.range.first - 600), minOf(js.length, a.range.last + 900))
+            for (m in urlInWin.findAll(w)) {
+                val u0 = m.groupValues[1]
+                val u = when {
+                    u0.startsWith("//") -> "https:$u0"
+                    u0.startsWith("/") -> origin + u0
+                    else -> u0
+                }
+                if (skipRe.containsMatchIn(u) || badHostRe.containsMatchIn(u) || u.contains("tmdb", true)) continue
+                if (u.length > 300 || u == origin || u == "$origin/") continue
+                cand.add(u)
+            }
+        }
         for (e in ends) {
             if (e.contains("iframe.php") || e.startsWith("/m.php")) continue
             val withV = if (e.endsWith("=") && vid.isNotBlank()) e + vid else e
@@ -695,7 +712,7 @@ class Dizilla : MainAPI() {
             "User-Agent" to ua, "Referer" to f, "Origin" to origin,
             "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*"
         )
-        val bodies = cand.take(14).toList().amap { u ->
+        val bodies = cand.take(24).toList().amap { u ->
             val b = try {
                 val r = app.get(u, headers = hdr)
                 if (r.code == 200) r.text else ""
@@ -719,6 +736,12 @@ class Dizilla : MainAPI() {
             val rt = allTexts(b)
             for ((su, sl) in findSubs(rt, origin)) {
                 if (emitSub(su, sl, f, subSent, subtitleCallback)) n++
+            }
+            if (n == 0 && b.length < 20000 && b.trimStart().let { it.startsWith("{") || it.startsWith("[") }) {
+                d("json yanit ${u.takeLast(60)}: " + b.take(300).replace(Regex("\\s+"), " "))
+                val inner = Regex("""["'](https?:[^"'\s<>\\]+)["']""").findAll(b.replace("\\/", "/")).map { it.groupValues[1] }
+                    .filter { !skipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) }.distinct().take(6).toList()
+                for (iu in inner) if (emitSub(iu, "", f, subSent, subtitleCallback)) n++
             }
         }
         d("ek altyazi sonuc=$n")
@@ -805,17 +828,16 @@ class Dizilla : MainAPI() {
             }
         }
         if (subSent.isEmpty() && subDbg.length < 700) {
-            // altyazı çıkmadıysa nedenini görebilmek için SADECE script metnindeki (CSS hariç) ilgili kelimeleri sakla
-            val joined = styleRe.replace(texts.joinToString(" "), " ")
-            val kws = Regex("""(?i)\.vtt|\.srt|<track|"tracks"|captions?\b|subtitles?\b|altyaz""").findAll(joined).toList()
-            val sn = kws.take(2).joinToString(" ~ ") {
-                joined.substring(maxOf(0, it.range.first - 60), minOf(joined.length, it.range.last + 100))
-                    .replace(Regex("\\s+"), " ")
+            // Oynatıcı ayarı (subs / ttList / srcList / optns) tanımlarını logla: altyazının nereden geldiği buradan görülür
+            val js = styleRe.replace(texts.joinToString(" "), " ")
+            val one = Regex("\\s+")
+            val php = Regex("""[A-Za-z0-9_\-/]*\.php[A-Za-z0-9_\-?=&%./]{0,40}""").findAll(js).map { it.value }.distinct().take(25).toList()
+            d("PHP uc noktalari: " + php.joinToString(" | "))
+            for (key in listOf("var subs", "subs=", "subs =", "subs.push", "var ttList", "ttList=", "ttList =", "var srcList", "srcList =", "var related", "var optns")) {
+                val i = js.indexOf(key)
+                if (i >= 0) d("TANIM[$key] " + js.substring(maxOf(0, i - 60), minOf(js.length, i + 900)).replace(one, " "))
             }
-            kws.take(6).forEachIndexed { i, it ->
-                d("subkw[$i] " + joined.substring(maxOf(0, it.range.first - 150), minOf(joined.length, it.range.last + 250)).replace(Regex("\\s+"), " "))
-            }
-            subDbg.append("[${origin.removePrefix("https://").removePrefix("http://").take(18)} len=${rawIfr.length} kw=${kws.size} $sn] ")
+            subDbg.append("[${origin.removePrefix("https://").removePrefix("http://").take(18)} len=${rawIfr.length} php=${php.size}] ")
         }
 
         // 2) açık / gizlenmiş video adresleri
