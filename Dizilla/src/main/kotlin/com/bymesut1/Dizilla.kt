@@ -398,6 +398,12 @@ class Dizilla : MainAPI() {
 
     // Dil adı: önce dosya adından (.tr. / .en. / tr.vtt ...), yoksa etiketten
     private fun subLang(u: String, label: String = ""): String {
+        val base = subLang0(u, label)
+        val forced = label.contains("forced", true) || label.contains("zorunlu", true)
+        return if (forced && !base.contains("Forced")) "$base Forced" else base
+    }
+
+    private fun subLang0(u: String, label: String = ""): String {
         val name = u.substringBefore("?").substringAfterLast("/").lowercase()
         val m = Regex("""(?:^|[._\-])(tr|tur|turkish|turkce|türkçe|en|eng|english)(?:[._\-]|$)""")
             .find(name)?.groupValues?.get(1)
@@ -656,6 +662,8 @@ class Dizilla : MainAPI() {
     }
 
     private var webCount = 0
+    private var curFrame = ""
+    private var curHosts: List<String> = emptyList()
     private var srcCount = 0
 
     private var subWebTried = false
@@ -804,7 +812,43 @@ class Dizilla : MainAPI() {
     private val phpRelRe = Regex("""["'`]((?:\./|/)?(?:[A-Za-z0-9_\-/]*/)?[A-Za-z0-9_\-]+\.php\?[A-Za-z0-9_%=&.+/\-]*)["'`]""")
     private val apiSkipRe = Regex("""(?i)/(?:iframe|m|l)\.php|/master\.m3u8""")
 
-    // Oynatıcının kendisi gibi: m.php -> master.m3u8. İkisi de verilir (biri çalışmazsa diğeri).
+    // Ana listeyi (nm.php / master.m3u8 ...) kendimiz çekip yerel sunucudan veririz: göreli adresler CDN sunucularına (hosts) çevrilir.
+    private suspend fun emitHls(
+        url: String,
+        title: String,
+        label: String,
+        origin: String,
+        f: String,
+        hosts: List<String>,
+        sent: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (!sent.add(url)) return false
+        val name = if (title.isBlank()) label else "$label $title"
+        val hdr = mapOf(
+            "User-Agent" to ua, "Referer" to f, "Origin" to origin,
+            "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*"
+        )
+        val body = getAny(url, hdr)
+        d("hls ${url.substringBefore("?").takeLast(30)} len=${body.length} hosts=${hosts.size}")
+        var ok = false
+        if (body.trimStart().startsWith("#EXTM3U")) {
+            dLong("hls", body.replace(Regex("\\s+"), " ").take(1400))
+            val cfg = SubProxy.newCfg(hosts, mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*"))
+            SubProxy.prime(url, body)
+            val local = SubProxy.hlsUrl(cfg, url)
+            if (local != null) {
+                emitLink(local, ExtractorLinkType.M3U8, name, origin, callback)
+                ok = true
+            }
+        } else if (body.isNotBlank()) {
+            d("hls govde: " + body.take(300).replace(Regex("\\s+"), " "))
+        }
+        emitLink(url, ExtractorLinkType.M3U8, if (ok) "$name (direkt)" else name, origin, callback)
+        return true
+    }
+
+    // Oynatıcının kendisi gibi: m.php -> master.m3u8.
     private suspend fun emitMedia(
         u: String,
         title: String,
@@ -814,18 +858,57 @@ class Dizilla : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val name = if (title.isBlank()) label else "$label $title"
-        val type = if (u.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-        val alt = if (u.contains("/m.php")) u.replace("/m.php", "/master.m3u8") else null
-        var ok = false
-        if (alt != null && sent.add(alt)) {
-            emitLink(alt, type, name, origin, callback)
-            ok = true
+        if (u.contains(".mp4", true)) {
+            if (!sent.add(u)) return false
+            emitLink(u, ExtractorLinkType.VIDEO, name, origin, callback)
+            return true
         }
-        if (sent.add(u)) {
-            emitLink(u, type, if (alt != null) "$name (m.php)" else name, origin, callback)
+        val alt = if (u.contains("/m.php")) u.replace("/m.php", "/master.m3u8") else u
+        var ok = emitHls(alt, title, label, origin, curFrame.ifBlank { "$origin/" }, curHosts, sent, callback)
+        if (alt != u && sent.add(u)) {
+            emitLink(u, ExtractorLinkType.M3U8, "$name (m.php)", origin, callback)
             ok = true
         }
         return ok
+    }
+
+    private fun hostsOf(texts: List<String>): List<String> {
+        for (t in texts) {
+            val m = Regex("\"hosts\"\\s*:\\s*\\[([^\\]]*)\\]").find(t) ?: continue
+            return Regex("\"(https?:[^\"]+)\"").findAll(m.groupValues[1]).map { it.groupValues[1].replace("\\/", "/") }.toList()
+        }
+        return emptyList()
+    }
+
+    // window.NP_CONFIG = {...}  (sources[].master, hosts, subtitles[].url)
+    private fun npConfig(t: String): JSONObject? {
+        val i = t.indexOf("NP_CONFIG")
+        if (i < 0) return null
+        val st = t.indexOf('{', i)
+        if (st < 0) return null
+        var depth = 0
+        var inStr = false
+        var esc = false
+        for (j in st until t.length) {
+            val c = t[j]
+            if (inStr) {
+                if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') inStr = false
+            } else {
+                if (c == '"') inStr = true
+                else if (c == '{') depth++
+                else if (c == '}') {
+                    depth--
+                    if (depth == 0) {
+                        return try {
+                            JSONObject(t.substring(st, j + 1))
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                }
+            }
+        }
+        return null
     }
 
     // Sayfadaki / çözülmüş metinlerdeki tüm m.php?v=... adresleri (başlığıyla: Dublaj / Altyazılı ...)
@@ -862,7 +945,7 @@ class Dizilla : MainAPI() {
             for (g in listOf("track.php", "nsub.php", "source2.php")) out.add("$origin/$g?v=$vid")
         }
         return out.map { if (it.endsWith("=") && vid.isNotBlank()) it + vid else it }
-            .filter { !apiSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) && it.length < 700 }
+            .filter { !apiSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) && it.length < 4000 }
             .distinct().take(10)
     }
 
@@ -930,7 +1013,7 @@ class Dizilla : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Pair<Boolean, Int> {
-        val eps = apiEndpoints(f, origin, texts)
+        val eps = apiEndpoints(f, origin, texts).filter { it !in subSent && it !in sent }
         if (eps.isEmpty()) return false to 0
         d("api uc noktalari=${eps.size} " + eps.joinToString(" | ") { it.takeLast(70) })
         val hdr = mapOf(
@@ -956,10 +1039,7 @@ class Dizilla : MainAPI() {
                 continue
             }
             if (b.trimStart().startsWith("#EXTM3U")) {
-                if (sent.add(u)) {
-                    emitLink(u, ExtractorLinkType.M3U8, label, origin, callback)
-                    gotVideo = true
-                }
+                if (emitHls(u, "", label, origin, f, curHosts, sent, callback)) gotVideo = true
                 continue
             }
             val found = ArrayList<Triple<String, String, String>>()
@@ -1028,6 +1108,40 @@ class Dizilla : MainAPI() {
 
         // 1b) oynatıcı listesi (m.php -> master.m3u8) + api uç noktaları (nm.php / nsub.php / track.php / source2.php)
         var got = false
+        curFrame = f
+        curHosts = hostsOf(listOf(rawIfr))
+        try {
+            val np = npConfig(rawIfr)
+            if (np != null) {
+                val srcs = np.optJSONArray("sources")
+                if (srcs != null) {
+                    for (i in 0 until srcs.length()) {
+                        val so = srcs.optJSONObject(i) ?: continue
+                        val master = so.optString("master", "")
+                        if (master.isBlank()) continue
+                        val hs = ArrayList<String>()
+                        so.optJSONArray("hosts")?.let { a -> for (k in 0 until a.length()) hs.add(a.optString(k)) }
+                        if (emitHls(master, so.optString("title", ""), label, origin, f, if (hs.isEmpty()) curHosts else hs, sent, callback)) got = true
+                    }
+                }
+                val sb = np.optJSONArray("subtitles")
+                if (sb != null) {
+                    for (i in 0 until sb.length()) {
+                        val so = sb.optJSONObject(i) ?: continue
+                        val su = so.optString("url", "")
+                        if (su.isBlank()) continue
+                        var lb = so.optString("label", "")
+                        if (lb.isBlank()) lb = so.optString("lang", "")
+                        if (so.optBoolean("forced", false) && !lb.contains("forced", true)) lb += " Forced"
+                        if (emitSub(su, lb, f, subSent, subtitleCallback)) subOk++
+                    }
+                }
+                d("np config kaynak=${srcs?.length() ?: 0} altyazi=${sb?.length() ?: 0} ok=$got/$subOk")
+            }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("np hata ${e.javaClass.simpleName} ${e.message}")
+        }
         try {
             if (emitPlaylist(texts, origin, label, sent, callback)) got = true
         } catch (e: Exception) {
@@ -1514,6 +1628,150 @@ private object SubProxy {
     }
 
     // Altyazı içeriğini saklar ve oynatıcıya verilecek yerel adresi döndürür
+    private class Cfg(val hosts: List<String>, val headers: Map<String, String>) {
+        @Volatile var type = -1
+        @Volatile var idx = 0
+    }
+
+    private val cfgs = ConcurrentHashMap<String, Cfg>()
+    private val primed = ConcurrentHashMap<String, String>()
+
+    fun newCfg(hosts: List<String>, headers: Map<String, String>): String {
+        val id = java.lang.Long.toString(System.nanoTime(), 36)
+        if (cfgs.size > 40) cfgs.clear()
+        cfgs[id] = Cfg(hosts, headers)
+        return id
+    }
+
+    fun prime(url: String, body: String) {
+        if (primed.size > 40) primed.clear()
+        primed[url] = body
+    }
+
+    fun hlsUrl(cfg: String, target: String): String? {
+        if (!ensure()) return null
+        return "http://127.0.0.1:$port/h?k=$cfg&u=" + URLEncoder.encode(target, "UTF-8")
+    }
+
+    private fun httpGet(u: String, h: Map<String, String>, probe: Boolean): Pair<Int, ByteArray> {
+        return try {
+            val c = java.net.URL(u).openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 12_000
+            c.readTimeout = 20_000
+            c.instanceFollowRedirects = true
+            for ((k, v) in h) c.setRequestProperty(k, v)
+            if (probe) c.setRequestProperty("Range", "bytes=0-0")
+            val code = c.responseCode
+            val bytes = if (!probe && code in 200..299) c.inputStream.readBytes() else ByteArray(0)
+            c.disconnect()
+            code to bytes
+        } catch (e: Exception) {
+            0 to ByteArray(0)
+        }
+    }
+
+    private fun build(type: Int, i: Int, uri: String, base: String, hosts: List<String>): String? = when (type) {
+        0 -> try {
+            java.net.URI(base).resolve(uri).toString()
+        } catch (e: Exception) {
+            null
+        }
+        1 -> hosts.getOrNull(i)?.let { it.trimEnd('/') + "/" + uri.trimStart('/') }
+        else -> if (uri.startsWith("/")) hosts.getOrNull(i)?.let { (Regex("^https?://[^/]+").find(it)?.value ?: "") + uri } else null
+    }
+
+    // Göreli adres: önce listenin kendi adresine göre, olmazsa CDN sunucularına (hosts) göre dener; çalışan biçim hatırlanır
+    private fun resolveUri(c: Cfg, uri: String, base: String): String {
+        if (uri.startsWith("http", true)) return uri
+        if (uri.startsWith("//")) return "https:$uri"
+        val ct = c.type
+        if (ct >= 0) return build(ct, c.idx, uri, base, c.hosts) ?: build(0, 0, uri, base, c.hosts) ?: uri
+        val tries = ArrayList<Triple<Int, Int, String>>()
+        build(0, 0, uri, base, c.hosts)?.let { tries.add(Triple(0, 0, it)) }
+        for (i in c.hosts.indices) for (t in 1..2) build(t, i, uri, base, c.hosts)?.let { tries.add(Triple(t, i, it)) }
+        for ((t, i, u) in tries) {
+            val code = httpGet(u, c.headers, true).first
+            if (code == 200 || code == 206) {
+                c.type = t
+                c.idx = i
+                Log.d("DizillaDbg", "hls adres bicimi tip=$t host=$i ornek=${u.take(90)}")
+                return u
+            }
+        }
+        c.type = 0
+        c.idx = 0
+        Log.d("DizillaDbg", "hls adres bicimi bulunamadi ornek=${uri.take(60)}")
+        return tries.firstOrNull()?.third ?: uri
+    }
+
+    private fun rewrite(body: String, base: String, k: String, c: Cfg): String {
+        val sb = StringBuilder()
+        var prevInf = false
+        val plRe = Regex("(?i)\\.m3u8|/l\\.php|/m\\.php|/nm\\.php|master")
+        val segRe = Regex("(?i)\\.(?:ts|m4s|mp4|aac|vtt|key)(?:\\?|$)")
+        fun map(u: String, pl: Boolean): String {
+            val abs = resolveUri(c, u, base)
+            return if (pl) "http://127.0.0.1:$port/h?k=$k&u=" + URLEncoder.encode(abs, "UTF-8") else abs
+        }
+        for (line in body.lines()) {
+            val t = line.trim()
+            if (t.isEmpty()) {
+                sb.append(line)
+            } else if (t.startsWith("#")) {
+                prevInf = t.startsWith("#EXT-X-STREAM-INF")
+                val media = t.startsWith("#EXT-X-MEDIA") || t.startsWith("#EXT-X-I-FRAME")
+                sb.append(Regex("URI=\"([^\"]+)\"").replace(t) { m ->
+                    val uu = m.groupValues[1]
+                    "URI=\"" + map(uu, media && plRe.containsMatchIn(uu)) + "\""
+                })
+            } else {
+                sb.append(map(t, prevInf || (plRe.containsMatchIn(t) && !segRe.containsMatchIn(t))))
+                prevInf = false
+            }
+            sb.append('\n')
+        }
+        return sb.toString()
+    }
+
+    private fun err(os: java.io.OutputStream, code: Int) {
+        os.write("HTTP/1.1 $code Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+        os.flush()
+    }
+
+    private fun hls(os: java.io.OutputStream, path: String) {
+        var k = ""
+        var u = ""
+        for (p in path.substringAfter("?").split("&")) {
+            val kv = p.split("=", limit = 2)
+            if (kv.size < 2) continue
+            if (kv[0] == "k") k = kv[1]
+            if (kv[0] == "u") u = URLDecoder.decode(kv[1], "UTF-8")
+        }
+        val c = cfgs[k]
+        if (c == null || u.isBlank()) {
+            err(os, 404)
+            return
+        }
+        val pre = primed.remove(u)
+        val text: String
+        if (pre != null) {
+            text = pre
+        } else {
+            val r = httpGet(u, c.headers, false)
+            Log.d("DizillaDbg", "hls liste kod=${r.first} ${u.substringBefore("?").takeLast(40)}")
+            if (r.first !in 200..299) {
+                err(os, if (r.first == 0) 502 else r.first)
+                return
+            }
+            text = String(r.second, Charsets.UTF_8)
+        }
+        val out = if (text.trimStart().startsWith("#EXTM3U")) rewrite(text, u, k, c) else text
+        val b = out.toByteArray(Charsets.UTF_8)
+        os.write(("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${b.size}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray())
+        os.write(b)
+        os.flush()
+    }
+
     fun put(bytes: ByteArray): String? {
         if (!ensure()) return null
         if (store.size > 80) store.clear()
@@ -1534,6 +1792,10 @@ private object SubProxy {
             val parts = reqLine.split(" ")
             val method = parts.getOrNull(0) ?: "GET"
             val path = parts.getOrNull(1) ?: "/"
+            if (path.startsWith("/h?")) {
+                hls(sock.getOutputStream(), path)
+                return
+            }
             val id = path.removePrefix("/s/").substringBefore("?").removeSuffix(".vtt")
             val os = sock.getOutputStream()
             val body = store[id]
