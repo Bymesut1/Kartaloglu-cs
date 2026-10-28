@@ -32,7 +32,7 @@ class Dizilla : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
 
     // true: bağlantı bulunamazsa kaynak listesine, altyazı bulunamazsa altyazı listesine "DEBUG ..." satırı ekler
-    private val debug = true
+    private val debug = false
 
     // TMDB (Türkçe bölüm adı, açıklama, bölüm/sezon resmi, süre, tarih). Boş/placeholder ise kapalı.
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
@@ -825,26 +825,7 @@ class Dizilla : MainAPI() {
     ): Boolean {
         if (!sent.add(url)) return false
         val name = if (title.isBlank()) label else "$label $title"
-        val hdr = mapOf(
-            "User-Agent" to ua, "Referer" to f, "Origin" to origin,
-            "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*"
-        )
-        val body = getAny(url, hdr)
-        d("hls ${url.substringBefore("?").takeLast(30)} len=${body.length} hosts=${hosts.size}")
-        var ok = false
-        if (body.trimStart().startsWith("#EXTM3U")) {
-            dLong("hls", body.replace(Regex("\\s+"), " ").take(1400))
-            val cfg = SubProxy.newCfg(hosts, mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*"))
-            SubProxy.prime(url, body)
-            val local = SubProxy.hlsUrl(cfg, url)
-            if (local != null) {
-                emitLink(local, ExtractorLinkType.M3U8, name, origin, callback)
-                ok = true
-            }
-        } else if (body.isNotBlank()) {
-            d("hls govde: " + body.take(300).replace(Regex("\\s+"), " "))
-        }
-        emitLink(url, ExtractorLinkType.M3U8, if (ok) "$name (direkt)" else name, origin, callback)
+        emitLink(url, ExtractorLinkType.M3U8, name, origin, callback)
         return true
     }
 
@@ -864,12 +845,7 @@ class Dizilla : MainAPI() {
             return true
         }
         val alt = if (u.contains("/m.php")) u.replace("/m.php", "/master.m3u8") else u
-        var ok = emitHls(alt, title, label, origin, curFrame.ifBlank { "$origin/" }, curHosts, sent, callback)
-        if (alt != u && sent.add(u)) {
-            emitLink(u, ExtractorLinkType.M3U8, "$name (m.php)", origin, callback)
-            ok = true
-        }
-        return ok
+        return emitHls(alt, title, label, origin, curFrame.ifBlank { "$origin/" }, curHosts, sent, callback)
     }
 
     private fun hostsOf(texts: List<String>): List<String> {
@@ -1409,7 +1385,10 @@ class Dizilla : MainAPI() {
                 info.append("[hata ${e.javaClass.simpleName}] ")
                 false
             }
-            if (got) ok = true
+            if (got) {
+                ok = true
+                break
+            }
         }
 
         if (!ok) {
@@ -1453,7 +1432,10 @@ class Dizilla : MainAPI() {
                 d("sayfa hata ${e.javaClass.simpleName} ${e.message}")
                 false
             }
-            if (got) ok = true
+            if (got) {
+                ok = true
+                break
+            }
         }
 
         // hiçbiri çıkmadıysa: ilk bölüm sayfasını gerçek WebView'da aç, oynatıcı / video isteğini yakala
