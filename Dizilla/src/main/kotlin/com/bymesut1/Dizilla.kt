@@ -25,6 +25,9 @@ class Dizilla : MainAPI() {
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
 
+    // true: bağlantı bulunamazsa kaynak listesine "DEBUG ..." satırı ekler (sorun bitince false yap)
+    private val debug = true
+
     // TMDB (Türkçe bölüm adı, açıklama, bölüm/sezon resmi, süre, tarih). Boş/placeholder ise kapalı.
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
 
@@ -58,24 +61,33 @@ class Dizilla : MainAPI() {
 
     // ---------------- Yardımcılar ----------------
 
-    private suspend fun fetch(url: String, referer: String? = null): String {
+    private fun isCf(code: Int, t: String): Boolean =
+        code == 403 || code == 503 ||
+            (t.length < 30_000 && (t.contains("Just a moment", true) || t.contains("cf-chl", true) ||
+                t.contains("challenge-platform", true)))
+
+    // Kod + metin döndürür; Cloudflare engeli varsa CloudflareKiller ile yeniden dener
+    private suspend fun fetchFull(url: String, referer: String? = null): Pair<Int, String> {
         val h = mapOf("User-Agent" to ua, "Accept-Language" to "tr-TR,tr;q=0.9")
-        return try {
-            val t = app.get(url, headers = h, referer = referer).text
-            if (t.contains("Just a moment", true) && t.length < 20_000) {
-                app.get(url, headers = h, referer = referer, interceptor = cf).text
-            } else t
+        try {
+            val r = app.get(url, headers = h, referer = referer)
+            if (!isCf(r.code, r.text)) return r.code to r.text
+            d("cf engeli ${r.code} $url")
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             d("fetch hata ${e.javaClass.simpleName} $url")
-            try {
-                app.get(url, headers = h, referer = referer, interceptor = cf).text
-            } catch (e2: Exception) {
-                if (e2 is java.util.concurrent.CancellationException) throw e2
-                ""
-            }
+        }
+        return try {
+            val r2 = app.get(url, headers = h, referer = referer, interceptor = cf)
+            r2.code to r2.text
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("cf fetch hata ${e.javaClass.simpleName} $url")
+            0 to ""
         }
     }
+
+    private suspend fun fetch(url: String, referer: String? = null): String = fetchFull(url, referer).second
 
     private fun abs(u: String): String = when {
         u.startsWith("http") -> u
@@ -352,6 +364,11 @@ class Dizilla : MainAPI() {
     private val iframeRe = Regex("""https?://[A-Za-z0-9.-]+/iframe\.php\?v=[A-Za-z0-9_%.=-]+""")
     private val trailerRe =
         Regex("""(https?://[A-Za-z0-9.-]+/iframe\.php\?v=[A-Za-z0-9_%.=-]+)"[^}]{0,300}?"trailer"\s*:\s*(true|false)""")
+    private val ifrTagRe = Regex("""(?i)<iframe[^>]+?(?:src|data-src)\s*=\s*["']([^"']+)["']""")
+    private val quotedUrlRe = Regex("[\"'](https?://[^\"'\\s<>\\\\]+|//[^\"'\\s<>\\\\]+)[\"']")
+    private val playerKeyRe = Regex(
+        """(?i)iframe|/embed|/player|/v/|/e/|/f/|vidmoly|filemoon|streamtape|dood|voe\.|mixdrop|sibnet|ok\.ru|rapidvid|vidmoxy|closeload|upstream|fembed|pixeldrain|uqload|streamwish|vidhide|hdplayer|peacemaker|cdn"""
+    )
     private val m3u8Re = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
     private val mp4Re = Regex("""https?://[^"'\s\\<>]+\.mp4[^"'\s\\<>]*""")
     private val subRe = Regex("""https?://[^"'\s\\<>]+\.(?:vtt|srt)[^"'\s\\<>]*""")
@@ -387,6 +404,34 @@ class Dizilla : MainAPI() {
         } catch (e: Exception) {
         }
         return out.map { unescape(it) }.distinct()
+    }
+
+    // Bölüm sayfasındaki olası oynatıcı (iframe / embed) adresleri
+    private fun playerCandidates(texts: List<String>, trailers: Set<String>): List<String> {
+        val strong = LinkedHashSet<String>()
+        val weak = LinkedHashSet<String>()
+        val selfHost = originOf(mainUrl)
+        for (t in texts) {
+            iframeRe.findAll(t).forEach { strong.add(it.value) }
+            ifrTagRe.findAll(t).forEach { m ->
+                val u = fixProto(m.groupValues[1])
+                if (u.startsWith("http")) strong.add(u)
+            }
+            quotedUrlRe.findAll(t).forEach { m ->
+                val u = fixProto(m.groupValues[1])
+                if (weak.size < 40 && playerKeyRe.containsMatchIn(u)) weak.add(u)
+            }
+        }
+        val out = ArrayList<String>()
+        for (u in strong) if (u !in trailers && !badHostRe.containsMatchIn(u)) out.add(u)
+        for (u in weak) {
+            if (u in out || u in trailers) continue
+            if (u.startsWith(selfHost)) continue
+            if (badHostRe.containsMatchIn(u) || assetRe.containsMatchIn(u)) continue
+            if (u.contains("themoviedb", true) || u.contains("image.tmdb", true)) continue
+            out.add(u)
+        }
+        return out.distinct().take(12)
     }
 
     // Metinlerdeki olası video adresleri (öncelik sırasıyla)
@@ -475,6 +520,166 @@ class Dizilla : MainAPI() {
 
     private var webTried = false
 
+    // Tek bir oynatıcı (iframe) adresinden video + altyazı çıkarır
+    private suspend fun resolveFrame(
+        f: String,
+        label: String,
+        sent: MutableSet<String>,
+        subSent: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        info: StringBuilder
+    ): Boolean {
+        val origin = originOf(f)
+
+        // 1) iframe sayfasını al (referer = dizi sitesi)
+        val rawIfr = fetch(f, "$mainUrl/")
+        val texts = allTexts(rawIfr)
+        val ifr = texts.firstOrNull() ?: ""
+        val cfErr = ifr.contains("cf-error", true) || ifr.contains("cf.errors", true) ||
+            ifr.contains("Attention Required", true)
+        d("$label iframe len=${rawIfr.length} cfHata=$cfErr")
+
+        // Altyazılar
+        val subs = LinkedHashSet<String>()
+        for (t in texts) subRe.findAll(t).forEach { subs.add(it.value) }
+        for (m in subs) {
+            if (subSent.add(m)) subtitleCallback(SubtitleFile(subLang(m), m))
+        }
+
+        // 2) açık / gizlenmiş video adresleri
+        val cands = mediaCandidates(texts)
+        d("$label aday=${cands.size} ${cands.take(4).joinToString(" | ") { it.take(90) }}")
+        var got = emitCandidates(cands, origin, label, sent, callback)
+
+        // 3) sayfadaki api / player uç noktalarını dene
+        if (!got && rawIfr.isNotBlank() && !cfErr) {
+            val ends = LinkedHashSet<String>()
+            Regex("[\"'](/[A-Za-z0-9_\\-/]*(?:api|source|player|video|stream|ajax|embed|get)[A-Za-z0-9_\\-/.?=&%]*)[\"']", RegexOption.IGNORE_CASE)
+                .findAll(ifr).forEach { ends.add(it.groupValues[1]) }
+            for (ep in ends.take(4)) {
+                val r = try {
+                    app.get(
+                        origin + ep,
+                        headers = mapOf(
+                            "User-Agent" to ua,
+                            "Referer" to f,
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Accept" to "*/*"
+                        )
+                    ).text
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ""
+                }
+                if (r.isBlank()) continue
+                val rt = allTexts(r)
+                val c2 = mediaCandidates(rt)
+                for (m in rt) subRe.findAll(m).forEach { mm ->
+                    if (subSent.add(mm.value)) subtitleCallback(SubtitleFile(subLang(mm.value), mm.value))
+                }
+                if (emitCandidates(c2, origin, label, sent, callback)) {
+                    got = true
+                    break
+                }
+            }
+        }
+
+        // 4) altyazı CDN klasöründen ana liste tahmini: .../f/<id>/<hash>/ + master.m3u8 ...
+        if (!got && subs.isNotEmpty()) {
+            val first = subs.first()
+            val folder = Regex("""^(https?://[^/]+/f/[^/]+/[^/]+/)""").find(first)?.groupValues?.get(1)
+            val query = first.substringAfter("?", "")
+            if (folder != null) {
+                val names = listOf("master.m3u8", "index.m3u8", "playlist.m3u8", "hls/master.m3u8", "hls/index.m3u8", "stream.m3u8")
+                val guesses = ArrayList<String>()
+                for (n in names) {
+                    if (query.isNotBlank()) guesses.add("$folder$n?$query")
+                    guesses.add("$folder$n")
+                }
+                val hit = guesses.take(12).amap { g ->
+                    val b = try {
+                        app.get(
+                            g,
+                            headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+                        ).text
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ""
+                    }
+                    if (b.trimStart().startsWith("#EXTM3U")) g else null
+                }.filterNotNull().firstOrNull()
+                d("$label cdn tahmin=${hit?.take(90)}")
+                if (hit != null && sent.add(hit)) {
+                    emitLink(hit, ExtractorLinkType.M3U8, label, origin, callback)
+                    got = true
+                }
+            }
+        }
+
+        // 4b) CloudStream'in hazır çıkarıcıları (bilinen oynatıcı siteleri için)
+        if (!got) {
+            try {
+                if (loadExtractor(f, "$mainUrl/", subtitleCallback, callback)) got = true
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+
+        // 5) son çare: WebView ile ağdan video adresi yakala (bölüm başına bir kez)
+        if (!got && !webTried) {
+            webTried = true
+            val w = try {
+                val r = app.get(
+                    f,
+                    referer = "$mainUrl/",
+                    interceptor = WebViewResolver(
+                        Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master"""),
+                        userAgent = ua,
+                        useOkhttp = true,
+                        timeout = 20_000L
+                    ),
+                    timeout = 30L
+                )
+                r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)""").containsMatchIn(it) }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("webview hata ${e.javaClass.simpleName}")
+                null
+            }
+            d("$label webview=${w?.take(90)}")
+            if (w != null && sent.add(w)) {
+                emitLink(
+                    w,
+                    if (w.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
+                    label,
+                    origin,
+                    callback
+                )
+                got = true
+            }
+        }
+
+        // Hâlâ bulunamadıysa: sonraki turda nedenini görebilmek için sayfa özetini logla
+        if (!got) {
+            val scripts = Regex("(?is)<script[^>]*>(.*?)</script>").findAll(ifr).map { it.groupValues[1].trim() }
+                .filter { it.length > 20 }.joinToString(" ¶ ")
+            d("$label BULUNAMADI. iframe ozet:")
+            dLong("ifr", (if (scripts.isNotBlank()) scripts else ifr).replace(Regex("\\s+"), " ").take(6000))
+        }
+        info.append("[${origin.removePrefix("https://").removePrefix("http://").take(22)} len=${rawIfr.length} cf=$cfErr aday=${cands.size} altyazi=${subs.size} ok=$got] ")
+        return got
+    }
+
+    private suspend fun debugLink(callback: (ExtractorLink) -> Unit, text: String) {
+        callback(
+            newExtractorLink(name, "DEBUG $text".take(600), "https://debug.invalid/x.m3u8", ExtractorLinkType.M3U8) {
+                this.referer = ""
+                this.quality = Qualities.Unknown.value
+            }
+        )
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -482,144 +687,94 @@ class Dizilla : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webTried = false
-        val html = unescape(fetch(data, "$mainUrl/"))
-        val trailers = trailerRe.findAll(html).filter { it.groupValues[2] == "true" }.map { it.groupValues[1] }.toSet()
-        val frames = iframeRe.findAll(html).map { it.value }.distinct().filter { it !in trailers }.toList()
-        d("iframe sayısı=${frames.size}")
-
-        var ok = false
+        val info = StringBuilder()
         val sent = HashSet<String>()
         val subSent = HashSet<String>()
+        var ok = false
+
+        // 1) bölüm sayfası
+        val pg = fetchFull(data, "$mainUrl/")
+        val html = unescape(pg.second)
+        info.append("sayfa=${pg.first}/${pg.second.length} ")
+        val pageTexts = allTexts(pg.second)
+        val trailers = trailerRe.findAll(html).filter { it.groupValues[2] == "true" }.map { it.groupValues[1] }.toSet()
+        val frames = playerCandidates(pageTexts, trailers)
+        d("oynatıcı adayı=${frames.size} ${frames.take(5).joinToString(" | ") { it.take(80) }}")
+        info.append("oynatici=${frames.size} ")
+
+        // 2) her oynatıcı adresini çöz
         for ((i, f) in frames.withIndex()) {
             val origin = originOf(f)
             val label = "Kaynak ${i + 1} (${origin.removePrefix("https://").removePrefix("http://")})"
-
-            // 1) iframe sayfasını al (referer = dizi sitesi)
-            val rawIfr = fetch(f, "$mainUrl/")
-            val texts = allTexts(rawIfr)
-            val ifr = texts.firstOrNull() ?: ""
-            val cfErr = ifr.contains("cf-error", true) || ifr.contains("cf.errors", true) ||
-                ifr.contains("Attention Required", true)
-            d("$label iframe len=${rawIfr.length} cfHata=$cfErr")
-
-            // Altyazılar
-            val subs = LinkedHashSet<String>()
-            for (t in texts) subRe.findAll(t).forEach { subs.add(it.value) }
-            for (m in subs) {
-                if (subSent.add(m)) subtitleCallback(SubtitleFile(subLang(m), m))
-            }
-
-            // 2) açık / gizlenmiş video adresleri
-            var cands = mediaCandidates(texts)
-            d("$label aday=${cands.size} ${cands.take(4).joinToString(" | ") { it.take(90) }}")
-            var got = emitCandidates(cands, origin, label, sent, callback)
-
-            // 3) sayfadaki api / player uç noktalarını dene
-            if (!got && rawIfr.isNotBlank() && !cfErr) {
-                val ends = LinkedHashSet<String>()
-                Regex("[\"'](/[A-Za-z0-9_\\-/]*(?:api|source|player|video|stream|ajax|embed|get)[A-Za-z0-9_\\-/.?=&%]*)[\"']", RegexOption.IGNORE_CASE)
-                    .findAll(ifr).forEach { ends.add(it.groupValues[1]) }
-                for (ep in ends.take(4)) {
-                    val r = try {
-                        app.get(
-                            origin + ep,
-                            headers = mapOf(
-                                "User-Agent" to ua,
-                                "Referer" to f,
-                                "X-Requested-With" to "XMLHttpRequest",
-                                "Accept" to "*/*"
-                            )
-                        ).text
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        ""
-                    }
-                    if (r.isBlank()) continue
-                    val c2 = mediaCandidates(allTexts(r))
-                    for (m in allTexts(r)) subRe.findAll(m).forEach { mm ->
-                        if (subSent.add(mm.value)) subtitleCallback(SubtitleFile(subLang(mm.value), mm.value))
-                    }
-                    if (emitCandidates(c2, origin, label, sent, callback)) {
-                        got = true
-                        break
-                    }
-                }
-            }
-
-            // 4) altyazı CDN klasöründen ana liste tahmini: .../f/<id>/<hash>/ + master.m3u8 ...
-            if (!got && subs.isNotEmpty()) {
-                val first = subs.first()
-                val folder = Regex("""^(https?://[^/]+/f/[^/]+/[^/]+/)""").find(first)?.groupValues?.get(1)
-                val query = first.substringAfter("?", "")
-                if (folder != null) {
-                    val names = listOf("master.m3u8", "index.m3u8", "playlist.m3u8", "hls/master.m3u8", "hls/index.m3u8", "stream.m3u8")
-                    val guesses = ArrayList<String>()
-                    for (n in names) {
-                        if (query.isNotBlank()) guesses.add("$folder$n?$query")
-                        guesses.add("$folder$n")
-                    }
-                    val hit = guesses.take(12).amap { g ->
-                        val b = try {
-                            app.get(
-                                g,
-                                headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
-                            ).text
-                        } catch (e: Exception) {
-                            if (e is java.util.concurrent.CancellationException) throw e
-                            ""
-                        }
-                        if (b.trimStart().startsWith("#EXTM3U")) g else null
-                    }.filterNotNull().firstOrNull()
-                    d("$label cdn tahmin=${hit?.take(90)}")
-                    if (hit != null && sent.add(hit)) {
-                        emitLink(hit, ExtractorLinkType.M3U8, label, origin, callback)
-                        got = true
-                    }
-                }
-            }
-
-            // 5) son çare: WebView ile ağdan video adresi yakala (bölüm başına bir kez)
-            if (!got && !webTried) {
-                webTried = true
-                val w = try {
-                    val r = app.get(
-                        f,
-                        referer = "$mainUrl/",
-                        interceptor = WebViewResolver(
-                            Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master"""),
-                            userAgent = ua,
-                            useOkhttp = true,
-                            timeout = 20_000L
-                        ),
-                        timeout = 30L
-                    )
-                    r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)""").containsMatchIn(it) }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    d("webview hata ${e.javaClass.simpleName}")
-                    null
-                }
-                d("$label webview=${w?.take(90)}")
-                if (w != null && sent.add(w)) {
-                    emitLink(
-                        w,
-                        if (w.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
-                        label,
-                        origin,
-                        callback
-                    )
-                    got = true
-                }
-            }
-
-            // Hâlâ bulunamadıysa: sonraki turda nedenini görebilmek için sayfa özetini logla
-            if (!got) {
-                val scripts = Regex("(?is)<script[^>]*>(.*?)</script>").findAll(ifr).map { it.groupValues[1].trim() }
-                    .filter { it.length > 20 }.joinToString(" ¶ ")
-                d("$label BULUNAMADI. iframe ozet:")
-                dLong("ifr", (if (scripts.isNotBlank()) scripts else ifr).replace(Regex("\\s+"), " ").take(6000))
+            val got = try {
+                resolveFrame(f, label, sent, subSent, subtitleCallback, callback, info)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("$label hata ${e.javaClass.simpleName} ${e.message}")
+                info.append("[hata ${e.javaClass.simpleName}] ")
+                false
             }
             if (got) ok = true
+        }
+
+        // 3) hiçbiri çıkmadıysa: bölüm sayfasını gerçek WebView'da aç, oynatıcı / video isteğini yakala
+        if (!ok) {
+            val w = try {
+                val r = app.get(
+                    data,
+                    referer = "$mainUrl/",
+                    interceptor = WebViewResolver(
+                        Regex("""(?i)iframe\.php\?v=|\.m3u8|\.mp4|/embed/|master\.txt"""),
+                        userAgent = ua,
+                        useOkhttp = false,
+                        timeout = 25_000L
+                    ),
+                    timeout = 35L
+                )
+                r.url.takeIf { it != data }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("sayfa webview hata ${e.javaClass.simpleName}")
+                null
+            }
+            d("sayfa webview=${w?.take(100)}")
+            info.append("webview=${if (w != null) "var" else "yok"} ")
+            if (w != null) {
+                val origin = originOf(w)
+                val label = "Kaynak (${origin.removePrefix("https://").removePrefix("http://")})"
+                if (Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)""").containsMatchIn(w)) {
+                    if (sent.add(w)) {
+                        emitLink(
+                            w,
+                            if (w.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
+                            label,
+                            origin,
+                            callback
+                        )
+                        ok = true
+                    }
+                } else {
+                    val got = try {
+                        resolveFrame(w, label, sent, subSent, subtitleCallback, callback, info)
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        false
+                    }
+                    if (got) ok = true
+                }
+            }
+        }
+
+        // 4) hâlâ yoksa: sayfa özetini logla ve (debug açıksa) nedenini kaynak listesinde göster
+        if (!ok) {
+            val scripts = Regex("(?is)<script[^>]*>(.*?)</script>").findAll(pg.second).map { it.groupValues[1].trim() }
+                .filter { it.length > 20 }.joinToString(" ¶ ")
+            d("BULUNAMADI sayfa=${pg.first} len=${pg.second.length}. sayfa ozet:")
+            dLong("pg", (if (scripts.isNotBlank()) scripts else pg.second).replace(Regex("\\s+"), " ").take(6000))
+            if (debug) {
+                debugLink(callback, info.toString())
+                return true
+            }
         }
         return ok
     }
