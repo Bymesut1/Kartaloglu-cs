@@ -32,7 +32,7 @@ class Dizilla : MainAPI() {
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
 
     // true: bağlantı bulunamazsa kaynak listesine, altyazı bulunamazsa altyazı listesine "DEBUG ..." satırı ekler
-    private val debug = false
+    private val debug = true
 
     // TMDB (Türkçe bölüm adı, açıklama, bölüm/sezon resmi, süre, tarih). Boş/placeholder ise kapalı.
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
@@ -663,6 +663,8 @@ class Dizilla : MainAPI() {
 
     private var webCount = 0
     private var curFrame = ""
+    private var videoOk = true
+    private var npDone = false
     private var curHosts: List<String> = emptyList()
     private var srcCount = 0
 
@@ -823,7 +825,7 @@ class Dizilla : MainAPI() {
         sent: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        if (!sent.add(url)) return false
+        if (!videoOk || !sent.add(url)) return false
         val name = if (title.isBlank()) label else "$label $title"
         emitLink(url, ExtractorLinkType.M3U8, name, origin, callback)
         return true
@@ -1085,6 +1087,7 @@ class Dizilla : MainAPI() {
         // 1b) oynatıcı listesi (m.php -> master.m3u8) + api uç noktaları (nm.php / nsub.php / track.php / source2.php)
         var got = false
         curFrame = f
+        videoOk = true
         curHosts = hostsOf(listOf(rawIfr))
         try {
             val np = npConfig(rawIfr)
@@ -1118,6 +1121,8 @@ class Dizilla : MainAPI() {
             if (e is java.util.concurrent.CancellationException) throw e
             d("np hata ${e.javaClass.simpleName} ${e.message}")
         }
+        videoOk = false
+        if (got) npDone = true
         try {
             if (emitPlaylist(texts, origin, label, sent, callback)) got = true
         } catch (e: Exception) {
@@ -1174,7 +1179,7 @@ class Dizilla : MainAPI() {
         // 2) açık / gizlenmiş video adresleri
         val cands = mediaCandidates(texts)
         d("$label aday=${cands.size} ${cands.take(4).joinToString(" | ") { it.take(90) }}")
-        if (emitCandidates(cands, origin, label, sent, callback)) got = true
+        if (!got && emitCandidates(cands, origin, label, sent, callback)) got = true
 
         // 3) sayfadaki api / player uç noktalarını dene
         if (!got && rawIfr.isNotBlank() && !cfErr) {
@@ -1249,12 +1254,8 @@ class Dizilla : MainAPI() {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
             for (l in seen) {
-                if (l.url.contains("/m.php")) {
-                    if (emitMedia(l.url, "", label, origin, sent, callback)) got = true
-                } else {
-                    callback(l)
-                    got = true
-                }
+                callback(l)
+                got = true
             }
             d("$label hazir cikarici link=${seen.size}")
         }
@@ -1387,7 +1388,7 @@ class Dizilla : MainAPI() {
             }
             if (got) {
                 ok = true
-                break
+                if (npDone) break
             }
         }
 
@@ -1407,6 +1408,7 @@ class Dizilla : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webCount = 0
+        npDone = false
         subWebTried = false
         srcCount = 0
         subCount.clear()
@@ -1434,7 +1436,7 @@ class Dizilla : MainAPI() {
             }
             if (got) {
                 ok = true
-                break
+                if (npDone) break
             }
         }
 
