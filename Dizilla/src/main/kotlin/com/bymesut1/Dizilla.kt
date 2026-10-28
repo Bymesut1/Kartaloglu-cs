@@ -8,11 +8,15 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class Dizilla : MainAPI() {
     override var mainUrl = "https://dizilla.now"
@@ -380,15 +384,106 @@ class Dizilla : MainAPI() {
 
     private fun fixProto(u: String): String = if (u.startsWith("//")) "https:$u" else u
 
-    private fun subLang(u: String): String {
-        val m = Regex("""/([a-z]{2,3})\.(?:vtt|srt)""", RegexOption.IGNORE_CASE).find(u)?.groupValues?.get(1)?.lowercase()
-        return when (m) {
-            "tr", "tur" -> "Türkçe"
-            "en", "eng" -> "İngilizce"
-            null -> "Altyazı"
-            else -> m.uppercase()
+    // ---------------- Altyazı ----------------
+
+    // Dil adı: önce dosya adından (.tr. / .en. / tr.vtt ...), yoksa etiketten
+    private fun subLang(u: String, label: String = ""): String {
+        val name = u.substringBefore("?").substringAfterLast("/").lowercase()
+        val m = Regex("""(?:^|[._\-])(tr|tur|turkish|turkce|türkçe|en|eng|english)(?:[._\-]|$)""")
+            .find(name)?.groupValues?.get(1)
+        when (m) {
+            "tr", "tur", "turkish", "turkce", "türkçe" -> return "Türkçe"
+            "en", "eng", "english" -> return "İngilizce"
         }
+        val l = label.lowercase()
+        if (l.contains("türk") || l.contains("turk") || l == "tr" || l == "tur") return "Türkçe"
+        if (l.contains("ingiliz") || l.contains("engl") || l == "en" || l == "eng") return "İngilizce"
+        if (label.isNotBlank()) return label
+        return "Altyazı"
     }
+
+    // Metinlerdeki altyazı adresleri (+ yakındaki label / lang alanı)
+    private fun findSubs(texts: List<String>): LinkedHashMap<String, String> {
+        val out = LinkedHashMap<String, String>()
+        val labelRe = Regex("(?:label|lang|language|srclang)[\"']?\\s*[:=]\\s*[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
+        for (t in texts) {
+            for (m in subRe.findAll(t)) {
+                val u = m.value
+                if (Regex("thumb|sprite|chapter", RegexOption.IGNORE_CASE).containsMatchIn(u)) continue
+                if (out.containsKey(u)) continue
+                val ctx = t.substring(maxOf(0, m.range.first - 200), minOf(t.length, m.range.last + 200))
+                out[u] = labelRe.find(ctx)?.groupValues?.get(1) ?: ""
+            }
+        }
+        return out
+    }
+
+    // WEBVTT ise aynen, SRT ise VTT'ye çevirip döndürür; altyazı değilse null
+    private fun toVtt(t0: String): String? {
+        val t = t0.trimStart('\uFEFF', ' ', '\n', '\r', '\t')
+        if (t.startsWith("WEBVTT")) return t
+        if (Regex("""^\d+\s*\r?\n\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->""").containsMatchIn(t)) {
+            return "WEBVTT\n\n" + t.replace(Regex("""(\d{2}:\d{2}:\d{2}),(\d{3})"""), "$1.$2")
+        }
+        return null
+    }
+
+    // Altyazıyı farklı istek biçimleriyle çekmeyi dener (CDN tarayıcı tarzı isteği engelleyebiliyor)
+    private suspend fun fetchSub(u: String, frameUrl: String): ByteArray? {
+        val fo = originOf(frameUrl)
+        val sets = listOf(
+            mapOf("User-Agent" to ua, "Referer" to frameUrl, "Origin" to fo, "Accept" to "*/*"),
+            mapOf("User-Agent" to ua, "Referer" to "$fo/", "Origin" to fo, "Accept" to "*/*"),
+            mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Accept" to "*/*"),
+            mapOf("User-Agent" to "Mozilla/5.0", "Accept" to "*/*"),
+            mapOf("Accept" to "*/*")
+        )
+        for ((i, h) in sets.withIndex()) {
+            try {
+                val r = app.get(u, headers = h)
+                val v = if (r.code == 200) toVtt(r.text) else null
+                d("altyazi deneme ${i + 1} kod=${r.code} vtt=${v != null}")
+                if (v != null) return v.toByteArray(Charsets.UTF_8)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("altyazi deneme ${i + 1} hata ${e.javaClass.simpleName}")
+            }
+        }
+        // son çare: Cloudflare atlatıcı
+        try {
+            val r = app.get(u, headers = sets[0], interceptor = cf)
+            val v = if (r.code == 200) toVtt(r.text) else null
+            d("altyazi cf kod=${r.code} vtt=${v != null}")
+            if (v != null) return v.toByteArray(Charsets.UTF_8)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
+        return null
+    }
+
+    private val subCount = HashMap<String, Int>()
+
+    // Altyazıyı çeker, yerel sunucudan oynatıcıya verir (olmazsa özgün adresi ekler). Çekilebildiyse true.
+    private suspend fun emitSub(
+        u: String,
+        label: String,
+        frameUrl: String,
+        subSent: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        if (!subSent.add(u)) return false
+        val lang = subLang(u, label)
+        val n = subCount[lang] ?: 0
+        subCount[lang] = n + 1
+        val shown = if (n == 0) lang else "$lang ${n + 1}"
+        val bytes = fetchSub(u, frameUrl)
+        val local = if (bytes != null) SubProxy.put(bytes) else null
+        d("altyazi $shown ${if (local != null) "yerel sunucu" else "dogrudan (cekilemedi)"} ${u.takeLast(70)}")
+        subtitleCallback(SubtitleFile(shown, local ?: u))
+        return local != null
+    }
+
+    // ---------------- Video adresleri ----------------
 
     // HTML + packer çözümü + base64/hex/% çözümü: gizlenmiş adresleri de yakalar
     private fun allTexts(html: String): List<String> {
@@ -540,11 +635,11 @@ class Dizilla : MainAPI() {
             ifr.contains("Attention Required", true)
         d("$label iframe len=${rawIfr.length} cfHata=$cfErr")
 
-        // Altyazılar
-        val subs = LinkedHashSet<String>()
-        for (t in texts) subRe.findAll(t).forEach { subs.add(it.value) }
-        for (m in subs) {
-            if (subSent.add(m)) subtitleCallback(SubtitleFile(subLang(m), m))
+        // Altyazılar: çek, yerel sunucudan ver
+        val subMap = findSubs(texts)
+        var subOk = 0
+        for ((su, sl) in subMap) {
+            if (emitSub(su, sl, f, subSent, subtitleCallback)) subOk++
         }
 
         // 2) açık / gizlenmiş video adresleri
@@ -575,8 +670,8 @@ class Dizilla : MainAPI() {
                 if (r.isBlank()) continue
                 val rt = allTexts(r)
                 val c2 = mediaCandidates(rt)
-                for (m in rt) subRe.findAll(m).forEach { mm ->
-                    if (subSent.add(mm.value)) subtitleCallback(SubtitleFile(subLang(mm.value), mm.value))
+                for ((su, sl) in findSubs(rt)) {
+                    if (emitSub(su, sl, f, subSent, subtitleCallback)) subOk++
                 }
                 if (emitCandidates(c2, origin, label, sent, callback)) {
                     got = true
@@ -586,8 +681,8 @@ class Dizilla : MainAPI() {
         }
 
         // 4) altyazı CDN klasöründen ana liste tahmini: .../f/<id>/<hash>/ + master.m3u8 ...
-        if (!got && subs.isNotEmpty()) {
-            val first = subs.first()
+        if (!got && subMap.isNotEmpty()) {
+            val first = subMap.keys.first()
             val folder = Regex("""^(https?://[^/]+/f/[^/]+/[^/]+/)""").find(first)?.groupValues?.get(1)
             val query = first.substringAfter("?", "")
             if (folder != null) {
@@ -667,7 +762,7 @@ class Dizilla : MainAPI() {
             d("$label BULUNAMADI. iframe ozet:")
             dLong("ifr", (if (scripts.isNotBlank()) scripts else ifr).replace(Regex("\\s+"), " ").take(6000))
         }
-        info.append("[${origin.removePrefix("https://").removePrefix("http://").take(22)} len=${rawIfr.length} cf=$cfErr aday=${cands.size} altyazi=${subs.size} ok=$got] ")
+        info.append("[${origin.removePrefix("https://").removePrefix("http://").take(22)} len=${rawIfr.length} cf=$cfErr aday=${cands.size} altyazi=${subMap.size}/$subOk ok=$got] ")
         return got
     }
 
@@ -687,6 +782,7 @@ class Dizilla : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webTried = false
+        subCount.clear()
         val info = StringBuilder()
         val sent = HashSet<String>()
         val subSent = HashSet<String>()
@@ -701,6 +797,13 @@ class Dizilla : MainAPI() {
         val frames = playerCandidates(pageTexts, trailers)
         d("oynatıcı adayı=${frames.size} ${frames.take(5).joinToString(" | ") { it.take(80) }}")
         info.append("oynatici=${frames.size} ")
+
+        // bölüm sayfasının kendisinde altyazı adresi varsa onu da ekle
+        try {
+            for ((su, sl) in findSubs(pageTexts)) emitSub(su, sl, data, subSent, subtitleCallback)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
 
         // 2) her oynatıcı adresini çöz
         for ((i, f) in frames.withIndex()) {
@@ -842,5 +945,91 @@ class Dizilla : MainAPI() {
             }
         }
         return out
+    }
+}
+
+// ----------------------------------------------------------------------
+// Yerel altyazı sunucusu: 127.0.0.1 üzerinde, bizim çektiğimiz altyazıyı oynatıcıya verir
+// (CDN, oynatıcının kendi isteğini engelleyebildiği için)
+// ----------------------------------------------------------------------
+private object SubProxy {
+    private val store = ConcurrentHashMap<String, ByteArray>()
+
+    @Volatile
+    private var server: ServerSocket? = null
+
+    @Volatile
+    private var port = 0
+
+    @Synchronized
+    fun ensure(): Boolean {
+        val cur = server
+        if (cur != null && !cur.isClosed) return true
+        return try {
+            val s = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+            server = s
+            port = s.localPort
+            val t = Thread {
+                while (!s.isClosed) {
+                    try {
+                        val c = s.accept()
+                        val w = Thread { serve(c) }
+                        w.isDaemon = true
+                        w.start()
+                    } catch (e: Exception) {
+                        if (s.isClosed) break
+                    }
+                }
+            }
+            t.isDaemon = true
+            t.name = "dizilla-sub-proxy"
+            t.start()
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Altyazı içeriğini saklar ve oynatıcıya verilecek yerel adresi döndürür
+    fun put(bytes: ByteArray): String? {
+        if (!ensure()) return null
+        if (store.size > 80) store.clear()
+        val id = java.lang.Long.toString(System.nanoTime(), 36)
+        store[id] = bytes
+        return "http://127.0.0.1:$port/s/$id.vtt"
+    }
+
+    private fun serve(sock: Socket) {
+        try {
+            sock.soTimeout = 15_000
+            val inp = sock.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+            val reqLine = inp.readLine() ?: return
+            while (true) {
+                val l = inp.readLine() ?: break
+                if (l.isEmpty()) break
+            }
+            val parts = reqLine.split(" ")
+            val method = parts.getOrNull(0) ?: "GET"
+            val path = parts.getOrNull(1) ?: "/"
+            val id = path.removePrefix("/s/").substringBefore("?").removeSuffix(".vtt")
+            val os = sock.getOutputStream()
+            val body = store[id]
+            if (body == null) {
+                os.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                os.flush()
+                return
+            }
+            val head = "HTTP/1.1 200 OK\r\nContent-Type: text/vtt; charset=utf-8\r\nContent-Length: ${body.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            os.write(head.toByteArray())
+            if (method != "HEAD") os.write(body)
+            os.flush()
+        } catch (ex: Exception) {
+        } finally {
+            try {
+                sock.close()
+            } catch (ex: Exception) {
+            }
+        }
     }
 }
