@@ -6,7 +6,9 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.jsoup.nodes.Document
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -67,8 +69,7 @@ class Dizilla : MainAPI() {
 
     private fun isCf(code: Int, t: String): Boolean =
         code == 403 || code == 503 ||
-            (t.length < 30_000 && (t.contains("Just a moment", true) || t.contains("cf-chl", true) ||
-                t.contains("challenge-platform", true)))
+            (t.length < 30_000 && (t.contains("Just a moment", true) || t.contains("cf-chl", true)))
 
     // Kod + metin döndürür; Cloudflare engeli varsa CloudflareKiller ile yeniden dener
     private suspend fun fetchFull(url: String, referer: String? = null): Pair<Int, String> {
@@ -654,7 +655,7 @@ class Dizilla : MainAPI() {
         return ok
     }
 
-    private var webTried = false
+    private var webCount = 0
     private var srcCount = 0
 
     private var subWebTried = false
@@ -748,7 +749,7 @@ class Dizilla : MainAPI() {
         return n
     }
 
-    // Video listesi (m.php -> m3u8) içinde altyazı satırı / .vtt adresi var mı?
+    // Video listesi (m.php / master.m3u8) içinde altyazı satırı / .vtt adresi var mı? (+ tanı logu)
     private suspend fun hlsSubs(
         l: ExtractorLink,
         frameUrl: String,
@@ -762,9 +763,10 @@ class Dizilla : MainAPI() {
             if (!h.containsKey("Referer")) h["Referer"] = l.referer.ifBlank { frameUrl }
             if (!h.containsKey("User-Agent")) h["User-Agent"] = ua
             val body = app.get(l.url, headers = h).text
-            d("liste govde len=${body.length} ilk=" + body.take(200).replace(Regex("\\s+"), " "))
+            d("liste govde len=${body.length} url=${l.url.take(60)}")
+            dLong("liste", body.replace(Regex("\\s+"), " ").take(2100))
             val base = l.url.substringBefore("?").substringBeforeLast("/") + "/"
-            for (m in Regex("""(?im)^#EXT-X-MEDIA:[^\r\n]*TYPE=SUBTITLES[^\r\n]*""").findAll(body)) {
+            for (m in Regex("""(?im)^#EXT-X-MEDIA:[^\r\n]*TYPE=(?:SUBTITLES|CLOSED-CAPTIONS)[^\r\n]*""").findAll(body)) {
                 val line = m.value
                 val uri = Regex("""URI="([^"]+)"""").find(line)?.groupValues?.get(1) ?: continue
                 val lb = Regex("""(?:LANGUAGE|NAME)="([^"]+)"""").find(line)?.groupValues?.get(1) ?: ""
@@ -775,11 +777,221 @@ class Dizilla : MainAPI() {
             for (m in subRe.findAll(body)) {
                 if (emitSub(m.value, "", frameUrl, subSent, subtitleCallback)) n++
             }
+            // ilk varyant listesi: segment adreslerini / altyazı satırlarını görmek için
+            val v = body.lines().firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim()
+            if (v != null) {
+                val vu = if (v.startsWith("http")) v else base + v
+                val vb = app.get(vu, headers = h).text
+                d("varyant len=${vb.length} url=${vu.take(60)}")
+                dLong("varyant", vb.replace(Regex("\\s+"), " ").take(1400))
+                for (m in subRe.findAll(vb)) {
+                    if (emitSub(m.value, "", frameUrl, subSent, subtitleCallback)) n++
+                }
+            }
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             d("liste hata ${e.javaClass.simpleName}")
         }
         return n
+    }
+
+    // ---------------- Oynatıcı listesi (m.php) ve api uç noktaları (nm.php / nsub.php / track.php / source2.php ...) ----------------
+
+    private val mphpRe = Regex("""https?://[^"'\s\\<>]+/m\.php\?v=[^"'\s\\<>]+""")
+    private val titleRe = Regex("""["']title["']\s*:\s*["']([^"']{1,40})["']""")
+    private val imgRe = Regex("""(?i)\.(?:png|jpe?g|gif|svg|webp|ico|css|js|woff2?|ttf)(?:\?|$)""")
+    private val phpAbsRe = Regex("""(?:https?:)?//[A-Za-z0-9.-]+/(?:[A-Za-z0-9_\-/]*/)?[A-Za-z0-9_\-]+\.php\?[A-Za-z0-9_%=&.+/\-]+""")
+    private val phpRelRe = Regex("""["'`]((?:\./|/)?(?:[A-Za-z0-9_\-/]*/)?[A-Za-z0-9_\-]+\.php\?[A-Za-z0-9_%=&.+/\-]*)["'`]""")
+    private val apiSkipRe = Regex("""(?i)/(?:iframe|m|l)\.php|/master\.m3u8""")
+
+    // Oynatıcının kendisi gibi: m.php -> master.m3u8. İkisi de verilir (biri çalışmazsa diğeri).
+    private suspend fun emitMedia(
+        u: String,
+        title: String,
+        label: String,
+        origin: String,
+        sent: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val name = if (title.isBlank()) label else "$label $title"
+        val type = if (u.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+        val alt = if (u.contains("/m.php")) u.replace("/m.php", "/master.m3u8") else null
+        var ok = false
+        if (alt != null && sent.add(alt)) {
+            emitLink(alt, type, name, origin, callback)
+            ok = true
+        }
+        if (sent.add(u)) {
+            emitLink(u, type, if (alt != null) "$name (m.php)" else name, origin, callback)
+            ok = true
+        }
+        return ok
+    }
+
+    // Sayfadaki / çözülmüş metinlerdeki tüm m.php?v=... adresleri (başlığıyla: Dublaj / Altyazılı ...)
+    private suspend fun emitPlaylist(
+        texts: List<String>,
+        origin: String,
+        label: String,
+        sent: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var ok = false
+        for (t in texts) {
+            for (m in mphpRe.findAll(t)) {
+                val after = t.substring(m.range.last + 1, minOf(t.length, m.range.last + 1 + 200)).substringBefore("m.php")
+                val before = t.substring(maxOf(0, m.range.first - 200), m.range.first).substringAfterLast("m.php")
+                val title = titleRe.find(after)?.groupValues?.get(1)
+                    ?: titleRe.findAll(before).lastOrNull()?.groupValues?.get(1) ?: ""
+                if (emitMedia(m.value, title, label, origin, sent, callback)) ok = true
+            }
+        }
+        return ok
+    }
+
+    private fun apiEndpoints(f: String, origin: String, texts: List<String>): List<String> {
+        val vid = Regex("""[?&]v=([A-Za-z0-9_%.=-]+)""").find(f)?.groupValues?.get(1) ?: ""
+        val out = LinkedHashSet<String>()
+        val js = styleRe.replace(texts.joinToString("\n"), " ")
+        for (m in phpAbsRe.findAll(js)) out.add(fixProto(m.value))
+        for (m in phpRelRe.findAll(js)) {
+            val r = m.groupValues[1]
+            out.add(if (r.startsWith("/")) origin + r else "$origin/${r.removePrefix("./")}")
+        }
+        if (vid.isNotBlank()) {
+            for (g in listOf("track.php", "nsub.php", "source2.php")) out.add("$origin/$g?v=$vid")
+        }
+        return out.map { if (it.endsWith("=") && vid.isNotBlank()) it + vid else it }
+            .filter { !apiSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) && it.length < 700 }
+            .distinct().take(10)
+    }
+
+    private suspend fun getAny(u: String, h: Map<String, String>): String {
+        try {
+            val r = app.get(u, headers = h)
+            if (r.code == 200 && !isCf(r.code, r.text)) return r.text
+            if (r.code != 403 && r.code != 503) return ""
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
+        return try {
+            val r = app.get(u, headers = h, interceptor = cf)
+            if (r.code == 200) r.text else ""
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ""
+        }
+    }
+
+    // JSON içindeki (yol, adres, etiket) üçlülerini toplar
+    private fun walkJson(x: Any?, path: String, out: MutableList<Triple<String, String, String>>, depth: Int = 0) {
+        if (depth > 8) return
+        when (x) {
+            is JSONObject -> {
+                var url: String? = null
+                for (k in listOf("file", "url", "src", "link", "path", "vtt", "srt", "source")) {
+                    val v = x.opt(k)
+                    if (v is String && v.isNotBlank()) {
+                        url = v
+                        break
+                    }
+                }
+                if (url != null) {
+                    var lb = ""
+                    for (k in listOf("label", "lang", "language", "srclang", "name", "title", "kind")) {
+                        val v = x.opt(k)
+                        if (v is String && v.isNotBlank()) {
+                            lb = v
+                            break
+                        }
+                    }
+                    out.add(Triple(path, url, lb))
+                }
+                val ks = x.keys()
+                while (ks.hasNext()) {
+                    val k = ks.next()
+                    walkJson(x.opt(k), "$path/$k", out, depth + 1)
+                }
+            }
+            is JSONArray -> for (i in 0 until x.length()) walkJson(x.opt(i), path, out, depth + 1)
+            is String -> if (x.startsWith("http") || x.startsWith("//")) out.add(Triple(path, x, ""))
+        }
+    }
+
+    // Sayfadaki nm.php / nsub.php / track.php / source2.php ... uç noktalarını çağırır; içinden video + altyazı çıkarır.
+    // Dönüş: (video bulundu mu, altyazı sayısı)
+    private suspend fun harvestApi(
+        f: String,
+        origin: String,
+        texts: List<String>,
+        label: String,
+        sent: MutableSet<String>,
+        subSent: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Pair<Boolean, Int> {
+        val eps = apiEndpoints(f, origin, texts)
+        if (eps.isEmpty()) return false to 0
+        d("api uc noktalari=${eps.size} " + eps.joinToString(" | ") { it.takeLast(70) })
+        val hdr = mapOf(
+            "User-Agent" to ua, "Referer" to f, "Origin" to origin,
+            "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*"
+        )
+        val bodies = eps.amap { u -> u to getAny(u, hdr) }
+        var gotVideo = false
+        var subs = 0
+        val subWord = Regex("(?i)sub|track|caption|altyaz")
+        for ((u, b) in bodies) {
+            if (b.isBlank()) continue
+            val tag = u.substringBefore("?").substringAfterLast("/").lowercase()
+            d("api $tag len=${b.length}: " + b.take(260).replace(Regex("\\s+"), " "))
+            val subEp = subWord.containsMatchIn(tag)
+            val direct = toVtt(b)
+            if (direct != null) {
+                if (subSent.add(u)) {
+                    val local = SubProxy.put(direct.toByteArray(Charsets.UTF_8))
+                    subtitleCallback(SubtitleFile(subLang(u, ""), local ?: u))
+                    subs++
+                }
+                continue
+            }
+            if (b.trimStart().startsWith("#EXTM3U")) {
+                if (sent.add(u)) {
+                    emitLink(u, ExtractorLinkType.M3U8, label, origin, callback)
+                    gotVideo = true
+                }
+                continue
+            }
+            val found = ArrayList<Triple<String, String, String>>()
+            val root: Any? = try {
+                JSONTokener(b.trim()).nextValue()
+            } catch (e: Exception) {
+                null
+            }
+            if (root is JSONObject || root is JSONArray) {
+                walkJson(root, tag, found)
+            } else {
+                val t = unescape(b)
+                for (m in m3u8Re.findAll(t)) found.add(Triple(tag, m.value, ""))
+                for (m in mphpRe.findAll(t)) found.add(Triple(tag, m.value, ""))
+                for ((su, sl) in findSubs(listOf(t), origin)) found.add(Triple("sub", su, sl))
+            }
+            val seenU = HashSet<String>()
+            for ((path, raw, lb) in found) {
+                var u0 = fixProto(raw.trim())
+                if (u0.startsWith("/")) u0 = origin + u0
+                if (!u0.startsWith("http") || !seenU.add(u0)) continue
+                if (imgRe.containsMatchIn(u0) || badHostRe.containsMatchIn(u0) || u0.contains("tmdb", true)) continue
+                val isSub = subRe.containsMatchIn(u0) || subEp || subWord.containsMatchIn(path)
+                if (isSub) {
+                    if (emitSub(u0, lb, f, subSent, subtitleCallback)) subs++
+                } else if (u0.contains(".m3u8", true) || u0.contains(".mp4", true) || u0.contains("/m.php") || u0.contains("master")) {
+                    if (emitMedia(u0, lb, label, origin, sent, callback)) gotVideo = true
+                }
+            }
+        }
+        d("api sonuc video=$gotVideo altyazi=$subs")
+        return gotVideo to subs
     }
 
     // Tek bir oynatıcı (iframe) adresinden video + altyazı çıkarır
@@ -789,10 +1001,15 @@ class Dizilla : MainAPI() {
         sent: MutableSet<String>,
         subSent: MutableSet<String>,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
+        callback0: (ExtractorLink) -> Unit,
         info: StringBuilder
     ): Boolean {
         val origin = originOf(f)
+        val seenLinks = ArrayList<ExtractorLink>()
+        val callback: (ExtractorLink) -> Unit = { l ->
+            seenLinks.add(l)
+            callback0(l)
+        }
 
         // 1) iframe sayfasını al (referer = dizi sitesi)
         val rawIfr = fetch(f, "$mainUrl/")
@@ -808,7 +1025,24 @@ class Dizilla : MainAPI() {
         for ((su, sl) in subMap) {
             if (emitSub(su, sl, f, subSent, subtitleCallback)) subOk++
         }
-        if (subMap.isEmpty()) {
+
+        // 1b) oynatıcı listesi (m.php -> master.m3u8) + api uç noktaları (nm.php / nsub.php / track.php / source2.php)
+        var got = false
+        try {
+            if (emitPlaylist(texts, origin, label, sent, callback)) got = true
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
+        try {
+            val r = harvestApi(f, origin, texts, label, sent, subSent, subtitleCallback, callback)
+            if (r.first) got = true
+            subOk += r.second
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            d("api hata ${e.javaClass.simpleName}")
+        }
+
+        if (subMap.isEmpty() && subSent.isEmpty()) {
             try {
                 subOk += extraSubs(f, origin, texts, subSent, subtitleCallback)
             } catch (e: Exception) {
@@ -819,9 +1053,16 @@ class Dizilla : MainAPI() {
         if (subSent.isEmpty() && f.contains("://pichive.online/")) {
             val alt = f.replace("://pichive.online/", "://four.pichive.online/")
             try {
-                val am = findSubs(allTexts(fetch(alt, "$mainUrl/")), originOf(alt))
+                val altRaw = fetch(alt, "$mainUrl/")
+                val altTexts = allTexts(altRaw)
+                val am = findSubs(altTexts, originOf(alt))
                 d("four deneme altyazi=${am.size} $alt")
                 for ((su, sl) in am) if (emitSub(su, sl, alt, subSent, subtitleCallback)) subOk++
+                if (subSent.isEmpty()) {
+                    val r = harvestApi(alt, originOf(alt), altTexts, label, sent, subSent, subtitleCallback, callback)
+                    if (r.first) got = true
+                    subOk += r.second
+                }
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 d("four deneme hata ${e.javaClass.simpleName}")
@@ -833,7 +1074,7 @@ class Dizilla : MainAPI() {
             val one = Regex("\\s+")
             val php = Regex("""[A-Za-z0-9_\-/]*\.php[A-Za-z0-9_\-?=&%./]{0,40}""").findAll(js).map { it.value }.distinct().take(25).toList()
             d("PHP uc noktalari: " + php.joinToString(" | "))
-            for (key in listOf("var subs", "subs=", "subs =", "subs.push", "var ttList", "ttList=", "ttList =", "var srcList", "srcList =", "var related", "var optns")) {
+            for (key in listOf("Response =", "Response=", "subs.push", "tracks", "var optns")) {
                 val i = js.indexOf(key)
                 if (i >= 0) d("TANIM[$key] " + js.substring(maxOf(0, i - 60), minOf(js.length, i + 900)).replace(one, " "))
             }
@@ -843,7 +1084,7 @@ class Dizilla : MainAPI() {
         // 2) açık / gizlenmiş video adresleri
         val cands = mediaCandidates(texts)
         d("$label aday=${cands.size} ${cands.take(4).joinToString(" | ") { it.take(90) }}")
-        var got = emitCandidates(cands, origin, label, sent, callback)
+        if (emitCandidates(cands, origin, label, sent, callback)) got = true
 
         // 3) sayfadaki api / player uç noktalarını dene
         if (!got && rawIfr.isNotBlank() && !cfErr) {
@@ -871,10 +1112,9 @@ class Dizilla : MainAPI() {
                 for ((su, sl) in findSubs(rt, origin)) {
                     if (emitSub(su, sl, f, subSent, subtitleCallback)) subOk++
                 }
-                if (emitCandidates(c2, origin, label, sent, callback)) {
-                    got = true
-                    break
-                }
+                if (emitPlaylist(rt, origin, label, sent, callback)) got = true
+                if (emitCandidates(c2, origin, label, sent, callback)) got = true
+                if (got) break
             }
         }
 
@@ -910,33 +1150,39 @@ class Dizilla : MainAPI() {
             }
         }
 
-        // 4b) CloudStream'in hazır çıkarıcıları (bilinen oynatıcı siteleri için)
+        // 4b) CloudStream'in hazır çıkarıcıları: m.php gelirse oynatıcının yaptığı gibi master.m3u8'e çevrilir
         if (!got) {
             val seen = ArrayList<ExtractorLink>()
             try {
-                if (loadExtractor(f, "$mainUrl/", subtitleCallback) { l -> seen.add(l); callback(l) }) got = true
+                loadExtractor(f, "$mainUrl/", subtitleCallback) { l -> seen.add(l) }
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
-            if (subSent.isEmpty()) {
-                for (l in seen.take(2)) subOk += hlsSubs(l, f, subSent, subtitleCallback)
+            for (l in seen) {
+                if (l.url.contains("/m.php")) {
+                    if (emitMedia(l.url, "", label, origin, sent, callback)) got = true
+                } else {
+                    callback(l)
+                    got = true
+                }
             }
+            d("$label hazir cikarici link=${seen.size}")
         }
 
-        // 4c) hâlâ altyazı yoksa: gerçek WebView'da oynatıcıyı çalıştır, istediği .vtt/.srt adresini yakala
-        if (subSent.isEmpty() && !subWebTried) {
+        // 4c) hâlâ altyazı yoksa: gerçek WebView'da oynatıcıyı çalıştır, istediği altyazı adresini yakala
+        if (subSent.isEmpty() && !subWebTried && !cfErr) {
             subWebTried = true
             val sw = try {
                 val r = app.get(
                     f,
                     referer = "$mainUrl/",
                     interceptor = WebViewResolver(
-                        Regex("""(?i)\.(?:vtt|srt)(?:\?|$)|/(?:subs?|subtitles?|captions?|tracks?|altyazi)[^/?]*(?:\.php)?\?"""),
+                        Regex("""(?i)\.(?:vtt|srt)(?:\?|$)|/(?:n?subs?|subtitles?|captions?|tracks?|altyazi)[^/?]*(?:\.php)?\?"""),
                         userAgent = ua,
                         useOkhttp = false,
-                        timeout = 15_000L
+                        timeout = 10_000L
                     ),
-                    timeout = 25L
+                    timeout = 20L
                 )
                 r.url.takeIf { it != f }
             } catch (e: Exception) {
@@ -945,41 +1191,46 @@ class Dizilla : MainAPI() {
                 null
             }
             d("$label altyazi webview=${sw?.take(120)}")
-            if (sw != null && emitSub(sw, "", f, subSent, subtitleCallback)) subOk++
+            if (sw != null) {
+                val body = getAny(sw, mapOf("User-Agent" to ua, "Referer" to f, "Origin" to origin, "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*"))
+                val vtt = toVtt(body)
+                if (vtt != null) {
+                    if (subSent.add(sw)) {
+                        subtitleCallback(SubtitleFile(subLang(sw, ""), SubProxy.put(vtt.toByteArray(Charsets.UTF_8)) ?: sw))
+                        subOk++
+                    }
+                } else if (emitSub(sw, "", f, subSent, subtitleCallback)) subOk++
+            }
         }
 
-        // 5) son çare: WebView ile ağdan video adresi yakala (bölüm başına bir kez)
-        if (!got && !webTried) {
-            webTried = true
+        // 5) son çare: WebView ile ağdan video adresi yakala (en fazla 2 kez)
+        if (!got && sent.isEmpty() && webCount < 2 && !cfErr) {
+            webCount++
             val w = try {
                 val r = app.get(
                     f,
                     referer = "$mainUrl/",
                     interceptor = WebViewResolver(
-                        Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master"""),
+                        Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master|/m\.php\?"""),
                         userAgent = ua,
                         useOkhttp = true,
-                        timeout = 20_000L
+                        timeout = 15_000L
                     ),
-                    timeout = 30L
+                    timeout = 25L
                 )
-                r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)""").containsMatchIn(it) }
+                r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)|/m\.php""").containsMatchIn(it) }
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 d("webview hata ${e.javaClass.simpleName}")
                 null
             }
             d("$label webview=${w?.take(90)}")
-            if (w != null && sent.add(w)) {
-                emitLink(
-                    w,
-                    if (w.contains(".mp4", true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
-                    label,
-                    origin,
-                    callback
-                )
-                got = true
-            }
+            if (w != null && emitMedia(w, "", label, origin, sent, callback)) got = true
+        }
+
+        // Altyazı hâlâ yoksa: ana listeyi (master) açıp EXT-X-MEDIA / .vtt ara (+ tanı logu)
+        if (subSent.isEmpty() && seenLinks.isNotEmpty()) {
+            subOk += hlsSubs(seenLinks.first(), f, subSent, subtitleCallback)
         }
 
         // Hâlâ bulunamadıysa: sonraki turda nedenini görebilmek için sayfa özetini logla
@@ -1062,7 +1313,7 @@ class Dizilla : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        webTried = false
+        webCount = 0
         subWebTried = false
         srcCount = 0
         subCount.clear()
