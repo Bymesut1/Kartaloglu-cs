@@ -321,56 +321,76 @@ class Selcukflix : MainAPI() {
     private var lastDebug = ""
 
     // Sitenin kendi arama sayfasını (/mobil-arama) gerçek WebView'da açar, kutuya sorguyu yazar,
-    // çıkan sonuç bağlantılarını toplayıp sahte bir adrese (selcukres.invalid) gönderir; adres yakalanır.
+    // çıkan sonuç bağlantılarını toplayıp sitenin KENDİ alan adındaki /__selcukres adresine gönderir; adres yakalanır.
+    @Volatile
+    private var webOk = false
+
     private val searchJs = """
 (function(){
   var q = %Q%;
-  var inp = document.querySelector('input[type=search]') || document.querySelector('input[type=text]') || document.querySelector('input');
-  if (!inp) { fetch('https://selcukres.invalid/r?d=' + encodeURIComponent(JSON.stringify({l:[],x:'input yok'}))).catch(function(){}); return 'noinput'; }
-  inp.focus();
-  var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  setter.call(inp, q);
-  inp.dispatchEvent(new Event('input', {bubbles:true}));
-  inp.dispatchEvent(new Event('change', {bubbles:true}));
-  inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'a'}));
-  var tries = 0;
-  var last = -1;
-  var iv = setInterval(function(){
-    tries++;
-    var as = [].slice.call(document.querySelectorAll('a[href]')).filter(function(a){
-      return /\/(dizi|film|seri-filmler)\//.test(a.getAttribute('href') || '');
-    });
-    var stable = (as.length === last);
-    last = as.length;
-    if ((as.length > 0 && stable && tries >= 4) || tries >= 16) {
-      clearInterval(iv);
-      var out = as.map(function(a){
-        var im = a.querySelector('img');
-        return {h: a.getAttribute('href'), t: (a.innerText || '').trim(), i: im ? (im.getAttribute('src') || im.getAttribute('data-src') || '') : ''};
+  function post(o){
+    try { fetch(location.origin + '/__selcukres?d=' + encodeURIComponent(JSON.stringify(o))).catch(function(){}); } catch(e) {}
+  }
+  function findInput(){
+    return document.querySelector('input[type=search]') || document.querySelector('input[type=text]') ||
+      document.querySelector('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit])');
+  }
+  var key = (q.toLowerCase().split(/\s+/)[0] || '');
+  function hits(as){
+    return as.filter(function(a){ return (a.innerText || '').toLowerCase().indexOf(key) > -1; });
+  }
+  var waited = 0;
+  var w = setInterval(function(){
+    waited++;
+    var inp = findInput();
+    if (!inp && waited < 24) return;
+    clearInterval(w);
+    if (!inp) { post({l: [], x: 'input yok'}); return; }
+    inp.focus();
+    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(inp, q);
+    inp.dispatchEvent(new Event('input', {bubbles: true}));
+    inp.dispatchEvent(new Event('change', {bubbles: true}));
+    inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
+    var tries = 0, last = -1;
+    var iv = setInterval(function(){
+      tries++;
+      var as = [].slice.call(document.querySelectorAll('a[href]')).filter(function(a){
+        return /\/(dizi|film|seri-filmler)\//.test(a.getAttribute('href') || '');
       });
-      var x = (document.body.innerText || '').slice(0, 500);
-      fetch('https://selcukres.invalid/r?d=' + encodeURIComponent(JSON.stringify({l: out, x: x}))).catch(function(){});
-    }
+      var h = hits(as);
+      var stable = (h.length === last);
+      last = h.length;
+      if ((h.length > 0 && stable && tries >= 3) || tries >= 16) {
+        clearInterval(iv);
+        var out = h.slice(0, 24).map(function(a){
+          var im = a.querySelector('img');
+          return {h: a.getAttribute('href'), t: (a.innerText || '').trim().slice(0, 120), i: im ? (im.getAttribute('src') || im.getAttribute('data-src') || '') : ''};
+        });
+        post({l: out, x: out.length ? '' : 'sonuc yok'});
+      }
+    }, 500);
   }, 500);
   return 'ok';
 })();
 """
 
     private suspend fun webSearch(query: String, dbg: StringBuilder): List<SearchResponse> {
+        webOk = false
         val js = searchJs.replace("%Q%", JSONObject.quote(query))
         val finalUrl = try {
             val r = app.get(
                 "$mainUrl/mobil-arama",
                 referer = "$mainUrl/",
                 interceptor = WebViewResolver(
-                    Regex("""selcukres\.invalid"""),
+                    Regex("""__selcukres"""),
                     userAgent = ua,
                     useOkhttp = false,
                     script = js,
                     scriptCallback = { },
-                    timeout = 20_000L
+                    timeout = 25_000L
                 ),
-                timeout = 30L
+                timeout = 35L
             )
             r.url
         } catch (e: Exception) {
@@ -378,7 +398,7 @@ class Selcukflix : MainAPI() {
             dbg.append("webview hata ${e.javaClass.simpleName} ${e.message}\n")
             ""
         }
-        if (!finalUrl.contains("selcukres.invalid")) {
+        if (!finalUrl.contains("__selcukres")) {
             dbg.append("webview yakalama yok url=${finalUrl.take(90)}\n")
             return emptyList()
         }
@@ -393,6 +413,9 @@ class Selcukflix : MainAPI() {
         } catch (e: Exception) {
             null
         }) ?: return emptyList()
+        // kutu bulunamadıysa sitenin aramasından cevap alınamadı: yedek yollar denensin
+        if (root.optString("x") == "input yok") return emptyList()
+        webOk = true
         val arr = root.optJSONArray("l") ?: return emptyList()
         val out = LinkedHashMap<String, SearchResponse>()
         for (i in 0 until arr.length()) {
@@ -433,20 +456,23 @@ class Selcukflix : MainAPI() {
             rethrow(e)
             emptyList()
         }
-        d("arama webview sonuc=${result.size}")
+        d("arama webview sonuc=${result.size} ok=$webOk")
 
-        if (result.isEmpty()) {
+        // Sitenin kendi araması çalıştıysa (sonuç boş olsa bile) yavaş yedek yollara gerek yok
+        if (result.isEmpty() && !webOk) {
             val q = URLEncoder.encode(query, "UTF-8")
             val templates = LinkedHashSet<String>()
             goodTemplate?.let { templates.add(it) }
-            templates.addAll(discoverSearch())
-            for (p in listOf("api/search?q={q}", "api/search?query={q}", "api/arama?q={q}", "api/bg/searchContent?searchTerm={q}",
+            // /api/bg/ uç noktaları "izinsiz erisim algilandi" döndürüyor: denenmez
+            templates.addAll(discoverSearch().filter { !it.contains("/api/bg/") })
+            for (p in listOf("api/search?q={q}", "api/search?query={q}", "api/arama?q={q}",
                 "mobil-arama?q={q}", "mobil-arama?query={q}", "arama?q={q}", "ara?q={q}", "search?q={q}")) {
                 templates.add("$mainUrl/$p")
             }
             for (batch in templates.toList().chunked(6)) {
                 val bodies = batch.amap { t -> t to fetchFull(t.replace("{q}", q), "$mainUrl/mobil-arama").second }
                 for ((t, b) in bodies) {
+                    if (b.contains("izinsiz erisim", true)) continue
                     val r = parseSearch(b, query)
                     dbg.append("api ${t.removePrefix(mainUrl)} len=${b.length} bas=${b.trim().take(70)} sonuc=${r.size}\n")
                     if (r.isNotEmpty()) {
@@ -458,11 +484,11 @@ class Selcukflix : MainAPI() {
                 if (result.isNotEmpty()) break
             }
         }
-        if (result.isEmpty()) {
+        if (result.isEmpty() && !webOk) {
             result = tmdbSearchFallback(query)
             dbg.append("tmdb yedek sonuc=${result.size}\n")
         }
-        if (result.isEmpty() && debug) {
+        if (result.isEmpty() && !webOk && debug) {
             lastDebug = dbg.toString()
             d("arama debug: $lastDebug")
             return listOf(
