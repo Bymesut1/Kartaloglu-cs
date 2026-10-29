@@ -1,5 +1,5 @@
 // Sürüm numarası: her güncellemede 1 artır
-version = 3
+version = 4
 
 cloudstream {
     description = "Selcukflix - yabancı dizi, film, anime ve kdrama (Türkçe altyazılı / dublajlı)"
