@@ -42,19 +42,7 @@ class Selcukflix : MainAPI() {
         "$mainUrl/" to "Ana Sayfa",
         "$mainUrl/dizi-izle" to "Diziler",
         "$mainUrl/film-izle" to "Filmler",
-        "$mainUrl/trend" to "Trend",
-        "$mainUrl/yabanci-dizi-izle" to "Yabancı Diziler",
-        "$mainUrl/turkce-dublaj-dizi-izle" to "Türkçe Dublaj Diziler",
-        "$mainUrl/turkce-altyazili-dizi-izle" to "Türkçe Altyazılı Diziler",
-        "$mainUrl/anime-izle" to "Anime",
-        "$mainUrl/kdrama-izle" to "Kdrama",
-        "$mainUrl/asya-dizileri-izle" to "Asya Dizileri",
-        "$mainUrl/yabanci-film-izle" to "Yabancı Filmler",
-        "$mainUrl/netflix-filmleri" to "Netflix Filmleri",
-        "$mainUrl/marvel-filmleri" to "Marvel Filmleri",
-        "$mainUrl/oscar-filmleri" to "Oscar Filmleri",
-        "$mainUrl/imdb-top-250-film" to "IMDb Top 250 Film",
-        "$mainUrl/imdb-top-100" to "IMDb Top 100 Dizi"
+        "$mainUrl/trend" to "Trend"
     )
 
     private fun d(m: String) {
