@@ -124,6 +124,7 @@ class Selcukflix : MainAPI() {
 
     private val diziPathRe = Regex("""^/dizi/([^/?#]+)""")
     private val filmPathRe = Regex("""^/film/([^/?#]+)""")
+    private val seriPathRe = Regex("""^/seri-filmler/([^/?#]+)""")
 
     private class Card(val url: String, val title: String, val poster: String?, val movie: Boolean, val score: Int)
 
@@ -138,6 +139,7 @@ class Selcukflix : MainAPI() {
             val path = raw.substringBefore("?").substringBefore("#").removePrefix(mainUrl)
             val dm = diziPathRe.find(path)
             val fm = filmPathRe.find(path)
+            val sm = seriPathRe.find(path)
             val key: String
             val url: String
             val slug: String
@@ -152,6 +154,11 @@ class Selcukflix : MainAPI() {
                 key = "f/$slug"
                 url = mainUrl + path.trimEnd('/')
                 movie = true
+            } else if (sm != null) {
+                slug = sm.groupValues[1]
+                key = "s/$slug"
+                url = "$mainUrl/seri-filmler/$slug"
+                movie = false
             } else continue
             val img = a.selectFirst("img")
             val src = cleanImg(img?.attr("src")) ?: cleanImg(img?.attr("data-src"))
@@ -236,7 +243,7 @@ class Selcukflix : MainAPI() {
                 val poster0 = firstStr(x, "poster", "image", "cover", "thumbnail", "img", "posterUrl", "poster_url")
                 val tmdbPoster = firstStr(x, "poster_path")
                 val link = firstStr(x, "url", "link", "path", "href", "permalink")
-                    ?: (if (poster0 != null || tmdbPoster != null) firstStr(x, "slug") else null)
+                    ?: (if (poster0 != null || tmdbPoster != null || x.length() >= 4) firstStr(x, "slug") else null)
                 val title = firstStr(x, "title", "name", "baslik", "original_title")
                 if (link != null && title != null) {
                     val typeS = (firstStr(x, "type", "kind", "contentType", "content_type", "mediaType", "media_type") ?: "").lowercase()
@@ -311,37 +318,155 @@ class Selcukflix : MainAPI() {
         }
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query, "UTF-8")
-        val templates = LinkedHashSet<String>()
-        goodTemplate?.let { templates.add(it) }
-        templates.addAll(discoverSearch())
-        for (p in listOf("api/search?q={q}", "api/search?query={q}", "api/arama?q={q}", "api/bg/searchContent?searchTerm={q}",
-            "mobil-arama?q={q}", "mobil-arama?query={q}", "arama?q={q}", "ara?q={q}", "search?q={q}")) {
-            templates.add("$mainUrl/$p")
+    private var lastDebug = ""
+
+    // Sitenin kendi arama sayfasını (/mobil-arama) gerçek WebView'da açar, kutuya sorguyu yazar,
+    // çıkan sonuç bağlantılarını toplayıp sahte bir adrese (selcukres.invalid) gönderir; adres yakalanır.
+    private val searchJs = """
+(function(){
+  var q = %Q%;
+  var inp = document.querySelector('input[type=search]') || document.querySelector('input[type=text]') || document.querySelector('input');
+  if (!inp) { fetch('https://selcukres.invalid/r?d=' + encodeURIComponent(JSON.stringify({l:[],x:'input yok'}))).catch(function(){}); return 'noinput'; }
+  inp.focus();
+  var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+  setter.call(inp, q);
+  inp.dispatchEvent(new Event('input', {bubbles:true}));
+  inp.dispatchEvent(new Event('change', {bubbles:true}));
+  inp.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'a'}));
+  var tries = 0;
+  var last = -1;
+  var iv = setInterval(function(){
+    tries++;
+    var as = [].slice.call(document.querySelectorAll('a[href]')).filter(function(a){
+      return /\/(dizi|film|seri-filmler)\//.test(a.getAttribute('href') || '');
+    });
+    var stable = (as.length === last);
+    last = as.length;
+    if ((as.length > 0 && stable && tries >= 4) || tries >= 16) {
+      clearInterval(iv);
+      var out = as.map(function(a){
+        var im = a.querySelector('img');
+        return {h: a.getAttribute('href'), t: (a.innerText || '').trim(), i: im ? (im.getAttribute('src') || im.getAttribute('data-src') || '') : ''};
+      });
+      var x = (document.body.innerText || '').slice(0, 500);
+      fetch('https://selcukres.invalid/r?d=' + encodeURIComponent(JSON.stringify({l: out, x: x}))).catch(function(){});
+    }
+  }, 500);
+  return 'ok';
+})();
+"""
+
+    private suspend fun webSearch(query: String, dbg: StringBuilder): List<SearchResponse> {
+        val js = searchJs.replace("%Q%", JSONObject.quote(query))
+        val finalUrl = try {
+            val r = app.get(
+                "$mainUrl/mobil-arama",
+                referer = "$mainUrl/",
+                interceptor = WebViewResolver(
+                    Regex("""selcukres\.invalid"""),
+                    userAgent = ua,
+                    useOkhttp = false,
+                    script = js,
+                    scriptCallback = { },
+                    timeout = 20_000L
+                ),
+                timeout = 30L
+            )
+            r.url
+        } catch (e: Exception) {
+            rethrow(e)
+            dbg.append("webview hata ${e.javaClass.simpleName} ${e.message}\n")
+            ""
         }
-        var result: List<SearchResponse> = emptyList()
-        for (batch in templates.toList().chunked(6)) {
-            val bodies = batch.amap { t -> t to fetchFull(t.replace("{q}", q), "$mainUrl/mobil-arama").second }
-            for ((t, b) in bodies) {
-                val r = parseSearch(b, query)
-                d("arama deneme ${t.removePrefix(mainUrl)} len=${b.length} sonuc=${r.size}")
-                if (r.isNotEmpty()) {
-                    result = r
-                    goodTemplate = t
-                    break
-                }
+        if (!finalUrl.contains("selcukres.invalid")) {
+            dbg.append("webview yakalama yok url=${finalUrl.take(90)}\n")
+            return emptyList()
+        }
+        val payload = try {
+            URLDecoder.decode(finalUrl.substringAfter("d="), "UTF-8")
+        } catch (e: Exception) {
+            ""
+        }
+        dbg.append("webview veri=${payload.take(700)}\n")
+        val root = (try {
+            JSONObject(payload)
+        } catch (e: Exception) {
+            null
+        }) ?: return emptyList()
+        val arr = root.optJSONArray("l") ?: return emptyList()
+        val out = LinkedHashMap<String, SearchResponse>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val path = o.optString("h").substringBefore("?").substringBefore("#").removePrefix(mainUrl)
+            val dm = diziPathRe.find(path)
+            val fm = filmPathRe.find(path)
+            val sm = seriPathRe.find(path)
+            val url: String
+            val slug: String
+            val movie: Boolean
+            if (dm != null) {
+                slug = dm.groupValues[1]
+                url = "$mainUrl/dizi/$slug"
+                movie = false
+            } else if (fm != null) {
+                slug = fm.groupValues[1]
+                url = mainUrl + path.trimEnd('/')
+                movie = true
+            } else if (sm != null) {
+                slug = sm.groupValues[1]
+                url = "$mainUrl/seri-filmler/$slug"
+                movie = false
+            } else continue
+            val lines = o.optString("t").split("\n").map { it.trim() }.filter { it.isNotBlank() }
+            var title = lines.firstOrNull() ?: ""
+            if (title.isBlank()) title = humanize(slug)
+            if (!out.containsKey(url)) out[url] = toResponse(Card(url, title, cleanImg(o.optString("i")), movie, 0))
+        }
+        return out.values.toList()
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val dbg = StringBuilder()
+        var result: List<SearchResponse> = try {
+            webSearch(query, dbg)
+        } catch (e: Exception) {
+            rethrow(e)
+            emptyList()
+        }
+        d("arama webview sonuc=${result.size}")
+
+        if (result.isEmpty()) {
+            val q = URLEncoder.encode(query, "UTF-8")
+            val templates = LinkedHashSet<String>()
+            goodTemplate?.let { templates.add(it) }
+            templates.addAll(discoverSearch())
+            for (p in listOf("api/search?q={q}", "api/search?query={q}", "api/arama?q={q}", "api/bg/searchContent?searchTerm={q}",
+                "mobil-arama?q={q}", "mobil-arama?query={q}", "arama?q={q}", "ara?q={q}", "search?q={q}")) {
+                templates.add("$mainUrl/$p")
             }
-            if (result.isNotEmpty()) break
+            for (batch in templates.toList().chunked(6)) {
+                val bodies = batch.amap { t -> t to fetchFull(t.replace("{q}", q), "$mainUrl/mobil-arama").second }
+                for ((t, b) in bodies) {
+                    val r = parseSearch(b, query)
+                    dbg.append("api ${t.removePrefix(mainUrl)} len=${b.length} bas=${b.trim().take(70)} sonuc=${r.size}\n")
+                    if (r.isNotEmpty()) {
+                        result = r
+                        goodTemplate = t
+                        break
+                    }
+                }
+                if (result.isNotEmpty()) break
+            }
         }
         if (result.isEmpty()) {
             result = tmdbSearchFallback(query)
-            d("arama tmdb yedek sonuc=${result.size}")
+            dbg.append("tmdb yedek sonuc=${result.size}\n")
         }
         if (result.isEmpty() && debug) {
-            val ep = (searchEndpoints ?: emptyList()).joinToString(" ") { it.removePrefix(mainUrl) }
+            lastDebug = dbg.toString()
+            d("arama debug: $lastDebug")
             return listOf(
-                newTvSeriesSearchResponse("DEBUG arama bulunamadi. ep=${ep.take(300)}", "$mainUrl/dizi/debug", TvType.TvSeries) {}
+                newTvSeriesSearchResponse("DEBUG arama bulunamadi (detay icin ac)", "$mainUrl/debug-arama", TvType.TvSeries) {}
             )
         }
         return result
@@ -473,12 +598,58 @@ class Selcukflix : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val u = abs(url).substringBefore("?").substringBefore("#").trimEnd('/')
-        return if (u.contains("/film/")) loadMovie(u) else loadSeries(u)
+        if (u.endsWith("/debug-arama")) {
+            return newMovieLoadResponse("DEBUG arama", u, TvType.Movie, u) {
+                this.plot = lastDebug.ifBlank { "bos" }
+            }
+        }
+        if (u.contains("/film/")) return loadMovie(u)
+        if (u.contains("/seri-filmler/")) return loadCollection(u)
+        val s = loadSeries(u)
+        // Sonuç dizi sanılmış ama bölüm yoksa aynı adlı film sayfasını dene
+        if (s is TvSeriesLoadResponse && s.episodes.isEmpty()) {
+            val slug = u.substringAfter("/dizi/").substringBefore("/")
+            val m = loadMovie("$mainUrl/film/$slug/izle")
+            if (m != null) return m
+        }
+        return s
+    }
+
+    // Seri film koleksiyonu (örn. Harry Potter Serisi): içindeki filmler bölüm olarak listelenir
+    private suspend fun loadCollection(pageUrl: String): LoadResponse? {
+        val raw = fetch(pageUrl)
+        if (raw.isBlank()) return null
+        val doc = org.jsoup.Jsoup.parse(raw, mainUrl)
+        fun meta(p: String) = doc.selectFirst("meta[property=$p]")?.attr("content")?.trim()
+        val title = cleanTitle(meta("og:title") ?: doc.selectFirst("title")?.text() ?: humanize(pageUrl.substringAfter("/seri-filmler/")))
+        val films = cardsOf(doc).filter { it.url.contains("/film/") }
+        val episodes = ArrayList<Episode>()
+        var n = 0
+        for (f in films) {
+            n++
+            val fn = f.name
+            val fp = f.posterUrl
+            val idx = n
+            episodes.add(
+                newEpisode(f.url) {
+                    this.season = 1
+                    this.episode = idx
+                    this.name = fn
+                    this.posterUrl = fp
+                }
+            )
+        }
+        d("koleksiyon $title film=${episodes.size}")
+        return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, episodes) {
+            this.posterUrl = cleanImg(meta("og:image")) ?: films.firstOrNull()?.posterUrl
+            this.plot = meta("og:description")
+        }
     }
 
     private suspend fun loadMovie(pageUrl: String): LoadResponse? {
-        val raw = fetch(pageUrl)
-        if (raw.isBlank()) return null
+        val pg = fetchFull(pageUrl)
+        val raw = pg.second
+        if (raw.isBlank() || pg.first == 404) return null
         val doc = org.jsoup.Jsoup.parse(raw, mainUrl)
         fun meta(p: String) = doc.selectFirst("meta[property=$p]")?.attr("content")?.trim()
         val title = cleanTitle(meta("og:title") ?: doc.selectFirst("title")?.text() ?: humanize(pageUrl.substringAfter("/film/").substringBefore("/")))
