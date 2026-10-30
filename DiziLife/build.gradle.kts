@@ -1,5 +1,5 @@
 // Sürüm numarası: her güncellemede 1 artır
-version = 3
+version = 4
 
 cloudstream {
     description = "DiziLife - film ve dizi (Türkçe dublaj / altyazı)"
