@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
-import com.lagradost.cloudstream3.utils.Coroutines.ioSafe
 
 class MailRu : MainAPI() {
     override var mainUrl        = "https://my.mail.ru"
@@ -309,14 +308,15 @@ class MailRu : MainAPI() {
         return null
     }
 
-    private fun prefetchMeta(url: String) {
+    private suspend fun prefetchMeta(url: String) {
         val path = pathOf(url)
         val id = cache[path]?.id.orEmpty()
         if (id.isBlank()) return
         val old = metaCache[path]
         if (old != null && System.currentTimeMillis() - old.first < metaTtlMs) return
-        ioSafe {
+        try {
             fetchMetaById(id, url)?.let { metaCache[path] = System.currentTimeMillis() to it }
+        } catch (e: Exception) {
         }
     }
 
