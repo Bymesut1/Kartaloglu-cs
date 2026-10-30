@@ -240,24 +240,11 @@ class MailRu : MainAPI() {
             accountItems().filter { norm(it.title).contains(q) }
         } else emptyList()
 
-        val results = (found + fromAccounts)
+        return (found + fromAccounts)
             .distinctBy { it.path }
             .filter(::keep)
             .sortedByDescending { isTurkish(it.title) }
             .map { it.toSearch() }
-
-        // GEÇİCİ TEŞHİS: canlı arama boş döndüyse Mail.ru'nun cevabını tek kayıt olarak göster
-        if (found.isEmpty()) {
-            val raw = try {
-                app.get("$mobileUrl/video/search?st=search&q=$enc", headers = pageHeaders()).text
-            } catch (e: Exception) {
-                "HATA: " + (e.message ?: "")
-            }
-            val head = raw.take(70).replace(Regex("\\s+"), " ")
-            val info = "TESHIS uzunluk=${raw.length} listeVar=${raw.contains("list-item")} | $head"
-            return listOf(newMovieSearchResponse(info, "$mainUrl/teshis", TvType.Movie)) + results
-        }
-        return results
     }
 
     // ---------------- Video sayfası ----------------
