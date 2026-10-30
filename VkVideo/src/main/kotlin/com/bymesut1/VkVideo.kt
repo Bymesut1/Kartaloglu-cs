@@ -1184,8 +1184,41 @@ class VkVideo : MainAPI() {
         }
         val found = LinkedHashMap<String, JSONObject>()
         collectVideos(r, found)
-        return found.values.firstOrNull()
-            ?: throw ErrorLoadingException("Video bilgisi bulunamadı: $key")
+        found.values.firstOrNull()?.let { return it }
+        // Normal videolar yukarıda döner. Buraya yalnız bilgisi gelmeyen kayıtlar (kısa klipler) düşer.
+        return fetchClipItem(key)
+    }
+
+    // Klip (kısa video) kayıtları video.getByIds'te boş dönebilir: başka metodlar denenir, olmazsa asgari kayıt üretilir
+    private suspend fun fetchClipItem(key: String): JSONObject {
+        val parts = key.split("_")
+        val oid = parts.getOrNull(0) ?: ""
+        val vid = parts.getOrNull(1) ?: ""
+        if (oid.isBlank() || vid.isBlank()) throw ErrorLoadingException("Video bilgisi bulunamadı: $key")
+        val tries = listOf(
+            "video.getByIds" to mapOf("videos" to key, "extended" to "1", "adult" to "1"),
+            "shortVideo.getByIds" to mapOf("videos" to key, "extended" to "1"),
+            "shortVideo.get" to mapOf("owner_id" to oid, "video_id" to vid, "extended" to "1")
+        )
+        for ((m, p) in tries) {
+            try {
+                val found = LinkedHashMap<String, JSONObject>()
+                collectVideos(api(m, p), found)
+                val hit = found.values.firstOrNull { baseOf(it) == "${oid}_$vid" } ?: found.values.firstOrNull()
+                if (hit != null) return hit
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        // Asgari kayıt: oynatma adımları (getForPlay, embed, WebView) bununla yine denenir
+        return JSONObject()
+            .put("owner_id", oid.toLongOrNull() ?: 0L)
+            .put("id", vid.toLongOrNull() ?: 0L)
+            .put("title", "Klip")
+            .put("duration", 0)
+            .put("type", "short_video")
+            .put("synthetic", true)
+            .also { o -> parts.getOrNull(2)?.let { o.put("access_key", it) } }
     }
 
     // ---------- Link yardımcıları ----------
@@ -1442,7 +1475,7 @@ class VkVideo : MainAPI() {
 
         // Başlık + yıl + süre uyuyorsa TMDB'deki gerçek film kaydından poster / özet / yıl al
         val tm = try {
-            tmdbLookup(title, durSec)
+            if (item.optBoolean("synthetic")) null else tmdbLookup(title, durSec)
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             null
@@ -1551,7 +1584,8 @@ class VkVideo : MainAPI() {
             val hash = Regex("[?&]hash=([0-9a-zA-Z]+)").find(player)?.groupValues?.get(1)
                 ?: item.optString("access_key")
             val mobileHdr = hdr + mapOf("User-Agent" to MOBILE_UA)
-            val alts = listOf(
+            val isClip = item.optBoolean("synthetic") || item.optString("type") == "short_video"
+            val alts = (if (isClip) listOf("$mainUrl/clip$data" to hdr, "$mainUrl/clip$data" to mobileHdr) else emptyList()) + listOf(
                 player to mobileHdr,
                 ("https://vk.com/video_ext.php?oid=$oid&id=$vid" + (if (hash.isNotBlank()) "&hash=$hash" else "")) to hdr,
                 ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
@@ -1571,7 +1605,8 @@ class VkVideo : MainAPI() {
 
         // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
         if (cands.isEmpty()) {
-            for (wu in listOf(player, "$mainUrl/video$data")) {
+            val clipWeb = if (item.optBoolean("synthetic") || item.optString("type") == "short_video") listOf("$mainUrl/clip$data") else emptyList()
+            for (wu in clipWeb + listOf(player, "$mainUrl/video$data")) {
                 if (cands.isNotEmpty()) break
                 try {
                     val r = app.get(
