@@ -36,12 +36,6 @@ class DiziLife : MainAPI() {
 
     private val cf = CloudflareKiller()
 
-    // Elle eklenen ek kaynaklar (her bölümde kaynak listesine eklenir)
-    private val extraLinks = listOf(
-        "https://one.makesomthingup.click/MoOLwBUw6Wqpdm42MMKemLUu/master.m3u8",
-        "https://one.makesomthingup.click/BA0or4NLeVu6C33EKpY31nUK/master.m3u8"
-    )
-
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Ana Sayfa",
         "$mainUrl/filmler" to "Filmler",
@@ -533,18 +527,6 @@ class DiziLife : MainAPI() {
             } catch (e: Exception) {
                 rethrow(e)
             }
-        }
-
-        // Elle eklenen ek kaynaklar
-        extraLinks.forEachIndexed { i, link ->
-            callback(
-                newExtractorLink(name, "$name Ek Kaynak ${i + 1}", link, ExtractorLinkType.M3U8) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")
-                }
-            )
-            ok = true
         }
 
         if (!ok && debug) {
