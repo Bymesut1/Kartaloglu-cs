@@ -46,6 +46,7 @@ jobs:
           cp Dizilla/build/*.cs3 out/
           cp Selcukflix/build/*.cs3 out/
           cp DiziLife/build/*.cs3 out/
+          cp DiziPal/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
