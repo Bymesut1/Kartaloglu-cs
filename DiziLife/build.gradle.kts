@@ -17,3 +17,8 @@ cloudstream {
 android {
     namespace = "com.bymesut1.dizilife"
 }
+
+dependencies {
+    // withTimeoutOrNull için gerekli (DiziLife.kt: import kotlinx.coroutines.withTimeoutOrNull)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
