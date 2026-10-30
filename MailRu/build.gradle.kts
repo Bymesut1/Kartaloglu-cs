@@ -1,4 +1,4 @@
-version = 5
+version = 12
 
 android {
     namespace = "com.Bymesut1"
