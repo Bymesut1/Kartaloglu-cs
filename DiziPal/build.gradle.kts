@@ -19,5 +19,10 @@ cloudstream {
 }
 
 android {
-    namespace = "com.bymesut1
+    namespace = "com.bymesut1.DiziPal"
+}
+
+dependencies {
+    // withTimeoutOrNull için gerekli (DiziPal.kt: import kotlinx.coroutines.withTimeoutOrNull)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }
