@@ -3,7 +3,7 @@ version = 1
 
 cloudstream {
     description = "DiziPal - Dizi ve film izle (Türkçe dublaj / altyazılı)"
-    authors = listOf("safakstream")
+    authors = listOf("bymesut1")
 
     /**
      * Status int as one of the following:
@@ -19,5 +19,5 @@ cloudstream {
 }
 
 android {
-    namespace = "com.safakstream.dizipal"
+    namespace = "com.bymesut1.dizipal"
 }
