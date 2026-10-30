@@ -7,6 +7,7 @@ import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 class CizgiMax : MainAPI() {
     override var mainUrl        = "https://cizgimax.online"
@@ -77,11 +78,44 @@ class CizgiMax : MainAPI() {
         Regex("Yay[ıi]n\\s*Y[ıi]l[ıi][^0-9]{0,60}((?:19|20)\\d{2})", RegexOption.IGNORE_CASE)
             .find(html)?.groupValues?.get(1)?.toIntOrNull()
 
-    private fun posterOf(img: Element?): String? {
-        if (img == null) return null
-        for (k in listOf("data-src", "data-lazy-src", "data-original", "src")) {
-            val v: String = img.attr(k)
-            if (v.isNotBlank() && !v.startsWith("data:")) return fixUrl(v)
+    private val reBgUrl = Regex("""url\(\s*['"]?([^'")]+)""", RegexOption.IGNORE_CASE)
+
+    private fun goodImg(v: String?): Boolean {
+        val s = (v ?: "").trim()
+        return s.isNotBlank() && !s.startsWith("data:")
+    }
+
+    // Afişi her yerden arar: img (src / data-src / srcset ...), picture>source, style background-image, data-bg
+    private fun posterOf(img: Element?, container: Element? = null): String? {
+        if (img != null) {
+            for (k in listOf("data-src", "data-lazy-src", "data-original", "data-lazy", "data-image", "data-thumb", "src")) {
+                val v: String = img.attr(k)
+                if (goodImg(v)) return fixUrl(v.trim())
+            }
+            for (k in listOf("data-srcset", "data-lazy-srcset", "srcset")) {
+                val v: String = img.attr(k).trim()
+                if (v.isBlank()) continue
+                val first = v.split(",").first().trim().substringBefore(" ")
+                if (goodImg(first)) return fixUrl(first)
+            }
+        }
+        if (container != null) {
+            for (s in container.select("source[srcset], source[data-srcset]")) {
+                val v: String = s.attr("data-srcset").ifBlank { s.attr("srcset") }.trim()
+                val first = v.split(",").first().trim().substringBefore(" ")
+                if (goodImg(first)) return fixUrl(first)
+            }
+            for (el in container.select("[style*=url(]")) {
+                val m = reBgUrl.find(el.attr("style"))
+                val v = m?.groupValues?.get(1)
+                if (goodImg(v)) return fixUrl(v!!.trim())
+            }
+            for (el in container.select("[data-bg], [data-background], [data-poster]")) {
+                for (k in listOf("data-bg", "data-background", "data-poster")) {
+                    val v: String = el.attr(k)
+                    if (goodImg(v)) return fixUrl(v.trim())
+                }
+            }
         }
         return null
     }
@@ -154,7 +188,7 @@ class CizgiMax : MainAPI() {
             if (title.isBlank()) title = rawSlug.removeSuffix("-izle").replace('-', ' ')
             title = cleanTitle(title)
             if (title.isBlank() || out.containsKey(href)) return
-            val poster: String? = posterOf(img)
+            val poster: String? = posterOf(img, container ?: a)
             out[href] = if (sm != null) {
                 newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
             } else {
@@ -172,6 +206,42 @@ class CizgiMax : MainAPI() {
         return out.values.toList()
     }
 
+    // Afişi gelmeyen kartlara TMDB'den afiş ekler: hepsinde resim görünsün
+    private val posterCache = ConcurrentHashMap<String, String>()
+
+    private suspend fun tmdbPoster(title: String, preferTv: Boolean): String? {
+        if (tmdbKey.startsWith("BURAYA")) return null
+        val key = "$preferTv|$title"
+        posterCache[key]?.let { return it }
+        val q = URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        for (kind in (if (preferTv) listOf("tv", "movie") else listOf("movie", "tv"))) {
+            try {
+                val results = app.get(
+                    "https://api.themoviedb.org/3/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q"
+                ).parsedSafe<TmdbSearch>()?.results.orEmpty()
+                val p = results.firstOrNull { !it.poster_path.isNullOrBlank() }?.poster_path
+                if (p != null) {
+                    val u = "https://image.tmdb.org/t/p/w342$p"
+                    posterCache[key] = u
+                    return u
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        return null
+    }
+
+    private suspend fun fillPosters(list: List<SearchResponse>): List<SearchResponse> {
+        val missing = list.filter { it.posterUrl.isNullOrBlank() }.take(40)
+        if (missing.isEmpty()) return list
+        val found = missing.amap { r ->
+            r to tmdbPoster(r.name, r.type != TvType.Movie)
+        }
+        for ((r, p) in found) if (p != null) r.posterUrl = p
+        return list
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val base = request.data
         if (base.contains("?") && page > 1) {
@@ -179,8 +249,9 @@ class CizgiMax : MainAPI() {
         }
         val url = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
         val list = try {
-            parseCards(app.get(url, headers = pageHeaders()).document)
+            fillPosters(parseCards(app.get(url, headers = pageHeaders()).document))
         } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             emptyList()
         }
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
@@ -189,8 +260,9 @@ class CizgiMax : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val enc = URLEncoder.encode(query, "UTF-8")
         return try {
-            parseCards(app.get("$mainUrl/ara/?q=$enc", headers = pageHeaders()).document)
+            fillPosters(parseCards(app.get("$mainUrl/ara/?q=$enc", headers = pageHeaders()).document))
         } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             emptyList()
         }
     }
@@ -204,7 +276,8 @@ class CizgiMax : MainAPI() {
         val name: String? = null,
         val original_name: String? = null,
         val title: String? = null,
-        val original_title: String? = null
+        val original_title: String? = null,
+        val poster_path: String? = null
     )
     data class TmdbSearch(val results: List<TmdbShow>? = null)
     data class TmdbSeasonSum(val season_number: Int? = null, val episode_count: Int? = null)
