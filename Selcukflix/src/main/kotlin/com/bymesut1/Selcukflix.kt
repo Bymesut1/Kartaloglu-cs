@@ -318,6 +318,36 @@ class Selcukflix : MainAPI() {
         }
     }
 
+    // Afişi olmayan arama sonuçları için TMDB'den afiş bulur (başlık sonundaki yapışık yıl temizlenir)
+    private suspend fun tmdbPosterFor(title: String, movie: Boolean): String? {
+        val clean = title.replace(Regex("""\s*\d{4}\s*$"""), "").trim().ifBlank { title }
+        if (clean.isBlank()) return null
+        val kind = if (movie) "movie" else "tv"
+        val q = URLEncoder.encode(clean, "UTF-8").replace("+", "%20")
+        val res = tmdbGet("/search/$kind?query=$q&include_adult=false")?.optJSONArray("results") ?: return null
+        for (i in 0 until minOf(res.length(), 5)) {
+            val p = jStr(res.optJSONObject(i), "poster_path")
+            if (p != null) return "https://image.tmdb.org/t/p/w342$p"
+        }
+        return null
+    }
+
+    private suspend fun fillPosters(list: List<SearchResponse>): List<SearchResponse> {
+        val missing = list.filter { it.posterUrl.isNullOrBlank() }.take(24)
+        if (missing.isEmpty()) return list
+        val found = missing.amap { r ->
+            try {
+                r to tmdbPosterFor(r.name, r.type == TvType.Movie)
+            } catch (e: Exception) {
+                rethrow(e)
+                r to null
+            }
+        }
+        for ((r, p) in found) if (p != null) r.posterUrl = p
+        d("afis tamamlama eksik=${missing.size} bulunan=${found.count { it.second != null }}")
+        return list
+    }
+
     private var lastDebug = ""
 
     // Sitenin kendi arama sayfasını (/mobil-arama) gerçek WebView'da açar, kutuya sorguyu yazar,
@@ -334,6 +364,22 @@ class Selcukflix : MainAPI() {
   function findInput(){
     return document.querySelector('input[type=search]') || document.querySelector('input[type=text]') ||
       document.querySelector('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit])');
+  }
+  function pickImg(a){
+    var im = a.querySelector('img');
+    if (!im) return '';
+    var s = im.currentSrc || im.getAttribute('src') || '';
+    if (!s || s.indexOf('data:') === 0) s = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || '';
+    if (!s || s.indexOf('data:') === 0) {
+      var ss = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '';
+      if (ss) s = ss.split(',')[0].trim().split(' ')[0];
+    }
+    if (!s) {
+      var pic = a.querySelector('source[srcset]');
+      if (pic) s = (pic.getAttribute('srcset') || '').split(',')[0].trim().split(' ')[0];
+    }
+    if (s && s.indexOf('data:') === 0) s = '';
+    return s || '';
   }
   var key = (q.toLowerCase().split(/\s+/)[0] || '');
   function hits(as){
@@ -359,13 +405,19 @@ class Selcukflix : MainAPI() {
         return /\/(dizi|film|seri-filmler)\//.test(a.getAttribute('href') || '');
       });
       var h = hits(as);
+      // tembel yüklenen (lazy) afişlerin yüklenmesi için kartları sırayla görünür alana getir
+      if (tries <= 8) {
+        h.slice(0, 24).forEach(function(a){
+          try { a.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+        });
+      }
       var stable = (h.length === last);
       last = h.length;
-      if ((h.length > 0 && stable && tries >= 3) || tries >= 16) {
+      var allImg = h.length > 0 && h.slice(0, 24).every(function(a){ return pickImg(a) !== ''; });
+      if ((h.length > 0 && stable && tries >= 4 && (allImg || tries >= 10)) || tries >= 18) {
         clearInterval(iv);
         var out = h.slice(0, 24).map(function(a){
-          var im = a.querySelector('img');
-          return {h: a.getAttribute('href'), t: (a.innerText || '').trim().slice(0, 120), i: im ? (im.getAttribute('src') || im.getAttribute('data-src') || '') : ''};
+          return {h: a.getAttribute('href'), t: (a.innerText || '').trim().slice(0, 120), i: pickImg(a)};
         });
         post({l: out, x: out.length ? '' : 'sonuc yok'});
       }
@@ -495,7 +547,13 @@ class Selcukflix : MainAPI() {
                 newTvSeriesSearchResponse("DEBUG arama bulunamadi (detay icin ac)", "$mainUrl/debug-arama", TvType.TvSeries) {}
             )
         }
-        return result
+        // afişi gelmeyen sonuçlara TMDB'den afiş ekle: hepsinde resim görünsün
+        return try {
+            fillPosters(result)
+        } catch (e: Exception) {
+            rethrow(e)
+            result
+        }
     }
 
     // ---------------- TMDB ----------------
