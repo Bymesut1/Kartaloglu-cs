@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MailRu : MainAPI() {
     override var mainUrl        = "https://my.mail.ru"
@@ -250,6 +253,7 @@ class MailRu : MainAPI() {
     // ---------------- Video sayfası ----------------
 
     override suspend fun load(url: String): LoadResponse? {
+        prefetchMeta(url)
         val cached = cache[pathOf(url)]
         var title  = cached?.title?.takeIf { it.isNotBlank() }?.let { cleanTitle(it) }
         var poster = cached?.poster
@@ -290,6 +294,36 @@ class MailRu : MainAPI() {
     private data class MetaResult(val meta: MailMeta, val cookie: String?)
 
     @Volatile private var metaMobileFirst = false
+
+    // video sayfası açılırken meta arka planda çekilir; oynat'a basınca hazır bekler (linkler süreli: 3 dk)
+    private val metaCache = ConcurrentHashMap<String, Pair<Long, MetaResult>>()
+    private val metaTtlMs = 3 * 60 * 1000L
+
+    private suspend fun fetchMetaById(id: String, pageUrl: String): MetaResult? {
+        val hosts = if (metaMobileFirst) listOf(mobileUrl, mainUrl) else listOf(mainUrl, mobileUrl)
+        for (h in hosts) {
+            val r = fromMeta("$h/+/video/meta/$id", pageUrl)
+            if (r != null) {
+                metaMobileFirst = (h == mobileUrl)
+                return r
+            }
+        }
+        return null
+    }
+
+    private fun prefetchMeta(url: String) {
+        val path = pathOf(url)
+        val id = cache[path]?.id.orEmpty()
+        if (id.isBlank()) return
+        val old = metaCache[path]
+        if (old != null && System.currentTimeMillis() - old.first < metaTtlMs) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                fetchMetaById(id, url)?.let { metaCache[path] = System.currentTimeMillis() to it }
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     private suspend fun fromMeta(url: String, pageUrl: String): MetaResult? {
         val res = try {
@@ -359,15 +393,9 @@ class MailRu : MainAPI() {
         // 1) listeden gelen kimlikle meta (önce masaüstü, sonra mobil alan adı)
         var mr: MetaResult? = null
         if (id.isNotBlank()) {
-            // en son çalışan alan adı önce denenir (boşuna başarısız istek beklenmez)
-            val hosts = if (metaMobileFirst) listOf(mobileUrl, mainUrl) else listOf(mainUrl, mobileUrl)
-            for (h in hosts) {
-                mr = fromMeta("$h/+/video/meta/$id", pageUrl)
-                if (mr != null) {
-                    metaMobileFirst = (h == mobileUrl)
-                    break
-                }
-            }
+            val hit = metaCache.remove(path)
+            mr = if (hit != null && System.currentTimeMillis() - hit.first < metaTtlMs) hit.second
+                 else fetchMetaById(id, pageUrl)
         }
 
         // 1b) id yoksa: oynatıcının kendi kullandığı JSON adresi (sayfa HTML'i indirilmez)
