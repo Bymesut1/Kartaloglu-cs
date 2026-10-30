@@ -180,7 +180,12 @@ class Selcukflix : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val base = request.data
         val url = if (page <= 1) base else base + (if (base.contains("?")) "&" else "?") + "page=$page"
-        val list = cardsOf(org.jsoup.Jsoup.parse(fetch(url), mainUrl))
+        val list = try {
+            fillPosters(cardsOf(org.jsoup.Jsoup.parse(fetch(url), mainUrl)))
+        } catch (e: Exception) {
+            rethrow(e)
+            cardsOf(org.jsoup.Jsoup.parse(fetch(url), mainUrl))
+        }
         val keys = list.map { it.url }.toSet()
         if (page <= 1) {
             firstPageKeys[base] = keys
@@ -318,26 +323,82 @@ class Selcukflix : MainAPI() {
         }
     }
 
-    // Afişi olmayan arama sonuçları için TMDB'den afiş bulur (başlık sonundaki yapışık yıl temizlenir)
-    private suspend fun tmdbPosterFor(title: String, movie: Boolean): String? {
-        val clean = title.replace(Regex("""\s*\d{4}\s*$"""), "").trim().ifBlank { title }
-        if (clean.isBlank()) return null
+    // Afişi olmayan sonuçlar için TMDB'den afiş bulur.
+    // Başlıktaki yapışık yıl ("The Rookies2019 Çaylaklar") ayrılır, birkaç varyant denenir.
+    private val posterCache = ConcurrentHashMap<String, String>()
+
+    private fun titleVariants(raw: String): List<String> {
+        val t = raw.replace(Regex("\\s+"), " ").trim()
+        val out = LinkedHashSet<String>()
+        val m = Regex("""(?<!\d)((?:19|20)\d{2})(?!\d)""").findAll(t).lastOrNull { it.range.first > 0 }
+        if (m != null) {
+            val before = t.substring(0, m.range.first).trim().trimEnd(':', '-', '–')
+            val after = t.substring(m.range.last + 1).trim()
+            if (before.isNotBlank()) out.add(before)
+            if (after.isNotBlank()) out.add(after)
+            if (before.isNotBlank() && after.isNotBlank()) out.add("$before $after")
+        }
+        out.add(t)
+        return out.filter { it.isNotBlank() }
+    }
+
+    private suspend fun tmdbPosterFor(title: String, movie: Boolean, siteUrl: String? = null): String? {
+        val key = "${if (movie) "m" else "t"}|$title"
+        posterCache[key]?.let { return it }
         val kind = if (movie) "movie" else "tv"
-        val q = URLEncoder.encode(clean, "UTF-8").replace("+", "%20")
-        val res = tmdbGet("/search/$kind?query=$q&include_adult=false")?.optJSONArray("results") ?: return null
-        for (i in 0 until minOf(res.length(), 5)) {
-            val p = jStr(res.optJSONObject(i), "poster_path")
-            if (p != null) return "https://image.tmdb.org/t/p/w342$p"
+        for (v in titleVariants(title)) {
+            val q = URLEncoder.encode(v, "UTF-8").replace("+", "%20")
+            // 1) tür bazlı arama
+            val res = tmdbGet("/search/$kind?query=$q&include_adult=false")?.optJSONArray("results")
+            if (res != null) {
+                for (i in 0 until minOf(res.length(), 6)) {
+                    val p = jStr(res.optJSONObject(i), "poster_path")
+                    if (p != null) return ("https://image.tmdb.org/t/p/w342$p").also { posterCache[key] = it }
+                }
+            }
+            // 2) multi arama (tür yanlış tahmin edilmişse)
+            val multi = tmdbGet("/search/multi?query=$q&include_adult=false")?.optJSONArray("results")
+            if (multi != null) {
+                for (i in 0 until minOf(multi.length(), 6)) {
+                    val o = multi.optJSONObject(i) ?: continue
+                    val mt = o.optString("media_type")
+                    if (mt != "tv" && mt != "movie") continue
+                    val p = jStr(o, "poster_path")
+                    if (p != null) return ("https://image.tmdb.org/t/p/w342$p").also { posterCache[key] = it }
+                }
+            }
+        }
+        // 3) son çare: sitenin kendi sayfasındaki og:image
+        if (siteUrl != null) {
+            try {
+                val html = fetch(siteUrl)
+                if (html.isNotBlank()) {
+                    val og = org.jsoup.Jsoup.parse(html, mainUrl)
+                        .selectFirst("meta[property=og:image]")?.attr("content")
+                    val img = cleanImg(og)
+                    if (img != null && !badPoster(img)) {
+                        posterCache[key] = img
+                        return img
+                    }
+                }
+            } catch (e: Exception) {
+                rethrow(e)
+            }
         }
         return null
     }
 
+    private fun badPoster(u: String?): Boolean =
+        u.isNullOrBlank() ||
+            Regex("""(?i)placeholder|blank|loading|lazy|noimage|no-image|pixel|spacer|\.svg(\?|$)|\.gif(\?|$)|1x1""")
+                .containsMatchIn(u)
+
     private suspend fun fillPosters(list: List<SearchResponse>): List<SearchResponse> {
-        val missing = list.filter { it.posterUrl.isNullOrBlank() }.take(24)
+        val missing = list.filter { badPoster(it.posterUrl) }.take(40)
         if (missing.isEmpty()) return list
         val found = missing.amap { r ->
             try {
-                r to tmdbPosterFor(r.name, r.type == TvType.Movie)
+                r to tmdbPosterFor(r.name, r.type == TvType.Movie, r.url)
             } catch (e: Exception) {
                 rethrow(e)
                 r to null
