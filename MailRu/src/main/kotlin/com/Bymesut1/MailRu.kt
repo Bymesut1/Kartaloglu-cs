@@ -387,6 +387,7 @@ class MailRu : MainAPI() {
 
         // 1) listeden gelen kimlikle meta (önce masaüstü, sonra mobil alan adı)
         var mr: MetaResult? = null
+        var via = "id"
         if (id.isNotBlank()) {
             val hit = metaCache.remove(path)
             mr = if (hit != null && System.currentTimeMillis() - hit.first < metaTtlMs) hit.second
@@ -396,6 +397,7 @@ class MailRu : MainAPI() {
         // 1b) id yoksa: oynatıcının kendi kullandığı JSON adresi (sayfa HTML'i indirilmez)
         if (mr == null && id.isBlank() && pageUrl.endsWith(".html")) {
             mr = fromMeta(pageUrl.removeSuffix(".html") + ".json?new=1", pageUrl)
+            via = "json"
         }
 
         // 2) yedek: video sayfasından meta adresi / doğrudan <video src>
@@ -414,6 +416,7 @@ class MailRu : MainAPI() {
             }
             val metaUrl = findMetaUrl(html)
             if (metaUrl != null) mr = fromMeta(metaUrl, pageUrl)
+            via = "html"
 
             if (mr == null) {
                 val v = Regex("<video[^>]+\\ssrc=\"((?:https?:)?//[^\"]+)\"", RegexOption.IGNORE_CASE)
@@ -447,7 +450,7 @@ class MailRu : MainAPI() {
                 callback.invoke(
                     newExtractorLink(
                         source = name,
-                        name   = if (cookie.isNullOrBlank()) "$name (çerez yok)" else name,
+                        name   = (if (cookie.isNullOrBlank()) "$name (çerez yok)" else name) + " [$via]",
                         url    = u,
                         type   = ExtractorLinkType.VIDEO
                     ) {
