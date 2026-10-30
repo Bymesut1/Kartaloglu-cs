@@ -36,6 +36,9 @@ class DiziLife : MainAPI() {
 
     private val cf = CloudflareKiller()
 
+    // Video akış sunucusu (host değişirse sadece burayı güncelle)
+    private val streamHost = "https://one.makesomthingup.click"
+
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Ana Sayfa",
         "$mainUrl/filmler" to "Filmler",
@@ -464,13 +467,22 @@ class DiziLife : MainAPI() {
         if (master == null) {
             master = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""").find(unescape(ph))?.value
         }
+        // Şifre çözülemezse: oynatıcı adresindeki kimlik, video adresinin kimliğiyle aynı
+        // (örn. /player/<id>  ->  <akisHost>/<id>/master.m3u8)
+        if (master == null) {
+            val id = Regex("""/player/([A-Za-z0-9_-]+)""").find(iframeUrl)?.groupValues?.get(1)
+            if (id != null) {
+                master = "$streamHost/$id/master.m3u8"
+                info.append("id-link ")
+            }
+        }
         if (master == null) return false
 
         callback(
             newExtractorLink(name, "$name 1080p Türkçe Dublaj / Altyazı", master, ExtractorLinkType.M3U8) {
-                this.referer = iframeUrl
+                this.referer = "$mainUrl/"
                 this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to ua, "Referer" to iframeUrl)
+                this.headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")
             }
         )
         return true
