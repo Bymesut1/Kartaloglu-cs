@@ -289,6 +289,8 @@ class MailRu : MainAPI() {
 
     private data class MetaResult(val meta: MailMeta, val cookie: String?)
 
+    @Volatile private var metaMobileFirst = false
+
     private suspend fun fromMeta(url: String, pageUrl: String): MetaResult? {
         val res = try {
             app.get(
@@ -357,8 +359,20 @@ class MailRu : MainAPI() {
         // 1) listeden gelen kimlikle meta (önce masaüstü, sonra mobil alan adı)
         var mr: MetaResult? = null
         if (id.isNotBlank()) {
-            mr = fromMeta("$mainUrl/+/video/meta/$id", pageUrl)
-                ?: fromMeta("$mobileUrl/+/video/meta/$id", pageUrl)
+            // en son çalışan alan adı önce denenir (boşuna başarısız istek beklenmez)
+            val hosts = if (metaMobileFirst) listOf(mobileUrl, mainUrl) else listOf(mainUrl, mobileUrl)
+            for (h in hosts) {
+                mr = fromMeta("$h/+/video/meta/$id", pageUrl)
+                if (mr != null) {
+                    metaMobileFirst = (h == mobileUrl)
+                    break
+                }
+            }
+        }
+
+        // 1b) id yoksa: oynatıcının kendi kullandığı JSON adresi (sayfa HTML'i indirilmez)
+        if (mr == null && id.isBlank() && pageUrl.endsWith(".html")) {
+            mr = fromMeta(pageUrl.removeSuffix(".html") + ".json?new=1", pageUrl)
         }
 
         // 2) yedek: video sayfasından meta adresi / doğrudan <video src>
