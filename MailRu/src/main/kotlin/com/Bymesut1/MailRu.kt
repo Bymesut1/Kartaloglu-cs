@@ -5,9 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import com.lagradost.cloudstream3.utils.Coroutines.ioSafe
 
 class MailRu : MainAPI() {
     override var mainUrl        = "https://my.mail.ru"
@@ -317,11 +315,8 @@ class MailRu : MainAPI() {
         if (id.isBlank()) return
         val old = metaCache[path]
         if (old != null && System.currentTimeMillis() - old.first < metaTtlMs) return
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                fetchMetaById(id, url)?.let { metaCache[path] = System.currentTimeMillis() to it }
-            } catch (_: Exception) {
-            }
+        ioSafe {
+            fetchMetaById(id, url)?.let { metaCache[path] = System.currentTimeMillis() to it }
         }
     }
 
