@@ -240,17 +240,29 @@ class MailRu : MainAPI() {
             accountItems().filter { norm(it.title).contains(q) }
         } else emptyList()
 
-        return (found + fromAccounts)
+        val results = (found + fromAccounts)
             .distinctBy { it.path }
             .filter(::keep)
             .sortedByDescending { isTurkish(it.title) }
             .map { it.toSearch() }
+
+        // GEÇİCİ TEŞHİS: canlı arama boş döndüyse Mail.ru'nun cevabını tek kayıt olarak göster
+        if (found.isEmpty()) {
+            val raw = try {
+                app.get("$mobileUrl/video/search?st=search&q=$enc", headers = pageHeaders()).text
+            } catch (e: Exception) {
+                "HATA: " + (e.message ?: "")
+            }
+            val head = raw.take(70).replace(Regex("\\s+"), " ")
+            val info = "TESHIS uzunluk=${raw.length} listeVar=${raw.contains("list-item")} | $head"
+            return listOf(newMovieSearchResponse(info, "$mainUrl/teshis", TvType.Movie)) + results
+        }
+        return results
     }
 
     // ---------------- Video sayfası ----------------
 
     override suspend fun load(url: String): LoadResponse? {
-        prefetchMeta(url)
         val cached = cache[pathOf(url)]
         var title  = cached?.title?.takeIf { it.isNotBlank() }?.let { cleanTitle(it) }
         var poster = cached?.poster
@@ -289,36 +301,6 @@ class MailRu : MainAPI() {
     data class MailMeta(val videos: List<MailVideo>? = null)
 
     private data class MetaResult(val meta: MailMeta, val cookie: String?)
-
-    @Volatile private var metaMobileFirst = false
-
-    // video sayfası açılırken meta arka planda çekilir; oynat'a basınca hazır bekler (linkler süreli: 3 dk)
-    private val metaCache = ConcurrentHashMap<String, Pair<Long, MetaResult>>()
-    private val metaTtlMs = 3 * 60 * 1000L
-
-    private suspend fun fetchMetaById(id: String, pageUrl: String): MetaResult? {
-        val hosts = if (metaMobileFirst) listOf(mobileUrl, mainUrl) else listOf(mainUrl, mobileUrl)
-        for (h in hosts) {
-            val r = fromMeta("$h/+/video/meta/$id", pageUrl)
-            if (r != null) {
-                metaMobileFirst = (h == mobileUrl)
-                return r
-            }
-        }
-        return null
-    }
-
-    private suspend fun prefetchMeta(url: String) {
-        val path = pathOf(url)
-        val id = cache[path]?.id.orEmpty()
-        if (id.isBlank()) return
-        val old = metaCache[path]
-        if (old != null && System.currentTimeMillis() - old.first < metaTtlMs) return
-        try {
-            fetchMetaById(id, url)?.let { metaCache[path] = System.currentTimeMillis() to it }
-        } catch (e: Exception) {
-        }
-    }
 
     private suspend fun fromMeta(url: String, pageUrl: String): MetaResult? {
         val res = try {
@@ -387,17 +369,9 @@ class MailRu : MainAPI() {
 
         // 1) listeden gelen kimlikle meta (önce masaüstü, sonra mobil alan adı)
         var mr: MetaResult? = null
-        var via = "id"
         if (id.isNotBlank()) {
-            val hit = metaCache.remove(path)
-            mr = if (hit != null && System.currentTimeMillis() - hit.first < metaTtlMs) hit.second
-                 else fetchMetaById(id, pageUrl)
-        }
-
-        // 1b) id yoksa: oynatıcının kendi kullandığı JSON adresi (sayfa HTML'i indirilmez)
-        if (mr == null && id.isBlank() && pageUrl.endsWith(".html")) {
-            mr = fromMeta(pageUrl.removeSuffix(".html") + ".json?new=1", pageUrl)
-            via = "json"
+            mr = fromMeta("$mainUrl/+/video/meta/$id", pageUrl)
+                ?: fromMeta("$mobileUrl/+/video/meta/$id", pageUrl)
         }
 
         // 2) yedek: video sayfasından meta adresi / doğrudan <video src>
@@ -416,7 +390,6 @@ class MailRu : MainAPI() {
             }
             val metaUrl = findMetaUrl(html)
             if (metaUrl != null) mr = fromMeta(metaUrl, pageUrl)
-            via = "html"
 
             if (mr == null) {
                 val v = Regex("<video[^>]+\\ssrc=\"((?:https?:)?//[^\"]+)\"", RegexOption.IGNORE_CASE)
@@ -450,7 +423,7 @@ class MailRu : MainAPI() {
                 callback.invoke(
                     newExtractorLink(
                         source = name,
-                        name   = (if (cookie.isNullOrBlank()) "$name (çerez yok)" else name) + " [$via]",
+                        name   = if (cookie.isNullOrBlank()) "$name (çerez yok)" else name,
                         url    = u,
                         type   = ExtractorLinkType.VIDEO
                     ) {
