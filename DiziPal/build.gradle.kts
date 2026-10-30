@@ -19,5 +19,5 @@ cloudstream {
 }
 
 android {
-    namespace = "com.bymesut1.dizipal"
+    namespace = "com.bymesut1
 }
