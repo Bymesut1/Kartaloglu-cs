@@ -942,6 +942,15 @@ class DiziPal : MainAPI() {
         val v = vParam(frameUrl)
 
         val cands = LinkedHashSet<String>()
+
+        // Asıl istek: $.getJSON("source2.php?v=" + playList, ...) ; playList = window.openPlayer('<uzun değer>', ...) ilk parametresi
+        val getJsonLit = Regex("""getJSON\(\s*["']([^"']+)["']\s*\+""").find(window)?.groupValues?.get(1) ?: "source2.php?v="
+        val playList = texts.asSequence()
+            .mapNotNull { Regex("""openPlayer\(\s*['"]([^'"]{20,})['"]\s*,""").find(it)?.groupValues?.get(1) }
+            .firstOrNull()
+        val primary = if (playList != null) absRel(getJsonLit + playList, frameUrl) else null
+        Log.d(tag, "openPlayer playList=${playList?.length} istek=${primary?.take(70)}")
+
         for (m in Regex("""["'`]([^"'`\s]{3,300})["'`]""").findAll(window)) {
             var lit = m.groupValues[1]
             if (lit.contains("\${") || imgRe.containsMatchIn(lit) || adHostRe.containsMatchIn(lit) || badHostRe.containsMatchIn(lit)) continue
@@ -951,7 +960,7 @@ class DiziPal : MainAPI() {
             absRel(lit, frameUrl)?.let { cands.add(it) }
         }
         // sayfaya en yakın olan önce denenir
-        val list = cands.toList().reversed().take(8)
+        val list = (listOfNotNull(primary) + cands.toList().reversed()).distinct().take(8)
         Log.d(tag, "playlist adayları=${list.size} ${list.take(4).joinToString(" | ") { it.take(90) }}")
 
         for (u in list) {
@@ -981,8 +990,34 @@ class DiziPal : MainAPI() {
                 continue
             }
             Log.d(tag, "playlist bulundu ${u.take(80)} öğe=${arr.length()}")
-            val cfg = JSONObject().put("playlist", arr)
-            if (emitConfig(cfg, origin, label, subtitleCallback, doneSubs, doneMedia, callback)) return true
+            var got = false
+            for (i in 0 until arr.length()) {
+                val el = arr.optJSONObject(i) ?: continue
+                val srcs = el.optJSONArray("sources") ?: continue
+                for (j in 0 until srcs.length()) {
+                    val so = srcs.optJSONObject(j) ?: continue
+                    val f = so.optString("file", "").ifBlank { so.optString("src", "") }
+                    if (f.isBlank()) continue
+                    var mu = absRel(f, frameUrl) ?: continue
+                    mu = mu.replace("m.php", "master.m3u8")
+                    val title = so.optString("title", "").ifBlank { el.optString("title", "") }
+                    if (emitLink(mu, title, label, origin, doneMedia, callback)) got = true
+                }
+            }
+            // altyazılar
+            val items = ArrayList<CfgItem>()
+            walkCfg(arr, "", "", "", items)
+            for (ci in items) {
+                val isSub = subFileRe.containsMatchIn(ci.value) || ci.path.contains("subtitle", true) ||
+                    ci.path.contains("caption", true) || ci.path.contains("track", true)
+                if (!isSub) continue
+                val su = absRel(ci.value, frameUrl) ?: continue
+                if (!doneSubs.add(su)) continue
+                subtitleCallback.invoke(newSubtitleFile(ci.title.ifBlank { "Altyazı" }, su) {
+                    this.headers = this@DiziPal.headers + mapOf("Referer" to "$origin/")
+                })
+            }
+            if (got) return true
         }
         return false
     }
