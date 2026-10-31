@@ -421,10 +421,11 @@ class DiziPal : MainAPI() {
 
     // Site başlıkları bazen "1. Bölüm", "S7:B1 1. Bölüm" gibi anlamsız / yinelenen geliyor: temizlenir.
     // Geriye anlamlı bir ad kalmazsa null döner (CloudStream kendi "Bölüm N" yazısını gösterir).
+    // Not: Android regex motoru "[:" dizisini POSIX sınıfı sanıyor; bu yüzden köşeli parantez yerine (?:a|b) kullanıldı.
     private fun cleanEpName(raw: String): String? {
         var t = cleanText(raw)
-        t = t.replace(Regex("""^S\d+\s*[:.]\s*B\d+\s*[-–:]?\s*"""), "")
-        t = t.replace(Regex("""^\d+\s*[.)\-]\s*"""), "")
+        t = t.replace(Regex("""^S\d+\s*(?:\.|:)\s*B\d+\s*(?:-|–|:)?\s*"""), "")
+        t = t.replace(Regex("""^\d+\s*(?:\.|\)|-)\s*"""), "")
         if (t.isBlank()) return null
         if (Regex("""(?i)^(\d+\s*\.?\s*)?(bölüm|bolum)(\s*\d+)?$""").matches(t)) return null
         if (Regex("""(?i)^\d*\.?\s*sezon\s*\d+\.?\s*\d*\.?\s*b[öo]l[üu]m.*$""").matches(t) && t.length < 30) return null
@@ -558,7 +559,7 @@ class DiziPal : MainAPI() {
     private val mphpRe = Regex("""https?://[^"'\s\\<>]+/m\.php\?v=[^"'\s\\<>]+""")
     private val nmphpRe = Regex("""https?://[^"'\s\\<>]+/nm\.php\?v=[^"'\s\\<>]+""")
     private val fileKeyRe = Regex(
-        """["']?(file|src|source|master|hls|stream|m3u8|playlist)["']?\s*[:=]\s*["']((?:https?:)?//[^"']+|/[^"'\s]+)["']""",
+        """["']?(file|src|source|master|hls|stream|m3u8|playlist)["']?\s*[=:]\s*["']((?:https?:)?//[^"']+|/[^"'\s]+)["']""",
         RegexOption.IGNORE_CASE
     )
     private val mediaHintRe = Regex("""(?i)\.m3u8|\.mp4|/nm\.php|/m\.php|master|playlist|/hls/""")
