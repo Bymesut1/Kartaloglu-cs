@@ -844,6 +844,16 @@ class DiziPal : MainAPI() {
             // 2) metinlerde doğrudan m3u8 / mp4 / nm.php / m.php ara
             if (!ok && emitScanned(texts, origin, label, doneMedia, callback)) ok = true
 
+            // 2b) "multiplayer" oynatıcı: liste (Response.playlist) sayfadan ayrı bir istekle geliyor
+            if (!ok) {
+                try {
+                    if (emitPlaylistApi(texts, frameUrl, origin, label, subtitleCallback, doneSubs, doneMedia, callback)) ok = true
+                } catch (e: Exception) {
+                    rethrow(e)
+                    Log.e(tag, "playlist hata ${e.javaClass.simpleName} ${e.message}")
+                }
+            }
+
             // 3) sayfa başka oynatıcılar (iframe / *.php?v=) içeriyorsa onlara in
             if (!ok && depth < 2) {
                 val inner = innerPlayers(texts, frameUrl, origin).take(8)
@@ -859,7 +869,10 @@ class DiziPal : MainAPI() {
                 }
             }
 
-            if (!ok && depth == 0) logPageSummary(html)
+            if (!ok && depth == 0) {
+                logResponseContext(texts)
+                logPageSummary(html)
+            }
         }
 
         // 4) hazır çıkarıcılar (bilinen oynatıcı siteleri)
@@ -875,6 +888,119 @@ class DiziPal : MainAPI() {
             }
         }
         return ok
+    }
+
+    // ---- multiplayer.php: "var pFile = Response.playlist" -> Response bir istekten geliyor ----
+
+    private fun vParam(u: String): String? =
+        Regex("""[?&]v=([^&#]+)""").find(u)?.groupValues?.get(1)
+
+    private fun absRel(u: String, frameUrl: String): String? {
+        val s = u.trim()
+        val dir = frameUrl.substringBefore("?").substringBeforeLast("/")
+        return when {
+            s.startsWith("http") -> s
+            s.startsWith("//") -> "https:$s"
+            s.startsWith("/") -> originOf(frameUrl) + s
+            s.startsWith("./") -> dir + "/" + s.removePrefix("./")
+            s.contains(".php") -> "$dir/$s"
+            else -> null
+        }
+    }
+
+    private fun playlistFrom(txt: String): JSONArray? {
+        val t = txt.trim()
+        if (!t.startsWith("{") && !t.startsWith("[")) return null
+        return try {
+            val x = JSONTokener(t).nextValue()
+            val arr: JSONArray? = when (x) {
+                is JSONArray -> x
+                is JSONObject -> x.optJSONArray("playlist")
+                    ?: x.optJSONObject("Response")?.optJSONArray("playlist")
+                    ?: x.optJSONObject("response")?.optJSONArray("playlist")
+                else -> null
+            }
+            if (arr != null && arr.length() > 0 && arr.optJSONObject(0)?.has("sources") == true) arr else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun emitPlaylistApi(
+        texts: List<String>,
+        frameUrl: String,
+        origin: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        doneSubs: MutableSet<String>,
+        doneMedia: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val src = texts.firstOrNull { it.contains("Response.playlist") } ?: return false
+        val idx = src.indexOf("Response.playlist")
+        val window = src.substring(maxOf(0, idx - 6000), idx)
+        val v = vParam(frameUrl)
+
+        val cands = LinkedHashSet<String>()
+        for (m in Regex("""["'`]([^"'`\s]{3,300})["'`]""").findAll(window)) {
+            var lit = m.groupValues[1]
+            if (lit.contains("\${") || imgRe.containsMatchIn(lit) || adHostRe.containsMatchIn(lit) || badHostRe.containsMatchIn(lit)) continue
+            if (lit == "m.php" || lit == "master.m3u8") continue
+            if (!(lit.startsWith("/") || lit.startsWith("http") || lit.contains(".php") || lit.contains("api", true))) continue
+            if (v != null && (lit.endsWith("=") || lit.endsWith("?"))) lit += v
+            absRel(lit, frameUrl)?.let { cands.add(it) }
+        }
+        // sayfaya en yakın olan önce denenir
+        val list = cands.toList().reversed().take(8)
+        Log.d(tag, "playlist adayları=${list.size} ${list.take(4).joinToString(" | ") { it.take(90) }}")
+
+        for (u in list) {
+            val h = headers + mapOf(
+                "X-Requested-With" to "XMLHttpRequest",
+                "Accept" to "application/json, text/plain, */*",
+                "Origin" to origin
+            )
+            var txt = try {
+                app.get(u, headers = h, referer = frameUrl, timeout = 15L).text
+            } catch (e: Exception) {
+                rethrow(e)
+                ""
+            }
+            var arr = playlistFrom(txt)
+            if (arr == null && v != null) {
+                txt = try {
+                    app.post(u, headers = h, referer = frameUrl, data = mapOf("v" to v), timeout = 15L).text
+                } catch (e: Exception) {
+                    rethrow(e)
+                    ""
+                }
+                arr = playlistFrom(txt)
+            }
+            if (arr == null) {
+                Log.d(tag, "playlist yok ${u.take(80)} len=${txt.length} baş=${txt.take(80).replace("\n", " ")}")
+                continue
+            }
+            Log.d(tag, "playlist bulundu ${u.take(80)} öğe=${arr.length()}")
+            val cfg = JSONObject().put("playlist", arr)
+            if (emitConfig(cfg, origin, label, subtitleCallback, doneSubs, doneMedia, callback)) return true
+        }
+        return false
+    }
+
+    // Bulunamazsa: "Response.playlist" öncesindeki kod logcat'e yazılır (uzun base64 blokları kısaltılarak)
+    private fun logResponseContext(texts: List<String>) {
+        val src = texts.firstOrNull { it.contains("Response.playlist") } ?: return
+        val idx = src.indexOf("Response.playlist")
+        val w = src.substring(maxOf(0, idx - 2500), minOf(src.length, idx + 300))
+            .replace(Regex("[A-Za-z0-9+/=_\\-]{100,}")) { "<b${it.value.length}:${it.value.take(24)}>" }
+            .replace(Regex("\\s+"), " ")
+        var i = 0
+        var n = 0
+        while (i < w.length && n < 8) {
+            Log.d(tag, "RESP[$n] " + w.substring(i, minOf(w.length, i + 600)))
+            i += 600
+            n++
+        }
     }
 
     private suspend fun emitLink(
@@ -1089,11 +1215,13 @@ class DiziPal : MainAPI() {
         val masked = html.replace(Regex("[A-Za-z0-9+/=_\\-]{120,}")) { "<b${it.value.length}>" }
             .replace(Regex("\\s+"), " ")
         Log.d(tag, "SAYFA OZET len=${html.length} maskeli=${masked.length}")
+        // sayfanın SONU (oynatıcı betiği genelde orada): son 2800 karakter
+        val tail = masked.takeLast(2800)
         var i = 0
         var n = 0
-        while (i < masked.length && n < 10) {
-            Log.d(tag, "ozet[$n] " + masked.substring(i, minOf(masked.length, i + 700)))
-            i += 700
+        while (i < tail.length && n < 5) {
+            Log.d(tag, "son[$n] " + tail.substring(i, minOf(tail.length, i + 600)))
+            i += 600
             n++
         }
         for (key in listOf("sources", "NP_", "CONFIG", "m3u8", "nm.php", "player", "iframe")) {
@@ -1164,18 +1292,25 @@ class DiziPal : MainAPI() {
 
     private fun deepTexts(texts: List<String>): List<String> {
         val out = LinkedHashSet<String>()
+        val useful = Regex("https?://|\\.m3u8|\\.mp4|\"file\"|sources|playlist|m\\.php", RegexOption.IGNORE_CASE)
         for (t in texts) {
             if (Regex("\\\\x[0-9a-fA-F]{2}|\\\\u[0-9a-fA-F]{4}").containsMatchIn(t)) {
                 var dd = Regex("\\\\x([0-9a-fA-F]{2})").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
                 dd = Regex("\\\\u([0-9a-fA-F]{4})").replace(dd) { it.groupValues[1].toInt(16).toChar().toString() }
                 out.add(dd)
             }
-            Regex("[A-Za-z0-9+/_\\-]{28,}={0,2}").findAll(t).take(400).forEach { m ->
-                val bytes = b64bin(m.value)
-                if (bytes.isNotEmpty()) {
+            // Uzun bloklar (sayfanın sonundaki asıl veri) kısa CSS / betik parçaları yüzünden atlanmasın:
+            // önce uzun olanlar (sınırsız değil ama geniş), sonra kısalar
+            val all = Regex("[A-Za-z0-9+/_\\-]{28,}={0,2}").findAll(t).toList()
+            val picked = all.filter { it.value.length >= 120 }.take(80) + all.filter { it.value.length < 120 }.take(300)
+            for (m in picked) {
+                for (cand in listOf(m.value, m.value.reversed())) {
+                    val bytes = b64bin(cand)
+                    if (bytes.isEmpty()) continue
                     val dd = String(bytes, Charsets.ISO_8859_1)
-                    if (dd.length > 12 && Regex("https?://|\\.m3u8|\\.mp4|\"file\"|sources", RegexOption.IGNORE_CASE).containsMatchIn(dd)) {
+                    if (dd.length > 12 && useful.containsMatchIn(dd)) {
                         out.add(dd)
+                        break
                     }
                 }
             }
