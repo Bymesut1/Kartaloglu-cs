@@ -840,7 +840,7 @@ class DiziPal : MainAPI() {
         return ok
     }
 
-    private fun emitNpSubs(
+    private suspend fun emitNpSubs(
         np: JSONObject,
         frameUrl: String,
         origin: String,
