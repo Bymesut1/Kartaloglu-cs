@@ -3,6 +3,7 @@ package com.bymesut1
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -138,6 +139,29 @@ class DiziPal : MainAPI() {
             }
             from = idx + 1
         }
+    }
+
+    // "key": ardından '[' gelen tüm geçerli diziler (en fazla 6)
+    private fun arraysAfterKey(text: String, key: String): List<JSONArray> {
+        val out = ArrayList<JSONArray>()
+        var from = 0
+        while (out.size < 6) {
+            val idx = text.indexOf(key, from)
+            if (idx < 0) break
+            from = idx + key.length
+            var p = from
+            while (p < text.length && text[p].isWhitespace()) p++
+            if (p < text.length && text[p] == '[') {
+                val s = balanced(text, p, '[', ']')
+                if (s != null) {
+                    try {
+                        out.add(JSONArray(s))
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        return out
     }
 
     private fun objectAfterKey(text: String, key: String): JSONObject? {
@@ -365,6 +389,18 @@ class DiziPal : MainAPI() {
         return "$mainUrl/series/${pick ?: (name0 + suffix)}"
     }
 
+    // Site başlıkları bazen "1. Bölüm", "S7:B1 1. Bölüm" gibi anlamsız / yinelenen geliyor: temizlenir.
+    // Geriye anlamlı bir ad kalmazsa null döner (CloudStream kendi "Bölüm N" yazısını gösterir).
+    private fun cleanEpName(raw: String): String? {
+        var t = cleanText(raw)
+        t = t.replace(Regex("""^S\d+\s*[:.]\s*B\d+\s*[-–:]?\s*"""), "")
+        t = t.replace(Regex("""^\d+\s*[.)\-]\s*"""), "")
+        if (t.isBlank()) return null
+        if (Regex("""(?i)^(\d+\s*\.?\s*)?(bölüm|bolum)(\s*\d+)?$""").matches(t)) return null
+        if (Regex("""(?i)^\d*\.?\s*sezon\s*\d+\.?\s*\d*\.?\s*b[öo]l[üu]m.*$""").matches(t) && t.length < 30) return null
+        return t
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         return try {
             var pageUrl = url
@@ -409,20 +445,24 @@ class DiziPal : MainAPI() {
             } else {
                 val seasons = data.optJSONArray("seasons") ?: return null
                 val episodes = mutableListOf<Episode>()
+                val hrefNum = Regex("""-(\d+)x(\d+)(?:-c\d+)?/?$""")
                 for (si in 0 until seasons.length()) {
                     val season = seasons.optJSONObject(si) ?: continue
                     val seasonNo = season.optInt("no", si + 1)
                     val eps = season.optJSONArray("episodes") ?: continue
                     for (ei in 0 until eps.length()) {
                         val ep = eps.optJSONObject(ei) ?: continue
-                        val epNo = ep.optInt("n", ei + 1)
-                        val epTitle = ep.optString("title", "").ifBlank { "$seasonNo. Sezon $epNo. Bölüm" }
                         val epHref = ep.optString("href", "").ifBlank { continue }
                         val epUrl = if (epHref.startsWith("http")) epHref else "$mainUrl$epHref"
+                        // sezon / bölüm numarası oynatılacak adresten alınır (…-5x1-c05); yoksa siteden gelen değer
+                        val hm = hrefNum.find(epHref.substringBefore("?"))
+                        val sNo = hm?.groupValues?.get(1)?.toIntOrNull() ?: seasonNo
+                        val eNo = hm?.groupValues?.get(2)?.toIntOrNull() ?: ep.optInt("n", ei + 1)
+                        val epName = cleanEpName(ep.optString("title", ""))
                         episodes.add(newEpisode(epUrl) {
-                            this.name = epTitle
-                            this.season = seasonNo
-                            this.episode = epNo
+                            this.name = epName
+                            this.season = sNo
+                            this.episode = eNo
                             this.posterUrl = poster
                         })
                     }
@@ -471,7 +511,13 @@ class DiziPal : MainAPI() {
     private val m3u8Re = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
     private val mp4Re = Regex("""https?://[^"'\s\\<>]+\.mp4[^"'\s\\<>]*""")
     private val mphpRe = Regex("""https?://[^"'\s\\<>]+/m\.php\?v=[^"'\s\\<>]+""")
-    private val fileKeyRe = Regex("""["']?(?:file|src|source|master|hls|stream)["']?\s*[:=]\s*["']((?:https?:)?//[^"']+)["']""", RegexOption.IGNORE_CASE)
+    private val nmphpRe = Regex("""https?://[^"'\s\\<>]+/nm\.php\?v=[^"'\s\\<>]+""")
+    private val fileKeyRe = Regex(
+        """["']?(file|src|source|master|hls|stream|m3u8|playlist)["']?\s*[:=]\s*["']((?:https?:)?//[^"']+|/[^"'\s]+)["']""",
+        RegexOption.IGNORE_CASE
+    )
+    private val mediaHintRe = Regex("""(?i)\.m3u8|\.mp4|/nm\.php|/m\.php|master|playlist|/hls/""")
+    private val subFileRe = Regex("""(?i)\.(?:vtt|srt)(?:\?|$)""")
 
     private fun withLang(u: String, l: String): String =
         if (u.contains("?")) "$u&lang=$l" else "$u?lang=$l"
@@ -507,13 +553,27 @@ class DiziPal : MainAPI() {
                 for (f in frames) {
                     if (!seenFrames.add(f)) continue
                     val ok = try {
-                        resolveFrame(f, u, lb, subtitleCallback, callback, doneMedia, doneSubs)
+                        resolveFrame(f, u, lb, subtitleCallback, callback, doneMedia, doneSubs, 0)
                     } catch (e: Exception) {
                         rethrow(e)
                         Log.e(tag, "oynatıcı hata ${e.javaClass.simpleName} ${e.message}")
                         false
                     }
                     if (ok) any = true
+                }
+            }
+
+            // hiçbir yoldan bulunamadıysa: oynatıcıyı gerçek WebView'da açıp video isteğini yakala
+            if (!any) {
+                val first = seenFrames.firstOrNull()
+                if (first != null) {
+                    any = try {
+                        webviewFallback(first, base, doneMedia, callback)
+                    } catch (e: Exception) {
+                        rethrow(e)
+                        Log.e(tag, "webview hata ${e.javaClass.simpleName}")
+                        false
+                    }
                 }
             }
             if (!any) Log.e(tag, "loadLinks: kaynak bulunamadı ${base.takeLast(70)}")
@@ -712,7 +772,8 @@ class DiziPal : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
         doneMedia: MutableSet<String>,
-        doneSubs: MutableSet<String>
+        doneSubs: MutableSet<String>,
+        depth: Int
     ): Boolean {
         val origin = originOf(frameUrl)
         val label = if (langLabel.isBlank()) name else "$name - $langLabel"
@@ -723,19 +784,39 @@ class DiziPal : MainAPI() {
         }
 
         val html = safeGet(frameUrl, pageUrl)
-        Log.d(tag, "oynatıcı ${frameUrl.take(80)} len=${html.length}")
+        Log.d(tag, "oynatıcı d=$depth ${frameUrl.take(90)} len=${html.length}")
         if (html.isNotBlank()) {
-            val np = npConfig(html)
-            if (np != null) {
-                emitNpSubs(np, frameUrl, origin, subtitleCallback, doneSubs)
-                if (emitNpSources(np, frameUrl, origin, label, doneMedia, callback)) ok = true
+            val texts = allTexts(html)
+
+            // 1) yapılandırma blokları (NP_CONFIG ve benzerleri, "sources" / "subtitles" dizileri)
+            val cfgs = configBlocks(texts)
+            Log.d(tag, "yapılandırma bloğu=${cfgs.size}")
+            for (cfg in cfgs) {
+                if (emitConfig(cfg, origin, label, subtitleCallback, doneSubs, doneMedia, callback)) ok = true
             }
-            if (!ok) {
-                if (emitScanned(allTexts(html), frameUrl, origin, label, doneMedia, callback)) ok = true
+
+            // 2) metinlerde doğrudan m3u8 / mp4 / nm.php / m.php ara
+            if (!ok && emitScanned(texts, origin, label, doneMedia, callback)) ok = true
+
+            // 3) sayfa başka oynatıcılar (iframe / *.php?v=) içeriyorsa onlara in
+            if (!ok && depth < 2) {
+                val inner = innerPlayers(texts, frameUrl, origin).take(8)
+                Log.d(tag, "iç oynatıcı=${inner.size} ${inner.take(3).joinToString(" | ") { it.take(80) }}")
+                for (u in inner) {
+                    val r = try {
+                        resolveFrame(u, frameUrl, langLabel, subtitleCallback, callback, doneMedia, doneSubs, depth + 1)
+                    } catch (e: Exception) {
+                        rethrow(e)
+                        false
+                    }
+                    if (r) ok = true
+                }
             }
+
+            if (!ok && depth == 0) logPageSummary(html)
         }
 
-        // hazır çıkarıcılar (bilinen oynatıcı siteleri)
+        // 4) hazır çıkarıcılar (bilinen oynatıcı siteleri)
         if (!ok) {
             try {
                 loadExtractor(frameUrl, pageUrl, subtitleCallback) { l ->
@@ -780,23 +861,6 @@ class DiziPal : MainAPI() {
         return true
     }
 
-    // window.NP_CONFIG = {...}  (dizelere duyarlı dengeli parantez; ";" olması gerekmez)
-    private fun npConfig(t: String): JSONObject? {
-        var from = 0
-        while (true) {
-            val i = t.indexOf("NP_CONFIG", from)
-            if (i < 0) return null
-            from = i + 9
-            val st = t.indexOf('{', i)
-            if (st < 0) return null
-            val s = balanced(t, st, '{', '}') ?: continue
-            try {
-                return JSONObject(s)
-            } catch (_: Exception) {
-            }
-        }
-    }
-
     private fun fixMaster(m: String, origin: String, hosts: List<String>): String {
         val u = m.trim()
         return when {
@@ -807,89 +871,226 @@ class DiziPal : MainAPI() {
         }
     }
 
-    private suspend fun emitNpSources(
-        np: JSONObject,
-        frameUrl: String,
+    // Sayfadaki yapılandırma blokları: "...CONFIG = {...}" ya da "...CONFIG": {...}
+    // Bulunamazsa "sources" / "subtitles" / "tracks" / "captions" dizileri tek başına alınır.
+    private fun configBlocks(texts: List<String>): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        val seen = HashSet<Int>()
+        val re = Regex("""[A-Za-z_]*CONFIG\b["']?\s*[=:]\s*(?=\{)""")
+        for (t in texts) {
+            for (m in re.findAll(t)) {
+                val st = m.range.last + 1
+                val s = balanced(t, st, '{', '}') ?: continue
+                if (!seen.add(s.hashCode())) continue
+                try {
+                    out.add(JSONObject(s))
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (out.isEmpty()) {
+            for (t in texts) {
+                for (key in listOf("\"sources\":", "\"subtitles\":", "\"tracks\":", "\"captions\":")) {
+                    for (arr in arraysAfterKey(t, key)) {
+                        if (!seen.add(arr.toString().hashCode())) continue
+                        out.add(JSONObject().put(key.removeSuffix(":").trim('"'), arr))
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    private class CfgItem(val path: String, val key: String, val value: String, val title: String)
+
+    // JSON içindeki tüm adres dizelerini (yol, anahtar, değer, en yakın başlık / etiket) ile toplar
+    private fun walkCfg(x: Any?, path: String, key: String, title: String, out: MutableList<CfgItem>, depth: Int = 0) {
+        if (depth > 10) return
+        when (x) {
+            is JSONObject -> {
+                var t = title
+                for (k in listOf("title", "label", "name", "lang", "language")) {
+                    val v = x.opt(k)
+                    if (v is String && v.isNotBlank()) {
+                        t = v
+                        break
+                    }
+                }
+                if (x.optBoolean("forced", false) && !t.contains("forced", true)) t += " Forced"
+                val ks = x.keys()
+                while (ks.hasNext()) {
+                    val k = ks.next()
+                    walkCfg(x.opt(k), "$path/$k", k, t, out, depth + 1)
+                }
+            }
+            is JSONArray -> for (i in 0 until x.length()) walkCfg(x.opt(i), path, key, title, out, depth + 1)
+            is String -> if (x.startsWith("http") || x.startsWith("//") || x.startsWith("/")) {
+                out.add(CfgItem(path, key, x, title))
+            }
+        }
+    }
+
+    private suspend fun emitConfig(
+        cfg: JSONObject,
         origin: String,
         label: String,
-        done: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        doneSubs: MutableSet<String>,
+        doneMedia: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val hosts = ArrayList<String>()
-        np.optJSONArray("hosts")?.let { a ->
+        cfg.optJSONArray("hosts")?.let { a ->
             for (i in 0 until a.length()) a.optString(i, "").takeIf { it.startsWith("http") }?.let { hosts.add(it) }
         }
-        val srcs = np.optJSONArray("sources") ?: return false
+        val items = ArrayList<CfgItem>()
+        walkCfg(cfg, "", "", "", items)
+        val strongKeys = setOf("master", "hls", "m3u8", "playlist")
+        val mediaKeys = setOf("master", "file", "url", "src", "hls", "m3u8", "link", "playlist", "stream", "source", "video")
         var ok = false
-        for (i in 0 until srcs.length()) {
-            val so = srcs.optJSONObject(i) ?: continue
-            var master = so.optString("master", "").ifBlank { so.optString("file", "") }
-                .ifBlank { so.optString("url", "") }.ifBlank { so.optString("src", "") }
-            if (master.isBlank()) continue
-            master = fixMaster(master, origin, hosts)
-            // uzantısız adreslerde gerçekten m3u8 mi diye bakılır; m.php ise master.m3u8 denenir
-            if (!master.contains(".m3u8", true) && !master.contains(".mp4", true)) {
-                val txt = safeGet(master, frameUrl)
-                if (!txt.trimStart().startsWith("#EXTM3U") && master.contains("/m.php")) {
-                    master = master.replace("/m.php", "/master.m3u8")
+        for (item in items) {
+            val v = item.value
+            if (imgRe.containsMatchIn(v) && !subFileRe.containsMatchIn(v)) continue
+            val isSub = subFileRe.containsMatchIn(v) ||
+                item.path.contains("subtitle", true) || item.path.contains("caption", true) || item.path.contains("track", true)
+            if (isSub) {
+                if (!subFileRe.containsMatchIn(v) && item.key !in setOf("url", "file", "src")) continue
+                val su = when {
+                    v.startsWith("//") -> "https:$v"
+                    v.startsWith("/") -> origin + v
+                    else -> v
                 }
+                if (!doneSubs.add(su)) continue
+                val lb = item.title.ifBlank { "Altyazı" }
+                Log.d(tag, "altyazı: $lb -> ${su.take(80)}")
+                subtitleCallback.invoke(newSubtitleFile(lb, su) {
+                    this.headers = this@DiziPal.headers + mapOf("Referer" to "$origin/")
+                })
+                continue
             }
-            val title = so.optString("title", "").ifBlank { so.optString("label", "") }
-            if (emitLink(master, title, label, origin, done, callback)) ok = true
+            val isMedia = item.key in strongKeys || v.contains(".m3u8", true) ||
+                (item.key in mediaKeys && mediaHintRe.containsMatchIn(v))
+            if (!isMedia) continue
+            var master = fixMaster(v, origin, hosts)
+            // m.php ise gerçekten liste mi diye bakılır; değilse master.m3u8 denenir
+            if (master.contains("/m.php") && !master.contains(".m3u8", true)) {
+                val txt = safeGet(master, "$origin/")
+                if (!txt.trimStart().startsWith("#EXTM3U")) master = master.replace("/m.php", "/master.m3u8")
+            }
+            if (emitLink(master, item.title, label, origin, doneMedia, callback)) ok = true
         }
         return ok
     }
 
-    private suspend fun emitNpSubs(
-        np: JSONObject,
-        frameUrl: String,
-        origin: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        doneSubs: MutableSet<String>
-    ) {
-        val subs = np.optJSONArray("subtitles") ?: return
-        for (i in 0 until subs.length()) {
-            val sub = subs.optJSONObject(i) ?: continue
-            var label = sub.optString("label", "").ifBlank { sub.optString("lang", "Altyazı") }
-            var subUrl = sub.optString("url", "")
-            if (subUrl.isBlank()) continue
-            if (subUrl.startsWith("//")) subUrl = "https:$subUrl"
-            else if (subUrl.startsWith("/")) subUrl = origin + subUrl
-            if (sub.optBoolean("forced", false) && !label.contains("forced", true)) label += " Forced"
-            if (!doneSubs.add(subUrl)) continue
-            Log.d(tag, "altyazı: $label -> ${subUrl.take(80)}")
-            subtitleCallback.invoke(newSubtitleFile(label, subUrl) {
-                this.headers = this@DiziPal.headers + mapOf("Referer" to frameUrl)
-            })
-        }
-    }
-
-    // NP_CONFIG yoksa: sayfa metinlerinde (çözülmüş / paketlenmiş dahil) m3u8, mp4, m.php ara
+    // Yapılandırma bulunamazsa: sayfa metinlerinde (çözülmüş / paketlenmiş / base64 dahil) m3u8, mp4, nm.php, m.php ara
     private suspend fun emitScanned(
         texts: List<String>,
-        frameUrl: String,
         origin: String,
         label: String,
         done: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val set = LinkedHashSet<String>()
+        val strongKeys = setOf("master", "hls", "m3u8", "playlist")
         for (t in texts) {
             m3u8Re.findAll(t).forEach { set.add(it.value) }
             mp4Re.findAll(t).forEach { set.add(it.value) }
+            nmphpRe.findAll(t).forEach { set.add(it.value) }
             mphpRe.findAll(t).forEach { set.add(it.value.replace("/m.php", "/master.m3u8")) }
             fileKeyRe.findAll(t).forEach { m ->
-                val u = absU(m.groupValues[1])
-                if (Regex("""(?i)m3u8|\.mp4|master|playlist""").containsMatchIn(u)) set.add(u)
+                val key = m.groupValues[1].lowercase()
+                var u = m.groupValues[2]
+                u = if (u.startsWith("/") && !u.startsWith("//")) origin + u else absU(u)
+                if ((key in strongKeys && !imgRe.containsMatchIn(u)) || mediaHintRe.containsMatchIn(u)) set.add(u)
             }
         }
         var ok = false
-        for (u in set.filter { !badHostRe.containsMatchIn(it) && !imgRe.containsMatchIn(it) }.take(8)) {
+        for (u in set.filter { !badHostRe.containsMatchIn(it) && !imgRe.containsMatchIn(it) }.take(10)) {
             if (emitLink(u, "", label, origin, done, callback)) ok = true
         }
         return ok
     }
 
+    // Sayfa içindeki diğer oynatıcı adresleri (iframe / *.php?v=); medya listesi olan nm.php / m.php hariç
+    private fun innerPlayers(texts: List<String>, frameUrl: String, origin: String): List<String> {
+        val out = LinkedHashSet<String>()
+        val abs1 = Regex("""(?:https?:)?//[A-Za-z0-9.-]+/[A-Za-z0-9_\-/]*\.php\?v=[A-Za-z0-9_%.=+/\-]+""")
+        val rel1 = Regex("""["'`]((?:\./|/)?[A-Za-z0-9_\-/]*\.php\?v=[A-Za-z0-9_%.=+/\-]+)["'`]""")
+        val ifr = Regex("""(?i)<iframe[^>]+?(?:src|data-src)\s*=\s*["']([^"']+)["']""")
+        fun add(u0: String) {
+            val s = u0.trim()
+            val u = when {
+                s.startsWith("http") -> s
+                s.startsWith("//") -> "https:$s"
+                s.startsWith("/") -> origin + s
+                s.contains(".php?v=") -> origin + "/" + s.removePrefix("./")
+                else -> return
+            }
+            if (u == frameUrl || adHostRe.containsMatchIn(u) || badHostRe.containsMatchIn(u)) return
+            if (Regex("""(?i)/(?:nm|m)\.php""").containsMatchIn(u)) return
+            out.add(u)
+        }
+        for (t in texts) {
+            abs1.findAll(t).forEach { add(it.value) }
+            rel1.findAll(t).forEach { add(it.groupValues[1]) }
+            ifr.findAll(t).forEach { add(it.groupValues[1]) }
+        }
+        return out.toList()
+    }
+
+    // Hiçbir yolla bulunamazsa: sayfanın yapısı logcat'e yazılır (uzun base64 blokları kısaltılarak)
+    private fun logPageSummary(html: String) {
+        val masked = html.replace(Regex("[A-Za-z0-9+/=_\\-]{120,}")) { "<b${it.value.length}>" }
+            .replace(Regex("\\s+"), " ")
+        Log.d(tag, "SAYFA OZET len=${html.length} maskeli=${masked.length}")
+        var i = 0
+        var n = 0
+        while (i < masked.length && n < 10) {
+            Log.d(tag, "ozet[$n] " + masked.substring(i, minOf(masked.length, i + 700)))
+            i += 700
+            n++
+        }
+        for (key in listOf("sources", "NP_", "CONFIG", "m3u8", "nm.php", "player", "iframe")) {
+            val idx = masked.indexOf(key)
+            if (idx >= 0) {
+                Log.d(tag, "baglam[$key@$idx] " + masked.substring(maxOf(0, idx - 200), minOf(masked.length, idx + 500)))
+            }
+        }
+    }
+
+    // Son çare: oynatıcıyı gerçek WebView'da çalıştırıp video isteğini yakalar
+    private suspend fun webviewFallback(
+        frameUrl: String,
+        pageUrl: String,
+        done: MutableSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val w = try {
+            val r = app.get(
+                frameUrl,
+                referer = pageUrl,
+                headers = headers,
+                interceptor = WebViewResolver(
+                    Regex("""(?i)\.m3u8|\.mp4(?:\?|$)|/nm\.php\?v=|/m\.php\?v=|master\.txt"""),
+                    userAgent = headers["User-Agent"],
+                    useOkhttp = false,
+                    timeout = 20_000L
+                ),
+                timeout = 30L
+            )
+            r.url.takeIf { it != frameUrl }
+        } catch (e: Exception) {
+            rethrow(e)
+            Log.e(tag, "webview istek hata ${e.javaClass.simpleName}")
+            null
+        }
+        Log.d(tag, "webview yakalanan=${w?.take(120)}")
+        if (w == null) return false
+        val u = if (w.contains("/m.php")) w.replace("/m.php", "/master.m3u8") else w
+        return emitLink(u, "", name, originOf(w), done, callback)
+    }
+
+    // HTML + paket çözümü + base64 / hex çözümü: gizlenmiş adresleri de yakalar
     private fun allTexts(html: String): List<String> {
         val base = unescape(html)
         val out = ArrayList<String>()
@@ -898,7 +1099,42 @@ class DiziPal : MainAPI() {
             out.addAll(unpackAll(base))
         } catch (_: Exception) {
         }
+        try {
+            out.addAll(deepTexts(out.toList()))
+        } catch (_: Exception) {
+        }
         return out.map { unescape(it) }.distinct()
+    }
+
+    private fun b64bin(s: String): ByteArray {
+        var c = s.replace('-', '+').replace('_', '/').replace(Regex("[^A-Za-z0-9+/]"), "")
+        while (c.length % 4 != 0) c += "="
+        return try {
+            Base64.decode(c, Base64.DEFAULT)
+        } catch (e: Exception) {
+            ByteArray(0)
+        }
+    }
+
+    private fun deepTexts(texts: List<String>): List<String> {
+        val out = LinkedHashSet<String>()
+        for (t in texts) {
+            if (Regex("\\\\x[0-9a-fA-F]{2}|\\\\u[0-9a-fA-F]{4}").containsMatchIn(t)) {
+                var dd = Regex("\\\\x([0-9a-fA-F]{2})").replace(t) { it.groupValues[1].toInt(16).toChar().toString() }
+                dd = Regex("\\\\u([0-9a-fA-F]{4})").replace(dd) { it.groupValues[1].toInt(16).toChar().toString() }
+                out.add(dd)
+            }
+            Regex("[A-Za-z0-9+/_\\-]{28,}={0,2}").findAll(t).take(400).forEach { m ->
+                val bytes = b64bin(m.value)
+                if (bytes.isNotEmpty()) {
+                    val dd = String(bytes, Charsets.ISO_8859_1)
+                    if (dd.length > 12 && Regex("https?://|\\.m3u8|\\.mp4|\"file\"|sources", RegexOption.IGNORE_CASE).containsMatchIn(dd)) {
+                        out.add(dd)
+                    }
+                }
+            }
+        }
+        return out.toList()
     }
 
     // Dean Edwards packer çözücü
