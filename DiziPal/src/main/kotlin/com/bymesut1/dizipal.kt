@@ -3,8 +3,10 @@ package com.bymesut1
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -24,6 +26,8 @@ class DiziPal : MainAPI() {
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
 
     private val tag = "DiziPal"
+
+    private val cf = CloudflareKiller()
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -55,15 +59,41 @@ class DiziPal : MainAPI() {
         if (e is java.util.concurrent.CancellationException) throw e
     }
 
-    private suspend fun safeGet(url: String, referer: String? = null): String {
-        return try {
-            val h = if (referer != null) headers + mapOf("Referer" to referer) else headers
-            app.get(url, headers = h).text
-        } catch (e: Exception) {
-            rethrow(e)
-            Log.e(tag, "get hata ${e.javaClass.simpleName} ${url.take(90)}")
-            ""
+    private fun isBlocked(code: Int, t: String): Boolean =
+        code == 403 || code == 429 || code == 503 ||
+            (t.length < 30_000 && (t.contains("Just a moment", true) || t.contains("cf-chl", true) ||
+                t.contains("Attention Required", true)))
+
+    // Site başka bir dizipal adresine yönlendirirse yeni adres kullanılır
+    private fun trackDomain(finalUrl: String) {
+        val o = originOf(finalUrl)
+        if (o != mainUrl && Regex("""^https?://dizipal[0-9a-z.\-]*\.[a-z]+$""", RegexOption.IGNORE_CASE).matches(o)) {
+            Log.d(tag, "alan adı değişti: $mainUrl -> $o")
+            mainUrl = o
         }
+    }
+
+    // En fazla 3 deneme: 1) normal  2) Cloudflare aşıcı  3) normal (kısa beklemeyle)
+    // Engel / hata / zaman aşımı olursa yeniden dener; engel yoksa gelen yanıtı (boş olsa da) döndürür.
+    private suspend fun safeGet(url: String, referer: String? = null): String {
+        val h = if (referer != null) headers + mapOf("Referer" to referer) else headers
+        for (attempt in 1..3) {
+            try {
+                val r = if (attempt == 2) {
+                    app.get(url, headers = h, interceptor = cf, timeout = 30L)
+                } else {
+                    app.get(url, headers = h, timeout = 25L)
+                }
+                trackDomain(r.url)
+                if (!isBlocked(r.code, r.text)) return r.text
+                Log.e(tag, "get engel kod=${r.code} len=${r.text.length} deneme=$attempt ${url.take(80)}")
+            } catch (e: Exception) {
+                rethrow(e)
+                Log.e(tag, "get hata ${e.javaClass.simpleName} deneme=$attempt ${url.take(80)}")
+            }
+            if (attempt < 3) delay(600L * attempt)
+        }
+        return ""
     }
 
     private fun absU(u: String): String = when {
@@ -401,7 +431,22 @@ class DiziPal : MainAPI() {
         return t
     }
 
+    // Açılan sayfalar 10 dakika saklanır: tekrar açınca anında gelir, anlık ağ sorununda hata vermez
+    private val loadCache = ConcurrentHashMap<String, Pair<Long, LoadResponse>>()
+
     override suspend fun load(url: String): LoadResponse? {
+        val now = System.currentTimeMillis()
+        val c = loadCache[url]
+        if (c != null && now - c.first < 10 * 60_000L) return c.second
+        val r = loadUncached(url)
+        if (r != null) {
+            if (loadCache.size > 60) loadCache.clear()
+            loadCache[url] = now to r
+        }
+        return r
+    }
+
+    private suspend fun loadUncached(url: String): LoadResponse? {
         return try {
             var pageUrl = url
             if (pageUrl.contains("/bolum/")) {
@@ -412,7 +457,7 @@ class DiziPal : MainAPI() {
             val rsc = extractRsc(html)
             val data = extractDataObject(rsc)
                 ?: run {
-                    Log.e(tag, "load: data bulunamadı")
+                    Log.e(tag, "load: data bulunamadı html=${html.length} rsc=${rsc.length} baş=${html.take(160).replace("\n", " ")}")
                     return null
                 }
 
@@ -478,7 +523,7 @@ class DiziPal : MainAPI() {
             }
         } catch (e: Exception) {
             rethrow(e)
-            Log.e(tag, "load hata: ${e.message}")
+            Log.e(tag, "load hata: ${e.javaClass.simpleName} ${e.message}")
             null
         }
     }
