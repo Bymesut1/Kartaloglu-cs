@@ -20,7 +20,7 @@ class DiziMom : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
-    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
+    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.Anime)
     override val vpnStatus = VPNStatus.None
 
     companion object {
@@ -37,11 +37,49 @@ class DiziMom : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/filmler?sirala=yeni" to "Yeni Eklenen Filmler",
         "$mainUrl/diziler?sirala=yeni" to "Yeni Eklenen Diziler",
+        "$mainUrl/animes?sirala=yeni" to "Yeni Eklenen Animeler",
+        "$mainUrl/trend" to "Trend İçerikler",
+        "$mainUrl/imdb-top-250" to "IMDB Top 250",
         "$mainUrl/filmler" to "Filmler",
+        "$mainUrl/diziler" to "Diziler",
+        "$mainUrl/animes" to "Animeler",
+        "$mainUrl/tur/aksiyon" to "Aksiyon",
+        "$mainUrl/tur/aksiyon-macera" to "Aksiyon & Macera",
+        "$mainUrl/tur/aile" to "Aile",
+        "$mainUrl/tur/animasyon" to "Animasyon",
+        "$mainUrl/tur/belgesel" to "Belgesel",
+        "$mainUrl/tur/bilim-kurgu" to "Bilim-Kurgu",
+        "$mainUrl/tur/bilim-kurgu-fantastik" to "Bilim Kurgu & Fantazi",
+        "$mainUrl/tur/biyografi" to "Biyografi",
+        "$mainUrl/tur/dram" to "Dram",
+        "$mainUrl/tur/fantastik" to "Fantastik",
+        "$mainUrl/tur/gerilim" to "Gerilim",
+        "$mainUrl/tur/gizem" to "Gizem",
+        "$mainUrl/tur/komedi" to "Komedi",
+        "$mainUrl/tur/korku" to "Korku",
+        "$mainUrl/tur/macera" to "Macera",
+        "$mainUrl/tur/muzik" to "Müzik",
+        "$mainUrl/tur/pembe-dizi" to "Pembe Dizi",
+        "$mainUrl/tur/romantik" to "Romantik",
+        "$mainUrl/tur/savas" to "Savaş",
+        "$mainUrl/tur/suc" to "Suç",
+        "$mainUrl/tur/tarih" to "Tarih",
+        "$mainUrl/tur/western" to "Vahşi Batı",
+        "$mainUrl/platform/netflix" to "Netflix",
+        "$mainUrl/platform/disney" to "Disney+",
+        "$mainUrl/platform/hbo-max" to "HBO Max",
+        "$mainUrl/platform/amazon-prime" to "Amazon Prime",
+        "$mainUrl/platform/apple-tv" to "Apple TV+",
+        "$mainUrl/platform/exxen" to "Exxen",
+        "$mainUrl/platform/gain" to "Gain",
+        "$mainUrl/platform/tabii" to "tabii",
+        "$mainUrl/platform/tod" to "TOD",
+        "$mainUrl/platform/paramount-plus" to "Paramount+",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val address = if (page <= 1) request.data else request.data.trimEnd('/') + "?page=$page"
+        val address = if (page <= 1) request.data
+            else request.data.trimEnd('/') + (if (request.data.contains("?")) "&" else "?") + "page=$page"
         val document = getDocument(address)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         val results = parseCatalog(document, address)
@@ -139,7 +177,8 @@ class DiziMom : MainAPI() {
             episodes.addAll(parseEpisodes(document, url, 1))
         }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+        val seriesType = if (url.contains("/anime/")) TvType.Anime else TvType.TvSeries
+        return newTvSeriesLoadResponse(title, url, seriesType, episodes) {
             posterUrl = poster
             this.plot = plot
             this.year = year
@@ -476,7 +515,8 @@ class DiziMom : MainAPI() {
         for (link: Element in links) {
             val url = absolute(link.attr("href"), baseUrl).substringBefore("#")
             if (url.isBlank()) continue
-            if (!url.contains("/film/") && !url.contains("/dizi/")) continue
+            if (!url.contains("/film/") && !url.contains("/dizi/") && !url.contains("/anime/")) continue
+            if (url.contains("/bolum-") || url.contains("/sezon-")) continue
             val card: Element = findCard(link)
             val poster: String? = imageFrom(link, baseUrl) ?: imageFrom(card, baseUrl)
             val title: String = listOf(
@@ -489,8 +529,11 @@ class DiziMom : MainAPI() {
             ).firstOrNull { it.isNotBlank() }?.trim() ?: continue
             if (title.length < 2) continue
             val key = canonical(url)
-            val item: SearchResponse = if (url.contains("/film/")) newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
-                       else newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = poster }
+            val item: SearchResponse = when {
+                url.contains("/film/") -> newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
+                url.contains("/anime/") -> newTvSeriesSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
+                else -> newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = poster }
+            }
             found.putIfAbsent(key, item)
         }
         return found.values.toList()
