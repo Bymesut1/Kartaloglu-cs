@@ -125,10 +125,10 @@ class DiziMom : MainAPI() {
         }
 
         val episodes = mutableListOf<Episode>()
-        val seasonLinks = document.select("div.flex.flex-wrap.gap-2 a[href*='?sezon=']")
+        val seasonLinks: List<Element> = document.select("div.flex.flex-wrap.gap-2 a[href*='?sezon=']").toList()
         if (seasonLinks.isNotEmpty()) {
-            for (seasonLink in seasonLinks) {
-                val href = seasonLink.attr("href").trim()
+            for (seasonLink: Element in seasonLinks) {
+                val href: String = seasonLink.attr("href").trim()
                 if (href.isBlank()) continue
                 val seasonUrl = absolute(href, url).substringBefore("#")
                 val seasonNum = Regex("""sezon=(\d+)""").find(seasonUrl)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -151,18 +151,19 @@ class DiziMom : MainAPI() {
 
     private fun parseEpisodes(document: Document, baseUrl: String, defaultSeason: Int): List<Episode> {
         val episodes = mutableListOf<Episode>()
-        val selectedEpisodeLinks = document.select("div.grid.grid-cols-2.gap-4 a[href*='/sezon-'][href*='/bolum-']")
-        val episodeLinks = if (selectedEpisodeLinks.isNotEmpty()) selectedEpisodeLinks
-        else document.select("a[href*='/sezon-'][href*='/bolum-']")
+        val selectedEpisodeLinks: List<Element> =
+            document.select("div.grid.grid-cols-2.gap-4 a[href*='/sezon-'][href*='/bolum-']").toList()
+        val episodeLinks: List<Element> = if (selectedEpisodeLinks.isNotEmpty()) selectedEpisodeLinks
+        else document.select("a[href*='/sezon-'][href*='/bolum-']").toList()
 
-        for (link in episodeLinks) {
-            val href = link.attr("href").trim()
+        for (link: Element in episodeLinks) {
+            val href: String = link.attr("href").trim()
             if (href.isBlank()) continue
             val fullUrl = absolute(href, baseUrl)
             val match = Regex("""/sezon-(\d+)/bolum-(\d+)""").find(fullUrl) ?: continue
             val seasonNum = match.groupValues[1].toIntOrNull() ?: defaultSeason
             val episodeNum = match.groupValues[2].toIntOrNull() ?: continue
-            val episodeName = link.selectFirst("p.text-sm.font-semibold")?.text()?.trim()
+            val episodeName: String = link.selectFirst("p.text-sm.font-semibold")?.text()?.trim()
                 ?: link.text().trim().ifBlank { "Bölüm $episodeNum" }
             val episodePoster = imageFrom(link, baseUrl)
             episodes.add(newEpisode(fullUrl) {
@@ -217,9 +218,10 @@ class DiziMom : MainAPI() {
         Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4|mpd)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE).findAll(html).forEach { emitLink(it.value, sourceUrl, "statik-media") }
 
         if (!found) {
-            val pvSlug = document.selectFirst("[data-pv]")?.attr("data-pv")?.trim()
-            val coreJsRaw = document.select("script[src]").firstOrNull {
-                val src = it.attr("src"); src.contains("/e/c.js") || src.contains("/assets/js/core.js")
+            val pvSlug: String? = document.selectFirst("[data-pv]")?.attr("data-pv")?.trim()
+            val coreJsRaw: String? = document.select("script[src]").toList().firstOrNull { el: Element ->
+                val src: String = el.attr("src")
+                src.contains("/e/c.js") || src.contains("/assets/js/core.js")
             }?.attr("src")
             val base = when {
                 !coreJsRaw.isNullOrBlank() -> absolute(coreJsRaw, sourceUrl).replace(Regex("/(?:e/c|assets/js/core)\\.js.*$"), "")
@@ -232,9 +234,10 @@ class DiziMom : MainAPI() {
                     val sPhpHtml = sPhpDoc.html().replace("\\/", "/")
                     Regex("""https?://[^\s"'<>]+/api/stream\.php[^\s"'<>]*""", RegexOption.IGNORE_CASE).findAll(sPhpHtml).forEach { emitLink(it.value, sPhpUrl, "s.php") }
                     Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4|mpd)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE).findAll(sPhpHtml).forEach { emitLink(it.value, sPhpUrl, "s.php-media") }
-                    sPhpDoc.select("iframe[src], iframe[data-src]").forEach { iframe ->
-                        val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-                        if (src.isBlank()) return@forEach
+                    val iframes: List<Element> = sPhpDoc.select("iframe[src], iframe[data-src]").toList()
+                    for (iframe: Element in iframes) {
+                        val src: String = iframe.attr("src").ifBlank { iframe.attr("data-src") }
+                        if (src.isBlank()) continue
                         val innerUrl = absolute(src, sPhpUrl)
                         if (innerUrl.contains("/api/stream.php", true)) emitLink(innerUrl, sPhpUrl, "s.php-iframe")
                     }
@@ -328,7 +331,7 @@ class DiziMom : MainAPI() {
             val sid = sub.optString("sid")
             val label = sub.optString("label").ifBlank { "Altyazı ${i + 1}" }
             val lang = sub.optString("lang").ifBlank { "tr" }
-            var src = sub.optString("src").replace("\\/", "/")
+            val src = sub.optString("src").replace("\\/", "/")
 
             Log.d(name, "  sub[$i]: sid=$sid, label=$label, lang=$lang, src=${src.take(300)}")
 
@@ -469,20 +472,24 @@ class DiziMom : MainAPI() {
 
     private fun parseCatalog(document: Document, baseUrl: String): List<SearchResponse> {
         val found = LinkedHashMap<String, SearchResponse>()
-        for (link in document.select("a[href]")) {
+        val links: List<Element> = document.select("a[href]").toList()
+        for (link: Element in links) {
             val url = absolute(link.attr("href"), baseUrl).substringBefore("#")
             if (url.isBlank()) continue
             if (!url.contains("/film/") && !url.contains("/dizi/")) continue
-            val card = findCard(link)
-            val poster = imageFrom(link, baseUrl) ?: imageFrom(card, baseUrl)
-            val title = listOf(link.attr("title"), link.attr("aria-label"),
+            val card: Element = findCard(link)
+            val poster: String? = imageFrom(link, baseUrl) ?: imageFrom(card, baseUrl)
+            val title: String = listOf(
+                link.attr("title"),
+                link.attr("aria-label"),
                 link.selectFirst("h2,h3,h4,.title,.name")?.text().orEmpty(),
-                link.selectFirst("img")?.attr("alt").orEmpty(), link.text(),
-                card.selectFirst("h2,h3,h4,.title,.name")?.text().orEmpty())
-                .firstOrNull { it.isNotBlank() }?.trim() ?: continue
+                link.selectFirst("img")?.attr("alt").orEmpty(),
+                link.text(),
+                card.selectFirst("h2,h3,h4,.title,.name")?.text().orEmpty(),
+            ).firstOrNull { it.isNotBlank() }?.trim() ?: continue
             if (title.length < 2) continue
             val key = canonical(url)
-            val item = if (url.contains("/film/")) newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
+            val item: SearchResponse = if (url.contains("/film/")) newMovieSearchResponse(title, url, TvType.Movie) { posterUrl = poster }
                        else newTvSeriesSearchResponse(title, url, TvType.TvSeries) { posterUrl = poster }
             found.putIfAbsent(key, item)
         }
@@ -490,21 +497,23 @@ class DiziMom : MainAPI() {
     }
 
     private fun findCard(link: Element): Element {
-        var best = link; var current: Element? = link
+        var best: Element = link
+        var current: Element? = link
         repeat(3) {
-            val item = current ?: return@repeat
+            val item: Element = current ?: return@repeat
             if (item.selectFirst("img") != null) best = item
-            val parent = item.parent() ?: return@repeat
+            val parent: Element = item.parent() ?: return@repeat
             if (parent.select("a[href]").size > 10) return@repeat
-            current = parent; best = parent
+            current = parent
+            best = parent
         }
         return best
     }
 
     private fun imageFrom(element: Element?, baseUrl: String): String? {
         if (element == null) return null
-        val img = if (element.tagName().equals("img", true)) element else element.selectFirst("img") ?: return null
-        val src = img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
+        val img: Element = if (element.tagName().equals("img", true)) element else (element.selectFirst("img") ?: return null)
+        val src: String = img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
         return if (src.isNotBlank()) absolute(src, baseUrl) else null
     }
 
@@ -514,9 +523,12 @@ class DiziMom : MainAPI() {
             ?: document.title().takeIf { it.isNotBlank() }
             ?: pathOf(url).substringAfterLast("/")
 
-    private fun pagePoster(document: Document, baseUrl: String): String? =
-        document.selectFirst("meta[property=og:image]")?.attr("content")?.let { absolute(it, baseUrl) }
-            ?: document.selectFirst(".poster img, .detail-poster img")?.let { imageFrom(it, baseUrl) }
+    private fun pagePoster(document: Document, baseUrl: String): String? {
+        val og: String? = document.selectFirst("meta[property=og:image]")?.attr("content")
+        if (og != null) return absolute(og, baseUrl)
+        val el: Element? = document.selectFirst(".poster img, .detail-poster img")
+        return if (el != null) imageFrom(el, baseUrl) else null
+    }
 
     private fun pagePlot(document: Document): String? =
         document.selectFirst("meta[property=og:description]")?.attr("content")?.trim()
@@ -524,15 +536,17 @@ class DiziMom : MainAPI() {
             ?: document.selectFirst(".description, .plot, .summary")?.text()?.trim()
 
     private fun detailValue(document: Document, label: String): String? {
-        val row = document.select("dl.divide-y.text-sm > div").firstOrNull {
-            it.selectFirst("dt")?.text()?.trim()?.equals(label, ignoreCase = true) == true
+        val rows: List<Element> = document.select("dl.divide-y.text-sm > div").toList()
+        val row: Element = rows.firstOrNull { r: Element ->
+            r.selectFirst("dt")?.text()?.trim()?.equals(label, ignoreCase = true) == true
         } ?: return null
         return row.selectFirst("dd")?.text()?.trim()?.takeIf { it.isNotBlank() }
     }
 
     private fun pageYear(document: Document, title: String): Int? {
         detailValue(document, "Yapım Yılı")?.let { Regex("""(19\d{2}|20\d{2})""").find(it)?.value?.toIntOrNull() }?.let { return it }
-        for (script in document.select("script[type=application/ld+json]")) {
+        val scripts: List<Element> = document.select("script[type=application/ld+json]").toList()
+        for (script: Element in scripts) {
             Regex("\"datePublished\"\\s*:\\s*\"(\\d{4})").find(script.data())
                 ?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
         }
@@ -540,23 +554,25 @@ class DiziMom : MainAPI() {
     }
 
     private fun pageRating(document: Document): Double? {
-        detailValue(document, "IMDB Puanı") ?: return null
-        val rating = Regex("""(?<!\d)(10(?:[.,]0)?|[0-9](?:[.,][0-9])?)""").find(detailValue(document, "IMDB Puanı") ?: "")?.value?.replace(',', '.')?.toDoubleOrNull()
+        val raw: String = detailValue(document, "IMDB Puanı") ?: return null
+        val rating = Regex("""(?<!\d)(10(?:[.,]0)?|[0-9](?:[.,][0-9])?)""").find(raw)?.value?.replace(',', '.')?.toDoubleOrNull()
         return rating?.takeIf { it in 0.0..10.0 }
     }
 
     private fun pageGenres(document: Document): List<String> {
         detailValue(document, "Tür")?.let { return it.split(',', '·').map { g -> g.trim() }.filter { it.isNotBlank() }.distinct().take(20) }
-        return document.select("a[href*='/tur/']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct().take(20)
+        val tags: List<Element> = document.select("a[href*='/tur/']").toList()
+        return tags.map { e: Element -> e.text().trim() }.filter { it.isNotBlank() }.distinct().take(20)
     }
 
     private fun pageActors(document: Document): List<String> {
         val actors = LinkedHashSet<String>()
-        document.select("#cast-grid a[href*='/oyuncu/']").forEach { card ->
-            val name = card.selectFirst("p[title]")?.attr("title")?.trim()
+        val cards: List<Element> = document.select("#cast-grid a[href*='/oyuncu/']").toList()
+        for (card: Element in cards) {
+            val actorName: String? = card.selectFirst("p[title]")?.attr("title")?.trim()
                 ?: card.selectFirst("p")?.text()?.trim()
                 ?: card.selectFirst("img[alt]")?.attr("alt")?.trim()
-            if (!name.isNullOrBlank()) actors.add(name)
+            if (!actorName.isNullOrBlank()) actors.add(actorName)
         }
         return actors.take(50).toList()
     }
