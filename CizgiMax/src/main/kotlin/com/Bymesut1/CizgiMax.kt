@@ -709,8 +709,9 @@ class CizgiMax : MainAPI() {
     }
 
     // Tek bir adresi açıp içinden video linki çıkarır (JSON / HTML / doğrudan video / iframe)
-    private suspend fun resolveOne(src: String, page: String, extra: Map<String, String>, depth: Int, hosts: List<String>): List<Media> {
+    private suspend fun resolveOne(src: String, page: String, extra: Map<String, String>, depth: Int, hosts: List<String>, status: IntArray): List<Media> {
         var r = app.get(src, headers = pageHeaders(page) + extra + ("Range" to "bytes=0-0"))
+        status[0] = r.code
         val fin = r.url
         val ct = r.headers["content-type"].orEmpty()
         val isMediaCt = Regex("^(video|audio)/|mpegurl|dash\\+xml|octet-stream", RegexOption.IGNORE_CASE).containsMatchIn(ct)
@@ -721,9 +722,10 @@ class CizgiMax : MainAPI() {
 
         var t = r.text
         // Bazı sunucular "Range" isteğine yanıtın sadece 1 baytını döndürür: Range olmadan tekrar al
-        if (r.code == 206 || t.length < 400) {
+        if (r.code == 206) {
             try {
                 r = app.get(src, headers = pageHeaders(page) + extra)
+                status[0] = r.code
                 t = r.text
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
@@ -782,7 +784,7 @@ class CizgiMax : MainAPI() {
                     u.startsWith("/") -> originOf(fin2) + u
                     else -> ""
                 }
-                if (full.isNotBlank() && full != src) return resolveOne(full, fin2, extra, depth + 1, hosts)
+                if (full.isNotBlank() && full != src) return resolveOne(full, fin2, extra, depth + 1, hosts, status)
             }
         }
         val base = refererFor(fin2, originOf(fin2) + "/")
@@ -803,16 +805,22 @@ class CizgiMax : MainAPI() {
             "X-Requested-With" to "XMLHttpRequest",
             "Accept" to "application/json, text/plain, */*"
         )
+        val st = IntArray(1)
         for (c in cands) {
             for (extra in listOf(emptyMap<String, String>(), xhr)) {
+                st[0] = 0
                 val res = try {
-                    resolveOne(c, page, extra, 0, hosts)
+                    resolveOne(c, page, extra, 0, hosts, st)
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     android.util.Log.e("CizgiMax", "adres hata ${e.javaClass.simpleName} ${c.take(70)}")
                     emptyList()
                 }
                 if (res.isNotEmpty()) return res
+                // Sunucu 2xx yanıt verdiyse farklı başlıkla tekrar denemek anlamsız (süre kaybı)
+                if (st[0] in 200..299) break
+                // Telif uyarılı sunucuda tek deneme
+                if (s.notice.equals("copyright", true)) break
             }
         }
         return emptyList()
