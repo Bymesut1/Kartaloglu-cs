@@ -415,98 +415,157 @@ class OkruProvider : MainAPI() {
     private fun isYoutubeUrl(u: String): Boolean =
         u.contains("youtube", true) || u.contains("youtu.be", true) || u.contains("ytimg", true)
 
+    // ok.ru oynatıcı verisi: önce sayfadaki data-options; içinde metadata yoksa metadataUrl;
+    // sayfada hiç oynatıcı verisi çıkmazsa ok.ru'nun kendi oynatıcı API'si (yedek)
     private suspend fun fetchMeta(id: String): OkMeta? {
+        val info = StringBuilder()
         for (path in listOf("/videoembed/", "/video/")) {
             val doc = try {
                 app.get(mainUrl + path + id, headers = hdr(path == "/video/"), timeout = 8L).document
             } catch (e: Exception) {
+                info.append("[$path istek hata ${e.javaClass.simpleName}] ")
                 continue
             }
-            for (el in doc.select("[data-options]")) {
+            val opts = doc.select("[data-options]")
+            val html = doc.html()
+            info.append("[$path data-options=${opts.size} flashvars=${html.contains("flashvars")} metadataUrl=${html.contains("metadataUrl")}] ")
+            for (el in opts) {
                 val raw = el.attr("data-options")
                 if (!raw.contains("flashvars")) continue
                 try {
-                    val opts = JSONObject(raw)
-                    val fv = opts.optJSONObject("flashvars") ?: continue
-                    val md = fv.optJSONObject("metadata") ?: JSONObject(fv.optString("metadata", "{}"))
-                    val mv = md.optJSONObject("movie") ?: JSONObject()
-
-                    val vids = ArrayList<Pair<Int, String>>()
-                    val arr = md.optJSONArray("videos")
-                    if (arr != null) {
-                        for (i in 0 until arr.length()) {
-                            val v = arr.optJSONObject(i) ?: continue
-                            val u = v.optString("url")
-                            if (u.isNotBlank()) vids.add((kalite[v.optString("name")] ?: 0) to u)
-                        }
+                    val o = JSONObject(raw)
+                    val fv = o.optJSONObject("flashvars") ?: continue
+                    var md = fv.optJSONObject("metadata") ?: JSONObject(fv.optString("metadata", "{}"))
+                    if (md.length() == 0) {
+                        val mu = fv.optString("metadataUrl", "")
+                        if (mu.isNotBlank()) md = fetchMetadataJson(mu, fv.optString("location", "")) ?: md
                     }
-                    val hls = listOf("hlsManifestUrl", "hlsMasterPlaylistUrl", "ondemandHls")
-                        .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
-                    val dash = listOf("ondemandDash", "dashManifestUrl", "ondemandDashUrl", "dashUrl")
-                        .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
-
-                    val posterRaw = listOf(
-                        mv.optString("poster"),
-                        mv.optString("bigThumbnail"),
-                        mv.optString("thumbnail"),
-                        md.optString("poster")
-                    ).firstOrNull { it.isNotBlank() }
-
-                    // ---- YouTube / dış site gömmeleri ----
-                    // Başlık ve açıklama dışarıda bırakılır (açıklamadaki bağlantılar yanıltmasın)
-                    val scan = try {
-                        val c = JSONObject(md.toString())
-                        c.remove("description")
-                        c.remove("title")
-                        c.optJSONObject("movie")?.let {
-                            it.remove("description")
-                            it.remove("title")
-                        }
-                        c.toString().replace("\\/", "/")
-                    } catch (e: Exception) {
-                        md.toString().replace("\\/", "/")
-                    }
-                    val yt = LinkedHashSet<String>()
-                    Regex("youtube(?:-nocookie)?\\.com/(?:embed/|v/|shorts/|watch\\?(?:[^\"'\\s]*?&)?v=)([A-Za-z0-9_-]{11})")
-                        .findAll(scan).forEach { yt.add(it.groupValues[1]) }
-                    Regex("youtu\\.be/([A-Za-z0-9_-]{11})").findAll(scan).forEach { yt.add(it.groupValues[1]) }
-                    val ytProvider = Regex("\"provider\"\\s*:\\s*\"[^\"]*youtube", RegexOption.IGNORE_CASE).containsMatchIn(scan)
-                    if (yt.isEmpty() && ytProvider) {
-                        Regex("\"(?:externalId|external_id|videoId|youtubeId|ytId|ytid|extId)\"\\s*:\\s*\"([A-Za-z0-9_-]{11})\"")
-                            .findAll(scan).forEach { yt.add(it.groupValues[1]) }
-                    }
-                    if (yt.isEmpty()) {
-                        // ana videonun kapak resmi YouTube küçük resmiyse kimlik oradan alınır
-                        val pr = posterRaw?.replace("\\/", "/").orEmpty()
-                        Regex("ytimg\\.com/vi(?:_webp)?/([A-Za-z0-9_-]{11})/").find(pr)?.let { yt.add(it.groupValues[1]) }
-                    }
-                    val ext = LinkedHashSet<String>()
-                    Regex("https?://(?:www\\.|player\\.|m\\.)?(?:vimeo\\.com|rutube\\.ru|dailymotion\\.com|dai\\.ly|streamable\\.com)/[^\"'\\s\\\\<>]+")
-                        .findAll(scan).forEach { ext.add(it.value) }
-
-                    Log.d(
-                        tag,
-                        "id=$id provider=${md.optString("provider")} videos=${vids.size} hls=${hls.isNotBlank()} dash=${dash.isNotBlank()} yt=$yt ext=${ext.size} " +
-                            "mdKeys=${md.keys().asSequence().joinToString(",")} " +
-                            "ilkUrl=${vids.firstOrNull()?.second?.take(90)}"
-                    )
-
-                    if (vids.isEmpty() && hls.isBlank() && dash.isBlank() && yt.isEmpty() && ext.isEmpty()) continue
-
-                    return OkMeta(
-                        id,
-                        mv.optString("title").trim(),
-                        fixPoster(posterRaw),
-                        mv.optString("duration").toIntOrNull() ?: 0,
-                        mv.optString("description"),
-                        vids, hls, dash,
-                        yt.toList(), ext.toList()
-                    )
+                    val built = metaFrom(id, md)
+                    if (built != null) return built
                 } catch (e: Exception) {
+                    info.append("[$path ayrıştırma hata ${e.javaClass.simpleName}] ")
                 }
             }
         }
+        val api = apiMetadata(id)
+        if (api != null) {
+            val built = metaFrom(id, api)
+            if (built != null) {
+                Log.d(tag, "id=$id api yedeği ile bulundu")
+                return built
+            }
+        }
+        Log.d(tag, "id=$id meta BULUNAMADI $info api=${api != null}")
         return null
+    }
+
+    // flashvars.metadataUrl: yüzde-kodlu adres, gerekirse st.location ile POST
+    private suspend fun fetchMetadataJson(rawUrl: String, location: String): JSONObject? {
+        return try {
+            var u = java.net.URLDecoder.decode(rawUrl.replace("+", "%2B"), "UTF-8")
+            if (u.startsWith("//")) u = "https:$u" else if (u.startsWith("/")) u = mainUrl + u
+            val data = if (location.isNotBlank()) mapOf("st.location" to location) else emptyMap()
+            val txt = app.post(u, data = data, headers = hdr(true), timeout = 10L).text
+            JSONObject(txt)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            Log.e(tag, "metadataUrl hata ${e.javaClass.simpleName}")
+            null
+        }
+    }
+
+    // ok.ru'nun kendi oynatıcı metadata API'si (sayfada oynatıcı verisi yoksa)
+    private suspend fun apiMetadata(id: String): JSONObject? {
+        val tries = listOf<suspend () -> String>(
+            { app.post("$mainUrl/dk", data = mapOf("cmd" to "videoPlayerMetadata", "mid" to id), headers = hdr(true), timeout = 10L).text },
+            { app.get("$mainUrl/dk?cmd=videoPlayerMetadata&mid=$id", headers = hdr(true), timeout = 10L).text }
+        )
+        for (t in tries) {
+            try {
+                val o = JSONObject(t())
+                if (o.has("videos") || o.has("hlsManifestUrl") || o.has("ondemandHls") || o.has("movie")) return o
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        return null
+    }
+
+    // metadata JSON'undan OkMeta üretir (eski fetchMeta gövdesi, davranış aynı); oynatılacak bir şey yoksa null
+    private fun metaFrom(id: String, md: JSONObject): OkMeta? {
+        val mv = md.optJSONObject("movie") ?: JSONObject()
+
+        val vids = ArrayList<Pair<Int, String>>()
+        val arr = md.optJSONArray("videos")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val v = arr.optJSONObject(i) ?: continue
+                val u = v.optString("url")
+                if (u.isNotBlank()) vids.add((kalite[v.optString("name")] ?: 0) to u)
+            }
+        }
+        val hls = listOf("hlsManifestUrl", "hlsMasterPlaylistUrl", "ondemandHls")
+            .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
+        val dash = listOf("ondemandDash", "dashManifestUrl", "ondemandDashUrl", "dashUrl")
+            .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
+
+        val posterRaw = listOf(
+            mv.optString("poster"),
+            mv.optString("bigThumbnail"),
+            mv.optString("thumbnail"),
+            md.optString("poster")
+        ).firstOrNull { it.isNotBlank() }
+
+        // ---- YouTube / dış site gömmeleri ----
+        // Başlık ve açıklama dışarıda bırakılır (açıklamadaki bağlantılar yanıltmasın)
+        val scan = try {
+            val c = JSONObject(md.toString())
+            c.remove("description")
+            c.remove("title")
+            c.optJSONObject("movie")?.let {
+                it.remove("description")
+                it.remove("title")
+            }
+            c.toString().replace("\\/", "/")
+        } catch (e: Exception) {
+            md.toString().replace("\\/", "/")
+        }
+        val yt = LinkedHashSet<String>()
+        Regex("youtube(?:-nocookie)?\\.com/(?:embed/|v/|shorts/|watch\\?(?:[^\"'\\s]*?&)?v=)([A-Za-z0-9_-]{11})")
+            .findAll(scan).forEach { yt.add(it.groupValues[1]) }
+        Regex("youtu\\.be/([A-Za-z0-9_-]{11})").findAll(scan).forEach { yt.add(it.groupValues[1]) }
+        val ytProvider = Regex("\"provider\"\\s*:\\s*\"[^\"]*youtube", RegexOption.IGNORE_CASE).containsMatchIn(scan)
+        if (yt.isEmpty() && ytProvider) {
+            Regex("\"(?:externalId|external_id|videoId|youtubeId|ytId|ytid|extId)\"\\s*:\\s*\"([A-Za-z0-9_-]{11})\"")
+                .findAll(scan).forEach { yt.add(it.groupValues[1]) }
+        }
+        if (yt.isEmpty()) {
+            // ana videonun kapak resmi YouTube küçük resmiyse kimlik oradan alınır
+            val pr = posterRaw?.replace("\\/", "/").orEmpty()
+            Regex("ytimg\\.com/vi(?:_webp)?/([A-Za-z0-9_-]{11})/").find(pr)?.let { yt.add(it.groupValues[1]) }
+        }
+        val ext = LinkedHashSet<String>()
+        Regex("https?://(?:www\\.|player\\.|m\\.)?(?:vimeo\\.com|rutube\\.ru|dailymotion\\.com|dai\\.ly|streamable\\.com)/[^\"'\\s\\\\<>]+")
+            .findAll(scan).forEach { ext.add(it.value) }
+
+        Log.d(
+            tag,
+            "id=$id provider=${md.optString("provider")} videos=${vids.size} hls=${hls.isNotBlank()} dash=${dash.isNotBlank()} yt=$yt ext=${ext.size} " +
+                "mdKeys=${md.keys().asSequence().joinToString(",")} " +
+                "ilkUrl=${vids.firstOrNull()?.second?.take(90)}"
+        )
+
+        if (vids.isEmpty() && hls.isBlank() && dash.isBlank() && yt.isEmpty() && ext.isEmpty()) return null
+
+        return OkMeta(
+            id,
+            mv.optString("title").trim(),
+            fixPoster(posterRaw),
+            mv.optString("duration").toIntOrNull() ?: 0,
+            mv.optString("description"),
+            vids, hls, dash,
+            yt.toList(), ext.toList()
+        )
     }
 
     private fun idOf(url: String): String = Regex("(\\d{8,})").find(url)?.groupValues?.get(1) ?: ""
