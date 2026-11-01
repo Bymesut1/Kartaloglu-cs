@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -156,7 +157,7 @@ class CizgiMax : MainAPI() {
     }
 
     private fun isMediaUrl(u: String): Boolean =
-        Regex("\\.(mp4|m3u8)(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
+        Regex("\\.(mp4|m3u8|mpd)(\\?|$)", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
             Regex("(okcdn\\.ru|mycdn\\.me|vkuser\\.net)/\\?", RegexOption.IGNORE_CASE).containsMatchIn(u)
 
     private fun refererFor(u: String, fallback: String): String {
@@ -616,7 +617,7 @@ class CizgiMax : MainAPI() {
         val t = fixMediaUrl(text)
         val out = ArrayList<Media>()
         val seen = HashSet<String>()
-        val re1 = Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
+        val re1 = Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4|mpd)(?:\?[^\s"'<>\\]*)?""", RegexOption.IGNORE_CASE)
         val re2 = Regex("""https?://[a-z0-9\-]+\.(?:okcdn\.ru|mycdn\.me|vkuser\.net)/\?[^\s"'<>\\]+""", RegexOption.IGNORE_CASE)
         for (r in listOf(re1, re2)) {
             for (m in r.findAll(t)) {
@@ -626,35 +627,65 @@ class CizgiMax : MainAPI() {
         return out
     }
 
-    private suspend fun resolveServer(s: Srv, page: String): List<Media> {
-        val direct = absUrl(s.streamUrl)
-        if (direct.startsWith("http")) {
-            return listOf(Media(direct, qualOf(direct), "$mainUrl/", originOf(direct) + "/"))
+    private val imgExtRe = Regex("""(?i)\.(?:png|jpe?g|gif|svg|webp|ico|css|js|vtt|srt)(?:\?|$)""")
+    private val urlKeys = setOf(
+        "url", "file", "src", "link", "stream", "video", "hls", "mp4", "dash",
+        "source", "path", "play", "playurl", "manifest", "m3u8"
+    )
+
+    // JSON yanıtı içindeki video adreslerini toplar
+    private fun walkJson(x: Any?, key: String, base: String, out: MutableList<Media>, depth: Int = 0) {
+        if (depth > 8) return
+        when (x) {
+            is JSONObject -> {
+                val ks = x.keys()
+                while (ks.hasNext()) {
+                    val k = ks.next()
+                    walkJson(x.opt(k), k.lowercase(), base, out, depth + 1)
+                }
+            }
+            is JSONArray -> for (i in 0 until x.length()) walkJson(x.opt(i), key, base, out, depth + 1)
+            is String -> {
+                val v = fixMediaUrl(x.trim())
+                if (v.isBlank() || imgExtRe.containsMatchIn(v)) return
+                val abs = when {
+                    v.startsWith("http") -> v
+                    v.startsWith("/") && !v.startsWith("//") -> originOf(base) + v
+                    else -> return
+                }
+                if (isMediaUrl(abs) || (key in urlKeys && v.startsWith("http"))) {
+                    out.add(Media(abs, qualOf(abs), ""))
+                }
+            }
         }
+    }
 
-        val src = absUrl(s.src.ifBlank { s.resolveUrl.ifBlank { s.metaUrl } })
-        if (src.isBlank()) return emptyList()
-
-        var r = app.get(src, headers = pageHeaders(page) + ("Range" to "bytes=0-0"))
+    // Tek bir adresi açıp içinden video linki çıkarır (JSON / HTML / doğrudan video / iframe)
+    private suspend fun resolveOne(src: String, page: String, extra: Map<String, String>, depth: Int): List<Media> {
+        var r = app.get(src, headers = pageHeaders(page) + extra + ("Range" to "bytes=0-0"))
         val fin = r.url
         val ct = r.headers["content-type"].orEmpty()
         val isMediaCt = Regex("^(video|audio)/|mpegurl|dash\\+xml|octet-stream", RegexOption.IGNORE_CASE).containsMatchIn(ct)
         if (isMediaCt || (isMediaUrl(fin) && !ct.contains("html", true))) {
-            // Oynatıcı adresinin kendisi videodur: doğrulamada kendi sitesi de referer olarak denenir
+            // Adresin kendisi videodur: doğrulamada kendi sitesi de referer olarak denenir
             return listOf(Media(fin, qualOf(fin), refererFor(fin, page), originOf(fin) + "/"))
         }
 
         var t = r.text
-        // Bazı sunucular "Range" isteğine sayfanın sadece 1 baytını döndürür: Range olmadan tekrar al
+        // Bazı sunucular "Range" isteğine yanıtın sadece 1 baytını döndürür: Range olmadan tekrar al
         if (r.code == 206 || t.length < 400) {
             try {
-                r = app.get(src, headers = pageHeaders(page))
+                r = app.get(src, headers = pageHeaders(page) + extra)
                 t = r.text
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
             }
         }
         val fin2 = r.url
+        android.util.Log.d(
+            "CizgiMax",
+            "yanıt ${src.take(70)} kod=${r.code} ct=${ct.take(30)} son=${fin2.take(90)} len=${t.length} baş=${t.take(220).replace(Regex("\\s+"), " ")}"
+        )
 
         var res: List<Media> = okruMeta(t)
         if (res.isEmpty()) {
@@ -664,10 +695,72 @@ class CizgiMax : MainAPI() {
                 res = listOf(Media(if (u.startsWith("http")) u else "https://video.sibnet.ru$u", Qualities.Unknown.value, ""))
             }
         }
+        if (res.isEmpty()) {
+            val tt = t.trim()
+            if (tt.startsWith("{") || tt.startsWith("[")) {
+                try {
+                    val lst = ArrayList<Media>()
+                    walkJson(JSONTokener(tt).nextValue(), "", fin2, lst)
+                    res = lst.distinctBy { it.url }
+                } catch (_: Exception) {
+                }
+            }
+        }
         if (res.isEmpty()) res = scanMedia(t)
+        if (res.isEmpty()) {
+            // Göreli yollar: "/file/....mp4"
+            val lst = ArrayList<Media>()
+            for (m in Regex("""["'`](/[^"'`\s]+\.(?:mp4|m3u8|mpd)(?:\?[^"'`\s]*)?)["'`]""", RegexOption.IGNORE_CASE)
+                .findAll(fixMediaUrl(t))) {
+                val u = originOf(fin2) + m.groupValues[1]
+                lst.add(Media(u, qualOf(u), ""))
+            }
+            res = lst.distinctBy { it.url }
+        }
+        if (res.isEmpty() && depth < 1) {
+            // Sayfa başka bir oynatıcı (iframe) içeriyorsa ona in
+            val im = Regex("""<iframe[^>]+?src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(t)
+            if (im != null) {
+                val u = fixMediaUrl(im.groupValues[1])
+                val full = when {
+                    u.startsWith("http") -> u
+                    u.startsWith("/") -> originOf(fin2) + u
+                    else -> ""
+                }
+                if (full.isNotBlank() && full != src) return resolveOne(full, fin2, extra, depth + 1)
+            }
+        }
         val base = refererFor(fin2, originOf(fin2) + "/")
         val ref = if (hostOf(fin2).contains("sibnet")) fin2 else base
         return res.map { it.copy(ref = ref, alt = fin2) }
+    }
+
+    private suspend fun resolveServer(s: Srv, page: String): List<Media> {
+        val direct = absUrl(s.streamUrl)
+        if (direct.startsWith("http")) {
+            return listOf(Media(direct, qualOf(direct), "$mainUrl/", originOf(direct) + "/"))
+        }
+
+        // src boşsa resolveUrl / metaUrl de denenir (hepsi sırayla)
+        val cands = listOf(s.src, s.resolveUrl, s.metaUrl).map { absUrl(it) }
+            .filter { it.startsWith("http") }.distinct()
+        val xhr = mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Accept" to "application/json, text/plain, */*"
+        )
+        for (c in cands) {
+            for (extra in listOf(emptyMap<String, String>(), xhr)) {
+                val res = try {
+                    resolveOne(c, page, extra, 0)
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    android.util.Log.e("CizgiMax", "adres hata ${e.javaClass.simpleName} ${c.take(70)}")
+                    emptyList()
+                }
+                if (res.isNotEmpty()) return res
+            }
+        }
+        return emptyList()
     }
 
     private fun typeOf(u: String): ExtractorLinkType = when {
@@ -770,7 +863,7 @@ class CizgiMax : MainAPI() {
             }
             android.util.Log.d(
                 "CizgiMax",
-                "sunucu '${s.label}' notice='${s.notice}' src=${s.src.take(70)} stream=${s.streamUrl.take(70)} bulunan=${found.size} ${found.firstOrNull()?.url?.take(80).orEmpty()}"
+                "sunucu '${s.label}' tip='${s.type}' notice='${s.notice}' src=${s.src.take(70)} stream=${s.streamUrl.take(70)} resolve=${s.resolveUrl.take(70)} meta=${s.metaUrl.take(70)} bulunan=${found.size} ${found.firstOrNull()?.url?.take(80).orEmpty()}"
             )
 
             // En iyi kaliteden başlayıp çalışan ilk linki seç
