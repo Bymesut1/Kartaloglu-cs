@@ -660,8 +660,56 @@ class CizgiMax : MainAPI() {
         }
     }
 
+    // Dzen sunucusu: /api/np-resolve/ {"id":"..."} döner; video adresi TauVideo API'sinden alınır:
+    // <host>/api/video/<id>  ->  {"urls":[{"url":"https://...mp4","label":"1080p"}]}
+    private suspend fun tauMedia(id: String, hosts: List<String>): List<Media> {
+        for (h in hosts) {
+            val api = "$h/api/video/$id"
+            val txt = try {
+                app.get(
+                    api,
+                    headers = mapOf(
+                        "User-Agent" to ua,
+                        "Referer"    to "$mainUrl/",
+                        "Accept"     to "application/json, text/plain, */*"
+                    )
+                ).text
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ""
+            }
+            android.util.Log.d("CizgiMax", "tau ${api.take(80)} len=${txt.length} baş=${txt.take(220).replace(Regex("\\s+"), " ")}")
+            val out = ArrayList<Media>()
+            try {
+                val x = JSONTokener(txt.trim()).nextValue()
+                val arr: JSONArray? = when (x) {
+                    is JSONObject -> x.optJSONArray("urls") ?: x.optJSONArray("sources") ?: x.optJSONArray("videos")
+                    is JSONArray -> x
+                    else -> null
+                }
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val u = fixMediaUrl(o.optString("url").ifBlank { o.optString("file") }.trim())
+                        if (!u.startsWith("http")) continue
+                        val q = qualOf(o.optString("label")).takeIf { it != Qualities.Unknown.value } ?: qualOf(u)
+                        out.add(Media(u, q, "$mainUrl/", "$h/"))
+                    }
+                }
+                if (out.isEmpty()) {
+                    val lst = ArrayList<Media>()
+                    walkJson(x, "", h, lst)
+                    for (m in lst) out.add(m.copy(ref = "$mainUrl/", alt = "$h/"))
+                }
+            } catch (_: Exception) {
+            }
+            if (out.isNotEmpty()) return out.distinctBy { it.url }
+        }
+        return emptyList()
+    }
+
     // Tek bir adresi açıp içinden video linki çıkarır (JSON / HTML / doğrudan video / iframe)
-    private suspend fun resolveOne(src: String, page: String, extra: Map<String, String>, depth: Int): List<Media> {
+    private suspend fun resolveOne(src: String, page: String, extra: Map<String, String>, depth: Int, hosts: List<String>): List<Media> {
         var r = app.get(src, headers = pageHeaders(page) + extra + ("Range" to "bytes=0-0"))
         val fin = r.url
         val ct = r.headers["content-type"].orEmpty()
@@ -717,6 +765,13 @@ class CizgiMax : MainAPI() {
             }
             res = lst.distinctBy { it.url }
         }
+        if (res.isEmpty()) {
+            val idm = Regex(""""id"\s*:\s*"([A-Za-z0-9_\-]{8,})"""").find(t)
+            if (idm != null) {
+                val tm = tauMedia(idm.groupValues[1], hosts)
+                if (tm.isNotEmpty()) return tm
+            }
+        }
         if (res.isEmpty() && depth < 1) {
             // Sayfa başka bir oynatıcı (iframe) içeriyorsa ona in
             val im = Regex("""<iframe[^>]+?src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(t)
@@ -727,7 +782,7 @@ class CizgiMax : MainAPI() {
                     u.startsWith("/") -> originOf(fin2) + u
                     else -> ""
                 }
-                if (full.isNotBlank() && full != src) return resolveOne(full, fin2, extra, depth + 1)
+                if (full.isNotBlank() && full != src) return resolveOne(full, fin2, extra, depth + 1, hosts)
             }
         }
         val base = refererFor(fin2, originOf(fin2) + "/")
@@ -735,7 +790,7 @@ class CizgiMax : MainAPI() {
         return res.map { it.copy(ref = ref, alt = fin2) }
     }
 
-    private suspend fun resolveServer(s: Srv, page: String): List<Media> {
+    private suspend fun resolveServer(s: Srv, page: String, hosts: List<String>): List<Media> {
         val direct = absUrl(s.streamUrl)
         if (direct.startsWith("http")) {
             return listOf(Media(direct, qualOf(direct), "$mainUrl/", originOf(direct) + "/"))
@@ -751,7 +806,7 @@ class CizgiMax : MainAPI() {
         for (c in cands) {
             for (extra in listOf(emptyMap<String, String>(), xhr)) {
                 val res = try {
-                    resolveOne(c, page, extra, 0)
+                    resolveOne(c, page, extra, 0, hosts)
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     android.util.Log.e("CizgiMax", "adres hata ${e.javaClass.simpleName} ${c.take(70)}")
@@ -834,6 +889,12 @@ class CizgiMax : MainAPI() {
             return false
         }
 
+        // Sayfada geçen TauVideo adresleri + bilinen adres
+        val tauHosts = (
+            Regex("""https?://[a-z0-9.\-]*tau-video[a-z0-9.\-]*""", RegexOption.IGNORE_CASE)
+                .findAll(html).map { it.value.lowercase() }.toList() + "https://tau-video.xyz"
+            ).distinct()
+
         var any = false
         val seen = HashSet<String>()
         val doneKeys = HashSet<String>()
@@ -855,7 +916,7 @@ class CizgiMax : MainAPI() {
             val label = "${langLabel(lang)} - $host"
 
             val found: List<Media> = try {
-                resolveServer(s, page)
+                resolveServer(s, page, tauHosts)
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 android.util.Log.e("CizgiMax", "çözme hata ${e.javaClass.simpleName} ${s.label}")
