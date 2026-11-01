@@ -248,8 +248,8 @@ class OkruProvider : MainAPI() {
         val c = item.selectFirst("div.video-card") ?: return@mapNotNull null
         val title = c.selectFirst("a.video-card_n")?.text()?.trim().orEmpty()
         val href = c.selectFirst("a.video-card_lk")?.attr("href").orEmpty()
-        val id = Regex("/video/(\\d{8,})").find(href)?.groupValues?.get(1)
-            ?: c.attr("data-id").takeIf { it.matches(Regex("\\d{8,}")) }
+        val id = Regex("/video/(\\d{5,})").find(href)?.groupValues?.get(1)
+            ?: c.attr("data-id").takeIf { it.matches(Regex("\\d{5,}")) }
             ?: return@mapNotNull null
         if (title.isBlank()) return@mapNotNull null
         val img = c.selectFirst("img.video-card_img")
@@ -329,7 +329,7 @@ class OkruProvider : MainAPI() {
                 val b = parseProps(html)
                 if (b.isNotEmpty()) return b
                 val ids = LinkedHashSet<String>()
-                Regex("/video/(\\d{8,})").findAll(html).forEach { ids.add(it.groupValues[1]) }
+                Regex("/video/(\\d{5,})").findAll(html).forEach { ids.add(it.groupValues[1]) }
                 if (ids.isNotEmpty()) {
                     // Başlığı olmayanlar için video sayfasından bilgi alınır (paralel, önbellekli)
                     return ids.take(24).toList().amap { id ->
@@ -346,7 +346,7 @@ class OkruProvider : MainAPI() {
     private fun parseProfile(html: String): List<OkItem> {
         val ids = ArrayList<Pair<String, Int>>()
         val seen = HashSet<String>()
-        Regex("/video/(\\d{8,})").findAll(html).forEach {
+        Regex("/video/(\\d{5,})").findAll(html).forEach {
             if (seen.add(it.groupValues[1])) ids.add(it.groupValues[1] to it.range.first)
         }
         val skip = Regex("^(görüntüle|izle|video|videolar|kapat|logo|ok|oynat)$", RegexOption.IGNORE_CASE)
@@ -384,7 +384,7 @@ class OkruProvider : MainAPI() {
             val mv = o.optJSONObject("movie")
             if (mv != null && mv.optString("id").isNotBlank()) {
                 add(mv)
-            } else if (Regex("^\\d{8,}$").matches(o.optString("id")) &&
+            } else if (Regex("^\\d{5,}$").matches(o.optString("id")) &&
                 (o.has("title") || o.has("name")) &&
                 (o.has("duration") || o.has("thumbnail") || o.has("poster") || o.has("imageUrl"))
             ) {
@@ -568,7 +568,9 @@ class OkruProvider : MainAPI() {
         )
     }
 
-    private fun idOf(url: String): String = Regex("(\\d{8,})").find(url)?.groupValues?.get(1) ?: ""
+    private fun idOf(url: String): String =
+        Regex("/(?:video|videoembed)/(\\d+)").find(url)?.groupValues?.get(1)
+            ?: Regex("(\\d{5,})").find(url)?.groupValues?.get(1) ?: ""
 
     override suspend fun load(url: String): LoadResponse? {
         val id = idOf(url)
