@@ -104,6 +104,18 @@ class VkVideo : MainAPI() {
             "türkçe dublaj izle vk", "tr dublaj izle vkvideo.ru", "Türkçe Dublaj film izle vkvideo.ru",
             "filmi izle vkvideo.ru", "film izle vkvideo.ru"
         )
+
+        // ExoPlayer'ın tanıdığı mp4 "brand" değerleri. Dosyanın başında bunlardan hiçbiri yoksa
+        // oynatıcı "ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED" verir (tarayıcı yine de oynatabilir)
+        private val KNOWN_BRANDS = listOf(
+            "isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso9", "avc1", "hvc1", "hev1", "av01",
+            "mp41", "mp42", "mmp4", "3g2a", "3g2b", "3g2c", "3gr6", "3gs6", "3ge6", "3gg6", "3gp4",
+            "3gp5", "3gp6", "3gp7", "M4V ", "M4A ", "f4v ", "kddi", "M4VP", "M4PH", "M4PC", "msnv",
+            "MSNV", "dby1", "isml", "piff", "qt  ", "XAVC"
+        )
+
+        // "ftyp" olmadan başlayıp yine de geçerli sayılan ilk kutular
+        private val OK_FIRST_BOX = listOf("moov", "mdat", "free", "skip", "wide", "pnot", "uuid")
     }
 
     private val hdr = mapOf(
@@ -1280,10 +1292,13 @@ class VkVideo : MainAPI() {
         }
     }
 
-    // Bağlantı adayı: hangi başlık takımının kabul edildiği (headers) ve ölü olup olmadığı (dead) test edilir
+    // Bağlantı adayı: hangi başlık takımının kabul edildiği (headers), ölü olup olmadığı (dead)
+    // ve oynatıcının tanımadığı bir mp4 olup olmadığı (unsupported) test edilir
     private class Cand(val hint: String, val url: String) {
         var headers: Map<String, String>? = null
         var dead = false
+        var unsupported = false
+        var size = -1L
         var diag = ""
     }
 
@@ -1291,7 +1306,9 @@ class VkVideo : MainAPI() {
     private fun isDash(c: Cand) = c.url.contains(".mpd") || c.hint.contains("dash", true)
 
     private fun addCand(list: MutableList<Cand>, seen: HashSet<String>, hint: String, raw: String): Boolean {
+        // "&bytes=0-5355" gibi parça aralığı parametresi varsa kaldırılır (tam dosya istenir)
         val u = raw.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+            .replace(Regex("&bytes=\\d+-\\d*"), "")
         if (!isMedia(u) || !seen.add(u)) return false
         list.add(Cand(hint, u))
         return true
@@ -1396,6 +1413,36 @@ class VkVideo : MainAPI() {
         c.diag = all.mapIndexed { i, p -> "V$i:${p.second}" }.joinToString(" ")
         if (okIdx >= 0) c.headers = hv[okIdx]
         else if (!unknown) c.dead = true
+    }
+
+    // mp4 dosyasının ilk baytlarına bakar: oynatıcının (ExoPlayer) tanımadığı bir kapsayıcıysa c.unsupported = true.
+    // Tarayıcı bu dosyaları oynatır ama CloudStream "ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED" verir.
+    private suspend fun sniffMp4(c: Cand) {
+        if (isHls(c) || isDash(c) || c.dead) return
+        val hv = c.headers ?: hdrList(c.url).first()
+        try {
+            val h = hv.toMutableMap()
+            h["Range"] = "bytes=0-95"
+            val r = app.get(c.url, headers = h, timeout = 5L)
+            val cr = r.headers["Content-Range"] ?: ""
+            val total = Regex("/(\\d+)$").find(cr)?.groupValues?.get(1)?.toLongOrNull()
+            val len = r.headers["Content-Length"]?.toLongOrNull() ?: -1L
+            c.size = total ?: (if (r.code == 200) len else -1L)
+            // Sunucu Range'i yok sayıp tüm dosyayı gönderirse gövde okunmaz (bellek / süre)
+            if (!(r.code == 206 || (len in 1..4096))) return
+            val t = r.text
+            if (t.length < 12) return
+            val head = t.take(64)
+            val box = head.substring(4, 8)
+            c.unsupported = when {
+                box == "ftyp" -> KNOWN_BRANDS.none { head.contains(it) }
+                box in OK_FIRST_BOX -> false
+                else -> true
+            }
+            c.diag += " box=$box"
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+        }
     }
 
     private suspend fun emitCand(c: Cand, lang: String, callback: (ExtractorLink) -> Unit) {
@@ -1555,9 +1602,17 @@ class VkVideo : MainAPI() {
         }
         for (l in playRes) for ((k, u) in l) addCand(cands, seen, k, u)
 
-        // 3) Yedek: oynatıcı (embed) sayfası — takılırsa 6 sn'de bırakılır
+        // 3) Yedek kaynak taraması: oynatıcı (embed) sayfası, farklı adresler, WebView.
+        //    Hiç link yoksa VEYA bulunan linkler oynatıcının tanımadığı biçimdeyse (aşağıda) çalıştırılır.
         var player = item.optString("player")
-        if (cands.isEmpty()) {
+        var fallbackDone = false
+
+        suspend fun runFallback() {
+            if (fallbackDone) return
+            fallbackDone = true
+            val base = cands.size
+
+            // 3a) oynatıcı (embed) sayfası — takılırsa 6 sn'de bırakılır
             if (player.isBlank()) {
                 val ak = item.optString("access_key")
                 player = "$mainUrl/video_ext.php?oid=$oid&id=$vid" +
@@ -1577,70 +1632,94 @@ class VkVideo : MainAPI() {
                 if (e is java.util.concurrent.CancellationException) throw e
                 debug.add("embed: ${e.message?.take(90)}")
             }
-        }
 
-        // 3b) Farklı adresler / mobil sayfa (HTML'de oynatıcı verisi başka yerde olabilir)
-        if (cands.isEmpty()) {
-            val hash = Regex("[?&]hash=([0-9a-zA-Z]+)").find(player)?.groupValues?.get(1)
-                ?: item.optString("access_key")
-            val mobileHdr = hdr + mapOf("User-Agent" to MOBILE_UA)
-            val isClip = item.optBoolean("synthetic") || item.optString("type") == "short_video"
-            val alts = (if (isClip) listOf("$mainUrl/clip$data" to hdr, "$mainUrl/clip$data" to mobileHdr) else emptyList()) + listOf(
-                player to mobileHdr,
-                ("https://vk.com/video_ext.php?oid=$oid&id=$vid" + (if (hash.isNotBlank()) "&hash=$hash" else "")) to hdr,
-                ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
-            )
-            for ((cu, ch) in alts) {
-                if (cands.isNotEmpty()) break
-                try {
-                    val html = fetchFollow(cu, ch, 5000L) ?: continue
-                    val n = scanHtml(html, cands, seen)
-                    debug.add("alt ${cu.take(45)} len=${html.length} links=$n")
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    debug.add("alt: ${e.message?.take(70)}")
+            // 3b) Farklı adresler / mobil sayfa (HTML'de oynatıcı verisi başka yerde olabilir)
+            if (cands.size == base) {
+                val hash = Regex("[?&]hash=([0-9a-zA-Z]+)").find(player)?.groupValues?.get(1)
+                    ?: item.optString("access_key")
+                val mobileHdr = hdr + mapOf("User-Agent" to MOBILE_UA)
+                val isClip = item.optBoolean("synthetic") || item.optString("type") == "short_video"
+                val alts = (if (isClip) listOf("$mainUrl/clip$data" to hdr, "$mainUrl/clip$data" to mobileHdr) else emptyList()) + listOf(
+                    player to mobileHdr,
+                    ("https://vk.com/video_ext.php?oid=$oid&id=$vid" + (if (hash.isNotBlank()) "&hash=$hash" else "")) to hdr,
+                    ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
+                )
+                for ((cu, ch) in alts) {
+                    if (cands.size > base) break
+                    try {
+                        val html = fetchFollow(cu, ch, 5000L) ?: continue
+                        val n = scanHtml(html, cands, seen)
+                        debug.add("alt ${cu.take(45)} len=${html.length} links=$n")
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        debug.add("alt: ${e.message?.take(70)}")
+                    }
                 }
             }
-        }
 
-        // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
-        if (cands.isEmpty()) {
-            val clipWeb = if (item.optBoolean("synthetic") || item.optString("type") == "short_video") listOf("$mainUrl/clip$data") else emptyList()
-            for (wu in clipWeb + listOf(player, "$mainUrl/video$data")) {
-                if (cands.isNotEmpty()) break
-                try {
-                    val r = app.get(
-                        wu,
-                        headers = hdr,
-                        referer = "$mainUrl/",
-                        interceptor = WebViewResolver(
-                            Regex("""(?i)\.m3u8|\.mpd|(vkvd|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4"""),
-                            userAgent = null,
-                            useOkhttp = false,
-                            timeout = 20_000L
-                        ),
-                        timeout = 30L
-                    )
-                    val cu = r.url
-                    debug.add("webview ${cu.take(70)}")
-                    if (cu != wu) addCand(cands, seen, "", cu)
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    debug.add("webview: ${e.message?.take(70)}")
+            // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
+            if (cands.size == base) {
+                val clipWeb = if (item.optBoolean("synthetic") || item.optString("type") == "short_video") listOf("$mainUrl/clip$data") else emptyList()
+                for (wu in clipWeb + listOf(player, "$mainUrl/video$data")) {
+                    if (cands.size > base) break
+                    try {
+                        val r = app.get(
+                            wu,
+                            headers = hdr,
+                            referer = "$mainUrl/",
+                            interceptor = WebViewResolver(
+                                Regex("""(?i)\.m3u8|\.mpd|(vkvd|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4"""),
+                                userAgent = null,
+                                useOkhttp = false,
+                                timeout = 20_000L
+                            ),
+                            timeout = 30L
+                        )
+                        val cu = r.url
+                        debug.add("webview ${cu.take(70)}")
+                        if (cu != wu) addCand(cands, seen, "", cu)
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        debug.add("webview: ${e.message?.take(70)}")
+                    }
                 }
             }
+            android.util.Log.d("VkVideo", "yedek tarama: ${base} -> ${cands.size} aday")
         }
 
-        // 4) Bağlantı testi: en iyi 4 mp4 + 1 HLS için hangi başlık takımının çalıştığı bulunur, ölüler sona atılır
-        if (cands.isNotEmpty()) {
-            val mp4s = cands.filter { !isHls(it) && !isDash(it) }
+        // 4) Bağlantı testi: yeni adaylar için hangi başlık takımının çalıştığı bulunur, ölüler sona atılır,
+        //    en iyi 2 mp4'ün kapsayıcısı oynatıcının tanıyacağı biçimde mi diye bakılır
+        suspend fun evaluate() {
+            val fresh = cands.filter { it.diag.isEmpty() && !it.dead }
+            val mp4s = fresh.filter { !isHls(it) && !isDash(it) }
                 .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
-            val targets = mp4s.take(4) + cands.filter { isHls(it) }.take(1)
+            val targets = mp4s.take(4) + fresh.filter { isHls(it) }.take(1)
             targets.amap { probe(it) }
             debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
+            targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(2).amap { sniffMp4(it) }
+            for (c in targets) {
+                android.util.Log.d(
+                    "VkVideo",
+                    "aday hint='${c.hint}' ${c.url.take(90)} dead=${c.dead} unsupported=${c.unsupported} size=${c.size} diag=${c.diag}"
+                )
+            }
+        }
 
+        if (cands.isEmpty()) runFallback()
+
+        if (cands.isNotEmpty()) {
+            evaluate()
+            // Bulunanların hiçbiri oynatılabilir değilse (ölü ya da tanınmayan mp4) yedek kaynakları da tara
+            if (cands.none { !it.dead && !it.unsupported } && !fallbackDone) {
+                val before = cands.size
+                runFallback()
+                if (cands.size > before) evaluate()
+            }
+
+            val usable = cands.filter { !it.dead && !it.unsupported }
             val alive = cands.filter { !it.dead }
-            val toEmit = if (alive.isNotEmpty()) alive else cands            // hepsi ölüyse yine de ver
+            // Hepsi kötüyse yine de verilir (eskiden olduğu gibi)
+            val toEmit = if (usable.isNotEmpty()) usable else if (alive.isNotEmpty()) alive else cands
             for (c in toEmit) emitCand(c, lang, callback)
             return true
         }
