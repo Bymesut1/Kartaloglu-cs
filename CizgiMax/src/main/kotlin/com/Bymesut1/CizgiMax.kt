@@ -523,7 +523,8 @@ class CizgiMax : MainAPI() {
         val label: String, val type: String, val lang: String, val notice: String
     )
 
-    private data class Media(val url: String, val quality: Int, val ref: String)
+    // alt: doğrulamada denenecek ek referer (oynatıcı sayfasının tam adresi)
+    private data class Media(val url: String, val quality: Int, val ref: String, val alt: String = "")
 
     private fun litJson(html: String, varName: String): String? {
         val m = Regex("""var $varName\s*=\s*JSON\.parse\(atob\(("(?:\\.|[^"\\])*")\)\)""").find(html) ?: return null
@@ -627,20 +628,34 @@ class CizgiMax : MainAPI() {
 
     private suspend fun resolveServer(s: Srv, page: String): List<Media> {
         val direct = absUrl(s.streamUrl)
-        if (direct.startsWith("http")) return listOf(Media(direct, qualOf(direct), "$mainUrl/"))
+        if (direct.startsWith("http")) {
+            return listOf(Media(direct, qualOf(direct), "$mainUrl/", originOf(direct) + "/"))
+        }
 
         val src = absUrl(s.src.ifBlank { s.resolveUrl.ifBlank { s.metaUrl } })
         if (src.isBlank()) return emptyList()
 
-        val r = app.get(src, headers = pageHeaders(page) + ("Range" to "bytes=0-0"))
+        var r = app.get(src, headers = pageHeaders(page) + ("Range" to "bytes=0-0"))
         val fin = r.url
         val ct = r.headers["content-type"].orEmpty()
         val isMediaCt = Regex("^(video|audio)/|mpegurl|dash\\+xml|octet-stream", RegexOption.IGNORE_CASE).containsMatchIn(ct)
         if (isMediaCt || (isMediaUrl(fin) && !ct.contains("html", true))) {
-            return listOf(Media(fin, qualOf(fin), refererFor(fin, page)))
+            // Oynatıcı adresinin kendisi videodur: doğrulamada kendi sitesi de referer olarak denenir
+            return listOf(Media(fin, qualOf(fin), refererFor(fin, page), originOf(fin) + "/"))
         }
 
-        val t = r.text
+        var t = r.text
+        // Bazı sunucular "Range" isteğine sayfanın sadece 1 baytını döndürür: Range olmadan tekrar al
+        if (r.code == 206 || t.length < 400) {
+            try {
+                r = app.get(src, headers = pageHeaders(page))
+                t = r.text
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        val fin2 = r.url
+
         var res: List<Media> = okruMeta(t)
         if (res.isEmpty()) {
             val sm = Regex("""player\.src\(\s*\[\s*\{\s*src:\s*"([^"]+)"""").find(t)
@@ -650,9 +665,9 @@ class CizgiMax : MainAPI() {
             }
         }
         if (res.isEmpty()) res = scanMedia(t)
-        val base = refererFor(fin, originOf(fin) + "/")
-        val ref = if (hostOf(fin).contains("sibnet")) fin else base
-        return res.map { it.copy(ref = ref) }
+        val base = refererFor(fin2, originOf(fin2) + "/")
+        val ref = if (hostOf(fin2).contains("sibnet")) fin2 else base
+        return res.map { it.copy(ref = ref, alt = fin2) }
     }
 
     private fun typeOf(u: String): ExtractorLinkType = when {
@@ -684,21 +699,33 @@ class CizgiMax : MainAPI() {
         } else h
     }
 
-    // Link gerçekten açılıyor mu? (engelli / hata veren videoları ele)
-    private suspend fun works(v: Media): Boolean = try {
-        val ref = v.ref.ifBlank { "$mainUrl/" }
-        val r = app.get(
-            v.url,
-            headers = mapOf(
-                "User-Agent" to ua,
-                "Referer"    to ref,
-                "Origin"     to ref.trimEnd('/'),
-                "Range"      to "bytes=0-0"
-            )
-        )
+    // Referer olmadan denemek için özel değer
+    private val noRef = "NONE"
+
+    private suspend fun probe(url: String, ref: String): Boolean = try {
+        val h = HashMap<String, String>()
+        h["User-Agent"] = ua
+        h["Range"] = "bytes=0-0"
+        if (ref != noRef) {
+            h["Referer"] = ref
+            h["Origin"] = originOf(ref).ifBlank { ref.trimEnd('/') }
+        }
+        val r = app.get(url, headers = h)
         r.code in 200..299
     } catch (e: Exception) {
+        if (e is java.util.concurrent.CancellationException) throw e
         false
+    }
+
+    // Link gerçekten açılıyor mu? Birkaç farklı referer ile denenir; çalışan referer döner, yoksa null
+    private suspend fun workingRef(v: Media): String? {
+        val first = v.ref.ifBlank { "$mainUrl/" }
+        val cands = listOf(first, v.alt, originOf(v.url) + "/", "$mainUrl/", noRef)
+            .filter { it.isNotBlank() }.distinct()
+        for (c in cands) {
+            if (probe(v.url, c)) return c
+        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -718,37 +745,65 @@ class CizgiMax : MainAPI() {
         val seen = HashSet<String>()
         val doneKeys = HashSet<String>()
 
-        // Sıra: önce Türkçe Dublaj, sonra Türkçe Altyazı, sonra diğerleri
+        // Sıra: önce Türkçe Dublaj, sonra Türkçe Altyazı, sonra diğerleri; telif uyarılı sunucular en sonda
         val servers = parseServers(html)
-            .filter { !it.notice.equals("copyright", true) }   // telif nedeniyle açılmayanları atla
-            .sortedBy { when (langOf(it)) { "dub" -> 0; "sub" -> 1; else -> 2 } }
+            .sortedBy {
+                (if (it.notice.equals("copyright", true)) 10 else 0) +
+                    when (langOf(it)) { "dub" -> 0; "sub" -> 1; else -> 2 }
+            }
 
         for (s in servers) {
             val lang = langOf(s)
             val host = hostLabel(s)
             val key = lang + "|" + host.lowercase()
             if (key in doneKeys) continue          // her dil + sunucu için yalnızca bir kaynak
+            val copyright = s.notice.equals("copyright", true)
 
             val label = "${langLabel(lang)} - $host"
 
             val found: List<Media> = try {
                 resolveServer(s, page)
             } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                android.util.Log.e("CizgiMax", "çözme hata ${e.javaClass.simpleName} ${s.label}")
                 emptyList()
             }
+            android.util.Log.d(
+                "CizgiMax",
+                "sunucu '${s.label}' notice='${s.notice}' src=${s.src.take(70)} stream=${s.streamUrl.take(70)} bulunan=${found.size} ${found.firstOrNull()?.url?.take(80).orEmpty()}"
+            )
 
             // En iyi kaliteden başlayıp çalışan ilk linki seç
             var chosen: Media? = null
+            var fallback: Media? = null
             for (v in found.sortedByDescending { it.quality }) {
                 if (!seen.add(v.url)) continue
-                if (works(v)) {
-                    chosen = v
+                val wr = workingRef(v)
+                if (wr != null) {
+                    chosen = v.copy(ref = wr)
                     break
                 }
+                if (fallback == null) fallback = v
+            }
+            // Doğrulama geçmese de (sunucu Range / başlık reddetmiş olabilir) videoyu yine de dene.
+            // Telif uyarılı sunucularda yalnızca doğrulanan link eklenir.
+            if (chosen == null && fallback != null && !copyright) {
+                android.util.Log.d("CizgiMax", "doğrulanamadı, yine de ekleniyor: ${fallback.url.take(90)}")
+                chosen = fallback
             }
 
             if (chosen != null) {
-                val ref = chosen.ref.ifBlank { "$mainUrl/" }
+                val noReferer = chosen.ref == noRef
+                val ref = if (noReferer) "" else chosen.ref.ifBlank { "$mainUrl/" }
+                val hdrs: Map<String, String> = if (noReferer) {
+                    mapOf("User-Agent" to ua)
+                } else {
+                    mapOf(
+                        "User-Agent" to ua,
+                        "Referer"    to ref,
+                        "Origin"     to originOf(ref).ifBlank { ref.trimEnd('/') }
+                    )
+                }
                 callback.invoke(
                     newExtractorLink(
                         source = name,
@@ -759,11 +814,7 @@ class CizgiMax : MainAPI() {
                         this.referer = ref
                         // Eşit kalite: sıra dublaj -> altyazı -> diğerleri bozulmasın
                         this.quality = Qualities.Unknown.value
-                        this.headers = mapOf(
-                            "User-Agent" to ua,
-                            "Referer"    to ref,
-                            "Origin"     to ref.trimEnd('/')
-                        )
+                        this.headers = hdrs
                     }
                 )
                 doneKeys.add(key)
