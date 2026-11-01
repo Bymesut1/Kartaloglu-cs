@@ -1,6 +1,7 @@
 package com.Bymesut1
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -243,6 +244,33 @@ class CizgiMax : MainAPI() {
         return list
     }
 
+    private val cf = CloudflareKiller()
+
+    // Kart listesini çeker; boş gelirse (Cloudflare engeli olabilir) aşıcıyla bir kez daha dener, durumu loglar
+    private suspend fun fetchCards(url: String, what: String): List<SearchResponse> {
+        var r = app.get(url, headers = pageHeaders())
+        var txt = r.text
+        var list = parseCards(r.document)
+        android.util.Log.d(
+            "CizgiMax",
+            "$what kod=${r.code} len=${txt.length} kart=${list.size} baş=${txt.take(120).replace(Regex("\\s+"), " ")}"
+        )
+        val blocked = r.code == 403 || r.code == 503 || r.code == 429 ||
+            txt.contains("Just a moment", true) || txt.contains("cf-chl", true)
+        if (list.isEmpty() && (blocked || txt.length < 2000)) {
+            try {
+                r = app.get(url, headers = pageHeaders(), interceptor = cf, timeout = 30L)
+                txt = r.text
+                list = parseCards(r.document)
+                android.util.Log.d("CizgiMax", "$what (cf sonrası) kod=${r.code} len=${txt.length} kart=${list.size}")
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                android.util.Log.e("CizgiMax", "$what cf hata ${e.javaClass.simpleName}")
+            }
+        }
+        return list
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val base = request.data
         if (base.contains("?") && page > 1) {
@@ -250,9 +278,10 @@ class CizgiMax : MainAPI() {
         }
         val url = if (page <= 1) base else base.trimEnd('/') + "/page/$page/"
         val list = try {
-            fillPosters(parseCards(app.get(url, headers = pageHeaders()).document))
+            fillPosters(fetchCards(url, "ana sayfa ${request.name} s$page"))
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
+            android.util.Log.e("CizgiMax", "ana sayfa hata ${e.javaClass.simpleName} ${e.message} ${url.take(80)}")
             emptyList()
         }
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
@@ -261,9 +290,10 @@ class CizgiMax : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val enc = URLEncoder.encode(query, "UTF-8")
         return try {
-            fillPosters(parseCards(app.get("$mainUrl/ara/?q=$enc", headers = pageHeaders()).document))
+            fillPosters(fetchCards("$mainUrl/ara/?q=$enc", "arama '$query'"))
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
+            android.util.Log.e("CizgiMax", "arama hata ${e.javaClass.simpleName} ${e.message}")
             emptyList()
         }
     }
