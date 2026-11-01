@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -20,6 +21,8 @@ class OkruProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie)
 
+    private val tag = "OkruDbg"
+
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
     private val uaDesktop =
@@ -38,7 +41,9 @@ class OkruProvider : MainAPI() {
         val desc: String,
         val videos: List<Pair<Int, String>>,
         val hls: String,
-        val dash: String
+        val dash: String,
+        val yt: List<String>,
+        val ext: List<String>
     )
 
     // ---- ok.ru arama JSON modelleri (video-search-result data-props ve web-api cevabı) ----
@@ -407,6 +412,9 @@ class OkruProvider : MainAPI() {
         "sd" to 480, "low" to 360, "lowest" to 240, "mobile" to 144
     )
 
+    private fun isYoutubeUrl(u: String): Boolean =
+        u.contains("youtube", true) || u.contains("youtu.be", true) || u.contains("ytimg", true)
+
     private suspend fun fetchMeta(id: String): OkMeta? {
         for (path in listOf("/videoembed/", "/video/")) {
             val doc = try {
@@ -436,7 +444,6 @@ class OkruProvider : MainAPI() {
                         .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
                     val dash = listOf("ondemandDash", "dashManifestUrl", "ondemandDashUrl", "dashUrl")
                         .map { md.optString(it) }.firstOrNull { it.isNotBlank() } ?: ""
-                    if (vids.isEmpty() && hls.isBlank() && dash.isBlank()) continue
 
                     val posterRaw = listOf(
                         mv.optString("poster"),
@@ -445,13 +452,55 @@ class OkruProvider : MainAPI() {
                         md.optString("poster")
                     ).firstOrNull { it.isNotBlank() }
 
+                    // ---- YouTube / dış site gömmeleri ----
+                    // Başlık ve açıklama dışarıda bırakılır (açıklamadaki bağlantılar yanıltmasın)
+                    val scan = try {
+                        val c = JSONObject(md.toString())
+                        c.remove("description")
+                        c.remove("title")
+                        c.optJSONObject("movie")?.let {
+                            it.remove("description")
+                            it.remove("title")
+                        }
+                        c.toString().replace("\\/", "/")
+                    } catch (e: Exception) {
+                        md.toString().replace("\\/", "/")
+                    }
+                    val yt = LinkedHashSet<String>()
+                    Regex("youtube(?:-nocookie)?\\.com/(?:embed/|v/|shorts/|watch\\?(?:[^\"'\\s]*?&)?v=)([A-Za-z0-9_-]{11})")
+                        .findAll(scan).forEach { yt.add(it.groupValues[1]) }
+                    Regex("youtu\\.be/([A-Za-z0-9_-]{11})").findAll(scan).forEach { yt.add(it.groupValues[1]) }
+                    val ytProvider = Regex("\"provider\"\\s*:\\s*\"[^\"]*youtube", RegexOption.IGNORE_CASE).containsMatchIn(scan)
+                    if (yt.isEmpty() && ytProvider) {
+                        Regex("\"(?:externalId|external_id|videoId|youtubeId|ytId|ytid|extId)\"\\s*:\\s*\"([A-Za-z0-9_-]{11})\"")
+                            .findAll(scan).forEach { yt.add(it.groupValues[1]) }
+                    }
+                    if (yt.isEmpty()) {
+                        // ana videonun kapak resmi YouTube küçük resmiyse kimlik oradan alınır
+                        val pr = posterRaw?.replace("\\/", "/").orEmpty()
+                        Regex("ytimg\\.com/vi(?:_webp)?/([A-Za-z0-9_-]{11})/").find(pr)?.let { yt.add(it.groupValues[1]) }
+                    }
+                    val ext = LinkedHashSet<String>()
+                    Regex("https?://(?:www\\.|player\\.|m\\.)?(?:vimeo\\.com|rutube\\.ru|dailymotion\\.com|dai\\.ly|streamable\\.com)/[^\"'\\s\\\\<>]+")
+                        .findAll(scan).forEach { ext.add(it.value) }
+
+                    Log.d(
+                        tag,
+                        "id=$id provider=${md.optString("provider")} videos=${vids.size} hls=${hls.isNotBlank()} dash=${dash.isNotBlank()} yt=$yt ext=${ext.size} " +
+                            "mdKeys=${md.keys().asSequence().joinToString(",")} " +
+                            "ilkUrl=${vids.firstOrNull()?.second?.take(90)}"
+                    )
+
+                    if (vids.isEmpty() && hls.isBlank() && dash.isBlank() && yt.isEmpty() && ext.isEmpty()) continue
+
                     return OkMeta(
                         id,
                         mv.optString("title").trim(),
                         fixPoster(posterRaw),
                         mv.optString("duration").toIntOrNull() ?: 0,
                         mv.optString("description"),
-                        vids, hls, dash
+                        vids, hls, dash,
+                        yt.toList(), ext.toList()
                     )
                 } catch (e: Exception) {
                 }
@@ -471,9 +520,11 @@ class OkruProvider : MainAPI() {
         val seed = secilmis.firstOrNull { it.id == id }
         val shownTitle = seed?.title ?: title
         val poster = m.poster ?: placeholder(shownTitle)
+        // ok.ru açıklaması yoksa "Konu Bulunamadı" yazıyor; bunu gösterme
+        val plot = m.desc.ifBlank { null }?.takeIf { !it.contains("konu bulunamad", true) }
         return newMovieLoadResponse(shownTitle, link, TvType.Movie, link) {
             this.posterUrl = poster
-            this.plot = m.desc.ifBlank { null }
+            this.plot = plot
             this.duration = if (m.dur > 0) m.dur / 60 else null
         }
     }
@@ -491,10 +542,38 @@ class OkruProvider : MainAPI() {
         val h = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Origin" to mainUrl)
         var any = false
 
+        // 1) YouTube ve dış site gömmeleri: CloudStream'in hazır çıkarıcılarına verilir
+        for (y in m.yt) {
+            try {
+                loadExtractor("https://www.youtube.com/watch?v=$y", "$mainUrl/", subtitleCallback) { l ->
+                    callback(l)
+                    any = true
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                Log.e(tag, "youtube çıkarıcı hata ${e.javaClass.simpleName} $y")
+            }
+        }
+        for (u in m.ext) {
+            try {
+                loadExtractor(u, "$mainUrl/", subtitleCallback) { l ->
+                    callback(l)
+                    any = true
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                Log.e(tag, "dış çıkarıcı hata ${e.javaClass.simpleName} ${u.take(60)}")
+            }
+        }
+        Log.d(tag, "loadLinks id=$id yt=${m.yt} ext=${m.ext.size} bulundu=$any")
+        if (any) return true
+
+        // 2) ok.ru'nun kendi video bağlantıları (YouTube adresleri doğrudan video sanılmasın diye atlanır)
         for ((q, u0) in m.videos.sortedByDescending { it.first }) {
             var u = u0.replace("\\/", "/")
             if (u.startsWith("//")) u = "https:$u"
             if (!u.startsWith("http")) continue
+            if (isYoutubeUrl(u)) continue
             callback(
                 newExtractorLink(name, "$name ${if (q > 0) "${q}p" else "Video"}", u, ExtractorLinkType.VIDEO) {
                     this.referer = "$mainUrl/"
@@ -504,7 +583,7 @@ class OkruProvider : MainAPI() {
             )
             any = true
         }
-        if (m.hls.isNotBlank()) {
+        if (m.hls.isNotBlank() && !isYoutubeUrl(m.hls)) {
             callback(
                 newExtractorLink(name, "$name HLS", m.hls, ExtractorLinkType.M3U8) {
                     this.referer = "$mainUrl/"
@@ -514,7 +593,7 @@ class OkruProvider : MainAPI() {
             )
             any = true
         }
-        if (m.dash.isNotBlank()) {
+        if (m.dash.isNotBlank() && !isYoutubeUrl(m.dash)) {
             callback(
                 newExtractorLink(name, "$name DASH", m.dash, ExtractorLinkType.DASH) {
                     this.referer = "$mainUrl/"
