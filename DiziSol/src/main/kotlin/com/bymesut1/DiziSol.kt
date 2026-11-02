@@ -390,14 +390,14 @@ class DiziSol : MainAPI() {
         imageUrl(link.selectFirst(imageSelector), baseUrl)?.let { return it }
         backgroundImageUrl(link, baseUrl)?.let { return it }
 
-        val card = link.closest(
+        val card: Element? = link.closest(
             "article, .movie-card, .film-card, .series-card, .content-card, " +
                 ".poster-card, .media-card, .item-card, .movie-item, .film-item, .dizi-item, " +
                 ".episode-item, .post-item, .swiper-slide, .grid-item, .film-box, .dizi-box, " +
                 ".thumb, .thumbnail, .post, .item, .card, li"
         )
-        card?.let { tmdbPosterFromRaw(it.outerHtml(), baseUrl) }?.let { return it }
-        val cardImage = card?.selectFirst(imageSelector)
+        card?.let { c: Element -> tmdbPosterFromRaw(c.outerHtml(), baseUrl) }?.let { return it }
+        val cardImage: Element? = card?.selectFirst(imageSelector)
         imageUrl(cardImage, baseUrl)?.let { return it }
         backgroundImageUrl(cardImage, baseUrl)?.let { return it }
         backgroundImageUrl(card, baseUrl)?.let { return it }
@@ -526,7 +526,7 @@ class DiziSol : MainAPI() {
     }
 
     private fun cardTitle(link: Element, url: String): String {
-        val card = link.closest(
+        val card: Element? = link.closest(
             "article, .movie-card, .film-card, .series-card, .content-card, " +
                 ".poster-card, .media-card, .item-card, .movie-item, .film-item, .dizi-item, " +
                 ".film-box, .dizi-box, .card, li"
@@ -534,7 +534,7 @@ class DiziSol : MainAPI() {
         val candidate = link.attr("title").ifBlank {
             card?.selectFirst("h1, h2, h3, h4, .title, .name, [itemprop=name]")?.text().orEmpty()
         }.ifBlank {
-            link.selectFirst("img")?.let { it.attr("alt").ifBlank { it.attr("title") } }.orEmpty()
+            link.selectFirst("img")?.let { img: Element -> img.attr("alt").ifBlank { img.attr("title") } }.orEmpty()
         }.ifBlank { link.text() }
         return cleanTitle(candidate).ifBlank { titleFromSlug(url) }
     }
@@ -1030,7 +1030,7 @@ class DiziSol : MainAPI() {
                 ratingValue(item.optJSONObject("aggregateRating")?.opt("ratingValue"))
             }
             ldScore ?: ratingValue(
-                imdbDoc.selectFirst("[itemprop=ratingValue], meta[property=og:rating]")?.let { el ->
+                imdbDoc.selectFirst("[itemprop=ratingValue], meta[property=og:rating]")?.let { el: Element ->
                     el.attr("content").ifBlank { el.attr("data-rating") }.ifBlank { el.text() }
                 }
             ) ?: extractImdbScore(imdbDoc.text())
@@ -1092,7 +1092,7 @@ class DiziSol : MainAPI() {
         val ratingRaw = ratingObj?.opt("ratingValue")?.toString().orEmpty()
         val score = ratingRaw.replace(',', '.').toDoubleOrNull()?.takeIf { it in 0.0..10.0 }
             ?: doc.selectFirst("[itemprop=ratingValue], meta[itemprop=ratingValue], .imdb-rating, .imdb-puan")
-                ?.let { el ->
+                ?.let { el: Element ->
                     el.attr("content").ifBlank { el.attr("data-rating") }
                         .ifBlank { el.attr("title") }.ifBlank { el.text() }
                 }?.let { raw ->
@@ -1130,7 +1130,7 @@ class DiziSol : MainAPI() {
             val value = el.attr("src").ifBlank { el.attr("content") }.ifBlank { el.attr("href") }
             value.contains("youtube.com/embed", true) || value.contains("youtu.be/", true) ||
                 value.contains("youtube.com/watch", true)
-        }?.let { el ->
+        }?.let { el: Element ->
             val raw = el.attr("src").ifBlank { el.attr("content") }.ifBlank { el.attr("href") }
             fixUrl(raw, pageUrl)
         }
@@ -1138,7 +1138,7 @@ class DiziSol : MainAPI() {
         val plot = doc.selectFirst(
             "meta[property=og:description], meta[name=description], main [itemprop=description], " +
                 "main .overview, main .plot, main .description, article .description"
-        )?.let { el ->
+        )?.let { el: Element ->
             el.attr("content").ifBlank { el.text() }.trim()
         }?.takeIf { it.length > 20 }
 
