@@ -1567,7 +1567,14 @@ class DiziSol : MainAPI() {
         return runCatching {
             val r = app.get(url, headers = headers, timeout = 10L)
             val t = r.text
-            if (r.isSuccessful && t.trimStart().startsWith("#EXTM3U")) t else null
+            val ok = r.isSuccessful && t.trimStart().startsWith("#EXTM3U")
+            if (!ok) {
+                Log.w(
+                    name,
+                    "Playlist yoklaması: kod=${r.code} başı='${t.take(80).replace('\n', ' ')}' kaynak=${safeLogUrl(url)}"
+                )
+            }
+            if (ok) t else null
         }.onFailure {
             Log.w(name, "Playlist yoklaması başarısız: ${safeLogUrl(url)} ${it.javaClass.simpleName}")
         }.getOrNull()
@@ -1685,6 +1692,127 @@ class DiziSol : MainAPI() {
         return null
     }
 
+    // Göreli (relative) playlist/segment adreslerini mutlak adrese çevirir
+    private fun resolveRef(base: String, ref: String): String? {
+        val r = ref.trim()
+        if (r.isEmpty()) return null
+        if (r.startsWith("http", true)) return r
+        if (r.startsWith("//")) return "https:$r"
+        return runCatching { URI(base).resolve(r).toString() }.getOrElse {
+            val origin = originOfUrl(base) ?: return null
+            if (r.startsWith("/")) origin + r
+            else base.substringBefore('?').substringBeforeLast('/') + "/" + r
+        }
+    }
+
+    // Tek bir video parçasının (segment) kısa sürede gelip gelmediğine bakar
+    private suspend fun probeOneSegment(url: String, headers: Map<String, String>): Boolean {
+        val started = System.currentTimeMillis()
+        return try {
+            val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 9L)
+            val ok = r.isSuccessful
+            Log.i(
+                name,
+                "Segment yoklaması: ${if (ok) "AÇILIYOR" else "AÇILMIYOR"} kod=${r.code} " +
+                    "süre=${System.currentTimeMillis() - started}ms kaynak=${safeLogUrl(url)}"
+            )
+            ok
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(
+                name,
+                "Segment yoklaması başarısız: ${e.javaClass.simpleName} " +
+                    "süre=${System.currentTimeMillis() - started}ms kaynak=${safeLogUrl(url)}"
+            )
+            false
+        }
+    }
+
+    // Playlist açılıyor, peki video parçaları da açılıyor mu? (baş, %40 ve %80 noktalarındaki parçalar)
+    private suspend fun probeSegments(
+        playlist: String,
+        playlistUrl: String,
+        headers: Map<String, String>
+    ): Boolean {
+        var text = playlist
+        var base = playlistUrl
+        var hops = 0
+        Log.d(name, "Playlist başı: " + text.lines().take(8).joinToString(" | ") { it.take(110) })
+        while (hops < 2 && text.contains("#EXT-X-STREAM-INF", true)) {
+            val lines = text.lines().map { it.trim() }
+            val tagIndex = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF", true) }
+            val variant = lines.drop(tagIndex + 1)
+                .firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: break
+            val variantUrl = resolveRef(base, variant) ?: break
+            val variantText = fetchPlaylist(variantUrl, headers)
+            if (variantText == null) {
+                Log.w(name, "Alt playlist açılmadı: ${safeLogUrl(variantUrl)}")
+                return false
+            }
+            base = variantUrl
+            text = variantText
+            hops++
+        }
+        val segs = text.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+        if (segs.isEmpty()) {
+            Log.w(name, "Playlist içinde segment bulunamadı; doğrulanamadı kabul ediliyor")
+            return true
+        }
+        val picks = listOf(0, segs.size * 2 / 5, segs.size * 4 / 5)
+            .filter { it < segs.size }.distinct()
+        val results = picks.amap { i ->
+            val segUrl = resolveRef(base, segs[i])
+            segUrl != null && probeOneSegment(segUrl, headers)
+        }
+        Log.i(name, "Segment sonucu: toplam=${segs.size} yoklanan=${picks.size} başarılı=${results.count { it }}")
+        return results.all { it }
+    }
+
+    // Setplay oynatıcı sayfasını (stfplay.php) telefondan açıp telefonun IP'sine uygun m3u8 arar
+    private suspend fun playerPageStream(
+        pageUrl: String,
+        referer: String
+    ): Pair<String, Map<String, String>>? {
+        val origin = originOfUrl(pageUrl) ?: return null
+        val pageHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to referer,
+            "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+        )
+        var body: String? = null
+        try {
+            val r = app.get(pageUrl, headers = pageHeaders, referer = referer, timeout = 12L)
+            Log.i(name, "Oynatıcı sayfası: kod=${r.code} uzunluk=${r.text.length} kaynak=${safeLogUrl(pageUrl)}")
+            if (r.isSuccessful) body = r.text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(name, "Oynatıcı sayfası alınamadı: ${e.javaClass.simpleName} ${safeLogUrl(pageUrl)}")
+        }
+        val html = body ?: return null
+
+        val cands = LinkedHashSet<String>()
+        directMediaUrls(html).forEach { cands += it }
+        Regex("""https?://[^\s"'<>\\]+/manifest\.php[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
+            .findAll(decode(html)).forEach { cands += it.value.trimEnd(')', ']', '}', ';', ',') }
+        Log.i(name, "Oynatıcı sayfasında adaylar: ${cands.size}")
+
+        for (cand in cands.take(4)) {
+            val hdr = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to pageUrl,
+                "Origin" to origin,
+                "Accept" to "*/*",
+                "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+            )
+            val pl = fetchPlaylist(cand, hdr) ?: continue
+            if (probeSegments(pl, cand, hdr)) return cand to hdr
+        }
+        return null
+    }
+
     private suspend fun emitApiRecord(
         record: JSONObject,
         sourcePage: String,
@@ -1711,11 +1839,12 @@ class DiziSol : MainAPI() {
             "Accept" to "*/*",
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
         )
-        // Setplay proxy'si bazı bölümlerde yanıt vermeyip oynatıcıyı ~1 dk bekletiyor (SocketTimeout).
-        // Önce kısa sürede yoklanır; açılmıyorsa proxy'nin işaret ettiği asıl adres doğrudan denenir.
+        // Setplay proxy'si bazı bölümlerde playlist'i veriyor ama video parçalarını (segment) vermeyip
+        // oynatıcıyı ~1 dk bekletiyor (SocketTimeout). Bu yüzden playlist'e değil, PARÇALARA da bakılır.
+        // Proxy sağlam değilse sırayla: doğrudan adres -> oynatıcı sayfası -> WebView -> kaynak sayfası.
         var verified = true
-        var directUrl: String? = null
-        var directHeaders: Map<String, String> = emptyMap()
+        val extras = ArrayList<Triple<String, String, Map<String, String>>>()
+        var webViewGot = false
         if (streamUrl.contains("/api/proxy/setplay/", true)) {
             val uTxt = queryParameter(streamUrl, "u")?.let { b64Text(it) }
             val rTxt = queryParameter(streamUrl, "r")?.let { b64Text(it) }
@@ -1727,35 +1856,53 @@ class DiziSol : MainAPI() {
                 "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
             )
             val probes = listOf(0, 1).amap { i ->
-                if (i == 0) fetchPlaylist(streamUrl, headers)
-                else if (uTxt != null && uTxt.startsWith("http", true)) fetchPlaylist(uTxt, dh)
-                else null
+                if (i == 0) {
+                    val pl = fetchPlaylist(streamUrl, headers)
+                    pl != null && probeSegments(pl, streamUrl, headers)
+                } else if (uTxt != null && uTxt.startsWith("http", true)) {
+                    val pl = fetchPlaylist(uTxt, dh)
+                    pl != null && probeSegments(pl, uTxt, dh)
+                } else {
+                    false
+                }
             }
-            verified = probes[0] != null
-            if (!verified && probes[1] != null) {
-                directUrl = uTxt
-                directHeaders = dh
+            verified = probes[0]
+            val directOk = probes[1]
+            if (!verified && directOk && uTxt != null) {
+                extras += Triple("DiziSol Doğrudan", uTxt, dh)
             }
             Log.i(
                 name,
-                "Setplay yoklaması: proxy=${if (verified) "açılıyor" else "AÇILMIYOR"} " +
-                    "doğrudan=${if (directUrl != null) "açılıyor" else "yok"}"
+                "Setplay yoklaması (segmentler dahil): proxy=${if (verified) "açılıyor" else "AÇILMIYOR"} " +
+                    "doğrudan=${if (directOk) "açılıyor" else "yok"}"
             )
+
+            if (!verified && extras.isEmpty() && rTxt != null && rTxt.startsWith("http", true)) {
+                val srcPage = sourcePageFromToken(record)
+                val ref = srcPage?.let { originOfUrl(it) }?.let { "$it/" } ?: "https://www.setfilmizle.uk/"
+                val alt = playerPageStream(rTxt, ref)
+                if (alt != null) {
+                    extras += Triple("DiziSol Oynatıcı", alt.first, alt.second)
+                } else {
+                    webViewGot = resolveWebView(rTxt, ref) { link ->
+                        callback(link)
+                    }
+                    Log.i(name, "Setplay oynatıcı WebView denemesi: sonuç=$webViewGot")
+                }
+            }
         }
 
-        val du: String? = directUrl
-        val dhdr: Map<String, String> = directHeaders
-        if (du != null) {
+        for ((exLabel, exUrl, exHeaders) in extras) {
             callback(
                 newExtractorLink(
                     source = name,
-                    name = "DiziSol Doğrudan",
-                    url = du,
+                    name = exLabel,
+                    url = exUrl,
                     type = ExtractorLinkType.M3U8
                 ) {
-                    referer = dhdr["Referer"].orEmpty()
-                    this.headers = dhdr
-                    quality = quality(du)
+                    referer = exHeaders["Referer"].orEmpty()
+                    this.headers = exHeaders
+                    quality = Qualities.P1080.value
                 }
             )
         }
@@ -1770,11 +1917,11 @@ class DiziSol : MainAPI() {
                 referer = "$mainUrl/"
                 this.headers = headers
                 // Doğrulanamayan proxy bağlantısı listede sona düşsün
-                quality = if (verified || du == null) quality(streamUrl) else Qualities.Unknown.value
+                quality = if (verified) quality(streamUrl) else Qualities.Unknown.value
             }
         )
-        // 1 = bağlantı doğrulandı (proxy ya da doğrudan), 2 = hiçbiri doğrulanamadı
-        state?.set(0, if (verified || du != null) 1 else 2)
+        // 1 = bağlantı doğrulandı (proxy ya da alternatif), 2 = hiçbiri doğrulanamadı
+        state?.set(0, if (verified || extras.isNotEmpty() || webViewGot) 1 else 2)
 
         record.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }?.let {
             fixUrl(it, mainUrl)?.let { url -> subtitleCallback(newSubtitleFile("Türkçe", url)) }
