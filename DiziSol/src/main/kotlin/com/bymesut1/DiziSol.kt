@@ -1525,17 +1525,112 @@ class DiziSol : MainAPI() {
             return null
         }
         val record = json.optJSONObject("data")
-            ?.takeIf { it.has("m3u8Url") }
+            ?.takeIf { it.has("m3u8Url") || it.has("id") }
             ?: json
         val stream = record.optString("m3u8Url").trim()
-        if (stream.isBlank() || stream.equals("null", true)) {
-            Log.w(
-                name,
-                "Video API kaydı bulundu ancak m3u8Url boş: tür=$mediaType tmdbId=$tmdbId koordinat=$coordinates"
-            )
+        if (stream.isNotBlank() && !stream.equals("null", true)) return record
+
+        // Netflix / Disney+ / HBO vb. platform içeriklerinde kayıt m3u8Url olmadan gelir;
+        // site bağlantıyı POST /api/admin/resolve-stream/{kayitId} ile üretir.
+        Log.i(
+            name,
+            "Video API kaydında m3u8Url yok, resolve-stream deneniyor: tür=$mediaType tmdbId=$tmdbId kayıt=${record.toString().take(300)}"
+        )
+        return resolveStreamRecord(record, mediaType, coordinates)
+    }
+
+    private fun looksLikeStream(value: String): Boolean {
+        val v = value.trim()
+        return (v.startsWith("http", true) || v.startsWith("/")) &&
+            (v.contains(".m3u8", true) || v.contains("/play?", true) ||
+                v.contains("/playlist", true) || v.contains("setplay", true))
+    }
+
+    private fun findStreamUrl(node: Any?, depth: Int = 0): String? {
+        if (node == null || depth > 6) return null
+        when (node) {
+            is JSONObject -> {
+                val preferred = listOf(
+                    "m3u8Url", "m3u8", "streamUrl", "stream_url", "playlistUrl",
+                    "playlist", "videoUrl", "url", "src", "file", "source"
+                )
+                for (key in preferred) {
+                    val v = node.opt(key)
+                    if (v is String && looksLikeStream(v)) return v
+                }
+                val keys = node.keys()
+                while (keys.hasNext()) {
+                    findStreamUrl(node.opt(keys.next()), depth + 1)?.let { return it }
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until node.length()) {
+                    findStreamUrl(node.opt(i), depth + 1)?.let { return it }
+                }
+            }
+            is String -> if (looksLikeStream(node)) return node
+        }
+        return null
+    }
+
+    private suspend fun resolveStreamRecord(
+        record: JSONObject,
+        mediaType: String,
+        coordinates: Pair<Int, Int>?
+    ): JSONObject? {
+        var recordId: String? = null
+        for (key in listOf("id", "recordId", "movieId", "episodeId", "streamId")) {
+            val v = record.optString(key).trim()
+            if (v.isNotBlank() && !v.equals("null", true) && v != "0") {
+                recordId = v
+                break
+            }
+        }
+        if (recordId == null) {
+            Log.w(name, "resolve-stream: kayıt kimliği bulunamadı: ${record.toString().take(200)}")
             return null
         }
-        return record
+
+        val resolveUrl = "$mainUrl/api/admin/resolve-stream/$recordId"
+        val bodies = ArrayList<Map<String, Any>>()
+        if (mediaType == "tv" && coordinates != null) {
+            bodies += mapOf<String, Any>("season" to coordinates.first, "episode" to coordinates.second)
+        }
+        bodies += mapOf<String, Any>("force" to true)
+        bodies += emptyMap<String, Any>()
+        bodies += mapOf<String, Any>("retry" to true)
+
+        for (body in bodies) {
+            val text = runCatching {
+                val response = app.post(
+                    resolveUrl,
+                    headers = apiHeaders + mapOf("Origin" to mainUrl, "Content-Type" to "application/json"),
+                    referer = "$mainUrl/",
+                    json = body,
+                    timeout = 20000
+                )
+                Log.d(name, "resolve-stream: kod=${response.code} gövde=$body yanıt=${response.text.take(300)}")
+                if (response.isSuccessful) response.text else null
+            }.onFailure {
+                Log.w(name, "resolve-stream isteği başarısız: ${safeLogUrl(resolveUrl)}", it)
+            }.getOrNull() ?: continue
+
+            val parsed = runCatching { JSONTokener(text).nextValue() }.getOrNull()
+            val found = findStreamUrl(parsed) ?: continue
+
+            val result = JSONObject(record.toString())
+            result.put("m3u8Url", found)
+            val responseObj = parsed as? JSONObject
+            val dataObj = responseObj?.optJSONObject("data")
+            for (key in listOf("subtitleTr", "subtitleEn")) {
+                val sub = (dataObj?.optString(key) ?: responseObj?.optString(key)).orEmpty()
+                if (sub.isNotBlank() && !sub.equals("null", true)) result.put(key, sub)
+            }
+            Log.i(name, "resolve-stream başarılı: kaynak=${safeLogUrl(found)}")
+            return result
+        }
+        Log.w(name, "resolve-stream hiçbir gövdeyle bağlantı üretmedi: kayıt=$recordId")
+        return null
     }
 
     private suspend fun emitApiRecord(
