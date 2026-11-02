@@ -1528,6 +1528,10 @@ class DiziSol : MainAPI() {
             ?.takeIf { it.has("m3u8Url") || it.has("id") }
             ?: json
         val stream = record.optString("m3u8Url").trim()
+        Log.i(
+            name,
+            "Video API yanıtı: anahtarlar=${record.keys().asSequence().toList()} m3u8Url=${stream.take(160)} kayıt=${record.toString().take(400)}"
+        )
         if (stream.isNotBlank() && !stream.equals("null", true)) return record
 
         // Netflix / Disney+ / HBO vb. platform içeriklerinde kayıt m3u8Url olmadan gelir;
@@ -1639,7 +1643,19 @@ class DiziSol : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val streamUrl = fixUrl(record.optString("m3u8Url"), mainUrl) ?: return false
+        val rawStream = record.optString("m3u8Url").trim()
+        val streamUrl = fixUrl(rawStream, mainUrl) ?: when {
+            rawStream.startsWith("//") -> "https:$rawStream"
+            rawStream.startsWith("/") -> mainUrl.trimEnd('/') + rawStream
+            rawStream.isNotBlank() && !rawStream.equals("null", true) &&
+                !rawStream.contains(' ') && rawStream.contains(".m3u8", true) ->
+                mainUrl.trimEnd('/') + "/" + rawStream.trimStart('/')
+            else -> null
+        }
+        if (streamUrl == null) {
+            Log.w(name, "emitApiRecord: m3u8Url kullanılamadı, değer='${rawStream.take(200)}'")
+            return false
+        }
         val headers = mapOf(
             "User-Agent" to USER_AGENT,
             "Referer" to "$mainUrl/",
@@ -1698,7 +1714,7 @@ class DiziSol : MainAPI() {
             }
             Log.w(
                 name,
-                "Video API fallback: tmdbId=$tmdbId tür=$mediaType koordinat=$coordinates; statik sayfa çözümlemesine geçiliyor"
+                "Video API fallback: tmdbId=$tmdbId tür=$mediaType koordinat=$coordinates kayıtVar=${record != null}; statik sayfa çözümlemesine geçiliyor"
             )
         }
 
