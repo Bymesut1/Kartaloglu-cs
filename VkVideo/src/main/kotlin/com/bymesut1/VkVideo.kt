@@ -126,6 +126,8 @@ class VkVideo : MainAPI() {
     )
 
     private var token: String? = null
+    private var tokenExp = 0L          // jetonun bitiş zamanı (unix saniye), 0 = bilinmiyor
+    private var tokenAt = 0L           // jetonun alındığı an (ms)
 
     // DEBUG kartına dokununca gösterilen tam teşhis metni
     private var lastDebug: String = ""
@@ -139,7 +141,15 @@ class VkVideo : MainAPI() {
     // ---------- API ----------
 
     private suspend fun getToken(): String {
-        token?.let { return it }
+        // Jeton süresi dolmak üzereyse ya da 25 dakikadan eskiyse yenilenir (eski / kısıtlanmış jeton
+        // video bağlantılarını boş döndürebiliyor; eklentiyi yeniden kurmak bunu geçici çözüyordu)
+        val cached = token
+        if (cached != null) {
+            val nowMs = System.currentTimeMillis()
+            val expired = tokenExp > 0L && tokenExp - 120L <= nowMs / 1000L
+            val old = nowMs - tokenAt > 25L * 60_000L
+            if (!expired && !old) return cached
+        }
         if (CLIENT_SECRET.isBlank()) {
             throw ErrorLoadingException("CLIENT_SECRET boş: VkVideo.kt içine yaz")
         }
@@ -155,13 +165,16 @@ class VkVideo : MainAPI() {
                 "app_id" to APP_ID
             ).also { if (DEVICE_ID.isNotBlank()) it["device_id"] = DEVICE_ID }
         ).text
-        val t = try {
-            JSONObject(text).optJSONObject("data")?.optString("access_token")
+        val dataObj = try {
+            JSONObject(text).optJSONObject("data")
         } catch (e: Exception) {
             null
         }
+        val t = dataObj?.optString("access_token")
         if (t.isNullOrBlank()) throw ErrorLoadingException("Token alınamadı: $text")
         token = t
+        tokenAt = System.currentTimeMillis()
+        tokenExp = dataObj?.optLong("expired_at", 0L) ?: 0L
         return t
     }
 
@@ -1187,7 +1200,7 @@ class VkVideo : MainAPI() {
         return out to hasMore
     }
 
-    private suspend fun fetchItem(key: String): JSONObject {
+    private suspend fun fetchItemRaw(key: String): JSONObject? {
         val r = try {
             api("video.getByIds", mapOf("videos" to key))
         } catch (e: Exception) {
@@ -1196,9 +1209,28 @@ class VkVideo : MainAPI() {
         }
         val found = LinkedHashMap<String, JSONObject>()
         collectVideos(r, found)
-        found.values.firstOrNull()?.let { return it }
+        return found.values.firstOrNull()
+    }
+
+    private suspend fun fetchItem(key: String): JSONObject {
+        var err: Exception? = null
+        // 1. deneme mevcut jetonla, 2. deneme taze jetonla (boş / hatalı yanıt jeton kaynaklı olabiliyor)
+        for (attempt in 0..1) {
+            if (attempt == 1) token = null
+            try {
+                fetchItemRaw(key)?.let { return it }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                err = e
+            }
+        }
         // Normal videolar yukarıda döner. Buraya yalnız bilgisi gelmeyen kayıtlar (kısa klipler) düşer.
-        return fetchClipItem(key)
+        return try {
+            fetchClipItem(key)
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            throw (err ?: e)
+        }
     }
 
     // Klip (kısa video) kayıtları video.getByIds'te boş dönebilir: başka metodlar denenir, olmazsa asgari kayıt üretilir
@@ -1558,7 +1590,7 @@ class VkVideo : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "debug") return false
-        val item = fetchItem(data)
+        var item = fetchItem(data)
         val seen = HashSet<String>()
         val cands = ArrayList<Cand>()
         val debug: MutableList<String> = java.util.Collections.synchronizedList(ArrayList<String>())
@@ -1574,33 +1606,53 @@ class VkVideo : MainAPI() {
                 "ovp=${item.optString("ov_provider_id")} h=${item.optInt("height")}"
         )
 
-        // 1) getByIds / get yanıtı içindeki linkler
-        val urls1 = ArrayList<Pair<String, String>>()
-        scanUrls(item, "", urls1)
-        for ((k, u) in urls1) addCand(cands, seen, k, u)
-        debug.add("item links=${cands.size}")
+        // 1) getByIds / get yanıtı içindeki linkler + 2) sitenin kendi oynatma metodları (paralel)
+        suspend fun collectPrimary() {
+            val urls1 = ArrayList<Pair<String, String>>()
+            scanUrls(item, "", urls1)
+            for ((k, u) in urls1) addCand(cands, seen, k, u)
+            debug.add("item links=${cands.size}")
+            android.util.Log.d(
+                "VkVideo",
+                "kayit anahtarlar=${item.keys().asSequence().joinToString(",").take(240)} link=${cands.size}"
+            )
 
-        // 2) Sitenin kendi oynatma metodları (paralel)
-        val playParams = mapOf(
-            "videos" to data,
-            "video" to data,
-            "owner_id" to oid,
-            "video_id" to vid,
-            "id" to vid
-        )
-        val playRes = listOf("video.getForPlay", "video.getPlayerConfig").amap { m ->
-            val list = ArrayList<Pair<String, String>>()
+            val playParams = mapOf(
+                "videos" to data,
+                "video" to data,
+                "owner_id" to oid,
+                "video_id" to vid,
+                "id" to vid
+            )
+            val playRes = listOf("video.getForPlay", "video.getPlayerConfig").amap { m ->
+                val list = ArrayList<Pair<String, String>>()
+                try {
+                    val r = api(m, playParams)
+                    scanUrls(r, "", list)
+                    debug.add("$m urls=${list.size} ${shape(r)}")
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    debug.add("$m: ${e.message?.take(90)}")
+                }
+                list
+            }
+            for (l in playRes) for ((k, u) in l) addCand(cands, seen, k, u)
+        }
+
+        collectPrimary()
+
+        // Hiç bağlantı gelmediyse: jeton eskimiş / kısıtlanmış olabilir. Jeton yenilenir, kayıt yeniden çekilir, bir kez daha denenir.
+        if (cands.isEmpty()) {
+            token = null
             try {
-                val r = api(m, playParams)
-                scanUrls(r, "", list)
-                debug.add("$m urls=${list.size} ${shape(r)}")
+                item = fetchItem(data)
+                debug.add("jeton yenilendi, yeniden denendi")
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
-                debug.add("$m: ${e.message?.take(90)}")
+                debug.add("jeton yenileme: ${e.message?.take(80)}")
             }
-            list
+            collectPrimary()
         }
-        for (l in playRes) for ((k, u) in l) addCand(cands, seen, k, u)
 
         // 3) Yedek kaynak taraması: oynatıcı (embed) sayfası, farklı adresler, WebView.
         //    Hiç link yoksa VEYA bulunan linkler oynatıcının tanımadığı biçimdeyse (aşağıda) çalıştırılır.
@@ -1660,20 +1712,23 @@ class VkVideo : MainAPI() {
             // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
             if (cands.size == base) {
                 val clipWeb = if (item.optBoolean("synthetic") || item.optString("type") == "short_video") listOf("$mainUrl/clip$data") else emptyList()
-                for (wu in clipWeb + listOf(player, "$mainUrl/video$data")) {
+                // Oynatıcı kullanıcı dokunuşu beklemesin: autoplay=1
+                val webPlayer = player + (if (player.contains("?")) "&" else "?") + "autoplay=1"
+                for (wu in listOf(webPlayer) + clipWeb) {
                     if (cands.size > base) break
                     try {
                         val r = app.get(
                             wu,
                             headers = hdr,
                             referer = "$mainUrl/",
+                            allowRedirects = false,
                             interceptor = WebViewResolver(
-                                Regex("""(?i)\.m3u8|\.mpd|(vkvd|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4"""),
+                                Regex("""(?i)\.m3u8|\.mpd|(vkvd\d*|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4|okcdn\.ru/\?[^\s]*type=\d"""),
                                 userAgent = null,
                                 useOkhttp = false,
-                                timeout = 20_000L
+                                timeout = 15_000L
                             ),
-                            timeout = 30L
+                            timeout = 25L
                         )
                         val cu = r.url
                         debug.add("webview ${cu.take(70)}")
