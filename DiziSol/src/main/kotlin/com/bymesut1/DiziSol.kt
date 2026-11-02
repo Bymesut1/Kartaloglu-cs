@@ -1717,7 +1717,7 @@ class DiziSol : MainAPI() {
                     "süre=${System.currentTimeMillis() - started}ms kaynak=${safeLogUrl(url)}"
             )
             ok
-        } catch (e: kotlinx.coroutines.CancellationException) {
+        } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(
@@ -1786,7 +1786,7 @@ class DiziSol : MainAPI() {
             val r = app.get(pageUrl, headers = pageHeaders, referer = referer, timeout = 12L)
             Log.i(name, "Oynatıcı sayfası: kod=${r.code} uzunluk=${r.text.length} kaynak=${safeLogUrl(pageUrl)}")
             if (r.isSuccessful) body = r.text
-        } catch (e: kotlinx.coroutines.CancellationException) {
+        } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(name, "Oynatıcı sayfası alınamadı: ${e.javaClass.simpleName} ${safeLogUrl(pageUrl)}")
