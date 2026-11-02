@@ -8,6 +8,9 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import kotlin.math.abs
 import kotlin.math.min
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class VkVideo : MainAPI() {
     override var mainUrl = "https://vkvideo.ru"
@@ -72,6 +75,9 @@ class VkVideo : MainAPI() {
         // true: arama sonuçlarının başına teşhis kartı (API yanıt şekli, kanallar, Yandex durumu) eklenir
         private const val DEBUG_SEARCH = true
 
+        // true: bağlantı bulunamazsa kaynak listesine DEBUG satırları eklenir (tıklayınca 2001 hatası verir). Normalde false.
+        private const val DEBUG_LINKS = false
+
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = "o557NLIkAErNhakXrQ7A"
@@ -132,6 +138,16 @@ class VkVideo : MainAPI() {
     // DEBUG kartına dokununca gösterilen tam teşhis metni
     private var lastDebug: String = ""
 
+    // loadLinks aynı anda tek çalışsın (CloudStream aynı videoyu iki kez paralel isteyebiliyor; VK bunu kısıtlıyor)
+    private val loadMutex = Mutex()
+    private var deviceId = ""                                   // boş: gönderilmez; yenileme turlarında rastgele üretilir
+    private class CachedLinks(val at: Long, val lang: String, val list: List<Cand>)
+    private val linkCache = HashMap<String, CachedLinks>()
+    private val CACHE_MS = 10L * 60_000L
+
+    private fun randomDeviceId(): String =
+        java.util.UUID.randomUUID().toString().replace("-", "")
+
     override val mainPage = mainPageOf(
         "türkçe dublaj film" to "Türkçe Dublaj Filmler",
         "tr dublaj izle" to "TR Dublaj İzle",
@@ -163,7 +179,10 @@ class VkVideo : MainAPI() {
                 "isApiOauthAnonymEnabled" to "false",
                 "version" to "1",
                 "app_id" to APP_ID
-            ).also { if (DEVICE_ID.isNotBlank()) it["device_id"] = DEVICE_ID }
+            ).also {
+                val d = if (deviceId.isNotBlank()) deviceId else DEVICE_ID
+                if (d.isNotBlank()) it["device_id"] = d
+            }
         ).text
         val dataObj = try {
             JSONObject(text).optJSONObject("data")
@@ -1598,6 +1617,22 @@ class VkVideo : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "debug") return false
+        return loadMutex.withLock {
+            val c = synchronized(linkCache) { linkCache[data] }
+            if (c != null && System.currentTimeMillis() - c.at < CACHE_MS) {
+                var n = 0
+                for (cand in c.list) if (emitCand(cand, c.lang, callback)) n++
+                if (n == 0) for (cand in c.list) emitCand(cand, c.lang, callback, allowUnknown = true)
+                return@withLock true
+            }
+            loadLinksInner(data, callback)
+        }
+    }
+
+    private suspend fun loadLinksInner(
+        data: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         var item = fetchItem(data)
         val seen = HashSet<String>()
         val cands = ArrayList<Cand>()
@@ -1770,6 +1805,31 @@ class VkVideo : MainAPI() {
 
         if (cands.isEmpty()) runFallback()
 
+        // Gerçek (HLS / DASH / kaliteli mp4) bağlantı var mı? "url" gibi kalitesiz tek aday sahte sayılır.
+        fun hasReal() = cands.any { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+
+        // VK birkaç istekten sonra jetonu/IP'yi kısıp boş yanıt dönebiliyor: bekle, yeni kimlikle jeton al, yeniden dene
+        var round = 0
+        while (!hasReal() && round < 3) {
+            round++
+            delay(2500L * round)
+            token = null
+            deviceId = randomDeviceId()
+            try {
+                item = fetchItem(data)
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                debug.add("tur $round fetchItem: ${e.message?.take(60)}")
+            }
+            player = item.optString("player").ifBlank { player }
+            collectPrimary()
+            if (!hasReal()) {
+                fallbackDone = false
+                runFallback()
+            }
+            debug.add("tur $round -> aday=${cands.size} gercek=${hasReal()}")
+        }
+
         if (cands.isNotEmpty()) {
             evaluate()
             // Bulunanların hiçbiri oynatılabilir değilse (ölü ya da tanınmayan mp4) yedek kaynakları da tara
@@ -1779,25 +1839,32 @@ class VkVideo : MainAPI() {
                 if (cands.size > before) evaluate()
             }
 
-            val noWebm = cands.filter { !isWebm(it) }.ifEmpty { cands }
+            val noWebm = cands.filter { !isWebm(it) }
             val usable = noWebm.filter { !it.dead && !it.unsupported }
-            val alive = noWebm.filter { !it.dead }
-            // Hepsi kötüyse yine de verilir (eskiden olduğu gibi)
-            val toEmit = if (usable.isNotEmpty()) usable else if (alive.isNotEmpty()) alive else noWebm
-            var emitted = 0
-            for (c in toEmit) if (emitCand(c, lang, callback)) emitted++
-            // Hiçbiri etiketli çıkmadıysa kalitesi bilinmeyen düz mp4'ler de verilir
-            if (emitted == 0) for (c in toEmit) emitCand(c, lang, callback, allowUnknown = true)
-            return true
+            // Oynatıcının tanımadığı (3003 hatası veren) kaynaklar ASLA verilmez
+            val toEmit = if (usable.isNotEmpty()) usable else noWebm.filter { !it.dead && !it.unsupported }
+            if (toEmit.isNotEmpty()) {
+                var emitted = 0
+                for (c in toEmit) if (emitCand(c, lang, callback)) emitted++
+                // Hiçbiri etiketli çıkmadıysa kalitesi bilinmeyen düz mp4'ler de verilir
+                if (emitted == 0) for (c in toEmit) emitCand(c, lang, callback, allowUnknown = true)
+                synchronized(linkCache) { linkCache[data] = CachedLinks(System.currentTimeMillis(), lang, toEmit.toList()) }
+                return true
+            }
         }
 
         // 5) Hiçbiri olmadıysa teşhis satırları göster (her satırın adresi benzersiz)
         debug.add("player=" + player.take(70))
-        debug.forEachIndexed { i, d ->
-            callback(
-                newExtractorLink(name, "DEBUG $d", "https://debug.invalid/$i") { }
-            )
+        lastDebug = debug.joinToString("\n")
+        android.util.Log.d("VkVideo", "BAGLANTI YOK: " + debug.joinToString(" | "))
+        if (DEBUG_LINKS) {
+            debug.forEachIndexed { i, d ->
+                callback(
+                    newExtractorLink(name, "DEBUG $d", "https://debug.invalid/$i") { }
+                )
+            }
+            return true
         }
-        return true
+        return false
     }
 }
