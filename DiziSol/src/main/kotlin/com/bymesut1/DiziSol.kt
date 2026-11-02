@@ -1532,6 +1532,8 @@ class DiziSol : MainAPI() {
             name,
             "Video API yanıtı: anahtarlar=${record.keys().asSequence().toList()} m3u8Url=${stream.take(160)} kayıt=${record.toString().take(400)}"
         )
+        // Kaynak jetonu sonradan (yedek yol için) kullanılabilsin diye kayda eklenir.
+        if (stream.contains("::")) runCatching { record.put("sourceToken", stream) }
         // Platform içeriklerinde m3u8Url gerçek bağlantı değil, "setfilmizle::<base64 sayfa>::diller"
         // gibi bir kaynak jetonu olarak gelir. Bu durumda site bağlantıyı kendi sunucusunda çözer.
         val directStream = stream.isNotBlank() && !stream.equals("null", true) &&
@@ -1546,6 +1548,40 @@ class DiziSol : MainAPI() {
             "Video API kaydında m3u8Url yok, resolve-stream deneniyor: tür=$mediaType tmdbId=$tmdbId kayıt=${record.toString().take(300)}"
         )
         return resolveStreamRecord(record, mediaType, coordinates)
+    }
+
+    private fun b64Text(raw: String): String? = runCatching {
+        var t = raw.trim().replace('-', '+').replace('_', '/')
+        while (t.length % 4 != 0) t += "="
+        String(android.util.Base64.decode(t, android.util.Base64.DEFAULT), Charsets.UTF_8)
+    }.getOrNull()
+
+    private fun originOfUrl(u: String): String? = runCatching {
+        val x = URI(u)
+        "${x.scheme}://${x.host}"
+    }.getOrNull()
+
+    // Playlist gerçekten açılıyor mu? (#EXTM3U ile başlayan yanıt). Gövde ya da null döner.
+    // Oynatıcı yanıt vermeyen sunucuda ~1 dk bekleyip hata verdiği için burada kısa sürede karar verilir.
+    private suspend fun fetchPlaylist(url: String, headers: Map<String, String>): String? {
+        return runCatching {
+            val r = app.get(url, headers = headers, timeout = 10L)
+            val t = r.text
+            if (r.isSuccessful && t.trimStart().startsWith("#EXTM3U")) t else null
+        }.onFailure {
+            Log.w(name, "Playlist yoklaması başarısız: ${safeLogUrl(url)} ${it.javaClass.simpleName}")
+        }.getOrNull()
+    }
+
+    // "setfilmizle::<base64 sayfa adresi>::diller" jetonundan kaynak sitenin bölüm sayfasını çıkarır
+    private fun sourcePageFromToken(record: JSONObject): String? {
+        val token = record.optString("sourceToken").trim()
+        if (token.contains("::")) {
+            val page = token.split("::").getOrNull(1)?.let { b64Text(it) }
+            if (page != null && page.startsWith("http", true)) return page
+        }
+        val su = record.optString("sourceUrl").trim()
+        return su.takeIf { it.startsWith("http", true) && !it.equals("null", true) }
     }
 
     private fun looksLikeStream(value: String): Boolean {
@@ -1653,7 +1689,8 @@ class DiziSol : MainAPI() {
         record: JSONObject,
         sourcePage: String,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        state: IntArray? = null
     ): Boolean {
         val rawStream = record.optString("m3u8Url").trim()
         val streamUrl = fixUrl(rawStream, mainUrl) ?: when {
@@ -1674,6 +1711,55 @@ class DiziSol : MainAPI() {
             "Accept" to "*/*",
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
         )
+        // Setplay proxy'si bazı bölümlerde yanıt vermeyip oynatıcıyı ~1 dk bekletiyor (SocketTimeout).
+        // Önce kısa sürede yoklanır; açılmıyorsa proxy'nin işaret ettiği asıl adres doğrudan denenir.
+        var verified = true
+        var directUrl: String? = null
+        var directHeaders: Map<String, String> = emptyMap()
+        if (streamUrl.contains("/api/proxy/setplay/", true)) {
+            val uTxt = queryParameter(streamUrl, "u")?.let { b64Text(it) }
+            val rTxt = queryParameter(streamUrl, "r")?.let { b64Text(it) }
+            val dh = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to (rTxt ?: "https://setplay.sbs/"),
+                "Origin" to ((rTxt?.let { originOfUrl(it) }) ?: "https://setplay.sbs"),
+                "Accept" to "*/*",
+                "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+            )
+            val probes = listOf(0, 1).amap { i ->
+                if (i == 0) fetchPlaylist(streamUrl, headers)
+                else if (uTxt != null && uTxt.startsWith("http", true)) fetchPlaylist(uTxt, dh)
+                else null
+            }
+            verified = probes[0] != null
+            if (!verified && probes[1] != null) {
+                directUrl = uTxt
+                directHeaders = dh
+            }
+            Log.i(
+                name,
+                "Setplay yoklaması: proxy=${if (verified) "açılıyor" else "AÇILMIYOR"} " +
+                    "doğrudan=${if (directUrl != null) "açılıyor" else "yok"}"
+            )
+        }
+
+        val du: String? = directUrl
+        val dhdr: Map<String, String> = directHeaders
+        if (du != null) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "DiziSol Doğrudan",
+                    url = du,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    referer = dhdr["Referer"].orEmpty()
+                    this.headers = dhdr
+                    quality = quality(du)
+                }
+            )
+        }
+
         callback(
             newExtractorLink(
                 source = name,
@@ -1683,9 +1769,12 @@ class DiziSol : MainAPI() {
             ) {
                 referer = "$mainUrl/"
                 this.headers = headers
-                quality = quality(streamUrl)
+                // Doğrulanamayan proxy bağlantısı listede sona düşsün
+                quality = if (verified || du == null) quality(streamUrl) else Qualities.Unknown.value
             }
         )
+        // 1 = bağlantı doğrulandı (proxy ya da doğrudan), 2 = hiçbiri doğrulanamadı
+        state?.set(0, if (verified || du != null) 1 else 2)
 
         record.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }?.let {
             fixUrl(it, mainUrl)?.let { url -> subtitleCallback(newSubtitleFile("Türkçe", url)) }
@@ -1718,21 +1807,32 @@ class DiziSol : MainAPI() {
         val tmdbId = tmdbIdFromUrl(pageUrl) ?: contentIdFromUrl(pageUrl)
         val mediaType = if (isFilmUrl(pageUrl)) "movie" else "tv"
         val coordinates = if (mediaType == "tv") seasonEpisode(pageUrl) else null
+        var extraPage: String? = null
+        var apiEmitted = false
         if (tmdbId != null) {
             val record = byTmdbRecord(tmdbId, mediaType, coordinates)
-            if (record != null && emitApiRecord(record, pageUrl, subtitleCallback, callback)) {
-                Log.i(name, "Video API sonucu: bağlantı=1 tür=$mediaType tmdbId=$tmdbId")
-                return true
+            val apiState = IntArray(1)
+            if (record != null && emitApiRecord(record, pageUrl, subtitleCallback, callback, apiState)) {
+                if (apiState[0] != 2) {
+                    Log.i(name, "Video API sonucu: bağlantı=1 tür=$mediaType tmdbId=$tmdbId")
+                    return true
+                }
+                // Bağlantı verildi ama doğrulanamadı: oynamazsa diye kaynak sitenin sayfasını da tara
+                apiEmitted = true
+                extraPage = sourcePageFromToken(record)
+                Log.w(name, "Video API bağlantısı doğrulanamadı; kaynak sayfası taranıyor: ${extraPage?.let { safeLogUrl(it) }}")
+            } else {
+                Log.w(
+                    name,
+                    "Video API fallback: tmdbId=$tmdbId tür=$mediaType koordinat=$coordinates kayıtVar=${record != null}; statik sayfa çözümlemesine geçiliyor"
+                )
             }
-            Log.w(
-                name,
-                "Video API fallback: tmdbId=$tmdbId tür=$mediaType koordinat=$coordinates kayıtVar=${record != null}; statik sayfa çözümlemesine geçiliyor"
-            )
         }
 
-        val first = document(pageUrl) ?: run {
-            Log.w(name, "Video teşhis: içerik sayfası alınamadı: ${safeLogUrl(pageUrl)}")
-            return false
+        val staticUrl = extraPage ?: pageUrl
+        val first = document(staticUrl) ?: run {
+            Log.w(name, "Video teşhis: içerik sayfası alınamadı: ${safeLogUrl(staticUrl)}")
+            return apiEmitted
         }
         val visitedPages = HashSet<String>()
         val seenMedia = HashSet<String>()
@@ -1796,14 +1896,14 @@ class DiziSol : MainAPI() {
             }
         }
 
-        inspect(first, pageUrl, 0)
+        inspect(first, staticUrl, 0)
 
         // SPA pages may contain only a small HTML shell; their player is initialized
         // client-side and therefore no iframe/source appears in Jsoup's static DOM.
         // In that case, give the actual content page one WebView interception pass.
         if (linkCount == 0) {
             webViewCount++
-            val resolved = resolveWebView(pageUrl, "$mainUrl/", countedCallback)
+            val resolved = resolveWebView(staticUrl, "$mainUrl/", countedCallback)
             Log.i(
                 name,
                 "Video teşhis ana sayfa WebView fallback: sonuç=$resolved bulunanBağlantı=$linkCount"
@@ -1814,6 +1914,6 @@ class DiziSol : MainAPI() {
             name,
             "Video çözümleme sonucu: sayfa=${safeLogUrl(pageUrl)} ziyaretEdilenSayfa=${visitedPages.size} adayMedya=${seenMedia.size} bağlantı=$linkCount webViewDenemesi=$webViewCount"
         )
-        return linkCount > 0
+        return linkCount > 0 || apiEmitted
     }
 }
