@@ -1532,7 +1532,12 @@ class DiziSol : MainAPI() {
             name,
             "Video API yanıtı: anahtarlar=${record.keys().asSequence().toList()} m3u8Url=${stream.take(160)} kayıt=${record.toString().take(400)}"
         )
-        if (stream.isNotBlank() && !stream.equals("null", true)) return record
+        // Platform içeriklerinde m3u8Url gerçek bağlantı değil, "setfilmizle::<base64 sayfa>::diller"
+        // gibi bir kaynak jetonu olarak gelir. Bu durumda site bağlantıyı kendi sunucusunda çözer.
+        val directStream = stream.isNotBlank() && !stream.equals("null", true) &&
+            !stream.contains("::") &&
+            (stream.startsWith("http", true) || stream.startsWith("/"))
+        if (directStream) return record
 
         // Netflix / Disney+ / HBO vb. platform içeriklerinde kayıt m3u8Url olmadan gelir;
         // site bağlantıyı POST /api/admin/resolve-stream/{kayitId} ile üretir.
@@ -1561,6 +1566,13 @@ class DiziSol : MainAPI() {
                 for (key in preferred) {
                     val v = node.opt(key)
                     if (v is String && looksLikeStream(v)) return v
+                }
+                for (key in preferred) {
+                    val v = node.opt(key)
+                    if (v is String && !v.contains("::") &&
+                        (v.startsWith("http", true) || v.startsWith("/")) &&
+                        !Regex("""(?i)\.(jpg|jpeg|png|webp|gif|vtt|srt)(\?|$)""").containsMatchIn(v)
+                    ) return v
                 }
                 val keys = node.keys()
                 while (keys.hasNext()) {
