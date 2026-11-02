@@ -1,4 +1,4 @@
-version = 28
+version = 29
 
 android {
     namespace = "com.bymesut1.vkvideo"
