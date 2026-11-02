@@ -1626,6 +1626,7 @@ class VkVideo : MainAPI() {
             }
             return loadLinksInner(data, callback)
         } finally {
+            if (deviceId.isNotBlank()) { deviceId = ""; token = null }   // rastgele kimlikli jeton sonraki videolara kalmasın
             if (got) loadSem.release()
         }
     }
@@ -1802,6 +1803,20 @@ class VkVideo : MainAPI() {
         // Gerçek (HLS / DASH / kaliteli mp4) bağlantı var mı? "url" gibi kalitesiz tek aday sahte sayılır.
 
         // Hızlı yol: gerçek bağlantı yoksa (yalnızca sahte "url" adayı ya da hiç) doğrudan yedek taramaya geç; sahte adayı sınamak için vakit harcanmaz
+        // Hiç bağlantı gelmediyse: jeton eskimiş / kısıtlanmış olabilir. Jeton yenilenir, kayıt yeniden çekilir, bir kez daha denenir.
+        if (cands.isEmpty()) {
+            token = null
+            try {
+                item = fetchItem(data)
+                debug.add("jeton yenilendi, yeniden denendi")
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                debug.add("jeton yenileme: ${e.message?.take(80)}")
+            }
+            player = item.optString("player").ifBlank { player }
+            collectPrimary()
+        }
+
         if (!hasReal()) runFallback()
 
         // VK birkaç istekten sonra jetonu/IP'yi kısıp boş yanıt dönebiliyor: bekle, yeni kimlikle jeton al, yeniden dene
@@ -1846,6 +1861,18 @@ class VkVideo : MainAPI() {
                 // Hiçbiri etiketli çıkmadıysa kalitesi bilinmeyen düz mp4'ler de verilir
                 if (emitted == 0) for (c in toEmit) emitCand(c, lang, callback, allowUnknown = true)
                 synchronized(linkCache) { linkCache[data] = CachedLinks(System.currentTimeMillis(), lang, toEmit.toList()) }
+                return true
+            }
+
+            // Son çare: test "ölü / tanınmıyor" dese bile gerçek görünümlü (HLS / DASH / kaliteli) adaylar yine de verilir.
+            // Sınama (Range isteği, başlık okuma) yanılabilir; oynatıcı çoğu zaman yine de açar.
+            val last = cands.filter { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+                .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
+                .take(4)
+            if (last.isNotEmpty()) {
+                var n = 0
+                for (c in last) if (emitCand(c, lang, callback)) n++
+                if (n == 0) for (c in last) emitCand(c, lang, callback, allowUnknown = true)
                 return true
             }
         }
