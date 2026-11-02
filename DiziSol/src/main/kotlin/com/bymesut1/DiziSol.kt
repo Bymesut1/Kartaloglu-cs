@@ -1565,7 +1565,7 @@ class DiziSol : MainAPI() {
     // Oynatıcı yanıt vermeyen sunucuda ~1 dk bekleyip hata verdiği için burada kısa sürede karar verilir.
     private suspend fun fetchPlaylist(url: String, headers: Map<String, String>): String? {
         return runCatching {
-            val r = app.get(url, headers = headers, timeout = 8L)
+            val r = app.get(url, headers = headers, timeout = 6L)
             val t = r.text
             val ok = r.isSuccessful && t.trimStart().startsWith("#EXTM3U")
             if (!ok) {
@@ -1710,7 +1710,7 @@ class DiziSol : MainAPI() {
     private suspend fun probeOneSegment(url: String, headers: Map<String, String>): Boolean {
         val started = System.currentTimeMillis()
         return try {
-            val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 6L)
+            val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 5L)
             val ok = r.isSuccessful
             Log.i(
                 name,
@@ -1820,7 +1820,7 @@ class DiziSol : MainAPI() {
     // Dönüş: (son playlist adresi, playlist metni)
     private suspend fun resolvePlayLink(url: String, headers: Map<String, String>): Pair<String, String>? {
         return try {
-            val r = app.get(url, headers = headers, timeout = 8L)
+            val r = app.get(url, headers = headers, timeout = 6L)
             val t = r.text
             val finalUrl = r.url.orEmpty().ifBlank { url }
             Log.i(
@@ -1837,7 +1837,7 @@ class DiziSol : MainAPI() {
                 val next = findStreamUrl(parsed) ?: directMediaUrls(decode(t)).firstOrNull()
                 val nextUrl = next?.let { resolveRef(finalUrl, it) }
                 if (nextUrl != null && nextUrl != url) {
-                    val r2 = app.get(nextUrl, headers = headers, timeout = 12L)
+                    val r2 = app.get(nextUrl, headers = headers, timeout = 6L)
                     val t2 = r2.text
                     Log.i(name, "Kaynak ikinci adım: kod=${r2.code} başı='${t2.take(40).replace('\n', ' ')}' kaynak=${safeLogUrl(nextUrl)}")
                     if (r2.isSuccessful && t2.trimStart().startsWith("#EXTM3U")) nextUrl to t2 else null
@@ -1899,102 +1899,116 @@ class DiziSol : MainAPI() {
             "Accept" to "*/*",
             "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
         )
-        // Setplay proxy'si bazı bölümlerde playlist'i veriyor ama video parçalarını (segment) vermeyip
-        // oynatıcıyı ~1 dk bekletiyor (SocketTimeout). Bu yüzden playlist'e değil, PARÇALARA da bakılır.
-        // Proxy sağlam değilse sırayla: doğrudan adres -> oynatıcı sayfası -> WebView -> kaynak sayfası.
+        // Başlık varyantları: temel (eskiden çalışan), + Origin, + Origin + Android Chrome UA.
+        // Bazı videolarda (ör. Masumiyet Müzesi) sunucu Origin/UA olmadan 403 verebiliyor.
+        val originHeaders = headers + mapOf("Origin" to mainUrl)
+        val androidHeaders = originHeaders + mapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/137.0.0.0 Mobile Safari/537.36"
+        )
+        val isSetplay = streamUrl.contains("/api/proxy/setplay/", true)
         var verified = true
-        var dropProxy = false
+        var dropMain = false
+        var mainHeaders = headers
         val extras = ArrayList<Triple<String, String, Map<String, String>>>()
-        if (streamUrl.contains("/api/proxy/setplay/", true)) {
-            val uTxt = queryParameter(streamUrl, "u")?.let { b64Text(it) }
-            val rTxt = queryParameter(streamUrl, "r")?.let { b64Text(it) }
-            val dh = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to (rTxt ?: "https://setplay.sbs/"),
-                "Origin" to ((rTxt?.let { originOfUrl(it) }) ?: "https://setplay.sbs"),
-                "Accept" to "*/*",
-                "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
-            )
-            // Kaydın "sources" listesi: cortina, vidmixi, dizipal vb. oynatılabilir kaynaklar (/play?id=...)
-            val srcList = ArrayList<JSONObject>()
-            val srcArray = record.optJSONArray("sources")
-            if (srcArray != null) {
-                for (i in 0 until srcArray.length()) {
-                    srcArray.optJSONObject(i)?.takeIf { it.optBoolean("isActive", true) }?.let { srcList += it }
-                }
-            }
-            srcList.sortBy { it.optInt("priority", 99) }
-            val srcHeaders = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to "$mainUrl/",
-                "Origin" to mainUrl,
-                "Accept" to "*/*",
-                "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
-            )
 
-            // Üç yoklama aynı anda yapılır (sıralı değil): proxy, doğrudan adres, kaynak listesi.
-            val probes = listOf(0, 1, 2).amap { i ->
-                if (i == 0) {
-                    val pl = fetchPlaylist(streamUrl, headers)
-                    val ok: Any = pl != null && probeSegments(pl, streamUrl, headers, true)
-                    ok
-                } else if (i == 1) {
-                    val ok: Any = if (uTxt != null && uTxt.startsWith("http", true)) {
-                        val pl = fetchPlaylist(uTxt, dh)
-                        pl != null && probeSegments(pl, uTxt, dh, true)
-                    } else {
-                        false
-                    }
-                    ok
+        val uTxt = if (isSetplay) queryParameter(streamUrl, "u")?.let { b64Text(it) } else null
+        val rTxt = if (isSetplay) queryParameter(streamUrl, "r")?.let { b64Text(it) } else null
+        val dh = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to (rTxt ?: "https://setplay.sbs/"),
+            "Origin" to ((rTxt?.let { originOfUrl(it) }) ?: "https://setplay.sbs"),
+            "Accept" to "*/*",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+        )
+        // Kaydın "sources" listesi: cortina, vidmixi, dizipal vb. oynatılabilir kaynaklar (/play?id=...)
+        Log.i(name, "Kayıt sources=${record.opt("sources")?.toString()?.take(1500)}")
+        val srcList = ArrayList<JSONObject>()
+        val srcArray = record.optJSONArray("sources")
+        if (srcArray != null) {
+            for (i in 0 until srcArray.length()) {
+                srcArray.optJSONObject(i)?.takeIf { it.optBoolean("isActive", true) }?.let { srcList += it }
+            }
+        }
+        srcList.sortBy { it.optInt("priority", 99) }
+        val srcHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to "$mainUrl/",
+            "Origin" to mainUrl,
+            "Accept" to "*/*",
+            "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+        )
+
+        // Tüm yoklamalar aynı anda yapılır (sıralı değil):
+        // 0-2 ana bağlantı (3 başlık varyantı), 3 setplay doğrudan adres, 4 kaynak listesi.
+        val probes = listOf(0, 1, 2, 3, 4).amap { i ->
+            if (i <= 2) {
+                val h = if (i == 0) headers else if (i == 1) originHeaders else androidHeaders
+                val pl = fetchPlaylist(streamUrl, h)
+                val ok: Any = pl != null && probeSegments(pl, streamUrl, h, true)
+                ok
+            } else if (i == 3) {
+                val ok: Any = if (uTxt != null && uTxt.startsWith("http", true)) {
+                    val pl = fetchPlaylist(uTxt, dh)
+                    pl != null && probeSegments(pl, uTxt, dh, true)
                 } else {
-                    val res: Any = srcList.take(3).amap { sObj ->
-                        val raw = sObj.optString("m3u8Url").trim()
-                        val full = if (raw.isBlank() || raw.equals("null", true)) null else resolveRef("$mainUrl/", raw)
-                        if (full == null) {
-                            null
-                        } else {
-                            val r = resolvePlayLink(full, srcHeaders)
-                            val ok = r != null && probeSegments(r.second, r.first, srcHeaders, true)
-                            Log.i(name, "Kaynak sonucu: sağlayıcı=${sObj.optString("provider")} çalışıyor=$ok")
-                            Triple(sObj, r?.first ?: full, ok)
-                        }
-                    }.filterNotNull()
-                    res
+                    false
                 }
-            }
-            verified = probes[0] as Boolean
-            val directOk = probes[1] as Boolean
-            @Suppress("UNCHECKED_CAST")
-            val srcResults = probes[2] as List<Triple<JSONObject, String, Boolean>>
-            Log.i(
-                name,
-                "Setplay yoklaması (segmentler dahil): proxy=${if (verified) "açılıyor" else "AÇILMIYOR"} " +
-                    "doğrudan=${if (directOk) "açılıyor" else "yok"} kaynakSayısı=${srcList.size}"
-            )
-
-            if (!verified) {
-                val okSrc = srcResults.filter { it.third }
-                for ((sObj, sUrl, _) in okSrc) {
-                    val label = "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() }
-                    extras += Triple(label, sUrl, srcHeaders)
-                    sObj.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }
-                        ?.let { subtitleCallback(newSubtitleFile("Türkçe", it)) }
-                    sObj.optString("subtitleEn").takeIf { it.isNotBlank() && !it.equals("null", true) }
-                        ?.let { subtitleCallback(newSubtitleFile("English", it)) }
-                }
-                // Çalışan kaynak varsa bozuk "DiziSol API" (proxy) bağlantısı listeden çıkarılır
-                dropProxy = okSrc.isNotEmpty()
-                if (extras.isEmpty() && directOk && uTxt != null) {
-                    extras += Triple("DiziSol Doğrudan", uTxt, dh)
-                }
-                if (extras.isEmpty()) {
-                    srcResults.firstOrNull()?.let { (sObj, sUrl, _) ->
-                        extras += Triple(
-                            "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() } + " (doğrulanamadı)",
-                            sUrl,
-                            srcHeaders
-                        )
+                ok
+            } else {
+                val res: Any = srcList.take(3).amap { sObj ->
+                    val raw = sObj.optString("m3u8Url").trim()
+                    val full = if (raw.isBlank() || raw.equals("null", true)) null else resolveRef("$mainUrl/", raw)
+                    if (full == null) {
+                        null
+                    } else {
+                        val r = resolvePlayLink(full, srcHeaders)
+                        val ok = r != null && probeSegments(r.second, r.first, srcHeaders, true)
+                        Log.i(name, "Kaynak sonucu: sağlayıcı=${sObj.optString("provider")} çalışıyor=$ok")
+                        Triple(sObj, r?.first ?: full, ok)
                     }
+                }.filterNotNull()
+                res
+            }
+        }
+        val okBase = probes[0] as Boolean
+        val okOrigin = probes[1] as Boolean
+        val okAndroid = probes[2] as Boolean
+        val directOk = probes[3] as Boolean
+        @Suppress("UNCHECKED_CAST")
+        val srcResults = probes[4] as List<Triple<JSONObject, String, Boolean>>
+        verified = okBase || okOrigin || okAndroid
+        mainHeaders = if (okBase) headers else if (okOrigin) originHeaders else if (okAndroid) androidHeaders else originHeaders
+        Log.i(
+            name,
+            "Ana bağlantı yoklaması (segmentler dahil): temel=$okBase origin=$okOrigin android=$okAndroid " +
+                "doğrudan=$directOk kaynakSayısı=${srcList.size} setplay=$isSetplay"
+        )
+
+        // Çalışan kaynaklar her zaman listenin başına konur
+        val okSrc = srcResults.filter { it.third }
+        for ((sObj, sUrl, _) in okSrc) {
+            val label = "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() }
+            extras += Triple(label, sUrl, srcHeaders)
+            if (!verified) {
+                sObj.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }
+                    ?.let { subtitleCallback(newSubtitleFile("Türkçe", it)) }
+                sObj.optString("subtitleEn").takeIf { it.isNotBlank() && !it.equals("null", true) }
+                    ?.let { subtitleCallback(newSubtitleFile("English", it)) }
+            }
+        }
+        // Ana bağlantı bozuk ama çalışan kaynak varsa bozuk "DiziSol API" listeden çıkarılır
+        dropMain = !verified && okSrc.isNotEmpty()
+        if (!verified && extras.isEmpty()) {
+            if (directOk && uTxt != null) {
+                extras += Triple("DiziSol Doğrudan", uTxt, dh)
+            } else {
+                srcResults.firstOrNull()?.let { (sObj, sUrl, _) ->
+                    extras += Triple(
+                        "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() } + " (doğrulanamadı)",
+                        sUrl,
+                        srcHeaders
+                    )
                 }
             }
         }
@@ -2014,7 +2028,7 @@ class DiziSol : MainAPI() {
             )
         }
 
-        if (!dropProxy) callback(
+        if (!dropMain) callback(
             newExtractorLink(
                 source = name,
                 name = "DiziSol API",
@@ -2022,13 +2036,13 @@ class DiziSol : MainAPI() {
                 type = ExtractorLinkType.M3U8
             ) {
                 referer = "$mainUrl/"
-                this.headers = headers
-                // Doğrulanamayan proxy bağlantısı listede sona düşsün
+                this.headers = mainHeaders
+                // Doğrulanamayan bağlantı listede sona düşsün
                 quality = if (verified) quality(streamUrl) else Qualities.Unknown.value
             }
         )
         // 1 = bağlantı doğrulandı (proxy ya da alternatif), 2 = hiçbiri doğrulanamadı
-        state?.set(0, if (verified || extras.isNotEmpty()) 1 else 2)
+        state?.set(0, if (!isSetplay || verified || extras.isNotEmpty()) 1 else 2)
 
         record.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }?.let {
             fixUrl(it, mainUrl)?.let { url -> subtitleCallback(newSubtitleFile("Türkçe", url)) }
@@ -2152,22 +2166,4 @@ class DiziSol : MainAPI() {
 
         inspect(first, staticUrl, 0)
 
-        // SPA pages may contain only a small HTML shell; their player is initialized
-        // client-side and therefore no iframe/source appears in Jsoup's static DOM.
-        // In that case, give the actual content page one WebView interception pass.
-        if (linkCount == 0) {
-            webViewCount++
-            val resolved = resolveWebView(staticUrl, "$mainUrl/", countedCallback)
-            Log.i(
-                name,
-                "Video teşhis ana sayfa WebView fallback: sonuç=$resolved bulunanBağlantı=$linkCount"
-            )
-        }
-
-        Log.i(
-            name,
-            "Video çözümleme sonucu: sayfa=${safeLogUrl(pageUrl)} ziyaretEdilenSayfa=${visitedPages.size} adayMedya=${seenMedia.size} bağlantı=$linkCount webViewDenemesi=$webViewCount"
-        )
-        return linkCount > 0 || apiEmitted
-    }
-}
+        // SPA pages may contain only a small HTML shell; their player is initialize
