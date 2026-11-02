@@ -1679,6 +1679,7 @@ class DiziSol : MainAPI() {
 
             val result = JSONObject(record.toString())
             result.put("m3u8Url", found)
+            runCatching { result.put("resolveRaw", text) }
             val responseObj = parsed as? JSONObject
             val dataObj = responseObj?.optJSONObject("data")
             for (key in listOf("subtitleTr", "subtitleEn")) {
@@ -1813,6 +1814,26 @@ class DiziSol : MainAPI() {
         return null
     }
 
+    // Kayıt/yanıt içindeki alternatif m3u8 adreslerini (düz, workers.dev sarmalı ya da base64) bulur
+    private fun alternativeStreams(record: JSONObject): List<String> {
+        val text = decode(record.toString())
+        val found = LinkedHashSet<String>()
+        val imageRegex = Regex("""\.(?:jpe?g|png|webp|gif|vtt|srt|svg)(?:\?|$)""", RegexOption.IGNORE_CASE)
+        Regex("""https?://[^\s"'<>\\]+""", RegexOption.IGNORE_CASE).findAll(text).forEach { m ->
+            val u = m.value.trimEnd(')', ']', '}', ';', ',')
+            val l = u.lowercase()
+            if (l.contains("/api/proxy/setplay/") || imageRegex.containsMatchIn(l)) return@forEach
+            if (l.contains(".m3u8") || l.contains("workers.dev/m3u8")) found += u
+        }
+        Regex("""aHR0c[A-Za-z0-9+/_-]{20,}""").findAll(text).forEach { m ->
+            val d = b64Text(m.value) ?: return@forEach
+            if (d.startsWith("http", true) && d.contains(".m3u8", true) &&
+                !d.contains("/api/proxy/setplay/", true)
+            ) found += d
+        }
+        return found.toList()
+    }
+
     private suspend fun emitApiRecord(
         record: JSONObject,
         sourcePage: String,
@@ -1877,18 +1898,48 @@ class DiziSol : MainAPI() {
                     "doğrudan=${if (directOk) "açılıyor" else "yok"}"
             )
 
+            // Site kendi oynatıcısında da setplay proxy'si bozuksa "Alternatif player"a geçiyor
+            // (cortina.dizisol12.workers.dev/m3u8?u=<base64 adres>). Bu adres yalnızca Referer/Origin
+            // dizisol.com ise açılıyor, bu yüzden bu başlıklarla denenir.
+            if (!verified && extras.isEmpty()) {
+                Log.i(name, "Kayıt sources=${record.opt("sources")?.toString()?.take(500)}")
+                val alts = alternativeStreams(record)
+                Log.i(name, "Alternatif akış adayları: ${alts.size} " + alts.joinToString(" | ") { safeLogUrl(it) })
+                val altHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "$mainUrl/",
+                    "Origin" to mainUrl,
+                    "Accept" to "*/*",
+                    "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+                )
+                val tries = ArrayList<String>()
+                for (a in alts) {
+                    if (a.contains("workers.dev/m3u8", true)) {
+                        tries += a
+                    } else {
+                        val enc = android.util.Base64.encodeToString(
+                            a.toByteArray(Charsets.UTF_8),
+                            android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
+                        )
+                        tries += "https://cortina.dizisol12.workers.dev/m3u8?u=$enc"
+                        tries += a
+                    }
+                }
+                val okAlts = tries.take(6).amap { t ->
+                    val pl = fetchPlaylist(t, altHeaders)
+                    if (pl != null && probeSegments(pl, t, altHeaders)) t else null
+                }.filterNotNull()
+                for (t in okAlts) extras += Triple("DiziSol Alternatif", t, altHeaders)
+                if (okAlts.isEmpty() && tries.isNotEmpty()) {
+                    extras += Triple("DiziSol Alternatif (doğrulanamadı)", tries.first(), altHeaders)
+                }
+            }
+
             if (!verified && extras.isEmpty() && rTxt != null && rTxt.startsWith("http", true)) {
                 val srcPage = sourcePageFromToken(record)
                 val ref = srcPage?.let { originOfUrl(it) }?.let { "$it/" } ?: "https://www.setfilmizle.uk/"
                 val alt = playerPageStream(rTxt, ref)
-                if (alt != null) {
-                    extras += Triple("DiziSol Oynatıcı", alt.first, alt.second)
-                } else {
-                    webViewGot = resolveWebView(rTxt, ref) { link ->
-                        callback(link)
-                    }
-                    Log.i(name, "Setplay oynatıcı WebView denemesi: sonuç=$webViewGot")
-                }
+                if (alt != null) extras += Triple("DiziSol Oynatıcı", alt.first, alt.second)
             }
         }
 
