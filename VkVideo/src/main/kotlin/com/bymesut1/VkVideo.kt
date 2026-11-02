@@ -8,9 +8,6 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import kotlin.math.abs
 import kotlin.math.min
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 class VkVideo : MainAPI() {
     override var mainUrl = "https://vkvideo.ru"
@@ -139,7 +136,7 @@ class VkVideo : MainAPI() {
     private var lastDebug: String = ""
 
     // loadLinks aynı anda tek çalışsın (CloudStream aynı videoyu iki kez paralel isteyebiliyor; VK bunu kısıtlıyor)
-    private val loadMutex = Mutex()
+    private val loadSem = java.util.concurrent.Semaphore(1)
     private var deviceId = ""                                   // boş: gönderilmez; yenileme turlarında rastgele üretilir
     private class CachedLinks(val at: Long, val lang: String, val list: List<Cand>)
     private val linkCache = HashMap<String, CachedLinks>()
@@ -1617,15 +1614,19 @@ class VkVideo : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "debug") return false
-        return loadMutex.withLock {
+        // Aynı anda tek istek; 90 sn içinde sıra gelmezse yine de devam eder
+        val got = loadSem.tryAcquire(90, java.util.concurrent.TimeUnit.SECONDS)
+        try {
             val c = synchronized(linkCache) { linkCache[data] }
             if (c != null && System.currentTimeMillis() - c.at < CACHE_MS) {
                 var n = 0
                 for (cand in c.list) if (emitCand(cand, c.lang, callback)) n++
                 if (n == 0) for (cand in c.list) emitCand(cand, c.lang, callback, allowUnknown = true)
-                return@withLock true
+                return true
             }
-            loadLinksInner(data, callback)
+            return loadLinksInner(data, callback)
+        } finally {
+            if (got) loadSem.release()
         }
     }
 
@@ -1812,7 +1813,7 @@ class VkVideo : MainAPI() {
         var round = 0
         while (!hasReal() && round < 3) {
             round++
-            delay(2500L * round)
+            Thread.sleep(2500L * round)
             token = null
             deviceId = randomDeviceId()
             try {
