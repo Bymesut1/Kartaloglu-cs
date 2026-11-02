@@ -1710,7 +1710,7 @@ class DiziSol : MainAPI() {
     private suspend fun probeOneSegment(url: String, headers: Map<String, String>): Boolean {
         val started = System.currentTimeMillis()
         return try {
-            val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 9L)
+            val r = app.get(url, headers = headers + mapOf("Range" to "bytes=0-4095"), timeout = 12L)
             val ok = r.isSuccessful
             Log.i(
                 name,
@@ -1814,6 +1814,43 @@ class DiziSol : MainAPI() {
         return null
     }
 
+    // "/play?id=..." gibi kaynak adresini açar; playlist ya da playlist'e işaret eden yanıt bekler.
+    // Dönüş: (son playlist adresi, playlist metni)
+    private suspend fun resolvePlayLink(url: String, headers: Map<String, String>): Pair<String, String>? {
+        return try {
+            val r = app.get(url, headers = headers, timeout = 12L)
+            val t = r.text
+            val finalUrl = r.url.orEmpty().ifBlank { url }
+            Log.i(
+                name,
+                "Kaynak yoklaması: kod=${r.code} uzunluk=${t.length} başı='${t.take(60).replace('\n', ' ')}' " +
+                    "kaynak=${safeLogUrl(url)} son=${safeLogUrl(finalUrl)}"
+            )
+            if (!r.isSuccessful) {
+                null
+            } else if (t.trimStart().startsWith("#EXTM3U")) {
+                finalUrl to t
+            } else {
+                val parsed = runCatching { JSONTokener(t).nextValue() }.getOrNull()
+                val next = findStreamUrl(parsed) ?: directMediaUrls(decode(t)).firstOrNull()
+                val nextUrl = next?.let { resolveRef(finalUrl, it) }
+                if (nextUrl != null && nextUrl != url) {
+                    val r2 = app.get(nextUrl, headers = headers, timeout = 12L)
+                    val t2 = r2.text
+                    Log.i(name, "Kaynak ikinci adım: kod=${r2.code} başı='${t2.take(40).replace('\n', ' ')}' kaynak=${safeLogUrl(nextUrl)}")
+                    if (r2.isSuccessful && t2.trimStart().startsWith("#EXTM3U")) nextUrl to t2 else null
+                } else {
+                    null
+                }
+            }
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(name, "Kaynak yoklaması başarısız: ${e.javaClass.simpleName} ${safeLogUrl(url)}")
+            null
+        }
+    }
+
     // Kayıt/yanıt içindeki alternatif m3u8 adreslerini (düz, workers.dev sarmalı ya da base64) bulur
     private fun alternativeStreams(record: JSONObject): List<String> {
         val text = decode(record.toString())
@@ -1903,6 +1940,52 @@ class DiziSol : MainAPI() {
             // dizisol.com ise açılıyor, bu yüzden bu başlıklarla denenir.
             if (!verified && extras.isEmpty()) {
                 Log.i(name, "Kayıt sources=${record.opt("sources")?.toString()?.take(500)}")
+                // Kaydın "sources" listesi: vidrame, cortina vb. oynatılabilir kaynaklar (/play?id=...)
+                val srcArray = record.optJSONArray("sources")
+                val srcList = ArrayList<JSONObject>()
+                if (srcArray != null) {
+                    for (i in 0 until srcArray.length()) {
+                        srcArray.optJSONObject(i)?.takeIf { it.optBoolean("isActive", true) }?.let { srcList += it }
+                    }
+                }
+                srcList.sortBy { it.optInt("priority", 99) }
+                val srcHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "$mainUrl/",
+                    "Origin" to mainUrl,
+                    "Accept" to "*/*",
+                    "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+                )
+                val srcResults = srcList.take(4).amap { sObj ->
+                    val raw = sObj.optString("m3u8Url").trim()
+                    val full = if (raw.isBlank() || raw.equals("null", true)) null else resolveRef("$mainUrl/", raw)
+                    if (full == null) {
+                        null
+                    } else {
+                        val res = resolvePlayLink(full, srcHeaders)
+                        val ok = res != null && probeSegments(res.second, res.first, srcHeaders)
+                        Log.i(name, "Kaynak sonucu: sağlayıcı=${sObj.optString("provider")} çalışıyor=$ok")
+                        Triple(sObj, res?.first ?: full, ok)
+                    }
+                }.filterNotNull()
+                for ((sObj, sUrl, sOk) in srcResults) {
+                    if (!sOk) continue
+                    val label = "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() }
+                    extras += Triple(label, sUrl, srcHeaders)
+                    sObj.optString("subtitleTr").takeIf { it.isNotBlank() && !it.equals("null", true) }
+                        ?.let { subtitleCallback(newSubtitleFile("Türkçe", it)) }
+                    sObj.optString("subtitleEn").takeIf { it.isNotBlank() && !it.equals("null", true) }
+                        ?.let { subtitleCallback(newSubtitleFile("English", it)) }
+                }
+                if (extras.isEmpty()) {
+                    srcResults.firstOrNull()?.let { (sObj, sUrl, _) ->
+                        extras += Triple(
+                            "DiziSol " + sObj.optString("provider").replaceFirstChar { it.uppercase() } + " (doğrulanamadı)",
+                            sUrl,
+                            srcHeaders
+                        )
+                    }
+                }
                 val alts = alternativeStreams(record)
                 Log.i(name, "Alternatif akış adayları: ${alts.size} " + alts.joinToString(" | ") { safeLogUrl(it) })
                 val altHeaders = mapOf(
@@ -2071,47 +2154,3 @@ class DiziSol : MainAPI() {
                 runCatching { loadExtractor(candidate, currentUrl, subtitleCallback, countedCallback) }
                     .onFailure { Log.d(name, "Extractor çözemedi: $candidate") }
 
-                // Embed sayfalarının içine yalnızca sınırlı derinlikte gir.
-                if (depth < 2) {
-                    val child = document(candidate)
-                    if (child != null) {
-                        inspect(child, candidate, depth + 1)
-                    } else {
-                        Log.d(name, "Video teşhis: aday sayfa okunamadı: ${safeLogUrl(candidate)}")
-                    }
-                }
-                if (linkCount == before && webViewCount < 2 &&
-                    (candidate.contains("player", true) || candidate.contains("embed", true) ||
-                        candidate != pageUrl)
-                ) {
-                    webViewCount++
-                    val resolved = resolveWebView(candidate, currentUrl, countedCallback)
-                    Log.d(
-                        name,
-                        "Video teşhis WebView: aday=${safeLogUrl(candidate)} sonuç=$resolved bulunanBağlantı=$linkCount"
-                    )
-                }
-            }
-        }
-
-        inspect(first, staticUrl, 0)
-
-        // SPA pages may contain only a small HTML shell; their player is initialized
-        // client-side and therefore no iframe/source appears in Jsoup's static DOM.
-        // In that case, give the actual content page one WebView interception pass.
-        if (linkCount == 0) {
-            webViewCount++
-            val resolved = resolveWebView(staticUrl, "$mainUrl/", countedCallback)
-            Log.i(
-                name,
-                "Video teşhis ana sayfa WebView fallback: sonuç=$resolved bulunanBağlantı=$linkCount"
-            )
-        }
-
-        Log.i(
-            name,
-            "Video çözümleme sonucu: sayfa=${safeLogUrl(pageUrl)} ziyaretEdilenSayfa=${visitedPages.size} adayMedya=${seenMedia.size} bağlantı=$linkCount webViewDenemesi=$webViewCount"
-        )
-        return linkCount > 0 || apiEmitted
-    }
-}
