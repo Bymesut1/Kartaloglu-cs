@@ -1440,7 +1440,7 @@ class VkVideo : MainAPI() {
             val h = hv[i].toMutableMap()
             if (!isH) h["Range"] = "bytes=0-1"
             return try {
-                val r = app.get(c.url, headers = h, timeout = 4L)
+                val r = app.get(c.url, headers = h, timeout = 3L)
                 val ct = r.headers["Content-Type"] ?: ""
                 val st = if (isH) {
                     if (r.code in 200..299 && r.text.trimStart().startsWith("#EXTM3U")) 1 else -1
@@ -1614,8 +1614,8 @@ class VkVideo : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (data == "debug") return false
-        // Aynı anda tek istek; 90 sn içinde sıra gelmezse yine de devam eder
-        val got = loadSem.tryAcquire(90, java.util.concurrent.TimeUnit.SECONDS)
+        // Aynı anda tek istek; 20 sn içinde sıra gelmezse yine de devam eder
+        val got = loadSem.tryAcquire(20, java.util.concurrent.TimeUnit.SECONDS)
         try {
             val c = synchronized(linkCache) { linkCache[data] }
             if (c != null && System.currentTimeMillis() - c.at < CACHE_MS) {
@@ -1685,23 +1685,13 @@ class VkVideo : MainAPI() {
 
         collectPrimary()
 
-        // Hiç bağlantı gelmediyse: jeton eskimiş / kısıtlanmış olabilir. Jeton yenilenir, kayıt yeniden çekilir, bir kez daha denenir.
-        if (cands.isEmpty()) {
-            token = null
-            try {
-                item = fetchItem(data)
-                debug.add("jeton yenilendi, yeniden denendi")
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                debug.add("jeton yenileme: ${e.message?.take(80)}")
-            }
-            collectPrimary()
-        }
-
         // 3) Yedek kaynak taraması: oynatıcı (embed) sayfası, farklı adresler, WebView.
         //    Hiç link yoksa VEYA bulunan linkler oynatıcının tanımadığı biçimdeyse (aşağıda) çalıştırılır.
         var player = item.optString("player")
         var fallbackDone = false
+        // Toplam süre sınırı: sonsuz dönen yükleme ekranı yerine en geç ~50 sn'de sonuç (ya da "bağlantı yok") döner
+        val deadline = System.currentTimeMillis() + 50_000L
+        var allowWebView = true
 
         suspend fun runFallback() {
             if (fallbackDone) return
@@ -1741,7 +1731,7 @@ class VkVideo : MainAPI() {
                     ("https://m.vk.com/video${oid}_$vid" + (if (hash.isNotBlank()) "?access_key=$hash" else "")) to mobileHdr
                 )
                 for ((cu, ch) in alts) {
-                    if (cands.size > base) break
+                    if (cands.size > base || System.currentTimeMillis() > deadline) break
                     try {
                         val html = fetchFollow(cu, ch, 5000L) ?: continue
                         val n = scanHtml(html, cands, seen)
@@ -1754,7 +1744,7 @@ class VkVideo : MainAPI() {
             }
 
             // 3c) Son çare: sayfayı WebView'da açıp oynatıcının istediği medya adresini yakala
-            if (cands.size == base) {
+            if (cands.size == base && allowWebView && System.currentTimeMillis() < deadline - 16_000L) {
                 val clipWeb = if (item.optBoolean("synthetic") || item.optString("type") == "short_video") listOf("$mainUrl/clip$data") else emptyList()
                 // Oynatıcı kullanıcı dokunuşu beklemesin: autoplay=1
                 val webPlayer = player + (if (player.contains("?")) "&" else "?") + "autoplay=1"
@@ -1788,14 +1778,19 @@ class VkVideo : MainAPI() {
 
         // 4) Bağlantı testi: yeni adaylar için hangi başlık takımının çalıştığı bulunur, ölüler sona atılır,
         //    en iyi 2 mp4'ün kapsayıcısı oynatıcının tanıyacağı biçimde mi diye bakılır
+        fun hasReal() = cands.any { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+
         suspend fun evaluate() {
+            if (hasReal()) {
+                for (c in cands) if (!isHls(c) && !isDash(c) && qualityOf(c.hint, c.url) == null) c.dead = true
+            }
             val fresh = cands.filter { it.diag.isEmpty() && !it.dead }
             val mp4s = fresh.filter { !isHls(it) && !isDash(it) }
                 .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
-            val targets = mp4s.take(4) + fresh.filter { isHls(it) }.take(1)
+            val targets = mp4s.take(2) + fresh.filter { isHls(it) }.take(1)
             targets.amap { probe(it) }
             debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
-            targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(4).amap { sniffMp4(it) }
+            targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(2).amap { sniffMp4(it) }
             for (c in targets) {
                 android.util.Log.d(
                     "VkVideo",
@@ -1804,16 +1799,17 @@ class VkVideo : MainAPI() {
             }
         }
 
-        if (cands.isEmpty()) runFallback()
-
         // Gerçek (HLS / DASH / kaliteli mp4) bağlantı var mı? "url" gibi kalitesiz tek aday sahte sayılır.
-        fun hasReal() = cands.any { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+
+        // Hızlı yol: gerçek bağlantı yoksa (yalnızca sahte "url" adayı ya da hiç) doğrudan yedek taramaya geç; sahte adayı sınamak için vakit harcanmaz
+        if (!hasReal()) runFallback()
 
         // VK birkaç istekten sonra jetonu/IP'yi kısıp boş yanıt dönebiliyor: bekle, yeni kimlikle jeton al, yeniden dene
         var round = 0
-        while (!hasReal() && round < 3) {
+        while (!hasReal() && round < 2 && System.currentTimeMillis() < deadline - 12_000L) {
             round++
-            Thread.sleep(2500L * round)
+            allowWebView = false          // yenileme turlarında 15 sn'lik WebView beklemesi yok
+            Thread.sleep(1500L)
             token = null
             deviceId = randomDeviceId()
             try {
