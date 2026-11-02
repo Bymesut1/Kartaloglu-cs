@@ -111,7 +111,7 @@ class VkVideo : MainAPI() {
             "isom", "iso2", "iso3", "iso4", "iso5", "iso6", "iso9", "avc1", "hvc1", "hev1", "av01",
             "mp41", "mp42", "mmp4", "3g2a", "3g2b", "3g2c", "3gr6", "3gs6", "3ge6", "3gg6", "3gp4",
             "3gp5", "3gp6", "3gp7", "M4V ", "M4A ", "f4v ", "kddi", "M4VP", "M4PH", "M4PC", "msnv",
-            "MSNV", "dby1", "isml", "piff", "qt  ", "XAVC"
+            "MSNV", "dash", "msdh", "msix", "cmfc", "dby1", "isml", "piff", "qt  ", "XAVC"
         )
 
         // "ftyp" olmadan başlayıp yine de geçerli sayılan ilk kutular
@@ -1334,8 +1334,12 @@ class VkVideo : MainAPI() {
         var diag = ""
     }
 
-    private fun isHls(c: Cand) = c.url.contains(".m3u8") || c.hint.contains("hls", true)
-    private fun isDash(c: Cand) = c.url.contains(".mpd") || c.hint.contains("dash", true)
+    // Tür artık anahtar adına değil URL'ye göre belirlenir (dash_sep / dash_webm gibi anahtarlar düz mp4/webm döndürebilir)
+    private fun isPlainFile(u: String) = Regex("(?i)\\.(mp4|webm|m4v|mov)(\\?|&|$)").containsMatchIn(u)
+    private fun isHls(c: Cand) = c.url.contains(".m3u8") ||
+        (c.hint.contains("hls", true) && !c.url.contains(".mpd") && !isPlainFile(c.url))
+    private fun isDash(c: Cand) = c.url.contains(".mpd")
+    private fun isWebm(c: Cand) = c.url.contains(".webm", true) || c.hint.contains("webm", true)
 
     private fun addCand(list: MutableList<Cand>, seen: HashSet<String>, hint: String, raw: String): Boolean {
         // "&bytes=0-5355" gibi parça aralığı parametresi varsa kaldırılır (tam dosya istenir)
@@ -1462,9 +1466,9 @@ class VkVideo : MainAPI() {
             c.size = total ?: (if (r.code == 200) len else -1L)
             // Sunucu Range'i yok sayıp tüm dosyayı gönderirse gövde okunmaz (bellek / süre)
             if (!(r.code == 206 || (len in 1..4096))) return
-            val t = r.text
-            if (t.length < 12) return
-            val head = t.take(64)
+            val bytes = r.body.bytes()
+            if (bytes.size < 12) return
+            val head = String(bytes, 0, minOf(bytes.size, 64), Charsets.ISO_8859_1)
             val box = head.substring(4, 8)
             c.unsupported = when {
                 box == "ftyp" -> KNOWN_BRANDS.none { head.contains(it) }
@@ -1477,7 +1481,7 @@ class VkVideo : MainAPI() {
         }
     }
 
-    private suspend fun emitCand(c: Cand, lang: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun emitCand(c: Cand, lang: String, callback: (ExtractorLink) -> Unit, allowUnknown: Boolean = false): Boolean {
         val ref = "$mainUrl/"
         val hdrs = c.headers ?: hdrList(c.url).first()
         val src = if (lang.isNotBlank()) "$name $lang" else name
@@ -1485,6 +1489,7 @@ class VkVideo : MainAPI() {
             isHls(c) -> {
                 try {
                     M3u8Helper.generateM3u8(src, c.url, ref, headers = hdrs).forEach(callback)
+                    return true
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     callback(
@@ -1494,6 +1499,7 @@ class VkVideo : MainAPI() {
                         }
                     )
                 }
+                return true
             }
             isDash(c) -> {
                 callback(
@@ -1502,11 +1508,12 @@ class VkVideo : MainAPI() {
                         this.headers = hdrs
                     }
                 )
+                return true
             }
             else -> {
                 val q = qualityOf(c.hint, c.url)
                 val label = if (q != null) "${q}p" else c.hint.ifBlank { "MP4" }
-                if (label.equals("MP4", ignoreCase = true)) return            // "MP4" etiketli (kalitesi bilinmeyen) kaynaklar çalışmıyor: gösterme
+                if (label.equals("MP4", ignoreCase = true) && !allowUnknown) return false   // kalitesi bilinmeyenler yalnızca başka kaynak yoksa gösterilir
                 callback(
                     newExtractorLink(src, "$src $label", c.url) {
                         this.referer = ref
@@ -1514,6 +1521,7 @@ class VkVideo : MainAPI() {
                         this.quality = q ?: Qualities.Unknown.value
                     }
                 )
+                return true
             }
         }
     }
@@ -1751,7 +1759,7 @@ class VkVideo : MainAPI() {
             val targets = mp4s.take(4) + fresh.filter { isHls(it) }.take(1)
             targets.amap { probe(it) }
             debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
-            targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(2).amap { sniffMp4(it) }
+            targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(4).amap { sniffMp4(it) }
             for (c in targets) {
                 android.util.Log.d(
                     "VkVideo",
@@ -1771,11 +1779,15 @@ class VkVideo : MainAPI() {
                 if (cands.size > before) evaluate()
             }
 
-            val usable = cands.filter { !it.dead && !it.unsupported }
-            val alive = cands.filter { !it.dead }
+            val noWebm = cands.filter { !isWebm(it) }.ifEmpty { cands }
+            val usable = noWebm.filter { !it.dead && !it.unsupported }
+            val alive = noWebm.filter { !it.dead }
             // Hepsi kötüyse yine de verilir (eskiden olduğu gibi)
-            val toEmit = if (usable.isNotEmpty()) usable else if (alive.isNotEmpty()) alive else cands
-            for (c in toEmit) emitCand(c, lang, callback)
+            val toEmit = if (usable.isNotEmpty()) usable else if (alive.isNotEmpty()) alive else noWebm
+            var emitted = 0
+            for (c in toEmit) if (emitCand(c, lang, callback)) emitted++
+            // Hiçbiri etiketli çıkmadıysa kalitesi bilinmeyen düz mp4'ler de verilir
+            if (emitted == 0) for (c in toEmit) emitCand(c, lang, callback, allowUnknown = true)
             return true
         }
 
