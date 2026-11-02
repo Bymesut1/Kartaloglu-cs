@@ -2154,3 +2154,47 @@ class DiziSol : MainAPI() {
                 runCatching { loadExtractor(candidate, currentUrl, subtitleCallback, countedCallback) }
                     .onFailure { Log.d(name, "Extractor çözemedi: $candidate") }
 
+                // Embed sayfalarının içine yalnızca sınırlı derinlikte gir.
+                if (depth < 2) {
+                    val child = document(candidate)
+                    if (child != null) {
+                        inspect(child, candidate, depth + 1)
+                    } else {
+                        Log.d(name, "Video teşhis: aday sayfa okunamadı: ${safeLogUrl(candidate)}")
+                    }
+                }
+                if (linkCount == before && webViewCount < 2 &&
+                    (candidate.contains("player", true) || candidate.contains("embed", true) ||
+                        candidate != pageUrl)
+                ) {
+                    webViewCount++
+                    val resolved = resolveWebView(candidate, currentUrl, countedCallback)
+                    Log.d(
+                        name,
+                        "Video teşhis WebView: aday=${safeLogUrl(candidate)} sonuç=$resolved bulunanBağlantı=$linkCount"
+                    )
+                }
+            }
+        }
+
+        inspect(first, staticUrl, 0)
+
+        // SPA pages may contain only a small HTML shell; their player is initialized
+        // client-side and therefore no iframe/source appears in Jsoup's static DOM.
+        // In that case, give the actual content page one WebView interception pass.
+        if (linkCount == 0) {
+            webViewCount++
+            val resolved = resolveWebView(staticUrl, "$mainUrl/", countedCallback)
+            Log.i(
+                name,
+                "Video teşhis ana sayfa WebView fallback: sonuç=$resolved bulunanBağlantı=$linkCount"
+            )
+        }
+
+        Log.i(
+            name,
+            "Video çözümleme sonucu: sayfa=${safeLogUrl(pageUrl)} ziyaretEdilenSayfa=${visitedPages.size} adayMedya=${seenMedia.size} bağlantı=$linkCount webViewDenemesi=$webViewCount"
+        )
+        return linkCount > 0 || apiEmitted
+    }
+}
