@@ -1357,11 +1357,26 @@ class VkVideo : MainAPI() {
     private fun isDash(c: Cand) = c.url.contains(".mpd")
     private fun isWebm(c: Cand) = c.url.contains(".webm", true) || c.hint.contains("webm", true)
 
+    // okcdn "?type=N" adreslerinde ct / ix / asubs parametreleri imzaya (sig) dahil değil. Oynatıcının (özellikle klipler)
+    // istediği adres yalnızca başlık/ilk parçayı (birkaç KB) döndürür; ct=19 ve ix/asubs olmadan aynı adres tam mp4 verir.
+    private fun normalizeOk(u: String): String {
+        if (!u.contains("okcdn.ru/?") || !Regex("[?&]type=\\d").containsMatchIn(u)) return u
+        var x = u.replace(Regex("&ix=\\d+"), "").replace(Regex("&asubs=[A-Za-z]+"), "")
+        if (Regex("[?&]ct=\\d+").containsMatchIn(x)) x = x.replace(Regex("([?&])ct=\\d+"), "$1ct=19")
+        return x
+    }
+
     private fun addCand(list: MutableList<Cand>, seen: HashSet<String>, hint: String, raw: String): Boolean {
         // "&bytes=0-5355" gibi parça aralığı parametresi varsa kaldırılır (tam dosya istenir)
         val u = raw.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
             .replace(Regex("&bytes=\\d+-\\d*"), "")
-        if (!isMedia(u) || !seen.add(u)) return false
+        val un = normalizeOk(u)
+        var added = false
+        if (un != u && isMedia(un) && seen.add(un)) {
+            list.add(Cand(hint, un))
+            added = true
+        }
+        if (!isMedia(u) || !seen.add(u)) return added
         list.add(Cand(hint, u))
         return true
     }
@@ -1480,6 +1495,12 @@ class VkVideo : MainAPI() {
             val total = Regex("/(\\d+)$").find(cr)?.groupValues?.get(1)?.toLongOrNull()
             val len = r.headers["Content-Length"]?.toLongOrNull() ?: -1L
             c.size = total ?: (if (r.code == 200) len else -1L)
+            // Birkaç KB'lık "video" aslında yalnızca başlık / ilk parçadır: oynatıcı 3003 verir
+            if (c.size in 1..100_000L) {
+                c.unsupported = true
+                c.diag += " kucuk=${c.size}"
+                return
+            }
             // Sunucu Range'i yok sayıp tüm dosyayı gönderirse gövde okunmaz (bellek / süre)
             if (!(r.code == 206 || (len in 1..4096))) return
             val bytes = r.body.bytes()
@@ -1866,7 +1887,7 @@ class VkVideo : MainAPI() {
 
             // Son çare: test "ölü / tanınmıyor" dese bile gerçek görünümlü (HLS / DASH / kaliteli) adaylar yine de verilir.
             // Sınama (Range isteği, başlık okuma) yanılabilir; oynatıcı çoğu zaman yine de açar.
-            val last = cands.filter { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+            val last = cands.filter { (isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null) && it.size !in 1..100_000L }
                 .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
                 .take(4)
             if (last.isNotEmpty()) {
