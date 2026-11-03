@@ -75,6 +75,15 @@ class VkVideo : MainAPI() {
         // true: bağlantı bulunamazsa kaynak listesine DEBUG satırları eklenir (tıklayınca 2001 hatası verir). Normalde false.
         private const val DEBUG_LINKS = false
 
+        // WebView'da oynatıcı kullanıcı dokunuşu beklediği için video kendiliğinden başlamaz; bu betik oynatmayı tetikler
+        private const val PLAY_JS =
+            "(function(){var n=0;var t=setInterval(function(){try{" +
+                "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                "var b=document.querySelector('[class*=\"play\" i],[aria-label*=\"Play\" i],[aria-label*=\"Воспр\" i],[class*=\"Play\"]');" +
+                "if(b&&b.click)b.click();" +
+                "var c=document.querySelector('video')||document.body;if(c&&c.click)c.click();" +
+                "}catch(e){}if(++n>40)clearInterval(t);},400);})();"
+
         // DevTools -> Ağ -> "?act=get_anonym_token" isteği -> Yük (Payload) / Başlıklar
         private const val LOGIN = "https://login.vk.ru/?act=get_anonym_token"
         private const val CLIENT_SECRET = "o557NLIkAErNhakXrQ7A"
@@ -283,6 +292,23 @@ class VkVideo : MainAPI() {
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    // Teşhis: yanıtın iki seviye derinliğindeki anahtarlar
+    private fun deepShape(r: Any?, depth: Int = 0): String {
+        if (r !is JSONObject || depth > 1) return ""
+        val sb = StringBuilder()
+        val ks = r.keys()
+        while (ks.hasNext()) {
+            val k = ks.next()
+            val v = r.opt(k)
+            sb.append(k)
+            if (v is JSONObject) sb.append("{").append(v.keys().asSequence().take(30).joinToString(",")).append("}")
+            else if (v is JSONArray) sb.append("[").append(v.length()).append("]")
+            else if (v is String) sb.append("=").append(v.take(24))
+            sb.append(' ')
+        }
+        return sb.toString().take(500)
+    }
 
     // Boş "Original sound" kartları (açılmayan ses klipleri) listeye alınmaz
     private fun isPlaceholder(o: JSONObject): Boolean =
@@ -1319,7 +1345,16 @@ class VkVideo : MainAPI() {
                 for (i in 0 until node.length()) scanUrls(node.opt(i), hint, out)
             }
             is String -> {
-                if (node.startsWith("http")) out.add(hint to node)
+                val t = node.trim()
+                if (t.startsWith("http")) out.add(hint to t)
+                else if (t.startsWith("//") && t.length > 8) out.add(hint to ("https:" + t))
+                else if ((t.startsWith("{") || t.startsWith("[")) && t.length > 20 && t.contains("http")) {
+                    // JSON metin olarak gömülmüş olabilir: ayrıştırıp içini de tara
+                    try {
+                        scanUrls(if (t.startsWith("{")) JSONObject(t) else JSONArray(t), hint, out)
+                    } catch (e: Exception) {
+                    }
+                }
             }
         }
     }
@@ -1385,8 +1420,17 @@ class VkVideo : MainAPI() {
 
     // Sayfa yapısı/anahtar adı ne olursa olsun HTML içindeki medya adreslerini bulur
     private fun scanHtml(html: String, list: MutableList<Cand>, seen: HashSet<String>): Int {
-        val t = html.replace("\\/", "/").replace("\\u0026", "&").replace("&quot;", "\"").replace("&amp;", "&")
+        val t = html.replace("\\/", "/").replace("\\u0026", "&").replace("\\u002F", "/").replace("\\u002f", "/")
+            .replace("\\x2F", "/").replace("&quot;", "\"").replace("&amp;", "&")
         var n = 0
+        // Yüzde kodlu adresler (https%3A%2F%2F...) çözülüp eklenir
+        for (m in Regex("https?%3A%2F%2F[^\\s\"'<>\\\\]+", RegexOption.IGNORE_CASE).findAll(t)) {
+            try {
+                val d = java.net.URLDecoder.decode(m.value, "UTF-8")
+                if (addCand(list, seen, "", d)) n++
+            } catch (e: Exception) {
+            }
+        }
         for (m in Regex("\"([A-Za-z0-9_]+)\"\\s*:\\s*\"(https?://[^\"\\s]+)\"").findAll(t)) {
             if (addCand(list, seen, m.groupValues[1], m.groupValues[2])) n++
         }
@@ -1682,22 +1726,31 @@ class VkVideo : MainAPI() {
             debug.add("item links=${cands.size}")
             android.util.Log.d(
                 "VkVideo",
-                "kayit anahtarlar=${item.keys().asSequence().joinToString(",").take(240)} link=${cands.size}"
+                "kayit anahtarlar=${item.keys().asSequence().joinToString(",").take(900)} link=${cands.size}"
             )
 
-            val playParams = mapOf(
+            val hashP = Regex("[?&]hash=([0-9a-zA-Z]+)").find(item.optString("player"))?.groupValues?.get(1)
+                ?: item.optString("access_key")
+            val playParams = mutableMapOf(
                 "videos" to data,
                 "video" to data,
                 "owner_id" to oid,
+                "oid" to oid,
                 "video_id" to vid,
                 "id" to vid
-            )
-            val playRes = listOf("video.getForPlay", "video.getPlayerConfig").amap { m ->
+            ).also {
+                if (hashP.isNotBlank()) {
+                    it["hash"] = hashP
+                    it["access_key"] = hashP
+                }
+            }
+            // video.getEmbed: oynatıcı sayfasının (embed) akış bilgisini aldığı metod; DASH / HLS adresleri buradan gelebilir
+            val playRes = listOf("video.getForPlay", "video.getPlayerConfig", "video.getEmbed").amap { m ->
                 val list = ArrayList<Pair<String, String>>()
                 try {
                     val r = api(m, playParams)
                     scanUrls(r, "", list)
-                    debug.add("$m urls=${list.size} ${shape(r)}")
+                    debug.add("$m urls=${list.size} ${shape(r)} ${deepShape(r)}")
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
                     debug.add("$m: ${e.message?.take(90)}")
@@ -1784,6 +1837,7 @@ class VkVideo : MainAPI() {
                                 Regex("""(?i)\.m3u8|\.mpd|(vkvd\d*|okcdn|mycdn)[^/\s]*/[^\s?]*\.mp4|okcdn\.ru/\?[^\s]*type=\d"""),
                                 userAgent = null,
                                 useOkhttp = false,
+                                script = PLAY_JS,
                                 timeout = 15_000L
                             ),
                             timeout = 25L
