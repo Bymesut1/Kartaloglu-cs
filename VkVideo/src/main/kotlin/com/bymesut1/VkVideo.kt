@@ -1355,6 +1355,8 @@ class VkVideo : MainAPI() {
     private fun isHls(c: Cand) = c.url.contains(".m3u8") ||
         (c.hint.contains("hls", true) && !c.url.contains(".mpd") && !isPlainFile(c.url))
     private fun isDash(c: Cand) = c.url.contains(".mpd")
+    // Kayıt (item) içindeki genel "url" anahtarı tam film değil, kısa önizleme / fragman (≈10 sn) dosyasıdır
+    private fun isPreview(c: Cand) = c.hint.equals("url", true) && !isHls(c) && !isDash(c)
     private fun isWebm(c: Cand) = c.url.contains(".webm", true) || c.hint.contains("webm", true)
 
     // okcdn "?type=N" adreslerinde ct / ix / asubs parametreleri imzaya (sig) dahil değil. Oynatıcının (özellikle klipler)
@@ -1800,11 +1802,12 @@ class VkVideo : MainAPI() {
 
         // 4) Bağlantı testi: yeni adaylar için hangi başlık takımının çalıştığı bulunur, ölüler sona atılır,
         //    en iyi 2 mp4'ün kapsayıcısı oynatıcının tanıyacağı biçimde mi diye bakılır
-        fun hasReal() = cands.any { isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null }
+        fun hasReal() = cands.any { !isPreview(it) && (isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null) }
 
         suspend fun evaluate() {
             if (hasReal()) {
-                for (c in cands) if (!isHls(c) && !isDash(c) && qualityOf(c.hint, c.url) == null) c.dead = true
+                // Tam akış bulunduysa önizleme ve kalitesiz sahte adaylar elenir
+                for (c in cands) if (isPreview(c) || (!isHls(c) && !isDash(c) && qualityOf(c.hint, c.url) == null)) c.dead = true
             }
             val fresh = cands.filter { it.diag.isEmpty() && !it.dead }
             val mp4s = fresh.filter { !isHls(it) && !isDash(it) }
@@ -1813,6 +1816,16 @@ class VkVideo : MainAPI() {
             targets.amap { probe(it) }
             debug.add("probe " + targets.joinToString(" | ") { (if (isHls(it)) "hls:" else "mp4:") + it.diag })
             targets.filter { !isHls(it) && !isDash(it) && !it.dead }.take(2).amap { sniffMp4(it) }
+            // Film uzun (>=60 sn) ama dosya çok küçükse (saniyede ~2.5 KB altı) bu kısa bir önizlemedir
+            val durSec = item.optInt("duration")
+            if (durSec >= 60) {
+                for (c in targets) {
+                    if (!isHls(c) && !isDash(c) && c.size > 0 && c.size * 8L / durSec < 20_000L) {
+                        c.unsupported = true
+                        c.diag += " onizleme"
+                    }
+                }
+            }
             for (c in targets) {
                 android.util.Log.d(
                     "VkVideo",
@@ -1888,7 +1901,7 @@ class VkVideo : MainAPI() {
             // Son çare: test "ölü / tanınmıyor" dese bile gerçek görünümlü (HLS / DASH / kaliteli) adaylar yine de verilir.
             // Sınama (Range isteği, başlık okuma) yanılabilir; oynatıcı çoğu zaman yine de açar.
             val last = cands.filter { (isHls(it) || isDash(it) || qualityOf(it.hint, it.url) != null) && it.size !in 1..100_000L }
-                .sortedByDescending { qualityOf(it.hint, it.url) ?: 0 }
+                .sortedWith(compareBy<Cand>({ isPreview(it) }, { -(qualityOf(it.hint, it.url) ?: 0) }))
                 .take(4)
             if (last.isNotEmpty()) {
                 var n = 0
