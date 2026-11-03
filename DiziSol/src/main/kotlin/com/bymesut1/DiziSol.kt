@@ -2057,6 +2057,20 @@ class DiziSol : MainAPI() {
         return true
     }
 
+    // Elle eklenen yedek M3U8 kaynakları: yalnızca belirtilen dizi/sezon/bölüm için kullanılır.
+    // Anahtar: (tmdbId, sezon, bölüm). The Rookie = tmdbId 79744 (sitedeki "1pj4" son eki).
+    // Başka bölüm eklemek için aşağıya yeni bir "Triple(79744, sezon, bölüm) to listOf(...)" satırı yazılır.
+    private data class ManualStream(val label: String, val url: String)
+
+    private val manualStreams: Map<Triple<Int, Int, Int>, List<ManualStream>> = mapOf(
+        Triple(79744, 1, 1) to listOf(
+            ManualStream(
+                "DiziSol Yedek",
+                "https://one.makesomthingup.click/erYJHS9Q8ARHzLc9u66QX9vr/master.m3u8"
+            )
+        )
+    )
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -2077,6 +2091,47 @@ class DiziSol : MainAPI() {
         val coordinates = if (mediaType == "tv") seasonEpisode(pageUrl) else null
         var extraPage: String? = null
         var apiEmitted = false
+
+        // Elle eklenen yedek kaynaklar (sadece listedeki dizi/sezon/bölüm için)
+        if (tmdbId != null && coordinates != null) {
+            val manual = manualStreams[Triple(tmdbId, coordinates.first, coordinates.second)]
+            if (!manual.isNullOrEmpty()) {
+                for (ms in manual) {
+                    val own = originOfUrl(ms.url)
+                    val baseHeaders = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Accept" to "*/*",
+                        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+                    )
+                    // Hangi Referer/Origin kabul ediliyorsa o seçilir: dizisol.com, kaynağın kendi adresi, hiçbiri
+                    val variants = listOf(
+                        baseHeaders + mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl),
+                        if (own != null) baseHeaders + mapOf("Referer" to "$own/", "Origin" to own) else baseHeaders,
+                        baseHeaders
+                    )
+                    val oks = variants.amap { h ->
+                        val pl = fetchPlaylist(ms.url, h)
+                        pl != null && probeSegments(pl, ms.url, h, true)
+                    }
+                    val idx = oks.indexOf(true)
+                    val chosen = if (idx >= 0) variants[idx] else variants[0]
+                    Log.i(name, "Elle eklenen kaynak: ${ms.label} çalışıyor=${idx >= 0} varyant=$idx kaynak=${safeLogUrl(ms.url)}")
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = ms.label + if (idx >= 0) "" else " (doğrulanamadı)",
+                            url = ms.url,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            referer = chosen["Referer"].orEmpty()
+                            this.headers = chosen
+                            quality = Qualities.P1080.value
+                        }
+                    )
+                }
+            }
+        }
+
         if (tmdbId != null) {
             val record = byTmdbRecord(tmdbId, mediaType, coordinates)
             val apiState = IntArray(1)
