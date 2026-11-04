@@ -1095,12 +1095,15 @@ class HDFilmCehennemi : MainAPI() {
                             embeddedSubs(mv.text, mu).forEach { es -> pushSub(es.label, es.url) }
                         }
                     }
+                    log("P ${job.name} aday=${cands.size} dogrulanan=${verified.count { it.second.ok }}")
                     var okList = verified.filter { it.second.ok }
                     if (okList.isEmpty()) {
                         // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
+                        // Close için: strict yoksa bile en olası adresi (master/m3u8 öncelikli) mutlaka ver
                         val st = verified.filter { res.strict.contains(it.first) }
-                        val pick = if (st.isNotEmpty()) st.take(1) else emptyList<Pair<String, Verified>>()
+                        val pick = if (st.isNotEmpty()) st.take(1) else verified.take(1)
                         okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
+                        log("P ${job.name} dogrulanamadi, yine de veriliyor: ${pick.firstOrNull()?.first?.take(90)}")
                     }
 
                     val nm = when {
