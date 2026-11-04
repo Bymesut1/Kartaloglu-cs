@@ -7,6 +7,8 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -341,63 +343,121 @@ class DiziPal : MainAPI() {
 
     // ---------------- Arama ----------------
 
+    // Genel aramada ~15 kaynak aynı anda istek atıyor; DiziPal'ın arama API'si bu yükte boş gövde dönebiliyor
+    // ("End of input at character 0"). Bu yüzden: tek seferde tek istek (Mutex), kısa önbellek,
+    // boş / engelli yanıtta yeniden deneme (düz -> Cloudflare aşıcı -> düz -> aşıcı) ve oturum ısıtma.
+    private val searchMutex = Mutex()
+    private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+
+    @Volatile
+    private var lastWarmup = 0L
+
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return try {
-            val body = JSONObject().apply {
-                put("action", "searchContent")
-                put("params", JSONArray().put(query))
-            }
+        val q = query.trim()
+        if (q.isEmpty()) return emptyList()
+        val key = q.lowercase()
+        val now0 = System.currentTimeMillis()
+        searchCache[key]?.let { if (now0 - it.first < 120_000L) return it.second }
 
-            val resp = app.post(
-                "$mainUrl/api/mj",
-                headers = headers + mapOf(
-                    "Content-Type" to "application/json",
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/kesfet"
-                ),
-                json = body
-            ).text
+        // quickSearch + search aynı anda gelirse ikincisi birincinin sonucunu önbellekten alır
+        return searchMutex.withLock {
+            val now1 = System.currentTimeMillis()
+            searchCache[key]?.let { if (now1 - it.first < 120_000L) return@withLock it.second }
+            val res = searchRemote(q)
+            if (res != null) {
+                if (searchCache.size > 40) searchCache.clear()
+                searchCache[key] = System.currentTimeMillis() to res
+            }
+            res ?: emptyList()
+        }
+    }
 
-            val root = JSONObject(resp)
-            if (!root.optBoolean("ok", false)) {
-                Log.e(tag, "search: ok=false")
-                return emptyList()
-            }
-            val results = root.optJSONArray("result") ?: return emptyList()
-            val items = mutableListOf<SearchResponse>()
-            for (i in 0 until results.length()) {
-                val node = results.optJSONObject(i) ?: continue
-                val slug = node.optString("used_slug", "").ifBlank { continue }
-                val type = node.optString("used_type", "")
-                val title = cleanText(node.optString("object_name", "")).ifBlank { continue }
-                val poster = node.optString("object_poster_url", "").ifBlank { null }
-                val year = node.optInt("object_release_year", 0).takeIf { it > 0 }
-                val imdb = node.optDouble("object_related_imdb_point", 0.0).takeIf { it > 0 }
-                val fullUrl = if (slug.startsWith("http")) slug else "$mainUrl/${slug.trimStart('/')}"
-                val isMovie = type.equals("Movies", ignoreCase = true) || slug.trimStart('/').startsWith("movies/")
-                if (isMovie) {
-                    items.add(newMovieSearchResponse(title, fullUrl, TvType.Movie) {
-                        this.posterUrl = poster
-                        this.year = year
-                        this.score = imdb?.let { Score.from10(it) }
-                    })
-                } else {
-                    items.add(newTvSeriesSearchResponse(title, fullUrl, TvType.TvSeries) {
-                        this.posterUrl = poster
-                        this.year = year
-                        this.score = imdb?.let { Score.from10(it) }
-                    })
-                }
-            }
-            Log.d(tag, "search: ${items.size} sonuç")
-            items.distinctBy { it.url }
+    // Oturum çerezleri (Cloudflare vb.) için ana sayfa bir kez ısıtılır
+    private suspend fun warmup() {
+        val now = System.currentTimeMillis()
+        if (now - lastWarmup < 5 * 60_000L) return
+        lastWarmup = now
+        try {
+            safeGet("$mainUrl/", mainUrl)
         } catch (e: Exception) {
             rethrow(e)
-            Log.e(tag, "search hata: ${e.message}")
-            emptyList()
         }
+    }
+
+    // null = hiçbir denemede geçerli yanıt alınamadı (önbelleğe yazılmaz); boş liste = gerçekten sonuç yok
+    private suspend fun searchRemote(query: String): List<SearchResponse>? {
+        val body = JSONObject().apply {
+            put("action", "searchContent")
+            put("params", JSONArray().put(query))
+        }
+        val h = headers + mapOf(
+            "Content-Type" to "application/json",
+            "Accept" to "application/json, text/plain, */*",
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/kesfet"
+        )
+
+        for (attempt in 1..4) {
+            try {
+                if (attempt == 2) warmup()
+                val useCf = attempt % 2 == 0
+                val r = if (useCf) {
+                    app.post("$mainUrl/api/mj", headers = h, json = body, interceptor = cf, timeout = 30L)
+                } else {
+                    app.post("$mainUrl/api/mj", headers = h, json = body, timeout = 25L)
+                }
+                trackDomain(r.url)
+                val txt = r.text.trim()
+                if (txt.startsWith("{")) {
+                    val root = JSONObject(txt)
+                    if (root.optBoolean("ok", false)) {
+                        val items = parseSearchResult(root.optJSONArray("result"))
+                        Log.d(tag, "search: ${items.size} sonuç (deneme=$attempt)")
+                        return items
+                    }
+                    Log.e(tag, "search: ok=false deneme=$attempt")
+                } else {
+                    Log.e(tag, "search boş/engel kod=${r.code} len=${txt.length} deneme=$attempt cf=$useCf")
+                }
+            } catch (e: Exception) {
+                rethrow(e)
+                Log.e(tag, "search hata ${e.javaClass.simpleName}: ${e.message} deneme=$attempt")
+            }
+            if (attempt < 4) delay(700L * attempt)
+        }
+        return null
+    }
+
+    private fun parseSearchResult(results: JSONArray?): List<SearchResponse> {
+        if (results == null) return emptyList()
+        val items = mutableListOf<SearchResponse>()
+        for (i in 0 until results.length()) {
+            val node = results.optJSONObject(i) ?: continue
+            val slug = node.optString("used_slug", "").ifBlank { continue }
+            val type = node.optString("used_type", "")
+            val title = cleanText(node.optString("object_name", "")).ifBlank { continue }
+            val poster = node.optString("object_poster_url", "").ifBlank { null }
+            val year = node.optInt("object_release_year", 0).takeIf { it > 0 }
+            val imdb = node.optDouble("object_related_imdb_point", 0.0).takeIf { it > 0 }
+            val fullUrl = if (slug.startsWith("http")) slug else "$mainUrl/${slug.trimStart('/')}"
+            val isMovie = type.equals("Movies", ignoreCase = true) || slug.trimStart('/').startsWith("movies/")
+            if (isMovie) {
+                items.add(newMovieSearchResponse(title, fullUrl, TvType.Movie) {
+                    this.posterUrl = poster
+                    this.year = year
+                    this.score = imdb?.let { Score.from10(it) }
+                })
+            } else {
+                items.add(newTvSeriesSearchResponse(title, fullUrl, TvType.TvSeries) {
+                    this.posterUrl = poster
+                    this.year = year
+                    this.score = imdb?.let { Score.from10(it) }
+                })
+            }
+        }
+        return items.distinctBy { it.url }
     }
 
     // ---------------- Detay ----------------
