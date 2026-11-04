@@ -53,6 +53,10 @@ class HDFilmCehennemi : MainAPI() {
     @Volatile
     private var cfWarm = false
 
+    // Ana sayfa boş gelirse nedeni ekranda göstermek için son hata özeti
+    @Volatile
+    private var diag = ""
+
     // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
     // Her eklentinin dosya adı farklı olmalı (aynı klasörü paylaşıyorlar).
     private val cfFile by lazy {
@@ -299,6 +303,12 @@ class HDFilmCehennemi : MainAPI() {
             ""
         }
         val items = parseCatalog(html, false).map { toSearchResponse(it) }
+        if (items.isEmpty() && page <= 1) {
+            // Boş kalmasın: nedeni kartın başlığında göster (ekran görüntüsü at)
+            val why = diag.ifBlank { "sayfa geldi ama içerik ayrıştırılamadı (html=${html.length})" }
+            val dbg = newMovieSearchResponse("⚠ Yüklenemedi: $why", mainUrl, TvType.Movie)
+            return newHomePageResponse(request.name, listOf(dbg), hasNext = false)
+        }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -548,11 +558,16 @@ class HDFilmCehennemi : MainAPI() {
             val r: NiceResponse? = try {
                 app.get(host + path, headers = siteHeaders(host, desk, extra), timeout = 10L)
             } catch (e: Exception) {
+                diag = "düz istek hata: ${e.javaClass.simpleName} ${e.message?.take(40)}"
                 null
             }
             if (!denied(r)) {
                 good = Pair(host, desk)
+                diag = ""
                 return r
+            }
+            if (r != null) {
+                diag = "düz:${r.code} cf=${r.headers["cf-mitigated"] ?: "-"} srv=${r.headers["server"] ?: "-"}"
             }
             // Cloudflare engeli: diğer kombinasyonları denemek yerine çözücüye geç
             if (r != null && (r.code == 403 || r.code == 503) &&
@@ -570,13 +585,17 @@ class HDFilmCehennemi : MainAPI() {
                 val r: NiceResponse? = try {
                     cfGet(host + path, siteHeaders(host, desk, extra), 25L)
                 } catch (e: Exception) {
+                    diag += " | çözücü hata: ${e.javaClass.simpleName} ${e.message?.take(40)}"
                     null
                 }
                 log("CF çözücü ${host.take(40)} kod=${r?.code}")
                 if (!denied(r)) {
                     good = Pair(host, desk)
+                    diag = ""
                     return r
                 }
+                diag += " | çözücü:${r?.code ?: "yok"}"
+
             }
         }
         return null
