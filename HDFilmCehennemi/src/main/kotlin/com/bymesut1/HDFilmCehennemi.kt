@@ -57,6 +57,13 @@ class HDFilmCehennemi : MainAPI() {
     @Volatile
     private var diag = ""
 
+    // WebView çözücü başarısız olursa (60 sn zaman aşımı) bir süre yenisini deneme;
+    // yoksa ana sayfadaki onlarca istek sırayla 60'ar sn bekleyip uygulamayı 2 dk kilitliyor.
+    @Volatile
+    private var cfFailAt = 0L
+    private val cfBreakMs = 3L * 60 * 1000
+    private fun cfBlocked(): Boolean = System.currentTimeMillis() - cfFailAt < cfBreakMs
+
     // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
     // Her eklentinin dosya adı farklı olmalı (aynı klasörü paylaşıyorlar).
     private val cfFile by lazy {
@@ -133,12 +140,25 @@ class HDFilmCehennemi : MainAPI() {
 
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
     private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        if (cfBlocked()) throw IllegalStateException("CF WebView çözücü az önce başarısız oldu, bekleniyor")
+        return try {
+            val r = cfGetInner(url, headers, timeout)
+            if (r.code !in 200..299) cfFailAt = System.currentTimeMillis()
+            r
+        } catch (e: Exception) {
+            cfFailAt = System.currentTimeMillis()
+            throw e
+        }
+    }
+
+    private suspend fun cfGetInner(url: String, headers: Map<String, String>, timeout: Long): NiceResponse {
         val k = cfKiller
         var r = if (cfWarm) {
             app.get(url, headers = headers, interceptor = k, timeout = timeout)
         } else {
             cfLock.acquire()
             try {
+                if (cfBlocked()) throw IllegalStateException("CF WebView çözücü az önce başarısız oldu, bekleniyor")
                 app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
@@ -148,6 +168,7 @@ class HDFilmCehennemi : MainAPI() {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
             cfLock.acquire()
             try {
+                if (cfBlocked()) throw IllegalStateException("CF WebView çözücü az önce başarısız oldu, bekleniyor")
                 if (cfKiller === k) {
                     cfKiller = CloudflareKiller()
                     cfWarm = false
