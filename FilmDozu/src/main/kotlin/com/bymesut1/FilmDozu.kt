@@ -89,7 +89,6 @@ class FilmDozu : MainAPI() {
         "$mainUrl/kategori/belgesel/" to "Belgesel",
         "$mainUrl/kategori/muzik/" to "Müzik",
         "$mainUrl/kategori/spor/" to "Spor",
-        "$mainUrl/kategori/tv-film/" to "TV Film"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
