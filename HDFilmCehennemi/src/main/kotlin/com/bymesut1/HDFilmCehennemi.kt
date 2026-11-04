@@ -1166,6 +1166,27 @@ class HDFilmCehennemi : MainAPI() {
                     log("P ${job.name} aday=${cands.size} dogrulanan=${verified.count { it.second.ok }}")
                     var okList = verified.filter { it.second.ok }
                     if (okList.isEmpty()) {
+                        // Önce oynatıcıyı tarayıcı gibi (WebView) çalıştırıp gerçek akış isteğini yakala.
+                        // Close'un sayfadaki adresi yem olabiliyor; tarayıcıdaki gerçek adres cdnimages üzerinden geliyor.
+                        try {
+                            val wvRe = Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)""")
+                            val wv = app.get(
+                                res.base,
+                                referer = siteBase() + "/",
+                                interceptor = WebViewResolver(wvRe)
+                            )
+                            val wu = wv.url
+                            log("P ${job.name} WV ${wu.take(120)}")
+                            val bad = Regex("""\.(?:vtt|srt|jpe?g|png|webp|gif|css|js)(?:\?|$)""", IC)
+                            if (wu != res.base && wvRe.containsMatchIn(wu) && !bad.containsMatchIn(wu)) {
+                                // Token tek kullanımlık olabilir: ağ doğrulaması yapmadan tarayıcıdaki header'larla ver
+                                okList = listOf(Pair(wu, Verified(false, streamHeaderSets(res.base, wu)[0])))
+                            }
+                        } catch (e: Exception) {
+                            log("P ${job.name} WV hata ${e.javaClass.simpleName}")
+                        }
+                    }
+                    if (okList.isEmpty()) {
                         // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
                         // Close için: strict yoksa bile en olası adresi (master/m3u8 öncelikli) mutlaka ver
                         val st = verified.filter { res.strict.contains(it.first) }
