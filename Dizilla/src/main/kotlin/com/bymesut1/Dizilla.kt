@@ -21,7 +21,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 class Dizilla : MainAPI() {
-    override var mainUrl = "https://dizilla.now"
+    override var mainUrl = "https://dizilla.la"
     override var name = "Dizilla"
     override var lang = "tr"
     override val hasMainPage = true
