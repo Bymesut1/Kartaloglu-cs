@@ -1,4 +1,4 @@
-version = 3
+version = 4
 
 android {
     namespace = "com.bymesut1"
@@ -15,5 +15,5 @@ cloudstream {
     requiresResources = false
     language = "tr"
 
-    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/FilmDozu/filmdozu.png"
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/FilmDozu/fd-icon.png""
 }
