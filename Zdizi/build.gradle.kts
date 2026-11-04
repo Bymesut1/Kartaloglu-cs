@@ -1,5 +1,5 @@
 // Sürüm numarasını her güncellemede 1 artır
-version = 13
+version = 14
 
 android {
     namespace = "com.bymesut1"
@@ -18,5 +18,5 @@ cloudstream {
 
     tvTypes = listOf("TvSeries", "Movie")
 
-    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/Zdizi/zdizi.png"
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/Zdizi/zd-icon.png"
 }
