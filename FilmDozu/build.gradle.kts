@@ -15,5 +15,5 @@ cloudstream {
     requiresResources = false
     language = "tr"
 
-    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/FilmDozu/fd-icon.png""
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/FilmDozu/fd-icon.png"
 }
