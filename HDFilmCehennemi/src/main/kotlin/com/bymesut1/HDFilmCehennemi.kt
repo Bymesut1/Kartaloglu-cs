@@ -916,20 +916,80 @@ class HDFilmCehennemi : MainAPI() {
     }
 
     // ---------------- Doğrulama ----------------
-    private fun streamHeaderSets(embedUrl: String): List<Map<String, String>> {
-        val org = originOf(embedUrl)
-        return listOf(
-            mapOf("User-Agent" to uaMobile, "Referer" to "$org/", "Origin" to org),
-            mapOf("User-Agent" to uaMobile, "Referer" to embedUrl),
-            mapOf("User-Agent" to uaMobile, "Referer" to siteBase() + "/", "Origin" to siteBase()),
-            mapOf("User-Agent" to uaMobile)
-        )
+    // Rapid ve Close CDN'leri Referer/Origin olarak oynatıcı alt alan adını bekliyor
+    // (rapid.<site> ve closeload.<site>). Adresi doğrudan açınca 403 vermesi bu yüzden.
+    private fun knownOrigins(streamUrl: String): List<String> {
+        val host = originOf(streamUrl).substringAfter("://").lowercase()
+        val site = siteBase().substringAfter("://").trimEnd('/').removePrefix("www.")
+        // Tarayıcıda görülen gerçek değer: Origin/Referer = https://hdfilmcehennemi.mobi
+        val mobi = "https://hdfilmcehennemi.mobi"
+        return when {
+            host.contains("cdnimages") -> listOf(mobi, "https://closeload.$site")
+            host.contains("rapidrame") -> listOf(mobi, "https://rapid.$site")
+            else -> emptyList()
+        }
     }
 
-    private suspend fun verifyUrl(u: String, sets0: List<Map<String, String>>): Verified {
-        val own = originOf(u)
-        val sets = listOf(mapOf("User-Agent" to uaMobile, "Referer" to "$own/", "Origin" to own)) + sets0
+    private fun streamHeaderSets(embedUrl: String, streamUrl: String): List<Map<String, String>> {
+        fun hs(ref: String?, origin: String?): Map<String, String> {
+            val m = LinkedHashMap<String, String>()
+            m["User-Agent"] = uaMobile
+            if (ref != null) m["Referer"] = ref
+            if (origin != null) m["Origin"] = origin
+            return m
+        }
+        val out = ArrayList<Map<String, String>>()
+        knownOrigins(streamUrl).forEach { out.add(hs("$it/", it)) }
+        val org = originOf(embedUrl)
+        if (org.isNotBlank()) out.add(hs("$org/", org))
+        out.add(hs(embedUrl, null))
+        out.add(hs(siteBase() + "/", siteBase()))
+        val own = originOf(streamUrl)
+        if (own.isNotBlank()) out.add(hs("$own/", own))
+        out.add(hs(null, null))
+        return out.distinct()
+    }
+
+    private fun joinUrl(base: String, ref: String): String = when {
+        ref.startsWith("http", true) -> ref
+        ref.startsWith("//") -> "https:$ref"
+        ref.startsWith("/") -> originOf(base) + ref
+        else -> base.substringBefore("?").substringBeforeLast('/') + "/" + ref
+    }
+
+    // Ana liste -> alt liste -> ilk parça zincirini aynı header'larla dener (403 genelde parçalarda çıkıyor)
+    private suspend fun deepCheck(startUrl: String, startText: String, h: Map<String, String>): Boolean {
+        var curUrl = startUrl
+        var curText = startText
+        for (i in 0..2) {
+            val line = curText.lines().map { it.trim() }
+                .firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: return false
+            val next = joinUrl(curUrl, line)
+            if (curText.contains("#EXTINF")) {
+                val r: NiceResponse? = try {
+                    app.get(next, headers = h + mapOf("Range" to "bytes=0-2047"), timeout = 8L)
+                } catch (e: Exception) {
+                    null
+                }
+                return r != null && (r.code == 200 || r.code == 206)
+            }
+            val r: NiceResponse? = try {
+                app.get(next, headers = h, timeout = 8L)
+            } catch (e: Exception) {
+                null
+            }
+            if (r == null || r.code != 200) return false
+            val t = r.text
+            if (!t.trimStart().startsWith("#EXTM3U")) return false
+            curUrl = next
+            curText = t
+        }
+        return false
+    }
+
+    private suspend fun verifyUrl(u: String, sets: List<Map<String, String>>): Verified {
         if (Regex("""\.mp4(\?|$)""", IC).containsMatchIn(u)) return Verified(true, sets[0])
+        var firstOk: Verified? = null
         for (h in sets) {
             val r: NiceResponse? = try {
                 app.get(u, headers = h, timeout = 8L)
@@ -937,10 +997,11 @@ class HDFilmCehennemi : MainAPI() {
                 null
             }
             if (r != null && (r.code == 200 || r.code == 206) && r.text.trimStart().startsWith("#EXTM3U")) {
-                return Verified(true, h, r.text)
+                if (deepCheck(u, r.text, h)) return Verified(true, h, r.text)
+                if (firstOk == null) firstOk = Verified(true, h, r.text)
             }
         }
-        return Verified(false, sets[0])
+        return firstOk ?: Verified(false, sets[0])
     }
 
     private fun rank(u: String): Int = when {
@@ -1056,7 +1117,6 @@ class HDFilmCehennemi : MainAPI() {
                         return@amap
                     }
                     log("P ${job.name} akis=${res.urls.size} altyazi=${res.subs.size} anahtar=${res.keys.size}")
-                    val sets = streamHeaderSets(res.base)
 
                     // Altyazılar (oynatıcı sayfasından; .mobi /vtt/ ve /srt/ bağlantıları dahil)
                     res.subs.forEach { pushItem(it) }
@@ -1087,7 +1147,7 @@ class HDFilmCehennemi : MainAPI() {
                     val cands = res.urls
                         .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
                         .take(6)
-                    val verified = cands.amap { u -> u to verifyUrl(u, sets) }
+                    val verified = cands.amap { u -> u to verifyUrl(u, streamHeaderSets(res.base, u)) }
 
                     // Akışın içine gömülü (HLS) altyazı kanalları
                     verified.forEach { (mu, mv) ->
@@ -1102,7 +1162,7 @@ class HDFilmCehennemi : MainAPI() {
                         // Close için: strict yoksa bile en olası adresi (master/m3u8 öncelikli) mutlaka ver
                         val st = verified.filter { res.strict.contains(it.first) }
                         val pick = if (st.isNotEmpty()) st.take(1) else verified.take(1)
-                        okList = pick.map { Pair(it.first, Verified(false, sets[0])) }
+                        okList = pick.map { Pair(it.first, Verified(false, streamHeaderSets(res.base, it.first)[0])) }
                         log("P ${job.name} dogrulanamadi, yine de veriliyor: ${pick.firstOrNull()?.first?.take(90)}")
                     }
 
