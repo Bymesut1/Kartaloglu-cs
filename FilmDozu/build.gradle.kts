@@ -15,5 +15,5 @@ cloudstream {
     requiresResources = false
     language = "tr"
 
-    iconUrl = "https://www.google.com/s2/favicons?domain=filmdozu.com&sz=%size%"
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/FilmDozu/filmdozu.png"
 }
