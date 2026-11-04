@@ -1,5 +1,5 @@
 // Her yayında bu sayıyı 1 artır (eklenti güncellemesi böyle algılanır)
-version = 5
+version = 6
 
 android {
     namespace = "com.bymesut1"
@@ -22,5 +22,5 @@ cloudstream {
 
     tvTypes = listOf("TvSeries", "Movie", "Anime")
 
-    iconUrl = "https://www.google.com/s2/favicons?domain=dizicehennemi.click&sz=%size%"
+    iconUrl = "https://dizicehennemi.click/favicon.ico"
 }
