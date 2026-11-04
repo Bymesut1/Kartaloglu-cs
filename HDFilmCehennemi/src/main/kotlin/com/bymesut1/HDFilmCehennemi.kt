@@ -815,6 +815,10 @@ class HDFilmCehennemi : MainAPI() {
     private fun embedVariants(u: String): List<String> {
         val out = ArrayList<String>()
         out.add(u)
+        // Close oynatıcısı tarayıcıda hdfilmcehennemi.mobi üzerinden açılıyor
+        if (u.contains("/video/embed/", true) && u.contains("hdfilmcehennemi.", true) && !u.contains("hdfilmcehennemi.mobi", true)) {
+            out.add(u.replace(Regex("^https?://[^/]+", IC), "https://hdfilmcehennemi.mobi"))
+        }
         val id = Regex("""[?&]rapidrame_id=([^&#\x22\x27]+)""").find(u)?.groupValues?.get(1)
         if (id != null) {
             out.add(siteBase() + "/playerr/" + id)
@@ -824,7 +828,7 @@ class HDFilmCehennemi : MainAPI() {
             if (u.startsWith(h, true)) return@forEach
             if (u.contains("hdfilmcehennemi.", true)) out.add(u.replace(Regex("^https?://[^/]+", IC), h))
         }
-        return out.distinct().take(4)
+        return out.distinct().take(5)
     }
 
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): EmbedResult? {
@@ -837,6 +841,7 @@ class HDFilmCehennemi : MainAPI() {
                 var r: NiceResponse? = try {
                     app.get(v, headers = embedHeaders(rf), timeout = 10L)
                 } catch (e: Exception) {
+                    log("EM hata ${e.javaClass.simpleName} ${v.take(60)}")
                     null
                 }
                 if (r != null && (r.code == 403 || r.code == 503) && !cfTried &&
@@ -849,6 +854,7 @@ class HDFilmCehennemi : MainAPI() {
                         r
                     }
                 }
+                log("EM kod=${r?.code} ref=${rf.take(32)} ${v.take(70)}")
                 if (r == null || r.code != 200) continue
                 val html = r.text
                 if (html.isEmpty()) continue
@@ -875,6 +881,8 @@ class HDFilmCehennemi : MainAPI() {
                 keySet.addAll(Decoder.keysFrom(blobs + listOf(v), false))
                 keySet.addAll(Decoder.keysFrom(allUrls.toList(), true))
 
+                log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
+                if (allUrls.isEmpty()) log("EM ilk150: " + html.take(150).replace("\n", " "))
                 if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v, keySet.toList())
 
                 val inner = Jsoup.parse(html).selectFirst("iframe[data-src], iframe[src]")
