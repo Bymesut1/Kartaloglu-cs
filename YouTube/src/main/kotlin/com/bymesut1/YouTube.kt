@@ -57,13 +57,65 @@ class YouTube : MainAPI() {
         }
     }
 
+    // Android VR istemcisi ile doğrudan, yavaşlatılmayan akış adresleri
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return loadExtractor(data, subtitleCallback, callback)
+        val id = videoId(data) ?: return false
+        val ver = "1.62.27"
+        val ua = "com.google.android.apps.youtube.vr.oculus/$ver " +
+            "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+
+        val client = JSONObject()
+            .put("clientName", "ANDROID_VR")
+            .put("clientVersion", ver)
+            .put("deviceMake", "Oculus")
+            .put("deviceModel", "Quest 3")
+            .put("androidSdkVersion", 32)
+            .put("osName", "Android")
+            .put("osVersion", "12L")
+            .put("hl", "tr")
+            .put("gl", "TR")
+        val body = JSONObject()
+            .put("context", JSONObject().put("client", client))
+            .put("videoId", id)
+            .put("contentCheckOk", true)
+            .put("racyCheckOk", true)
+            .toString()
+
+        val text = app.post(
+            "$mainUrl/youtubei/v1/player?prettyPrint=false",
+            headers = mapOf(
+                "User-Agent" to ua,
+                "X-YouTube-Client-Name" to "28",
+                "X-YouTube-Client-Version" to ver,
+                "Origin" to mainUrl
+            ),
+            requestBody = body.toRequestBody("application/json".toMediaType())
+        ).text
+
+        val formats = JSONObject(text)
+            .optJSONObject("streamingData")
+            ?.optJSONArray("formats") ?: return false
+
+        var found = false
+        for (i in 0 until formats.length()) {
+            val f = formats.getJSONObject(i)
+            val url = f.optString("url")
+            if (url.isBlank()) continue
+            val h = f.optInt("height", 360)
+            callback(
+                newExtractorLink(name, "$name ${h}p", url) {
+                    this.quality = h
+                    this.headers = mapOf("User-Agent" to ua)
+                }
+            )
+            found = true
+        }
+        return found
     }
 
     // ---------- Yardımcılar ----------
