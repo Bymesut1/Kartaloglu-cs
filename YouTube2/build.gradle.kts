@@ -1,5 +1,5 @@
 // Her güncellemede bu sayıyı 1 artır
-version = 1
+version = 2
 
 cloudstream {
     language = "tr"
