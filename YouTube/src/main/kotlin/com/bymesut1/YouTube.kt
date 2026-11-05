@@ -63,10 +63,46 @@ class YouTube : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return loadExtractor(data, subtitleCallback, callback)
+        // Tüm YouTube linklerini topla, sadece en uygun TEK VP9 linkini ilet.
+        val all = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
+        loadExtractor(data, subtitleCallback) { link -> all.add(link) }
+
+        val vp9 = synchronized(all) { all.toList() }.filter { it.name.contains("VP9", ignoreCase = true) }
+
+        // 720p ve altı; en yüksek olan seçilir (720p varsa 720p, yoksa 480p, yoksa 360p ...)
+        val best = vp9
+            .map { it to heightOf(it) }
+            .filter { (_, h) -> h in 1..720 }
+            .sortedWith(
+                compareByDescending<Pair<ExtractorLink, Int>> { it.second }
+                    .thenBy { fps60Itags.contains(itagOf(it.first)) } // 720p60 yerine normal 720p
+            )
+            .firstOrNull()?.first
+
+        if (best != null) {
+            callback(best)
+            return true
+        }
+        return false
     }
 
     // ---------- Yardımcılar ----------
+
+    // VP9 itag -> yükseklik (HDR ve 60fps dahil)
+    private val vp9Heights = mapOf(
+        278 to 144, 242 to 240, 243 to 360, 244 to 480, 247 to 720, 248 to 1080,
+        271 to 1440, 313 to 2160,
+        302 to 720, 303 to 1080, 308 to 1440, 315 to 2160,
+        330 to 144, 331 to 240, 332 to 360, 333 to 480, 334 to 720, 335 to 1080,
+        336 to 1440, 337 to 2160
+    )
+    private val fps60Itags = setOf(302, 303, 308, 315, 334, 335, 336, 337)
+
+    private fun itagOf(link: ExtractorLink): Int? =
+        Regex("[?&]itag=(\\d+)").find(link.url)?.groupValues?.get(1)?.toIntOrNull()
+
+    private fun heightOf(link: ExtractorLink): Int =
+        itagOf(link)?.let { vp9Heights[it] } ?: link.quality
 
     private fun thumb(id: String) = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
 
