@@ -63,21 +63,15 @@ class YouTube : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Tüm YouTube linklerini topla, sadece en uygun TEK VP9 linkini ilet.
+        // Tüm YouTube linklerini topla, sadece TEK bir VP9 480p linkini ilet.
         val all = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
         loadExtractor(data, subtitleCallback) { link -> all.add(link) }
 
-        val vp9 = synchronized(all) { all.toList() }.filter { it.name.contains("VP9", ignoreCase = true) }
-
-        // 720p ve altı; en yüksek olan seçilir (720p varsa 720p, yoksa 480p, yoksa 360p ...)
-        val best = vp9
-            .map { it to heightOf(it) }
-            .filter { (_, h) -> h in 1..720 }
-            .sortedWith(
-                compareByDescending<Pair<ExtractorLink, Int>> { it.second }
-                    .thenBy { fps60Itags.contains(itagOf(it.first)) } // 720p60 yerine normal 720p
-            )
-            .firstOrNull()?.first
+        val best = synchronized(all) { all.toList() }
+            .filter { it.name.contains("VP9", ignoreCase = true) }
+            .filter { heightOf(it) == 480 }
+            .sortedBy { fps60Itags.contains(itagOf(it)) } // 480p60 yerine normal 480p
+            .firstOrNull()
 
         if (best != null) {
             callback(best)
