@@ -1,132 +1,144 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
+import org.jsoup.nodes.Document
 import java.net.URLEncoder
 
 class YouTube : MainAPI() {
 
-    override var mainUrl = "https://www.youtube.com"
+    // Invidious sitesi. Site kapanırsa sadece bu satırı değiştir.
+    override var mainUrl = "https://inv.nadeko.net"
     override var name = "YouTube"
     override val hasMainPage = true
     override var lang = "tr"
     override val supportedTypes = setOf(TvType.Others)
 
-    private val apiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+    private val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+    private val hdr = mapOf("User-Agent" to ua)
 
     override val mainPage = mainPageOf(
-        "türkçe müzik" to "Müzik",
-        "film fragmanı" to "Fragmanlar",
-        "belgesel türkçe" to "Belgeseller",
-        "komik videolar" to "Komik",
-        "oyun videoları" to "Oyun",
-        "son dakika haberler" to "Haberler"
+        "/feed/popular" to "Popüler",
+        "/feed/trending?region=TR" to "Trendler",
+        "/feed/trending?type=Music&region=TR" to "Müzik",
+        "/feed/trending?type=Gaming&region=TR" to "Oyun",
+        "/feed/trending?type=Movies&region=TR" to "Filmler",
+        "search:film fragmanı" to "Fragmanlar",
+        "search:belgesel türkçe" to "Belgeseller"
     )
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        if (page > 1) return newHomePageResponse(request.name, emptyList(), false)
-        return newHomePageResponse(request.name, searchVideos(request.data), false)
+        val data = request.data
+        val isSearch = data.startsWith("search:")
+        if (!isSearch && page > 1) {
+            return newHomePageResponse(request.name, emptyList(), false)
+        }
+        val url = if (isSearch) {
+            "$mainUrl/search?q=${enc(data.removePrefix("search:"))}&page=$page"
+        } else {
+            "$mainUrl$data"
+        }
+        val items = parseVideos(app.get(url, headers = hdr).document)
+        return newHomePageResponse(request.name, items, isSearch)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return searchVideos(query)
+        val url = "$mainUrl/search?q=${enc(query)}"
+        return parseVideos(app.get(url, headers = hdr).document)
     }
 
     override suspend fun load(url: String): LoadResponse {
         val id = videoId(url) ?: throw ErrorLoadingException("Geçersiz video adresi")
         val watch = "$mainUrl/watch?v=$id"
-        val info = try {
-            val enc = URLEncoder.encode(watch, "UTF-8")
-            JSONObject(app.get("$mainUrl/oembed?url=$enc&format=json").text)
+        var title = "YouTube"
+        var plot: String? = null
+        try {
+            val doc = app.get(watch, headers = hdr).document
+            val t = doc.selectFirst("meta[property=og:title]")?.attr("content")
+                ?: doc.selectFirst("h1")?.text()
+            if (!t.isNullOrBlank()) title = t
+            plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
         } catch (e: Exception) {
-            null
+            Log.e("YTINV", "load hata: $e")
         }
-        val title = info?.optString("title").takeUnless { it.isNullOrBlank() } ?: "YouTube"
-        val author = info?.optString("author_name")
-
-        return newMovieLoadResponse(title, watch, TvType.Others, watch) {
+        return newMovieLoadResponse(title, watch, TvType.Others, id) {
             this.posterUrl = thumb(id)
-            this.plot = author
+            this.plot = plot
         }
     }
 
+    // Sadece DASH: Invidious'un hazır DASH manifestini oynatıcıya verir (otomatik kalite)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return loadExtractor(data, subtitleCallback, callback)
+        val id = videoId(data) ?: return false
+        var dash: String? = null
+        try {
+            val doc = app.get("$mainUrl/watch?v=$id&quality=dash", headers = hdr).document
+            val src = doc.selectFirst("source[type=\"application/dash+xml\"]")?.attr("src")
+            if (!src.isNullOrBlank()) {
+                dash = when {
+                    src.startsWith("http") -> src
+                    src.startsWith("/") -> "$mainUrl$src"
+                    else -> "$mainUrl/$src"
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("YTINV", "sayfa hata: $e")
+        }
+        if (dash == null) {
+            dash = "$mainUrl/api/manifest/dash/id/$id?local=true&unique_res=1"
+        }
+        Log.d("YTINV", "dash=$dash")
+
+        callback(
+            newExtractorLink(
+                name,
+                "$name DASH (otomatik kalite)",
+                dash,
+                ExtractorLinkType.DASH
+            ) {
+                this.referer = mainUrl
+                this.quality = Qualities.Unknown.value
+                this.headers = hdr
+            }
+        )
+        return true
     }
 
     // ---------- Yardımcılar ----------
 
-    private fun thumb(id: String) = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun thumb(id: String) = "$mainUrl/vi/$id/mqdefault.jpg"
 
     private fun videoId(url: String): String? {
         val r = Regex("(?:v=|youtu\\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})")
-        return r.find(url)?.groupValues?.get(1)
+        r.find(url)?.groupValues?.get(1)?.let { return it }
+        return if (Regex("^[A-Za-z0-9_-]{11}$").matches(url)) url else null
     }
 
-    private suspend fun searchVideos(query: String): List<SearchResponse> {
-        val client = JSONObject()
-            .put("clientName", "WEB")
-            .put("clientVersion", "2.20250101.00.00")
-            .put("hl", "tr")
-            .put("gl", "TR")
-        val body = JSONObject()
-            .put("context", JSONObject().put("client", client))
-            .put("query", query)
-            .put("params", "EgIQAQ==") // sadece videolar
-            .toString()
-
-        val text = app.post(
-            "$mainUrl/youtubei/v1/search?key=$apiKey&prettyPrint=false",
-            requestBody = body.toRequestBody("application/json".toMediaType())
-        ).text
-
-        val found = mutableListOf<JSONObject>()
-        collectVideos(JSONObject(text), found)
-
+    private fun parseVideos(doc: Document): List<SearchResponse> {
         val seen = HashSet<String>()
-        val result = ArrayList<SearchResponse>()
-        for (v in found) {
-            val id = v.optString("videoId")
-            if (id.isBlank() || !seen.add(id)) continue
-            val title = v.optJSONObject("title")
-                ?.optJSONArray("runs")
-                ?.optJSONObject(0)
-                ?.optString("text")
-                ?.takeIf { it.isNotBlank() } ?: continue
-            result.add(
+        val out = ArrayList<SearchResponse>()
+        for (a in doc.select("div.video-card-row a[href^=\"/watch?v=\"]")) {
+            val id = videoId(a.attr("href")) ?: continue
+            val title = a.text().trim()
+            if (title.isBlank() || !seen.add(id)) continue
+            out.add(
                 newMovieSearchResponse(title, "$mainUrl/watch?v=$id", TvType.Others) {
                     this.posterUrl = thumb(id)
                 }
             )
         }
-        return result
-    }
-
-    private fun collectVideos(node: Any?, out: MutableList<JSONObject>) {
-        when (node) {
-            is JSONObject -> {
-                node.optJSONObject("videoRenderer")?.let { out.add(it) }
-                val keys = node.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    if (k != "videoRenderer") collectVideos(node.opt(k), out)
-                }
-            }
-            is JSONArray -> {
-                for (i in 0 until node.length()) collectVideos(node.opt(i), out)
-            }
-        }
+        return out
     }
 }
