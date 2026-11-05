@@ -466,7 +466,7 @@ class YouTube2 : MainAPI() {
         return found
     }
 
-    private fun emitSubtitles(resp: JSONObject, subtitleCallback: (SubtitleFile) -> Unit) {
+    private suspend fun emitSubtitles(resp: JSONObject, subtitleCallback: (SubtitleFile) -> Unit) {
         val tracks = resp.optJSONObject("captions")
             ?.optJSONObject("playerCaptionsTracklistRenderer")
             ?.optJSONArray("captionTracks") ?: return
