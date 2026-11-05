@@ -59,7 +59,26 @@ class YouTube : MainAPI() {
         }
     }
 
-    // Android VR istemcisi ile doğrudan, yavaşlatılmayan akış adresleri
+    // Sadece DASH: Android VR istemcisiyle ayrı video + ses akışlarından manifest üretir
+    private data class VrClient(
+        val version: String,
+        val androidVersion: String,
+        val ua: String
+    )
+
+    private val clients = listOf(
+        VrClient(
+            "1.65.10", "12L",
+            "com.google.android.apps.youtube.vr.oculus/1.65.10 " +
+                "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        ),
+        VrClient(
+            "1.62.27", "12L",
+            "com.google.android.apps.youtube.vr.oculus/1.62.27 " +
+                "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        )
+    )
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -67,33 +86,31 @@ class YouTube : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val id = videoId(data) ?: return false
-        var found = false
-        try {
-            found = vrLinks(id, callback)
-        } catch (e: Exception) {
-            Log.e("YTVR", "hata: $e")
-            found = false
+        for (c in clients) {
+            val ok = try {
+                dashLinks(id, c, callback)
+            } catch (e: Exception) {
+                Log.e("YTVR", "${c.version} hata: $e")
+                false
+            }
+            if (ok) return true
         }
-        // Hiçbir şey bulunamazsa CloudStream'ın kendi çözücüsüne dön
-        if (!found) {
-            found = loadExtractor(data, subtitleCallback, callback)
-        }
-        return found
+        return false
     }
 
-    private suspend fun vrLinks(id: String, callback: (ExtractorLink) -> Unit): Boolean {
-        val ver = "1.62.27"
-        val ua = "com.google.android.apps.youtube.vr.oculus/$ver " +
-            "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-
+    private suspend fun dashLinks(
+        id: String,
+        c: VrClient,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val client = JSONObject()
             .put("clientName", "ANDROID_VR")
-            .put("clientVersion", ver)
+            .put("clientVersion", c.version)
             .put("deviceMake", "Oculus")
             .put("deviceModel", "Quest 3")
             .put("androidSdkVersion", 32)
             .put("osName", "Android")
-            .put("osVersion", "12L")
+            .put("osVersion", c.androidVersion)
             .put("hl", "tr")
             .put("gl", "TR")
         val body = JSONObject()
@@ -106,85 +123,67 @@ class YouTube : MainAPI() {
         val text = app.post(
             "$mainUrl/youtubei/v1/player?prettyPrint=false",
             headers = mapOf(
-                "User-Agent" to ua,
+                "User-Agent" to c.ua,
                 "X-YouTube-Client-Name" to "28",
-                "X-YouTube-Client-Version" to ver,
+                "X-YouTube-Client-Version" to c.version,
                 "Origin" to mainUrl
             ),
-            requestBody = body.toRequestBody("application/json".toMediaType())
+            requestBody = body.toRequestBody("application/json".toMediaType()),
+            timeout = 30L
         ).text
 
         val root = JSONObject(text)
         val ps = root.optJSONObject("playabilityStatus")
-        val sdLog = root.optJSONObject("streamingData")
+        val sd = root.optJSONObject("streamingData")
         Log.d(
             "YTVR",
-            "durum=${ps?.optString("status")} sebep=${ps?.optString("reason")} " +
-                "birlesik=${sdLog?.optJSONArray("formats")?.length()} " +
-                "ayri=${sdLog?.optJSONArray("adaptiveFormats")?.length()}"
+            "${c.version} durum=${ps?.optString("status")} sebep=${ps?.optString("reason")} " +
+                "ayri=${sd?.optJSONArray("adaptiveFormats")?.length()}"
         )
-        val sd = root.optJSONObject("streamingData") ?: return false
+        if (sd == null) return false
+
         val dur = root.optJSONObject("videoDetails")
             ?.optString("lengthSeconds")?.toIntOrNull() ?: 0
-        val hdr = mapOf("User-Agent" to ua)
-        var found = false
+        val adaptive = sd.optJSONArray("adaptiveFormats") ?: return false
+        if (dur <= 0) return false
 
-        // 1) Hazır birleşik akışlar (varsa)
-        val muxed = sd.optJSONArray("formats")
-        if (muxed != null) {
-            for (i in 0 until muxed.length()) {
-                val f = muxed.getJSONObject(i)
-                val url = f.optString("url")
-                if (url.isBlank()) continue
-                val h = f.optInt("height", 360)
-                callback(
-                    newExtractorLink(name, "$name ${h}p", url) {
-                        this.quality = h
-                        this.headers = hdr
-                    }
-                )
-                found = true
+        val videos = ArrayList<JSONObject>()
+        var audio: JSONObject? = null
+        for (i in 0 until adaptive.length()) {
+            val f = adaptive.getJSONObject(i)
+            if (f.optString("url").isBlank()) continue
+            val mime = f.optString("mimeType")
+            if (mime.startsWith("video/mp4") && mime.contains("avc1")) {
+                videos.add(f)
+            } else if (mime.startsWith("audio/mp4")) {
+                if (audio == null || f.optInt("bitrate") > audio.optInt("bitrate")) {
+                    audio = f
+                }
             }
         }
+        if (audio == null) return false
 
-        // 2) Ayrı video + ses akışlarından DASH üret (H264 + AAC)
-        val adaptive = sd.optJSONArray("adaptiveFormats")
-        if (adaptive != null && dur > 0) {
-            val videos = ArrayList<JSONObject>()
-            var audio: JSONObject? = null
-            for (i in 0 until adaptive.length()) {
-                val f = adaptive.getJSONObject(i)
-                if (f.optString("url").isBlank()) continue
-                val mime = f.optString("mimeType")
-                if (mime.startsWith("video/mp4") && mime.contains("avc1")) {
-                    videos.add(f)
-                } else if (mime.startsWith("audio/mp4")) {
-                    if (audio == null || f.optInt("bitrate") > audio.optInt("bitrate")) {
-                        audio = f
-                    }
+        val hdr = mapOf("User-Agent" to c.ua)
+        var found = false
+        val byHeight = videos.groupBy { it.optInt("height") }
+            .toSortedMap(compareByDescending<Int> { it })
+        for ((h, list) in byHeight) {
+            if (h <= 0) continue
+            val v = list.maxByOrNull { it.optInt("bitrate") } ?: continue
+            val mpd = buildMpd(dur, v, audio)
+            val b64 = Base64.encodeToString(mpd.toByteArray(), Base64.NO_WRAP)
+            callback(
+                newExtractorLink(
+                    name,
+                    "$name ${h}p DASH",
+                    "data:application/dash+xml;base64,$b64",
+                    ExtractorLinkType.DASH
+                ) {
+                    this.quality = h
+                    this.headers = hdr
                 }
-            }
-            if (audio != null) {
-                val byHeight = videos.groupBy { it.optInt("height") }
-                for ((h, list) in byHeight) {
-                    if (h <= 0) continue
-                    val v = list.maxByOrNull { it.optInt("bitrate") } ?: continue
-                    val mpd = buildMpd(dur, v, audio)
-                    val b64 = Base64.encodeToString(mpd.toByteArray(), Base64.NO_WRAP)
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "$name ${h}p (HD)",
-                            "data:application/dash+xml;base64,$b64",
-                            ExtractorLinkType.DASH
-                        ) {
-                            this.quality = h
-                            this.headers = hdr
-                        }
-                    )
-                    found = true
-                }
-            }
+            )
+            found = true
         }
         return found
     }
