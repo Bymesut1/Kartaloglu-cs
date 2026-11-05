@@ -7,7 +7,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
-import kotlin.math.abs
 
 class YouTube : MainAPI() {
 
@@ -64,28 +63,15 @@ class YouTube : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Tüm YouTube linklerini topla, sadece TEK bir H264 480p linkini ilet.
+        // Tüm YouTube linklerini topla, sadece TEK bir VP9 1080p linkini ilet.
         val all = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
         loadExtractor(data, subtitleCallback) { link -> all.add(link) }
 
-        val h264 = synchronized(all) { all.toList() }
-            .filter { it.name.contains("H264", ignoreCase = true) }
-
-        // Önce tam 480p, 60fps olmayan tercih edilir.
-        var best = h264
-            .filter { heightOf(it) == 480 }
-            .sortedBy { fps60Itags.contains(itagOf(it)) }
+        val best = synchronized(all) { all.toList() }
+            .filter { it.name.contains("VP9", ignoreCase = true) }
+            .filter { heightOf(it) == 1080 }
+            .sortedBy { fps60Itags.contains(itagOf(it)) } // 1080p60 yerine normal 1080p
             .firstOrNull()
-
-        // Videoda H264 480p yoksa en yakın H264 kaliteyi ver (bağlantı bulunamadı olmasın).
-        if (best == null) {
-            best = h264
-                .sortedWith(
-                    compareBy<ExtractorLink> { abs(heightOf(it) - 480) }
-                        .thenBy { fps60Itags.contains(itagOf(it)) }
-                )
-                .firstOrNull()
-        }
 
         if (best != null) {
             callback(best)
@@ -96,18 +82,21 @@ class YouTube : MainAPI() {
 
     // ---------- Yardımcılar ----------
 
-    // H264 itag -> yükseklik (60fps dahil)
-    private val h264Heights = mapOf(
-        160 to 144, 133 to 240, 134 to 360, 135 to 480, 136 to 720, 137 to 1080,
-        298 to 720, 299 to 1080
+    // VP9 itag -> yükseklik (HDR ve 60fps dahil)
+    private val vp9Heights = mapOf(
+        278 to 144, 242 to 240, 243 to 360, 244 to 480, 247 to 720, 248 to 1080,
+        271 to 1440, 313 to 2160,
+        302 to 720, 303 to 1080, 308 to 1440, 315 to 2160,
+        330 to 144, 331 to 240, 332 to 360, 333 to 480, 334 to 720, 335 to 1080,
+        336 to 1440, 337 to 2160
     )
-    private val fps60Itags = setOf(298, 299)
+    private val fps60Itags = setOf(302, 303, 308, 315, 334, 335, 336, 337)
 
     private fun itagOf(link: ExtractorLink): Int? =
         Regex("[?&]itag=(\\d+)").find(link.url)?.groupValues?.get(1)?.toIntOrNull()
 
     private fun heightOf(link: ExtractorLink): Int =
-        itagOf(link)?.let { h264Heights[it] } ?: link.quality
+        itagOf(link)?.let { vp9Heights[it] } ?: link.quality
 
     private fun thumb(id: String) = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
 
