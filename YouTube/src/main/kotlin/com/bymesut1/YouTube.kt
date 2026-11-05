@@ -99,6 +99,7 @@ class YouTube : MainAPI() {
     // ---------- Linkler (sadece inv.nadeko.net) ----------
     // 1) Watch sayfasındaki <source> etiketleri (varsa)
     // 2) Hazır adresler: itag 22 (720p MP4), itag 18 (360p MP4), DASH (otomatik kalite)
+    // Nadeko 500 verirse yedek olarak doğrudan YouTube çıkarıcısı kullanılır.
 
     override suspend fun loadLinks(
         data: String,
@@ -108,9 +109,28 @@ class YouTube : MainAPI() {
     ): Boolean {
         val id = videoId(data) ?: return false
         val added = HashSet<String>()
+        var okCount = 0
+
+        // Link nadeko'dan gerçekten açılıyor mu? (500 veren linkler listeye eklenmez)
+        suspend fun works(url: String): Boolean {
+            return try {
+                val r = app.get(
+                    url,
+                    headers = hdr + mapOf("Range" to "bytes=0-1"),
+                    referer = mainUrl,
+                    timeout = 12L
+                )
+                Log.d("YTINV", "prob ${r.code} $url")
+                r.code == 200 || r.code == 206
+            } catch (e: Exception) {
+                Log.e("YTINV", "prob hata $url: $e")
+                false
+            }
+        }
 
         suspend fun add(label: String, url: String, type: ExtractorLinkType, q: Int) {
             if (!added.add(url)) return
+            if (!works(url)) return
             callback(
                 newExtractorLink(name, "$name $label", url, type) {
                     this.referer = mainUrl
@@ -118,6 +138,7 @@ class YouTube : MainAPI() {
                     this.headers = hdr
                 }
             )
+            okCount++
         }
 
         // 1) Sayfadaki source etiketleri
@@ -158,8 +179,26 @@ class YouTube : MainAPI() {
             Qualities.Unknown.value
         )
 
-        Log.d("YTINV", "eklenen link sayısı: ${added.size}")
-        return added.isNotEmpty()
+        Log.d("YTINV", "nadeko çalışan link sayısı: $okCount")
+
+        // Nadeko hiçbir link vermediyse (sunucu 500): CloudStream'in doğrudan YouTube çıkarıcısı, VP9 hariç
+        if (okCount == 0) {
+            try {
+                loadExtractor(
+                    "https://www.youtube.com/watch?v=$id",
+                    null,
+                    subtitleCallback
+                ) { link ->
+                    if (!link.name.contains("VP9")) {
+                        callback(link)
+                        okCount++
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("YTINV", "yedek çıkarıcı hata: $e")
+            }
+        }
+        return okCount > 0
     }
 
     // ---------- Yardımcılar ----------
