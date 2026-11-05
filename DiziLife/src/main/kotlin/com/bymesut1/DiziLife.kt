@@ -19,7 +19,7 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 class DiziLife : MainAPI() {
-    override var mainUrl = "https://dizi82.life"
+    override var mainUrl = "https://dizi83.life"
     override var name = "DiziLife"
     override var lang = "tr"
     override val hasMainPage = true
