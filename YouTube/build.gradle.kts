@@ -1,4 +1,4 @@
-version = 28
+version = 30
 
 android {
     namespace = "com.bymesut1"
