@@ -51,6 +51,7 @@ jobs:
           cp RecTV/build/*.cs3 out/
           cp YouTube/build/*.cs3 out/
           cp FilmizleHell/build/*.cs3 out/
+          cp YouTube2/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
