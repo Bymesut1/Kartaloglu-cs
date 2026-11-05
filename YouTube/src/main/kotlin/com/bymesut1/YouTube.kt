@@ -1,6 +1,5 @@
 package com.bymesut1
 
-import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -59,26 +58,7 @@ class YouTube : MainAPI() {
         }
     }
 
-    // Sadece DASH: Android VR istemcisiyle ayrı video + ses akışlarından manifest üretir
-    private data class VrClient(
-        val version: String,
-        val androidVersion: String,
-        val ua: String
-    )
-
-    private val clients = listOf(
-        VrClient(
-            "1.65.10", "12L",
-            "com.google.android.apps.youtube.vr.oculus/1.65.10 " +
-                "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-        ),
-        VrClient(
-            "1.62.27", "12L",
-            "com.google.android.apps.youtube.vr.oculus/1.62.27 " +
-                "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-        )
-    )
-
+    // Sadece HLS: iOS istemcisiyle otomatik kaliteli akış
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -86,31 +66,24 @@ class YouTube : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val id = videoId(data) ?: return false
-        for (c in clients) {
-            val ok = try {
-                dashLinks(id, c, callback)
-            } catch (e: Exception) {
-                Log.e("YTVR", "${c.version} hata: $e")
-                false
-            }
-            if (ok) return true
+        return try {
+            hlsLink(id, callback)
+        } catch (e: Exception) {
+            Log.e("YTVR", "ios hata: $e")
+            false
         }
-        return false
     }
 
-    private suspend fun dashLinks(
-        id: String,
-        c: VrClient,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun hlsLink(id: String, callback: (ExtractorLink) -> Unit): Boolean {
+        val ver = "20.10.4"
+        val ua = "com.google.ios.youtube/$ver (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
         val client = JSONObject()
-            .put("clientName", "ANDROID_VR")
-            .put("clientVersion", c.version)
-            .put("deviceMake", "Oculus")
-            .put("deviceModel", "Quest 3")
-            .put("androidSdkVersion", 32)
-            .put("osName", "Android")
-            .put("osVersion", c.androidVersion)
+            .put("clientName", "IOS")
+            .put("clientVersion", ver)
+            .put("deviceMake", "Apple")
+            .put("deviceModel", "iPhone16,2")
+            .put("osName", "iPhone")
+            .put("osVersion", "18.3.2.22D82")
             .put("hl", "tr")
             .put("gl", "TR")
         val body = JSONObject()
@@ -123,9 +96,9 @@ class YouTube : MainAPI() {
         val text = app.post(
             "$mainUrl/youtubei/v1/player?prettyPrint=false",
             headers = mapOf(
-                "User-Agent" to c.ua,
-                "X-YouTube-Client-Name" to "28",
-                "X-YouTube-Client-Version" to c.version,
+                "User-Agent" to ua,
+                "X-YouTube-Client-Name" to "5",
+                "X-YouTube-Client-Version" to ver,
                 "Origin" to mainUrl
             ),
             requestBody = body.toRequestBody("application/json".toMediaType()),
@@ -134,97 +107,26 @@ class YouTube : MainAPI() {
 
         val root = JSONObject(text)
         val ps = root.optJSONObject("playabilityStatus")
-        val sd = root.optJSONObject("streamingData")
+        val hls = root.optJSONObject("streamingData")?.optString("hlsManifestUrl")
         Log.d(
             "YTVR",
-            "${c.version} durum=${ps?.optString("status")} sebep=${ps?.optString("reason")} " +
-                "ayri=${sd?.optJSONArray("adaptiveFormats")?.length()}"
+            "ios durum=${ps?.optString("status")} sebep=${ps?.optString("reason")} " +
+                "hls=${!hls.isNullOrBlank()}"
         )
-        if (sd == null) return false
+        if (hls.isNullOrBlank()) return false
 
-        val dur = root.optJSONObject("videoDetails")
-            ?.optString("lengthSeconds")?.toIntOrNull() ?: 0
-        val adaptive = sd.optJSONArray("adaptiveFormats") ?: return false
-        if (dur <= 0) return false
-
-        val videos = ArrayList<JSONObject>()
-        var audio: JSONObject? = null
-        for (i in 0 until adaptive.length()) {
-            val f = adaptive.getJSONObject(i)
-            if (f.optString("url").isBlank()) continue
-            val mime = f.optString("mimeType")
-            if (mime.startsWith("video/mp4") && mime.contains("avc1")) {
-                videos.add(f)
-            } else if (mime.startsWith("audio/mp4")) {
-                if (audio == null || f.optInt("bitrate") > audio.optInt("bitrate")) {
-                    audio = f
-                }
+        callback(
+            newExtractorLink(
+                name,
+                "$name Otomatik kalite (HLS)",
+                hls,
+                ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf("User-Agent" to ua)
             }
-        }
-        if (audio == null) return false
-
-        val hdr = mapOf("User-Agent" to c.ua)
-        var found = false
-        val byHeight = videos.groupBy { it.optInt("height") }
-            .toSortedMap(compareByDescending<Int> { it })
-        for ((h, list) in byHeight) {
-            if (h <= 0) continue
-            val v = list.maxByOrNull { it.optInt("bitrate") } ?: continue
-            val mpd = buildMpd(dur, v, audio)
-            val b64 = Base64.encodeToString(mpd.toByteArray(), Base64.NO_WRAP)
-            callback(
-                newExtractorLink(
-                    name,
-                    "$name ${h}p DASH",
-                    "data:application/dash+xml;base64,$b64",
-                    ExtractorLinkType.DASH
-                ) {
-                    this.quality = h
-                    this.headers = hdr
-                }
-            )
-            found = true
-        }
-        return found
-    }
-
-    private fun xml(s: String) = s
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-
-    private fun rep(f: JSONObject, video: Boolean): String {
-        val mime = f.optString("mimeType")
-        val codecs = Regex("codecs=\"([^\"]+)\"").find(mime)?.groupValues?.get(1) ?: ""
-        val initR = f.optJSONObject("initRange")
-        val idxR = f.optJSONObject("indexRange")
-        val sb = StringBuilder()
-        sb.append("<Representation id=\"${f.optInt("itag")}\" codecs=\"$codecs\" ")
-        sb.append("bandwidth=\"${f.optInt("bitrate")}\"")
-        if (video) {
-            sb.append(" width=\"${f.optInt("width")}\" height=\"${f.optInt("height")}\"")
-            sb.append(" frameRate=\"${f.optInt("fps", 30)}\"")
-        }
-        sb.append(">")
-        sb.append("<BaseURL>${xml(f.optString("url"))}</BaseURL>")
-        sb.append("<SegmentBase indexRange=\"${idxR?.optString("start")}-${idxR?.optString("end")}\">")
-        sb.append("<Initialization range=\"${initR?.optString("start")}-${initR?.optString("end")}\"/>")
-        sb.append("</SegmentBase></Representation>")
-        return sb.toString()
-    }
-
-    private fun buildMpd(durSec: Int, video: JSONObject, audio: JSONObject): String {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-            "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" " +
-            "profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\" " +
-            "type=\"static\" mediaPresentationDuration=\"PT${durSec}S\" minBufferTime=\"PT2S\">" +
-            "<Period>" +
-            "<AdaptationSet mimeType=\"video/mp4\" subsegmentAlignment=\"true\">" +
-            rep(video, true) + "</AdaptationSet>" +
-            "<AdaptationSet mimeType=\"audio/mp4\" subsegmentAlignment=\"true\">" +
-            rep(audio, false) + "</AdaptationSet>" +
-            "</Period></MPD>"
+        )
+        return true
     }
 
     // ---------- Yardımcılar ----------
