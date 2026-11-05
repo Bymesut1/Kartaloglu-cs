@@ -1,5 +1,9 @@
 // Her güncellemede bu sayıyı 1 artır
-version = 1
+version = 2
+
+android {
+    namespace = "com.bymesut1"
+}
 
 cloudstream {
     language = "tr"
@@ -12,6 +16,6 @@ cloudstream {
     iconUrl = "https://www.google.com/s2/favicons?domain=filmizlehell.net&sz=%size%"
 }
 
-android {
-    namespace = "com.bymesut1"
+dependencies {
+    compileOnly("org.jspecify:jspecify:1.0.0")
 }
