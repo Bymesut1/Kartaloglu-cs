@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 android {
     namespace = "com.bymesut1"
@@ -9,11 +9,9 @@ cloudstream {
     description = "RecTV - film, dizi ve canlı TV"
     authors = listOf("Bymesut1")
 
-    /**
-     * Status int:
-     * 0: Down, 1: Ok, 2: Slow, 3: Beta only
-     */
     status = 1
 
     tvTypes = listOf("Movie", "TvSeries", "Live")
+
+    iconUrl = "https://rectvapk.cc/wp-content/uploads/2023/02/Rec-TV.webp"
 }
