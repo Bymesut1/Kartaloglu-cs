@@ -48,6 +48,7 @@ jobs:
           cp DiziLife/build/*.cs3 out/
           cp DiziPal/build/*.cs3 out/
           cp DiziSol/build/*.cs3 out/
+          cp RecTV/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
