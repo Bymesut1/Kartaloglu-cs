@@ -3,7 +3,7 @@ package com.bymesut1
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import org.json.JSONObject
 import org.jsoup.nodes.Document
 import java.net.URLEncoder
 
@@ -275,8 +275,31 @@ class YouTube : MainAPI() {
                 headers = hdr, timeout = 15L
             ).text
             if (txt.trimStart().startsWith("<")) return null // bot sayfası / HTML
-            val v = tryParseJson<InvVideo>(txt) ?: return null
-            if (!v.error.isNullOrBlank()) null else v
+            val j = JSONObject(txt)
+            if (j.optString("error").isNotBlank()) return null
+            val fs = ArrayList<InvFormat>()
+            val arr = j.optJSONArray("formatStreams")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    fs.add(
+                        InvFormat(
+                            url = o.optString("url").ifBlank { null },
+                            qualityLabel = o.optString("qualityLabel").ifBlank { null },
+                            resolution = o.optString("resolution").ifBlank { null },
+                            container = o.optString("container").ifBlank { null }
+                        )
+                    )
+                }
+            }
+            InvVideo(
+                title = j.optString("title").ifBlank { null },
+                description = j.optString("description").ifBlank { null },
+                error = null,
+                dashUrl = j.optString("dashUrl").ifBlank { null },
+                hlsUrl = j.optString("hlsUrl").ifBlank { null },
+                formatStreams = fs
+            )
         } catch (e: Exception) {
             Log.e("YTINV", "api hata ($base): $e")
             null
