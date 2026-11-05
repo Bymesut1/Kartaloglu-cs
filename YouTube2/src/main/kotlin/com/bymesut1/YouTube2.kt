@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -237,6 +238,247 @@ class YouTube2 : MainAPI() {
         }
     }
 
+    // ---------------------------------------------------------------- Akış çıkarma
+    // CloudStream'in YouTube çıkarıcısı kullanılmıyor: linkler doğrudan YouTube'un
+    // youtubei/v1/player API'sinden alınıyor.
+
+    private data class YtClient(
+        val name: String,
+        val id: Int,
+        val version: String,
+        val ua: String,
+        val extra: Map<String, Any>
+    )
+
+    private val vrClient = YtClient(
+        "ANDROID_VR", 28, "1.65.10",
+        "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+        mapOf(
+            "deviceMake" to "Oculus",
+            "deviceModel" to "Quest 3",
+            "androidSdkVersion" to 32,
+            "osName" to "Android",
+            "osVersion" to "12L"
+        )
+    )
+
+    private val iosClient = YtClient(
+        "IOS", 5, "20.10.4",
+        "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        mapOf(
+            "deviceMake" to "Apple",
+            "deviceModel" to "iPhone16,2",
+            "osName" to "iPhone",
+            "osVersion" to "18.3.2.22D82"
+        )
+    )
+
+    private suspend fun playerResponse(id: String, c: YtClient): JSONObject? {
+        val client = LinkedHashMap<String, Any>()
+        client["clientName"] = c.name
+        client["clientVersion"] = c.version
+        client.putAll(c.extra)
+        client["hl"] = "tr"
+        client["gl"] = "TR"
+        client["utcOffsetMinutes"] = 180
+
+        val body = mapOf(
+            "context" to mapOf("client" to client),
+            "videoId" to id,
+            "contentCheckOk" to true,
+            "racyCheckOk" to true,
+            "playbackContext" to mapOf(
+                "contentPlaybackContext" to mapOf("html5Preference" to "HTML5_PREF_WANTS")
+            )
+        )
+        val res = runCatching {
+            app.post(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                headers = mapOf(
+                    "User-Agent" to c.ua,
+                    "X-YouTube-Client-Name" to c.id.toString(),
+                    "X-YouTube-Client-Version" to c.version,
+                    "Origin" to "https://www.youtube.com"
+                ),
+                json = body
+            )
+        }.onFailure { Log.w(name, "${c.name} player isteği başarısız", it) }.getOrNull() ?: return null
+        return runCatching { JSONObject(res.text) }.getOrNull()
+    }
+
+    private fun mimeOf(f: JSONObject): String = f.optString("mimeType").substringBefore(";").trim()
+
+    private fun codecsOf(f: JSONObject): String =
+        Regex("codecs=\"([^\"]+)\"").find(f.optString("mimeType"))?.groupValues?.get(1).orEmpty()
+
+    private fun rangeOf(o: JSONObject?): String? {
+        if (o == null) return null
+        val a = o.optString("start")
+        val b = o.optString("end")
+        if (a.isBlank() || b.isBlank()) return null
+        return "$a-$b"
+    }
+
+    private fun xml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+    private fun representation(f: JSONObject, video: Boolean): String? {
+        val url = f.optString("url").takeIf { it.isNotBlank() } ?: return null
+        val init = rangeOf(f.optJSONObject("initRange")) ?: return null
+        val index = rangeOf(f.optJSONObject("indexRange")) ?: return null
+        val bw = maxOf(f.optInt("bitrate", 0), f.optInt("averageBitrate", 0), 1)
+        val sb = StringBuilder()
+        sb.append("<Representation id=\"").append(f.optInt("itag")).append("\"")
+        sb.append(" codecs=\"").append(xml(codecsOf(f))).append("\"")
+        sb.append(" bandwidth=\"").append(bw).append("\"")
+        if (video) {
+            sb.append(" width=\"").append(f.optInt("width")).append("\"")
+            sb.append(" height=\"").append(f.optInt("height")).append("\"")
+            val fps = f.optInt("fps", 0)
+            if (fps > 0) sb.append(" frameRate=\"").append(fps).append("\"")
+        } else {
+            val rate = f.optString("audioSampleRate").ifBlank { "44100" }
+            sb.append(" audioSamplingRate=\"").append(rate).append("\"")
+        }
+        sb.append(">")
+        if (!video) {
+            sb.append("<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\" value=\"")
+                .append(f.optInt("audioChannels", 2)).append("\"/>")
+        }
+        sb.append("<BaseURL>").append(xml(url)).append("</BaseURL>")
+        sb.append("<SegmentBase indexRange=\"").append(index).append("\"><Initialization range=\"")
+            .append(init).append("\"/></SegmentBase></Representation>")
+        return sb.toString()
+    }
+
+    private fun buildMpd(durationSec: Int, v: JSONObject, a: JSONObject): String? {
+        val vr = representation(v, true) ?: return null
+        val ar = representation(a, false) ?: return null
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+            "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" " +
+            "profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\" type=\"static\" " +
+            "mediaPresentationDuration=\"PT${durationSec}S\" minBufferTime=\"PT2S\">" +
+            "<Period>" +
+            "<AdaptationSet id=\"0\" mimeType=\"${mimeOf(v)}\" subsegmentAlignment=\"true\">$vr</AdaptationSet>" +
+            "<AdaptationSet id=\"1\" mimeType=\"${mimeOf(a)}\" subsegmentAlignment=\"true\">$ar</AdaptationSet>" +
+            "</Period></MPD>"
+    }
+
+    private fun qualityLabel(height: Int): String = if (height >= 2160) "4K" else "${height}p"
+
+    private suspend fun emitStreams(
+        resp: JSONObject,
+        c: YtClient,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val sd = resp.optJSONObject("streamingData") ?: return false
+        val linkHeaders = mapOf("User-Agent" to c.ua)
+        var found = false
+
+        val duration = resp.optJSONObject("videoDetails")?.optString("lengthSeconds")?.toIntOrNull() ?: 0
+
+        // 1) Ayrı video + ses akışları -> DASH manifest (4K / 1440p / 1080p ...)
+        val adaptive = sd.optJSONArray("adaptiveFormats")
+        if (adaptive != null) {
+            val videos = ArrayList<JSONObject>()
+            val audios = ArrayList<JSONObject>()
+            for (i in 0 until adaptive.length()) {
+                val f = adaptive.optJSONObject(i) ?: continue
+                if (f.optString("url").isBlank()) continue
+                val mime = mimeOf(f)
+                if (mime.startsWith("video/")) {
+                    videos.add(f)
+                } else if (mime.startsWith("audio/")) {
+                    val track = f.optJSONObject("audioTrack")
+                    if (track == null || track.optBoolean("audioIsDefault", true)) audios.add(f)
+                }
+            }
+
+            fun bestAudio(mime: String): JSONObject? =
+                audios.filter { mimeOf(it) == mime }.maxByOrNull { it.optInt("bitrate") }
+                    ?: audios.maxByOrNull { it.optInt("bitrate") }
+
+            val heights = videos.map { it.optInt("height") }.filter { it >= 360 }.distinct().sortedDescending()
+            val emitted = HashSet<String>()
+            for (h in heights) {
+                for (family in listOf("vp9", "avc")) {
+                    val candidates = videos.filter { f ->
+                        f.optInt("height") == h && when (family) {
+                            "vp9" -> codecsOf(f).startsWith("vp09") || codecsOf(f).startsWith("vp9")
+                            else -> codecsOf(f).startsWith("avc1")
+                        }
+                    }
+                    val v = candidates.maxByOrNull { it.optInt("bitrate") } ?: continue
+                    val audio = bestAudio(if (mimeOf(v) == "video/webm") "audio/webm" else "audio/mp4") ?: continue
+                    val dur = if (duration > 0) duration else (v.optString("approxDurationMs").toLongOrNull()?.div(1000)?.toInt() ?: 0)
+                    val mpd = buildMpd(dur, v, audio) ?: continue
+                    val label = "YouTube " + (if (family == "vp9") "VP9" else "H264") + " " + qualityLabel(h)
+                    if (!emitted.add(label)) continue
+                    val dataUri = "data:application/dash+xml;base64," +
+                        Base64.encodeToString(mpd.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                    callback(
+                        newExtractorLink(source = name, name = label, url = dataUri, type = ExtractorLinkType.DASH) {
+                            this.referer = "https://www.youtube.com/"
+                            this.quality = h
+                            this.headers = linkHeaders
+                        }
+                    )
+                    found = true
+                }
+            }
+        }
+
+        // 2) Video + ses tek dosyada (genelde 360p) -> doğrudan MP4
+        val muxed = sd.optJSONArray("formats")
+        if (muxed != null) {
+            for (i in 0 until muxed.length()) {
+                val f = muxed.optJSONObject(i) ?: continue
+                val url = f.optString("url").takeIf { it.isNotBlank() } ?: continue
+                val h = f.optInt("height", 0)
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "YouTube ${if (h > 0) "${h}p" else "tek dosya"} (MP4)",
+                        url = url,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://www.youtube.com/"
+                        this.quality = if (h > 0) h else Qualities.Unknown.value
+                        this.headers = linkHeaders
+                    }
+                )
+                found = true
+            }
+        }
+
+        // 3) HLS (canlı yayınlar ve bazı istemciler)
+        val hls = sd.optString("hlsManifestUrl")
+        if (hls.isNotBlank()) {
+            callback(
+                newExtractorLink(source = name, name = "YouTube HLS", url = hls, type = ExtractorLinkType.M3U8) {
+                    this.referer = "https://www.youtube.com/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = linkHeaders
+                }
+            )
+            found = true
+        }
+        return found
+    }
+
+    private fun emitSubtitles(resp: JSONObject, subtitleCallback: (SubtitleFile) -> Unit) {
+        val tracks = resp.optJSONObject("captions")
+            ?.optJSONObject("playerCaptionsTracklistRenderer")
+            ?.optJSONArray("captionTracks") ?: return
+        for (i in 0 until tracks.length()) {
+            val t = tracks.optJSONObject(i) ?: continue
+            val base = t.optString("baseUrl").takeIf { it.isNotBlank() } ?: continue
+            val lang = textOf(t.opt("name")) ?: t.optString("languageCode").ifBlank { "Altyazı" }
+            val url = if (base.contains("fmt=")) base else "$base&fmt=vtt"
+            subtitleCallback(newSubtitleFile(lang, url))
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -244,7 +486,19 @@ class YouTube2 : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val id = videoId(data) ?: return false
-        // Akış çözme (imza, n-parametresi vb.) CloudStream'in kendi YouTube çıkarıcısına bırakıldı.
-        return loadExtractor(watchUrl(id), subtitleCallback, callback)
+        var found = false
+        for (c in listOf(vrClient, iosClient)) {
+            val resp = playerResponse(id, c) ?: continue
+            val status = resp.optJSONObject("playabilityStatus")
+            Log.d(name, "${c.name}: durum=${status?.optString("status")} neden=${status?.optString("reason")}")
+            if (status?.optString("status") != "OK") continue
+            emitSubtitles(resp, subtitleCallback)
+            if (emitStreams(resp, c, callback)) {
+                found = true
+                break
+            }
+        }
+        if (!found) Log.d(name, "hiçbir istemciden link alınamadı: $id")
+        return found
     }
 }
