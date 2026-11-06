@@ -11,14 +11,6 @@ import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -172,10 +164,6 @@ class SezonlukDizi : MainAPI() {
 
     // Captcha kapi sayfasi bolum basina yalnizca bir kez incelenir (hiz icin)
     private val gateProbed = AtomicBoolean(false)
-
-    // Kapi ayni anda yalnizca bir kez cozulur; embed istekleri en fazla 2 paralel (Cloudflare 1015 hiz siniri icin)
-    private val gateMutex = Mutex()
-    private val embedSem  = Semaphore(2)
 
     private fun originOf(u: String): String =
         Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
@@ -494,16 +482,13 @@ class SezonlukDizi : MainAPI() {
             val raw = r?.text.orEmpty()
             val limited = raw.contains("1015") || raw.contains("rate limit", true) || raw.contains("too many", true)
             if (!limited || att == 2) break
-            delay(3000L * (att + 1))
+            try { Thread.sleep(3000L * (att + 1)) } catch (e: Exception) { }
         }
         return ""
     }
 
     // Kapi (reCAPTCHA / Turnstile) donen bir Vidmoly adresinden gercek oynatici adresini cikarir
-    private suspend fun resolveGate(gateUrl: String, ref: String, id: Int): String? =
-        gateMutex.withLock { resolveGateLocked(gateUrl, ref, id) }
-
-    private suspend fun resolveGateLocked(gateUrl: String, ref: String, id: Int): String? {
+    private suspend fun resolveGate(gateUrl: String, ref: String, id: Int): String? {
         lg("vidmoly kapi url=$gateUrl")
         // baska bir kaynak kapiyi az once cozduyse, cerezlerle dogrudan yeniden dene
         if (System.currentTimeMillis() < gateOkUntil) {
@@ -545,32 +530,25 @@ class SezonlukDizi : MainAPI() {
 
         // dil=1 -> altyazi, dil=0 -> dublaj
         // Gorunum sirasi: Dublaj Filemoon, Altyazi Filemoon, Dublaj Vidmoly, Altyazi Vidmoly
-        // Tum kaynaklar paralel cozulur; Filemoon'lar hemen, Vidmoly'ler cozuldukce eklenir.
+        // Filemoon (kapisiz) kaynaklar once hemen eklenir, kapinin arkasindaki Vidmoly'ler en sonda.
         val diller = listOf("0" to "Dublaj", "1" to "Altyazı")
-        var any = false
-
-        coroutineScope {
-            class Is(val vidmoly: Boolean, val job: Deferred<List<ExtractorLink>>)
-            val isler = ArrayList<Is>()
-
-            for ((dil, etiket) in diller) {
-                val alts = alternatifGetir(bid, dil, data)
-                lg("dil=$dil alternatifler=" + alts.joinToString(",") { it.baslik })
-                for (veri in alts) {
-                    val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
-                    isler.add(Is(vm, async { kaynakCoz(veri, etiket, data, subtitleCallback) }))
-                }
+        val isler = ArrayList<Triple<String, KaynakData, Boolean>>()
+        for ((dil, etiket) in diller) {
+            val alts = alternatifGetir(bid, dil, data)
+            lg("dil=$dil alternatifler=" + alts.joinToString(",") { it.baslik })
+            for (veri in alts) {
+                isler.add(Triple(etiket, veri, veri.baslik.contains("vidmoly", ignoreCase = true)))
             }
+        }
 
-            val sirali = isler.filter { !it.vidmoly } + isler.filter { it.vidmoly }
-            val goruldu = HashSet<String>()
-            for (i in sirali) {
-                val links = try { i.job.await() } catch (e: Exception) { emptyList() }
-                for (l in links) {
-                    if (goruldu.add(l.name + "|" + l.url)) {
-                        callback(l)
-                        any = true
-                    }
+        var any = false
+        val goruldu = HashSet<String>()
+        for (i in isler.filter { !it.third } + isler.filter { it.third }) {
+            val links = try { kaynakCoz(i.second, i.first, data, subtitleCallback) } catch (e: Exception) { emptyList() }
+            for (l in links) {
+                if (goruldu.add(l.name + "|" + l.url)) {
+                    callback(l)
+                    any = true
                 }
             }
         }
@@ -602,7 +580,7 @@ class SezonlukDizi : MainAPI() {
         try {
             val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
             val kaynakAdi = "$etiket - ${veri.baslik}"
-            var src = embedSem.withPermit { embedSrc(veri.id, ref) }
+            var src = embedSrc(veri.id, ref)
 
             // bazi alternatifler (Pixel) reCAPTCHA kapisi dondurur, atla; Vidmoly icin kapi asilmaya calisilir
             if (src.contains("reCAPTCHA", ignoreCase = true)) {
