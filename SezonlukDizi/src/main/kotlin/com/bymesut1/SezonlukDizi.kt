@@ -21,7 +21,7 @@ class SezonlukDizi : MainAPI() {
     override var lang = "tr"
     override val hasMainPage = true
     override val hasQuickSearch = false
-    override val supportedTypes = setOf(TvType.TvSeries)
+    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie)
 
     // CAPTCHA / Cloudflare "tarayıcı kontrolü" killer:
     // Site bir kontrol sayfası döndürürse otomatik geçer, çerezi saklar ve sonraki isteklerde kullanır.
@@ -229,6 +229,9 @@ class SezonlukDizi : MainAPI() {
     // /diziler/mobland.html
     private val reSeries = Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?(/diziler/[^/?#]+\.html)$""")
 
+    // /filmler/ben-10-alien-swarm.html  veya  /film/ben-10-alien-swarm.html
+    private val reFilm = Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?(/film(?:ler)?/[^/?#]+\.html)$""")
+
     // /mobland/2-sezon-5-bolum.html  veya  /mobland/dublaj/2-sezon-5-bolum.html
     private val reEp =
         Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?/([a-z0-9-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
@@ -272,6 +275,10 @@ class SezonlukDizi : MainAPI() {
                     link = mainUrl + reSeries.find(href)!!.groupValues[1]
                     key = "s:" + slugOf(link)
                 }
+                reFilm.containsMatchIn(href) -> {
+                    link = mainUrl + reFilm.find(href)!!.groupValues[1]
+                    key = "f:" + link.substringAfterLast("/").removeSuffix(".html")
+                }
                 epm != null -> {
                     link = abs(href)
                     key = "s:" + epm.groupValues[1]
@@ -284,10 +291,17 @@ class SezonlukDizi : MainAPI() {
                 a.selectFirst(".description")?.text(),
                 a.selectFirst(".title")?.text(),
                 cleanTitle(a.attr("title")),
-                img.attr("alt")
+                img.attr("alt"),
+                cleanTitle(a.text())
             ).firstOrNull { !it.isNullOrBlank() }?.trim() ?: continue
-            out[key] = newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
-                this.posterUrl = posterOf(img)
+            out[key] = if (key.startsWith("f:")) {
+                newMovieSearchResponse(title, link, TvType.Movie) {
+                    this.posterUrl = posterOf(img)
+                }
+            } else {
+                newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
+                    this.posterUrl = posterOf(img)
+                }
             }
         }
         return out.values.toList()
@@ -349,7 +363,7 @@ class SezonlukDizi : MainAPI() {
         for (r in responses) {
             if (r == null) continue
             val doc = r.document
-            val list = cards(doc.selectFirst(".afis") ?: doc.body())
+            val list = cards(doc.selectFirst(".afis") ?: doc.body()).filter { it.type != TvType.Movie }
             d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
@@ -360,17 +374,92 @@ class SezonlukDizi : MainAPI() {
                         c
                     }
                 }
-                val out = newSearchResponseList(list, page < maxPage(doc))
+                val films = if (page == 1) searchFilms(q) else emptyList()
+                val out = newSearchResponseList(list + films, page < maxPage(doc))
                 if (searchCache.size > 30) searchCache.clear()
                 searchCache[cacheKey] = out
                 return out
             }
+        }
+        // Dizi çıkmadıysa filmler yine de aranır
+        val onlyFilms = if (page == 1) searchFilms(q) else emptyList()
+        if (onlyFilms.isNotEmpty()) {
+            val out = newSearchResponseList(onlyFilms, false)
+            searchCache[cacheKey] = out
+            return out
         }
         if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
         return newSearchResponseList(emptyList(), false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
+
+    // ---------------- Film arama ----------------
+    @Volatile private var searchEndpoint: String? = null
+
+    // 1) filmler.asp?adi=... liste sayfası, 2) olmazsa sitenin arama kutusunun ajax adresi (siteden otomatik bulunur)
+    private suspend fun searchFilms(q: String): List<SearchResponse> {
+        val urls = listOf(
+            "$mainUrl/filmler.asp?adi=${encQ(q)}",
+            "$mainUrl/filmler.asp?adi=${URLEncoder.encode(q, "UTF-8")}"
+        ).distinct()
+        for (u in urls) {
+            try {
+                val r = get(u, t = 10L)
+                if (r.code !in 200..299) { d("film liste kod=${r.code}"); continue }
+                val doc = r.document
+                val l = cards(doc.selectFirst(".afis") ?: doc.body()).filter { it.type == TvType.Movie }
+                d("film liste kart=${l.size}")
+                if (l.isNotEmpty()) return l
+            } catch (e: Exception) {
+                d("film liste hata ${e.javaClass.simpleName}")
+            }
+        }
+        return try { searchFilmsAjax(q) } catch (e: Exception) { d("film ajax hata ${e.javaClass.simpleName}"); emptyList() }
+    }
+
+    private suspend fun searchFilmsAjax(q: String): List<SearchResponse> {
+        if (searchEndpoint == null) {
+            val res = get(mainUrl)
+            val sb = StringBuilder(res.text)
+            res.document.select("script[src]").map { it.attr("src") }.filter { it.contains("site") }.take(3).forEach { src ->
+                try { sb.append('\n').append(get(abs(src)).text) } catch (e: Exception) { }
+            }
+            searchEndpoint = Regex("""/ajax/\w*(?:ara|search)\w*\.asp""", RegexOption.IGNORE_CASE)
+                .find(sb.toString())?.value ?: ""
+            d("arama ajax adresi='${searchEndpoint}'")
+        }
+        val ep = searchEndpoint.orEmpty()
+        if (ep.isBlank()) return emptyList()
+        for (param in listOf("q", "adi", "kelime", "arama", "s")) {
+            val txt = try {
+                post(mainUrl + ep, mapOf(param to q), "$mainUrl/", 10L).text
+            } catch (e: Exception) { continue }
+            val l = cards(org.jsoup.Jsoup.parse(txt.replace("\\/", "/"), mainUrl)).filter { it.type == TvType.Movie }
+            d("film ajax $param kart=${l.size}")
+            if (l.isNotEmpty()) return l
+        }
+        return emptyList()
+    }
+
+    // ---------------- Film sayfası ----------------
+    private suspend fun loadFilm(url: String): LoadResponse? {
+        val res = get(url)
+        val doc = res.document
+        val title = (doc.selectFirst("h1")?.text()?.let { cleanTitle(it) }?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.let { cleanTitle(it) }
+            ?: cleanTitle(doc.title())).ifBlank { return null }
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+        val year = Regex("""\((\d{4})\)""").find(doc.title() + " " + (doc.selectFirst("h1")?.text() ?: ""))
+            ?.groupValues?.get(1)?.toIntOrNull()
+        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+            this.posterUrl = poster?.let { abs(it) }
+            this.plot = plot
+            if (year != null) this.year = year
+        }
+    }
 
     // ---------------- Dizi sayfası ----------------
 
@@ -424,6 +513,7 @@ class SezonlukDizi : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        reFilm.find(url)?.let { return loadFilm(mainUrl + it.groupValues[1]) }
         val seriesUrl = resolveSeriesUrl(url)
         val res = get(seriesUrl)
         val html = res.text
