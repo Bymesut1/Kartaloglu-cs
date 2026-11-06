@@ -49,7 +49,6 @@ jobs:
           cp DiziPal/build/*.cs3 out/
           cp DiziSol/build/*.cs3 out/
           cp RecTV/build/*.cs3 out/
-          cp YouTube/build/*.cs3 out/
           cp FilmizleHell/build/*.cs3 out/
           cp WebDramaTurkey2/build/*.cs3 out/
           cp build/plugins.json out/
