@@ -4,6 +4,10 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -147,7 +151,7 @@ class SezonlukDizi : MainAPI() {
         val res = try {
             app.get(
                 "$tmdbApi/search/tv?api_key=$tmdbKey&language=en-US&include_adult=false&query=${URLEncoder.encode(title, "UTF-8")}",
-                timeout = 3L
+                timeout = 2L
             ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
         } catch (e: Exception) {
             return null
@@ -195,14 +199,14 @@ class SezonlukDizi : MainAPI() {
     private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 15L) =
         try {
             if (needCf) throw Exception("cf")
-            val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
+            val r = app.get(url, headers = hdr(), referer = referer, cookies = aspCookies(), timeout = t)
             if (isChallenge(r.code, r.text)) {
                 needCf = true
                 throw Exception("cf")
             }
             r
         } catch (e: Exception) {
-            app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
+            app.get(url, headers = hdr(), referer = referer, cookies = aspCookies(), interceptor = cf, timeout = 20L)
         }
 
     // Daha önce çalışan kaynakların adı / sırası: sonraki bölümlerde önce onlar denenir (hız için)
@@ -211,14 +215,20 @@ class SezonlukDizi : MainAPI() {
     // Sayfadan ve ajax yanıtlarından gelen oturum çerezleri (ASP oturumu) sonraki ajax isteklerine eklenir
     @Volatile private var sessionCookies: Map<String, String> = emptyMap()
 
+    // Doğrulanmış (captcha geçilmiş) oturum yalnızca ASP oturum çerezine bağlı; cf_clearance WebView'in UA'sına bağlı olduğundan
+    // düz isteklerde gönderilmez (gönderilince Cloudflare reddedip oturumsuz yedek isteğe düşürüyordu)
+    private fun aspCookies(): Map<String, String> = sessionCookies.filterKeys { it.startsWith("ASPSESSION", true) }
+
     private suspend fun post(url: String, form: Map<String, String>, referer: String, t: Long = 15L) =
         try {
-            val r = app.post(url, data = form, headers = ajaxHdr(referer), cookies = sessionCookies, timeout = t)
+            val r = app.post(url, data = form, headers = ajaxHdr(referer), cookies = aspCookies(), timeout = t)
             if (isChallenge(r.code, r.text)) throw Exception("cf")
             if (r.cookies.isNotEmpty()) sessionCookies = sessionCookies + r.cookies
             r
         } catch (e: Exception) {
-            app.post(url, data = form, headers = ajaxHdr(referer), interceptor = cf, timeout = t)
+            val r = app.post(url, data = form, headers = ajaxHdr(referer), cookies = aspCookies(), interceptor = cf, timeout = t)
+            if (r.cookies.isNotEmpty()) sessionCookies = sessionCookies + r.cookies
+            r
         }
 
     private fun abs(u: String): String = if (u.startsWith("http")) u else fixUrl(u)
@@ -358,10 +368,13 @@ class SezonlukDizi : MainAPI() {
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
                     // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    list.take(12).amap { c ->
-                        val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
-                        if (!tp.isNullOrBlank()) c.posterUrl = tp
-                        c
+                    // Hız: en çok 1,5 sn beklenir; yetişmeyen afişte sitenin afişi kalır (liste anında gelir)
+                    withTimeoutOrNull(1500L) {
+                        list.take(12).amap { c ->
+                            val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
+                            if (!tp.isNullOrBlank()) c.posterUrl = tp
+                            c
+                        }
                     }
                 }
                 val out = newSearchResponseList(list, page < maxPage(doc))
@@ -1092,7 +1105,7 @@ class SezonlukDizi : MainAPI() {
                     Regex("""zz-asla-eslesmez-zz"""),
                     userAgent = null,      // eskiden: ua
                     useOkhttp = false,
-                    timeout = 12_000L      // eskiden: 18_000L
+                    timeout = 22_000L      // Turnstile ~10 sn sürüyor; 12 sn sınırda kalıyordu
                 )
             )
         } catch (e: Exception) {
@@ -1403,16 +1416,20 @@ class SezonlukDizi : MainAPI() {
                 solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
             }
             val okBefore = okCnt.values.sum()
-            for ((dil, id, ref) in pending) {
-                try { Thread.sleep(800) } catch (e: Exception) { }
-                tryId(dil, id, ref, "R ")
+            for (pass in 1..2) {
+                for ((dil, id, ref) in pending) {
+                    try { Thread.sleep(800) } catch (e: Exception) { }
+                    tryId(dil, id, ref, "R$pass ")
+                }
+                if (!gated || okCnt.values.sum() > okBefore) break
+                if (pass == 1) try { Thread.sleep(3500) } catch (e: Exception) { }   // doğrulama sunucuda yerleşsin
             }
             if (gated) {
                 if (okCnt.values.sum() > okBefore) {
                     gateCookies = sessionCookies
                     gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
                 } else {
-                    gateFailUntil = System.currentTimeMillis() + 90_000L
+                    gateFailUntil = System.currentTimeMillis() + 45_000L
                 }
             }
         }
@@ -1542,6 +1559,17 @@ class SezonlukDizi : MainAPI() {
             )
         }
         return any
+    }
+
+    // Cloudflare "tarayıcı kontrolü" eklenti yüklenir yüklenmez arka planda geçilir; ilk arama 12-15 sn beklemez.
+    // (Sınıfın en sonunda: tüm alanlar hazır olduktan sonra çalışır.)
+    init {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                get(mainUrl, t = 10L)
+            } catch (e: Throwable) {
+            }
+        }
     }
 }
 
