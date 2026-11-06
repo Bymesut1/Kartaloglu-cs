@@ -609,6 +609,11 @@ class SezonlukDizi : MainAPI() {
     private fun embedOf(txt0: String): String? {
         val txt = txt0.replace("\\/", "/")
         reIframe.find(txt)?.let { return it.groupValues[1] }
+        // Dzen: yanıt iframe değil, "<script>var vid = 'oVUYjD9YIAAA'; ..." şeklinde bir betik; oynatıcı adresi
+        // https://dzen.ru/embed/<vid> olarak kurulur. Betikte tam adres açıkça yazıyorsa o kullanılır.
+        Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/embed/[A-Za-z0-9_-]+""").find(txt)?.let { return it.value }
+        Regex("""\bvar\s+vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(txt)
+            ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
         // iframe yoksa src / data-src / file gibi alanlardaki adresler (göreli olanlar dahil)
         Regex("""(?:src|data-src|file|source|url)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .findAll(txt).map { it.groupValues[1] }
@@ -1377,6 +1382,7 @@ class SezonlukDizi : MainAPI() {
             val n = nm.trim().lowercase()
             return when {
                 n.contains("byse") || n.contains("filemoon") || n.contains("dzen") -> 0
+                n.contains("okru") || n.contains("ok.ru") -> 4
                 "i:$dil:$idx" in goodKeys -> 1
                 n.isNotBlank() && "n:$n" in goodKeys -> 2
                 else -> 3
