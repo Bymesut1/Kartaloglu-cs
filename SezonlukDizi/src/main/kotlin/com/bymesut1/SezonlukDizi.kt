@@ -137,8 +137,112 @@ class SezonlukDizi : MainAPI() {
                 episodes.add(newEpisode(epHref) { this.name = epName; this.season = epSeason; this.episode = epEpisode })
             }
         }
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+        // Yalnizca bolum satirlari TMDB ile zenginlestirilir (Turkce ad, aciklama, bolum gorseli); hata olursa site listesi aynen kalir
+        val bolumler = try { tmdbBolumleri(title, episodes) } catch (e: Exception) { episodes }
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, bolumler) {
             this.posterUrl = poster; this.year = year; this.plot = description; this.tags = tags; this.duration = duration; this.actors = actors.map { ActorData(it) }
+        }
+    }
+
+    // ---------------- TMDB: yalnizca dizi sayfasindaki bolum satirlari icin ----------------
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
+    private val tmdbApi = "https://api.themoviedb.org/3"
+    private val tmdbImg = "https://image.tmdb.org/t/p"
+    private val reGenericEp = Regex("""(?iu)^\s*(bölüm|episode|ep\.?)\s*\d+\s*$""")
+
+    private fun norm(t: String): String = t.lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), "")
+
+    private fun dateMs(s: String?): Long? = try {
+        if (s.isNullOrBlank()) null else java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).parse(s)?.time
+    } catch (e: Exception) {
+        null
+    }
+
+    private suspend fun tmdbSearch(q: String): List<TmdbTvResult> = try {
+        app.get(
+            "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${java.net.URLEncoder.encode(q, "UTF-8")}",
+            timeout = 15L
+        ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private suspend fun tmdbDetails(id: Int): TmdbTvDetails? = try {
+        app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR", timeout = 15L).parsedSafe<TmdbTvDetails>()
+    } catch (e: Exception) {
+        null
+    }
+
+    // Sitedeki diziyi TMDB'deki dogru diziyle esler; ayni adli birden fazla dizi varsa sezon basina bolum sayisi en yakin olan secilir
+    private suspend fun tmdbMatch(title: String, siteCounts: Map<Int, Int>): TmdbTvDetails? {
+        val key = norm(title)
+        if (key.isEmpty()) return null
+        val results = tmdbSearch(title)
+        if (results.isEmpty()) return null
+        val exact = results.filter {
+            norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key
+        }
+        val cands = if (exact.isNotEmpty()) exact.take(3) else listOfNotNull(
+            results.firstOrNull {
+                val n = norm(it.name.orEmpty())
+                n.isNotEmpty() && (n.contains(key) || key.contains(n))
+            }
+        )
+        if (cands.isEmpty()) return null
+        if (cands.size == 1) return cands[0].id?.let { tmdbDetails(it) }
+        val details = cands.amap { c -> c.id?.let { tmdbDetails(it) } }.filterNotNull()
+        if (details.isEmpty()) return null
+        return details.minByOrNull { d ->
+            val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
+            var score = 0
+            for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
+            score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
+        }
+    }
+
+    private suspend fun tmdbSeason(id: Int, sn: Int, lang: String): Map<Int, TmdbEpisode> = try {
+        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 15L)
+            .parsedSafe<TmdbSeasonDetails>()?.episodes.orEmpty()
+            .mapNotNull { e -> e.episode_number?.let { it to e } }.toMap()
+    } catch (e: Exception) {
+        emptyMap()
+    }
+
+    // Sitedeki her bolum satirina TMDB'den Turkce ad, aciklama, gorsel, sure ve tarih ekler. Sitede olmayan bolum eklenmez.
+    private suspend fun tmdbBolumleri(title: String, siteEps: List<Episode>): List<Episode> {
+        if (siteEps.isEmpty()) return siteEps
+        val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
+        val tm = tmdbMatch(title, counts) ?: return siteEps
+        val tid = tm.id ?: return siteEps
+        val rows = counts.keys.filter { it > 0 }.amap { sn ->
+            Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+        }
+        val trMap = rows.associate { it.first to it.second }
+        val enMap = rows.associate { it.first to it.third }
+
+        return siteEps.map { old ->
+            val sn = old.season ?: 0
+            val en = old.episode ?: 0
+            val tr = trMap[sn]?.get(en)
+            val us = enMap[sn]?.get(en)
+            if (tr == null && us == null) return@map old
+            // Turkce ad yoksa ("Bolum 3" gibi) Ingilizce ad, o da yoksa sitenin adi
+            val epName = tr?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: us?.name?.takeIf { it.isNotBlank() && !reGenericEp.matches(it) }
+                ?: old.name
+            val overview = tr?.overview?.takeIf { it.isNotBlank() } ?: us?.overview?.takeIf { it.isNotBlank() }
+            val still = (tr?.still_path ?: us?.still_path)?.let { "$tmdbImg/w500$it" }
+            val runtime = tr?.runtime ?: us?.runtime
+            val airMs = dateMs(tr?.air_date ?: us?.air_date)
+            newEpisode(old.data) {
+                this.season = old.season
+                this.episode = old.episode
+                this.name = epName
+                this.description = overview
+                this.posterUrl = still
+                if (runtime != null && runtime > 0) this.runTime = runtime
+                if (airMs != null) this.date = airMs
+            }
         }
     }
 
@@ -425,7 +529,7 @@ class SezonlukDizi : MainAPI() {
                     Regex("""zz-asla-eslesmez-zz"""),
                     userAgent = null,
                     useOkhttp = false,
-                    timeout = 25_000L
+                    timeout = 15_000L
                 )
             )
         } catch (e: Exception) {
@@ -469,7 +573,7 @@ class SezonlukDizi : MainAPI() {
             val r = try {
                 app.post(
                     "${mainUrl}/ajax/dataEmbed22.asp",
-                    headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
+                    headers = mapOf("User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
                     cookies = sessionCookies,
                     data = mapOf("id" to "$id")
                 )
@@ -522,29 +626,51 @@ class SezonlukDizi : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         gateProbed.set(false)
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
-        val res      = app.get(data)
-        if (res.cookies.isNotEmpty()) sessionCookies = sessionCookies + res.cookies
-        val document = res.document
-        val bid      = document.selectFirst("div#dilsec")?.attr("data-id")?.trim().orEmpty()
-        if (bid.isEmpty()) return false
+        // Calisan surumdeki gibi: her dil icin o dilin kendi bolum sayfasi (Dublaj: /dublaj/, Altyazi: normal) acilir;
+        // oturum cerezleri iki sayfadan toplanir, bid ve Referer o dilin sayfasindan alinir (kapi bunu kontrol ediyor).
+        val m = Regex("""^(https?://[^/]+)/([a-z0-9-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""").find(data)
+        val sayfaAlt = if (m != null) "${m.groupValues[1]}/${m.groupValues[2]}/${m.groupValues[3]}-sezon-${m.groupValues[4]}-bolum.html" else data
+        val sayfaDub = if (m != null) "${m.groupValues[1]}/${m.groupValues[2]}/dublaj/${m.groupValues[3]}-sezon-${m.groupValues[4]}-bolum.html" else data
+        val sayfalar = mapOf("0" to sayfaDub, "1" to sayfaAlt)
+        val bidler = HashMap<String, String>()
+        for ((dil, pu) in sayfalar) {
+            try {
+                val res = app.get(pu, headers = hdr(), referer = "$mainUrl/")
+                if (res.cookies.isNotEmpty()) sessionCookies = sessionCookies + res.cookies
+                val b = res.document.selectFirst("div#dilsec")?.attr("data-id")?.trim().orEmpty()
+                if (b.isNotEmpty()) bidler[dil] = b
+            } catch (e: Exception) {
+                lg("sayfa hata dil=$dil ${e.message}")
+            }
+            if (sayfaDub == sayfaAlt) break
+        }
+        val bidYedek = bidler.values.firstOrNull().orEmpty()
+        if (bidYedek.isEmpty()) return false
 
         // dil=1 -> altyazi, dil=0 -> dublaj
         // Gorunum sirasi: Dublaj Filemoon, Altyazi Filemoon, Dublaj Vidmoly, Altyazi Vidmoly
         // Filemoon (kapisiz) kaynaklar once hemen eklenir, kapinin arkasindaki Vidmoly'ler en sonda.
         val diller = listOf("0" to "Dublaj", "1" to "Altyazı")
-        val isler = ArrayList<Triple<String, KaynakData, Boolean>>()
+        class Is(val etiket: String, val veri: KaynakData, val vidmoly: Boolean, val ref: String)
+        val isler = ArrayList<Is>()
         for ((dil, etiket) in diller) {
-            val alts = alternatifGetir(bid, dil, data)
+            val ref = sayfalar[dil] ?: data
+            val alts = alternatifGetir(bidler[dil] ?: bidYedek, dil, ref)
             lg("dil=$dil alternatifler=" + alts.joinToString(",") { it.baslik })
+            // Her dilde yalnizca ilk Filemoon gosterilir (sitedeki ayni adli ek Filemoon'lar atlanir)
+            var filemoonSayisi = 0
             for (veri in alts) {
-                isler.add(Triple(etiket, veri, veri.baslik.contains("vidmoly", ignoreCase = true)))
+                val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
+                val fm = veri.baslik.contains("filemoon", ignoreCase = true)
+                if (fm && ++filemoonSayisi > 1) continue
+                isler.add(Is(etiket, veri, vm, ref))
             }
         }
 
         var any = false
         val goruldu = HashSet<String>()
-        for (i in isler.filter { !it.third } + isler.filter { it.third }) {
-            val links = try { kaynakCoz(i.second, i.first, data, subtitleCallback) } catch (e: Exception) { emptyList() }
+        for (i in isler.filter { !it.vidmoly } + isler.filter { it.vidmoly }) {
+            val links = try { kaynakCoz(i.veri, i.etiket, i.ref, subtitleCallback) } catch (e: Exception) { emptyList() }
             for (l in links) {
                 if (goruldu.add(l.name + "|" + l.url)) {
                     callback(l)
@@ -560,7 +686,7 @@ class SezonlukDizi : MainAPI() {
         return try {
             app.post(
                 "${mainUrl}/ajax/dataAlternatif22.asp",
-                headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
+                headers = mapOf("User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
                 cookies = sessionCookies,
                 data = mapOf("bid" to bid, "dil" to dil)
             ).parsedSafe<Kaynak>()?.takeIf { it.status == "success" }?.data ?: emptyList()
@@ -574,12 +700,13 @@ class SezonlukDizi : MainAPI() {
         veri: KaynakData,
         etiket: String,
         ref: String,
-        subtitleCallback: (SubtitleFile) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit,
+        gorunenAd: String = veri.baslik
     ): List<ExtractorLink> {
         val out = ArrayList<ExtractorLink>()
         try {
             val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
-            val kaynakAdi = "$etiket - ${veri.baslik}"
+            val kaynakAdi = "$etiket - $gorunenAd"
             var src = embedSrc(veri.id, ref)
 
             // bazi alternatifler (Pixel) reCAPTCHA kapisi dondurur, atla; Vidmoly icin kapi asilmaya calisilir
@@ -610,3 +737,39 @@ class SezonlukDizi : MainAPI() {
     data class AramaSonuc(val title: String = "", val description: String = "", val url: String = "", val image: String = "")
     data class AspData(val alternatif: String, val embed: String)
 }
+
+// ---------------- TMDB JSON veri siniflari (alan adlari TMDB JSON'u ile birebir ayni) ----------------
+data class TmdbTvResult(
+    val id: Int? = null,
+    val name: String? = null,
+    val original_name: String? = null,
+    val popularity: Double? = null
+)
+
+data class TmdbSearchResponse(
+    val results: List<TmdbTvResult>? = null
+)
+
+data class TmdbSeasonInfo(
+    val season_number: Int? = null,
+    val episode_count: Int? = null
+)
+
+data class TmdbTvDetails(
+    val id: Int? = null,
+    val popularity: Double? = null,
+    val seasons: List<TmdbSeasonInfo>? = null
+)
+
+data class TmdbEpisode(
+    val episode_number: Int? = null,
+    val name: String? = null,
+    val overview: String? = null,
+    val still_path: String? = null,
+    val runtime: Int? = null,
+    val air_date: String? = null
+)
+
+data class TmdbSeasonDetails(
+    val episodes: List<TmdbEpisode>? = null
+)
