@@ -11,6 +11,14 @@ import okhttp3.Response
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -149,6 +157,11 @@ class SezonlukDizi : MainAPI() {
 
     private fun hdr(): Map<String, String> = mapOf("User-Agent" to ua)
 
+    // Logcat'te "SezonlukDizi" etiketiyle görünür (kaynak / kapı hata ayıklama)
+    private fun lg(m: String) {
+        try { android.util.Log.i("SezonlukDizi", m.take(300)) } catch (e: Throwable) { }
+    }
+
     // Sayfadan ve ajax yanitlarindan gelen oturum cerezleri (ASP oturumu) sonraki ajax isteklerine eklenir
     @Volatile private var sessionCookies: Map<String, String> = emptyMap()
 
@@ -160,6 +173,10 @@ class SezonlukDizi : MainAPI() {
     // Captcha kapi sayfasi bolum basina yalnizca bir kez incelenir (hiz icin)
     private val gateProbed = AtomicBoolean(false)
 
+    // Kapi ayni anda yalnizca bir kez cozulur; embed istekleri en fazla 2 paralel (Cloudflare 1015 hiz siniri icin)
+    private val gateMutex = Mutex()
+    private val embedSem  = Semaphore(2)
+
     private fun originOf(u: String): String =
         Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
 
@@ -170,10 +187,10 @@ class SezonlukDizi : MainAPI() {
     }
 
     // Kaynak adini (AltYazi - Filemoon gibi) baglantinin onune ekler
-    private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
+    private suspend fun relabel(l: ExtractorLink, label: String, q: Int? = null): ExtractorLink =
         newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
             this.referer = l.referer
-            this.quality = l.quality
+            this.quality = q ?: l.quality
             this.headers = l.headers
         }
 
@@ -194,7 +211,12 @@ class SezonlukDizi : MainAPI() {
     ) {
         val origin = originOf(embed)
         callback(
-            newExtractorLink(name, "$label - ${hostLabel(embed)}", m3u8, ExtractorLinkType.M3U8) {
+            newExtractorLink(
+                name,
+                if (label.contains(hostLabel(embed), ignoreCase = true)) label else "$label - ${hostLabel(embed)}",
+                m3u8,
+                ExtractorLinkType.M3U8
+            ) {
                 this.referer = "$origin/"
                 this.quality = Qualities.Unknown.value
                 this.headers = mapOf(
@@ -289,13 +311,13 @@ class SezonlukDizi : MainAPI() {
                 } catch (e: Exception) {
                     emptyList()
                 }
-                if (links.isNotEmpty()) links.forEach { callback(relabel(it, tag)) }
+                if (links.isNotEmpty()) links.forEach { callback(relabel(it, tag, Qualities.P720.value)) }
                 else emitM3u8(url, tag, embed, callback)
             } else {
                 callback(
                     newExtractorLink(name, "$tag - Byse", url, ExtractorLinkType.VIDEO) {
                         this.referer = "$origin/"
-                        this.quality = getQualityFromName(ql)
+                        this.quality = Qualities.P720.value
                         this.headers = headers
                     }
                 )
@@ -347,9 +369,10 @@ class SezonlukDizi : MainAPI() {
             // Kalite adlarini (720p vb.) gorebilmek icin alt listeler de eklenir
             try {
                 M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
-                    .forEach { callback(relabel(it, label)) }
+                    .forEach { callback(relabel(it, label, Qualities.Unknown.value)) }
             } catch (e: Exception) {
             }
+            lg("vidmoly tamam host=$host")
             return true
         }
         return false
@@ -414,16 +437,18 @@ class SezonlukDizi : MainAPI() {
                     Regex("""zz-asla-eslesmez-zz"""),
                     userAgent = null,
                     useOkhttp = false,
-                    timeout = 12_000L
+                    timeout = 25_000L
                 )
             )
         } catch (e: Exception) {
         }
         try {
+            val before = sessionCookies.size
             cm?.getCookie(mainUrl)?.split(";")?.forEach { c ->
                 val kv = c.trim().split("=", limit = 2)
                 if (kv.size == 2 && kv[0].isNotBlank()) sessionCookies = sessionCookies + (kv[0] to kv[1])
             }
+            lg("kapi webview bitti cerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",")}")
         } catch (e: Throwable) {
         }
     }
@@ -469,26 +494,43 @@ class SezonlukDizi : MainAPI() {
             val raw = r?.text.orEmpty()
             val limited = raw.contains("1015") || raw.contains("rate limit", true) || raw.contains("too many", true)
             if (!limited || att == 2) break
-            try { Thread.sleep(3000L * (att + 1)) } catch (e: Exception) { }
+            delay(3000L * (att + 1))
         }
         return ""
     }
 
     // Kapi (reCAPTCHA / Turnstile) donen bir Vidmoly adresinden gercek oynatici adresini cikarir
-    private suspend fun resolveGate(gateUrl: String, ref: String, id: Int): String? {
+    private suspend fun resolveGate(gateUrl: String, ref: String, id: Int): String? =
+        gateMutex.withLock { resolveGateLocked(gateUrl, ref, id) }
+
+    private suspend fun resolveGateLocked(gateUrl: String, ref: String, id: Int): String? {
+        lg("vidmoly kapi url=$gateUrl")
+        // baska bir kaynak kapiyi az once cozduyse, cerezlerle dogrudan yeniden dene
+        if (System.currentTimeMillis() < gateOkUntil) {
+            val again = embedSrc(id, ref)
+            if (again.isNotEmpty() && !again.contains("reCAPTCHA", true)) return again
+        }
         var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
-        if (!inner.isNullOrBlank()) return inner
-        if (System.currentTimeMillis() < gateFailUntil) return null
+        if (!inner.isNullOrBlank()) {
+            lg("vidmoly kapidan adres cikti: $inner")
+            return inner
+        }
+        if (System.currentTimeMillis() < gateFailUntil) {
+            lg("vidmoly kapi yakin zamanda cozulemedi, atlandi")
+            return null
+        }
         solveGate(ref, gateUrl)
         val f2 = embedSrc(id, ref)
         inner = if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) f2
         else try { captchaInner(f2.ifEmpty { gateUrl }, ref, true) } catch (e: Exception) { null }
         if (inner.isNullOrBlank()) {
-            gateFailUntil = System.currentTimeMillis() + 90_000L
+            gateFailUntil = System.currentTimeMillis() + 3 * 60_000L
+            lg("vidmoly kapi COZULEMEDI (sonraki deneme 3 dk sonra) f2=$f2")
             return null
         }
         gateCookies = sessionCookies
         gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+        lg("vidmoly kapi cozuldu: $inner")
         return inner
     }
 
@@ -501,48 +543,84 @@ class SezonlukDizi : MainAPI() {
         val bid      = document.selectFirst("div#dilsec")?.attr("data-id")?.trim().orEmpty()
         if (bid.isEmpty()) return false
 
-        // dil=1 -> altyazi, dil=0 -> dublaj; ikisi de ayni alternatif listesini verir
-        alternatifleriEkle(bid, "1", "AltYazi", data, subtitleCallback, callback)
-        alternatifleriEkle(bid, "0", "Dublaj", data, subtitleCallback, callback)
-        return true
+        // dil=1 -> altyazi, dil=0 -> dublaj
+        // Gorunum sirasi: Dublaj Filemoon, Altyazi Filemoon, Dublaj Vidmoly, Altyazi Vidmoly
+        // Tum kaynaklar paralel cozulur; Filemoon'lar hemen, Vidmoly'ler cozuldukce eklenir.
+        val diller = listOf("0" to "Dublaj", "1" to "Altyazı")
+        var any = false
+
+        coroutineScope {
+            class Is(val vidmoly: Boolean, val job: Deferred<List<ExtractorLink>>)
+            val isler = ArrayList<Is>()
+
+            for ((dil, etiket) in diller) {
+                val alts = alternatifGetir(bid, dil, data)
+                lg("dil=$dil alternatifler=" + alts.joinToString(",") { it.baslik })
+                for (veri in alts) {
+                    val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
+                    isler.add(Is(vm, async { kaynakCoz(veri, etiket, data, subtitleCallback) }))
+                }
+            }
+
+            val sirali = isler.filter { !it.vidmoly } + isler.filter { it.vidmoly }
+            val goruldu = HashSet<String>()
+            for (i in sirali) {
+                val links = try { i.job.await() } catch (e: Exception) { emptyList() }
+                for (l in links) {
+                    if (goruldu.add(l.name + "|" + l.url)) {
+                        callback(l)
+                        any = true
+                    }
+                }
+            }
+        }
+        return any
     }
 
     // /ajax/dataAlternatif22.asp (bid + dil) -> [{id, baslik, kalite}]
-    // /ajax/dataEmbed22.asp       (id)       -> <iframe src="...">
-    // (eski .asp uclari 404'e dustu, "22" ekiyle yenilendi)
-    private suspend fun alternatifleriEkle(
-        bid: String, dil: String, etiket: String, ref: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val alternatifler = app.post(
-            "${mainUrl}/ajax/dataAlternatif22.asp",
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
-            cookies = sessionCookies,
-            data = mapOf("bid" to bid, "dil" to dil)
-        ).parsedSafe<Kaynak>()?.takeIf { it.status == "success" }?.data ?: return
+    private suspend fun alternatifGetir(bid: String, dil: String, ref: String): List<KaynakData> {
+        return try {
+            app.post(
+                "${mainUrl}/ajax/dataAlternatif22.asp",
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
+                cookies = sessionCookies,
+                data = mapOf("bid" to bid, "dil" to dil)
+            ).parsedSafe<Kaynak>()?.takeIf { it.status == "success" }?.data ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
 
-        // Kapinin arkasindaki Vidmoly en sona birakilir (kapi cozumu beklerken diger kaynaklar gecikmesin)
-        val sirali = alternatifler.sortedBy { if (it.baslik.contains("vidmoly", true)) 1 else 0 }
-
-        for (veri in sirali) {
+    // /ajax/dataEmbed22.asp (id) -> <iframe src="..."> ; tek bir alternatifi cozer ve linklerini dondurur
+    private suspend fun kaynakCoz(
+        veri: KaynakData,
+        etiket: String,
+        ref: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): List<ExtractorLink> {
+        val out = ArrayList<ExtractorLink>()
+        try {
+            val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
             val kaynakAdi = "$etiket - ${veri.baslik}"
-            var src = embedSrc(veri.id, ref)
+            var src = embedSem.withPermit { embedSrc(veri.id, ref) }
 
             // bazi alternatifler (Pixel) reCAPTCHA kapisi dondurur, atla; Vidmoly icin kapi asilmaya calisilir
             if (src.contains("reCAPTCHA", ignoreCase = true)) {
-                if (!veri.baslik.contains("vidmoly", ignoreCase = true)) continue
-                src = resolveGate(src, ref, veri.id) ?: continue
+                if (!vm) return out
+                src = resolveGate(src, ref, veri.id) ?: return out
             }
-            if (src.isEmpty()) continue
+            if (src.isEmpty()) return out
             val iframe = when {
                 src.startsWith("//") -> "https:$src"
                 src.startsWith("http") -> src
-                else -> fixUrlNull(src) ?: continue
+                else -> fixUrlNull(src) ?: return out
             }
 
-            emitSource(iframe, kaynakAdi, subtitleCallback, callback)
+            emitSource(iframe, kaynakAdi, subtitleCallback) { synchronized(out) { out.add(it) } }
+        } catch (e: Exception) {
+            lg("kaynakCoz hata ${veri.baslik}: ${e.message}")
         }
+        return synchronized(out) { ArrayList(out) }
     }
 
     data class Kaynak(val status: String = "", val data: List<KaynakData>? = null)
