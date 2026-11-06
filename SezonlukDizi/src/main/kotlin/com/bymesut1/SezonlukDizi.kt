@@ -482,6 +482,18 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Kapidan (Turnstile) yakalanan dogrudan Vidmoly m3u8 adresi (vmpx.online ...master.m3u8)
+        if (embed.contains(".m3u8", ignoreCase = true)) {
+            val refO = originOf(vmRef)
+            callback(
+                newExtractorLink(name, label, embed, ExtractorLinkType.M3U8) {
+                    this.referer = "$refO/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to ua, "Referer" to "$refO/", "Origin" to refO)
+                }
+            )
+            return true
+        }
         if (embed.contains("byse", ignoreCase = true)) {
             val okByse = try {
                 extractBysejikuar(embed, label, callback)
@@ -511,7 +523,11 @@ class SezonlukDizi : MainAPI() {
     // Kapi adresi gorunmez WebView'de acilir ve kendi kendine cozmesi icin sure taninir.
     // useOkhttp = false: WebView kendi ag yigini ve cerez yoneticisini kullanir, dogrulama cerezi
     // WebView'in CookieManager'ina yazilir; sonra geri alinip oturum cerezlerine eklenir.
-    private suspend fun solveGate(ref: String, gateUrl: String) {
+    // Kapi sayfasi acilirken Vidmoly'ye giden istek (embed ya da .m3u8) yakalanir; dogrulama gecilince oynatici yuklenir.
+    private val vmCapture = Regex("""(?i)(vmpx\.|vidmoly\.[a-z]+/(?:embed-|embed/|w/|e/)|\.m3u8)""")
+    @Volatile private var vmRef: String = "https://vidmoly.biz/"
+
+    private suspend fun solveGate(ref: String, gateUrl: String): String? {
         val gate = when {
             gateUrl.startsWith("//") -> "https:$gateUrl"
             gateUrl.startsWith("/") -> mainUrl + gateUrl
@@ -524,20 +540,26 @@ class SezonlukDizi : MainAPI() {
             cm?.flush()
         } catch (e: Throwable) {
         }
+        var captured: String? = null
         try {
-            app.get(
-                gate,
-                headers = hdr(),
-                referer = ref,
-                cookies = sessionCookies,
-                interceptor = WebViewResolver(
-                    Regex("""zz-asla-eslesmez-zz"""),
-                    userAgent = null,
-                    useOkhttp = false,
-                    timeout = 15_000L
-                )
-            )
+            val r = WebViewResolver(
+                vmCapture,
+                userAgent = null,
+                useOkhttp = false,
+                timeout = 45_000L
+            ).resolveUsingWebView(gate, ref)
+            val req = r.first
+            val u = req?.url?.toString().orEmpty()
+            if (u.isNotEmpty() && !u.contains("sezonlukdizi", true) && vmCapture.containsMatchIn(u)) {
+                captured = u
+                val rf = req?.header("Referer").orEmpty()
+                if (rf.contains("vidmoly", true)) vmRef = rf
+                note("kapi yakalama tamam: ${u.take(110)}")
+            } else {
+                note("kapi yakalama bos (45 sn icinde Vidmoly istegi gelmedi)")
+            }
         } catch (e: Exception) {
+            note("kapi yakalama hata: ${e.message}")
         }
         try {
             val before = sessionCookies.size
@@ -548,6 +570,7 @@ class SezonlukDizi : MainAPI() {
             lg("kapi webview bitti cerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",")}")
         } catch (e: Throwable) {
         }
+        return captured
     }
 
     // Kapi adresinin icinde ya da (oturum cerezleriyle acilan) sayfasinda gercek oynatici adresi var mi bakar
@@ -613,7 +636,13 @@ class SezonlukDizi : MainAPI() {
             lg("vidmoly kapi yakin zamanda cozulemedi, atlandi")
             return null
         }
-        solveGate(ref, gateUrl)
+        val cap = solveGate(ref, gateUrl)
+        if (!cap.isNullOrBlank()) {
+            gateCookies = sessionCookies
+            gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+            lg("vidmoly kapi cozuldu (yakalandi): $cap")
+            return cap
+        }
         val f2 = embedSrc(id, ref)
         inner = if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) f2
         else try { captchaInner(f2.ifEmpty { gateUrl }, ref, true) } catch (e: Exception) { null }
