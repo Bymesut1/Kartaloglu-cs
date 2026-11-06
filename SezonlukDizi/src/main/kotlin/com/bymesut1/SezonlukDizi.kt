@@ -639,6 +639,13 @@ class SezonlukDizi : MainAPI() {
         return h.replaceFirstChar { it.uppercase() }
     }
 
+    // Listede görünecek kaynak adı: sitedeki ad (Dzen, Pixel, Okru, VidMoly, Filemoon); yoksa adresten
+    private fun srcLabel(u: String, nm: String): String {
+        val n = nm.trim()
+        if (n.isNotBlank()) return n
+        return if (u.contains("byse", true)) "Filemoon" else hostLabel(u)
+    }
+
     // Dil adını kaynak adının önüne ekler: "Dublaj - Filemoon (1080p)"
     private suspend fun relabel(l: ExtractorLink, label: String): ExtractorLink =
         newExtractorLink(l.source, "$label - ${l.name}", l.url, l.type) {
@@ -928,7 +935,7 @@ class SezonlukDizi : MainAPI() {
         // 2) CloudflareKiller ile sayfayı aç, .m3u8 ara
         try {
             val page = app.get(u, referer = "$mainUrl/", timeout = 10L)
-                .text.replace("\\/", "/")
+                .text.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&")
             val m = Regex("""https?://[^"'\s<>\\]+\.m3u8[^"'\s<>\\]*""").find(page)
             if (m != null) {
                 emitM3u8(m.value.replace("&amp;", "&"), label, u, callback)
@@ -1079,7 +1086,7 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        webviewLeft.set(2)
+        webviewLeft.set(3)
         gateProbed.set(false)
         dbg.clear()
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
@@ -1100,15 +1107,15 @@ class SezonlukDizi : MainAPI() {
 
         // Bir kaynağın topladığımız bağlantılarından dil başına TEK, temiz adlı bağlantı verir:
         // "Türkçe Dublaj (720p)" / "Türkçe Altyazı (720p)". Dublaj üstte çıksın diye kalitesi biraz yüksek tutulur.
-        suspend fun flush(dil: String, buf: List<ExtractorLink>): Boolean {
+        suspend fun flush(dil: String, buf: List<ExtractorLink>, src: String): Boolean {
             if (buf.isEmpty()) return false
-            if (dil in emitted) return true
+            if (!emitted.add("$dil|${src.lowercase()}")) return true
             val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
                 ?: buf.maxByOrNull { it.quality }
                 ?: buf.first()
             val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
                 .maxOrNull()
-            val linkName = "Türkçe ${dilName(dil)}" + (res?.let { " (${it}p)" } ?: "")
+            val linkName = "Türkçe ${dilName(dil)} - $src" + (res?.let { " (${it}p)" } ?: "")
             callback(
                 newExtractorLink(pick.source, linkName, pick.url, pick.type) {
                     this.referer = pick.referer
@@ -1116,12 +1123,11 @@ class SezonlukDizi : MainAPI() {
                     this.headers = pick.headers
                 }
             )
-            emitted.add(dil)
             return true
         }
 
         // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
-        suspend fun emit(dil: String, embed0: String): Boolean {
+        suspend fun emit(dil: String, embed0: String, srcName: String = ""): Boolean {
             var embed = embed0
             if (embed.isBlank()) return false
             if (embed.contains("reCAPTCHA", true)) {
@@ -1132,6 +1138,7 @@ class SezonlukDizi : MainAPI() {
                 embed = inner
             }
             if (!seen.add(embed)) return false
+            val src = srcLabel(embed, srcName)
             val buf = ArrayList<ExtractorLink>()
             val collect: (ExtractorLink) -> Unit = { l -> synchronized(buf) { buf.add(l) } }
             val ok: Boolean
@@ -1139,10 +1146,10 @@ class SezonlukDizi : MainAPI() {
             if (Regex("""\.m3u8(\?|$)""").containsMatchIn(embed)) {
                 val full = abs(embed)
                 emitM3u8(full, dilName(dil), full, collect)
-                ok = flush(dil, buf)
+                ok = flush(dil, buf, src)
             } else {
                 val r = emitEmbed(embed, dilName(dil), subtitleCallback, collect)
-                ok = r && flush(dil, buf)
+                ok = r && flush(dil, buf, src)
             }
             d("kaynak ${dilName(dil)} $embed -> $ok")
             if (ok) {
@@ -1202,7 +1209,7 @@ class SezonlukDizi : MainAPI() {
                 gatedSeen = true
                 lastGateUrl = f
             }
-            val ok = emit(dil, f)
+            val ok = emit(dil, f, nm)
             if (cap && !ok) retryQ.add(Triple(dil, id, ref))
             if (ok) {
                 if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
@@ -1311,7 +1318,6 @@ class SezonlukDizi : MainAPI() {
         while (more) {
             more = false
             for (dil in listOf("0", "1")) {
-                if (dil in got) continue
                 val q = queues[dil] ?: continue
                 val i = pos[dil] ?: 0
                 if (i >= q.size) continue
