@@ -552,7 +552,7 @@ class SezonlukDizi : MainAPI() {
                     Regex("""zz-asla-eslesmez-zz"""),
                     userAgent = null,
                     useOkhttp = false,
-                    timeout = 12_000L
+                    timeout = 30_000L
                 )
             )
         } catch (e: Exception) {
@@ -641,7 +641,13 @@ class SezonlukDizi : MainAPI() {
         }
         // (b) kapiyi WebView'de coz, adresi yeniden iste
         solveGate(ref, gateUrl)
-        val f2 = embedSrc(id, ref, true)
+        // Dogrulama sunucudaki oturuma yazilir; gec islenirse birkac kez yeniden sorulur
+        var f2 = embedSrc(id, ref, true)
+        for (k in 1..3) {
+            if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) break
+            try { Thread.sleep(2500L) } catch (e: Exception) { }
+            f2 = embedSrc(id, ref, true)
+        }
         note("vidmoly kapi sonrasi src=${f2.take(100)}")
         inner = if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) f2
         else try { captchaInner(f2.ifEmpty { gateUrl }, ref, true) } catch (e: Exception) { null }
