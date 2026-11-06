@@ -63,27 +63,40 @@ class YouTube : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Tüm YouTube linklerini topla, sadece en uygun TEK VP9 linkini ilet.
+        // Tüm YouTube linklerini topla.
         val all = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
         loadExtractor(data, subtitleCallback) { link -> all.add(link) }
+        val links = synchronized(all) { all.toList() }
 
-        val vp9 = synchronized(all) { all.toList() }.filter { it.name.contains("VP9", ignoreCase = true) }
+        var sent = false
 
-        // 720p ve altı; en yüksek olan seçilir (720p varsa 720p, yoksa 480p, yoksa 360p ...)
-        val best = vp9
+        // 1) En uygun TEK VP9 linki (720p ve altı). Sesi Cloudstream'in kendi
+        //    oynatıcısında ayrı ses parçası olarak gelir (video-only).
+        val best = links
+            .filter { it.name.contains("VP9", ignoreCase = true) }
             .map { it to heightOf(it) }
             .filter { (_, h) -> h in 1..720 }
             .sortedWith(
                 compareByDescending<Pair<ExtractorLink, Int>> { it.second }
-                    .thenBy { fps60Itags.contains(itagOf(it.first)) } // 720p60 yerine normal 720p
+                    .thenBy { fps60Itags.contains(itagOf(it.first)) }
             )
             .firstOrNull()?.first
-
         if (best != null) {
             callback(best)
-            return true
+            sent = true
         }
-        return false
+
+        // 2) VLC / MX Player gibi harici oynatıcılar için SESLİ (muxed) linkler.
+        //    itag 22 = 720p mp4 (video+ses), itag 18 = 360p mp4 (video+ses).
+        val muxed = links
+            .filter { itagOf(it) in muxedItags }
+            .sortedByDescending { itagOf(it) } // önce 22, sonra 18
+        for (m in muxed) {
+            callback(m)
+            sent = true
+        }
+
+        return sent
     }
 
     // ---------- Yardımcılar ----------
@@ -96,6 +109,8 @@ class YouTube : MainAPI() {
         330 to 144, 331 to 240, 332 to 360, 333 to 480, 334 to 720, 335 to 1080,
         336 to 1440, 337 to 2160
     )
+    // Video + ses birlikte gelen klasik YouTube formatları
+    private val muxedItags = setOf(18, 22)
     private val fps60Itags = setOf(302, 303, 308, 315, 334, 335, 336, 337)
 
     private fun itagOf(link: ExtractorLink): Int? =
