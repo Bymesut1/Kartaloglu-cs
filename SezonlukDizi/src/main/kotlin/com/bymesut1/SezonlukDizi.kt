@@ -520,19 +520,44 @@ class SezonlukDizi : MainAPI() {
     }
 
     // ---- Turnstile kapisi (Vidmoly kaynagi bu kapinin arkasinda) ----
-    // Kapi adresi gorunmez WebView'de acilir ve kendi kendine cozmesi icin sure taninir.
-    // useOkhttp = false: WebView kendi ag yigini ve cerez yoneticisini kullanir, dogrulama cerezi
-    // WebView'in CookieManager'ina yazilir; sonra geri alinip oturum cerezlerine eklenir.
-    // Kapi sayfasi acilirken Vidmoly'ye giden istek (embed ya da .m3u8) yakalanir; dogrulama gecilince oynatici yuklenir.
-    private val vmCapture = Regex("""(?i)(vmpx\.|vidmoly\.[a-z]+/(?:embed-|embed/|w/|e/)|\.m3u8)""")
+    // /ajax/reCAPTCHADATA.asp tek basina bir sayfa degil, bolum sayfasinin icine gomulen bir parca; bu yuzden
+    // kapi adresi tek basina acilinca Vidmoly istegi hic gelmiyordu. Simdi gorunmez WebView'de BOLUM SAYFASININ
+    // kendisi acilir, enjekte edilen JS "VidMoly" alternatifine tiklar ve sitenin kendi akisi (kapi -> iframe)
+    // calisir. Vidmoly'ye giden .m3u8 (ya da embed) istegi yakalanir.
+    // useOkhttp = false: WebView kendi ag yigini ve cerez yoneticisini kullanir; dogrulama cerezi
+    // WebView'in CookieManager'ina yazilir, sonra geri alinip oturum cerezlerine eklenir.
+    private val vmM3u8 = Regex("""(?i)\.m3u8""")
+    private val vmEmbed = Regex("""(?i)vidmoly\.[a-z]+/(?:embed-|embed/|w/|e/)""")
     @Volatile private var vmRef: String = "https://vidmoly.biz/"
 
+    // Alternatifler ajax ile gec geldigi icin 0,7 sn arayla ~42 sn boyunca "VidMoly" dugmesi aranir; bulununca bir kez tiklanir
+    private val vmClickJs = """
+        (function(){
+          if (window.__vmGo) return 'zaten';
+          window.__vmGo = 1;
+          var n = 0;
+          var t = setInterval(function(){
+            n++;
+            if (n > 60) { clearInterval(t); return; }
+            var all = document.querySelectorAll('a,button,div,span,li,label');
+            var hit = null;
+            for (var i = 0; i < all.length; i++) {
+              var el = all[i];
+              var tx = (el.textContent || '').trim().toLowerCase();
+              if (tx.indexOf('vidmoly') === 0 && tx.length < 20 && (!hit || hit.contains(el))) hit = el;
+            }
+            if (hit) {
+              clearInterval(t);
+              ['mousedown','mouseup','click'].forEach(function(e){
+                hit.dispatchEvent(new MouseEvent(e, {bubbles:true, cancelable:true, view:window}));
+              });
+            }
+          }, 700);
+          return 'basladi';
+        })();
+    """.trimIndent()
+
     private suspend fun solveGate(ref: String, gateUrl: String): String? {
-        val gate = when {
-            gateUrl.startsWith("//") -> "https:$gateUrl"
-            gateUrl.startsWith("/") -> mainUrl + gateUrl
-            else -> gateUrl
-        }
         val cm = try { android.webkit.CookieManager.getInstance() } catch (e: Throwable) { null }
         try {
             cm?.setAcceptCookie(true)
@@ -543,20 +568,26 @@ class SezonlukDizi : MainAPI() {
         var captured: String? = null
         try {
             val r = WebViewResolver(
-                vmCapture,
+                vmM3u8,
+                additionalUrls = listOf(vmEmbed),
                 userAgent = null,
                 useOkhttp = false,
-                timeout = 45_000L
-            ).resolveUsingWebView(gate, ref)
+                script = vmClickJs,
+                timeout = 50_000L
+            ).resolveUsingWebView(ref, "$mainUrl/")
             val req = r.first
+                ?: r.second.firstOrNull {
+                    val s = it.url.toString()
+                    !s.contains("sezonlukdizi", true) && vmEmbed.containsMatchIn(s)
+                }
             val u = req?.url?.toString().orEmpty()
-            if (u.isNotEmpty() && !u.contains("sezonlukdizi", true) && vmCapture.containsMatchIn(u)) {
+            if (u.isNotEmpty() && !u.contains("sezonlukdizi", true)) {
                 captured = u
                 val rf = req?.header("Referer").orEmpty()
                 if (rf.contains("vidmoly", true)) vmRef = rf
                 note("kapi yakalama tamam: ${u.take(110)}")
             } else {
-                note("kapi yakalama bos (45 sn icinde Vidmoly istegi gelmedi)")
+                note("kapi yakalama bos (50 sn icinde Vidmoly istegi gelmedi)")
             }
         } catch (e: Exception) {
             note("kapi yakalama hata: ${e.message}")
