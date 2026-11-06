@@ -269,6 +269,11 @@ class SezonlukDizi : MainAPI() {
     // Captcha kapi sayfasi bolum basina yalnizca bir kez incelenir (hiz icin)
     private val gateProbed = AtomicBoolean(false)
 
+    // Hata ayiklama: Vidmoly cikmazsa sebebi kaynak listesinde "DEBUG" satiri olarak gorunur. Sorun cozulunce false yap.
+    private val debug = true
+    private val dbgNotes = java.util.Collections.synchronizedList(ArrayList<String>())
+    private fun note(m: String) { dbgNotes.add(m.replace("\n", " ").take(200)); lg(m) }
+
     private fun originOf(u: String): String =
         Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
 
@@ -625,6 +630,7 @@ class SezonlukDizi : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         gateProbed.set(false)
+        dbgNotes.clear()
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
         // Calisan surumdeki gibi: her dil icin o dilin kendi bolum sayfasi (Dublaj: /dublaj/, Altyazi: normal) acilir;
         // oturum cerezleri iki sayfadan toplanir, bid ve Referer o dilin sayfasindan alinir (kapi bunu kontrol ediyor).
@@ -656,7 +662,7 @@ class SezonlukDizi : MainAPI() {
         for ((dil, etiket) in diller) {
             val ref = sayfalar[dil] ?: data
             val alts = alternatifGetir(bidler[dil] ?: bidYedek, dil, ref)
-            lg("dil=$dil alternatifler=" + alts.joinToString(",") { it.baslik })
+            note("dil=$dil bid=${bidler[dil] ?: bidYedek} alt=" + alts.joinToString(",") { it.baslik })
             // Her dilde yalnizca ilk Filemoon gosterilir (sitedeki ayni adli ek Filemoon'lar atlanir)
             var filemoonSayisi = 0
             for (veri in alts) {
@@ -668,6 +674,7 @@ class SezonlukDizi : MainAPI() {
         }
 
         var any = false
+        var vidmolyVar = false
         val goruldu = HashSet<String>()
         for (i in isler.filter { !it.vidmoly } + isler.filter { it.vidmoly }) {
             val links = try { kaynakCoz(i.veri, i.etiket, i.ref, subtitleCallback) } catch (e: Exception) { emptyList() }
@@ -675,7 +682,21 @@ class SezonlukDizi : MainAPI() {
                 if (goruldu.add(l.name + "|" + l.url)) {
                     callback(l)
                     any = true
+                    if (i.vidmoly) vidmolyVar = true
                 }
+            }
+        }
+
+        // Vidmoly cikmadiysa sebebi listeye DEBUG satiri olarak eklenir
+        if (debug && !vidmolyVar) {
+            val notlar = synchronized(dbgNotes) { ArrayList(dbgNotes) }
+            notlar.chunked(2).take(4).forEachIndexed { n, grup ->
+                callback(
+                    newExtractorLink(name, "DEBUG ${n + 1} [Vidmoly yok] " + grup.joinToString(" | ").take(480), "https://debug.invalid/$n", ExtractorLinkType.VIDEO) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
         return any
@@ -708,11 +729,12 @@ class SezonlukDizi : MainAPI() {
             val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
             val kaynakAdi = "$etiket - $gorunenAd"
             var src = embedSrc(veri.id, ref)
+            if (vm) note("$etiket vidmoly id=${veri.id} src=${src.take(90)}")
 
             // bazi alternatifler (Pixel) reCAPTCHA kapisi dondurur, atla; Vidmoly icin kapi asilmaya calisilir
             if (src.contains("reCAPTCHA", ignoreCase = true)) {
                 if (!vm) return out
-                src = resolveGate(src, ref, veri.id) ?: return out
+                src = resolveGate(src, ref, veri.id) ?: run { note("$etiket vidmoly kapi cozulemedi"); return out }
             }
             if (src.isEmpty()) return out
             val iframe = when {
@@ -721,11 +743,16 @@ class SezonlukDizi : MainAPI() {
                 else -> fixUrlNull(src) ?: return out
             }
 
-            emitSource(iframe, kaynakAdi, subtitleCallback) { synchronized(out) { out.add(it) } }
+            val ok = emitSource(iframe, kaynakAdi, subtitleCallback) { synchronized(out) { out.add(it) } }
+            if (vm) note("$etiket vidmoly ${iframe.take(70)} cikarma=$ok")
         } catch (e: Exception) {
             lg("kaynakCoz hata ${veri.baslik}: ${e.message}")
         }
-        return synchronized(out) { ArrayList(out) }
+        // Bir kaynak icin TEK baglanti: Byse/Vidmoly kalite varyantlari ayni adla tekrar liste doldurmasin
+        val tek = synchronized(out) {
+            out.firstOrNull { it.url.contains("master.m3u8", true) } ?: out.maxByOrNull { it.quality } ?: out.firstOrNull()
+        }
+        return if (tek == null) emptyList() else listOf(tek)
     }
 
     data class Kaynak(val status: String = "", val data: List<KaynakData>? = null)
