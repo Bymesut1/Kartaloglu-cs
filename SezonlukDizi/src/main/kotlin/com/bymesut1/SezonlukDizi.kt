@@ -33,6 +33,8 @@ class SezonlukDizi : MainAPI() {
     private val debug = false
     // Sadece hiç bağlantı bulunamayınca sebebi hata mesajı olarak gösterir (çalışan bölümlere DEBUG satırı eklemez)
     private val failDebug = true
+    // Bir bölümde çalışmayan kaynak varsa nedeni kaynak listesinde kısa "DEBUG" satırları olarak gösterir (logcat gerekmesin diye)
+    private val showSrcDebug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
@@ -660,20 +662,36 @@ class SezonlukDizi : MainAPI() {
         m3u8: String,
         label: String,
         embed: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        hdrs: Map<String, String>? = null
     ) {
         val origin = originOf(embed)
         callback(
             newExtractorLink(name, "$label - ${hostLabel(embed)}", m3u8, ExtractorLinkType.M3U8) {
                 this.referer = "$origin/"
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf(
+                this.headers = hdrs ?: mapOf(
                     "User-Agent" to ua,
                     "Referer" to "$origin/",
                     "Origin" to origin
                 )
             }
         )
+    }
+
+    // m3u8 adresini farklı başlık kombinasyonlarıyla dener; 200 + #EXTM3U dönen ilk kombinasyonu verir (yoksa null).
+    // "Sunucu hatası 2004" (403/404) gibi oynatma hatalarını listeye eklemeden önce yakalamak için.
+    private suspend fun probeM3u8(url: String, variants: List<Map<String, String>>): Map<String, String>? {
+        for (h in variants) {
+            try {
+                val r = app.get(url, headers = h, timeout = 8L)
+                if (r.code in 200..299 && r.text.trimStart().startsWith("#EXTM3U")) return h
+                d("m3u8 probe kod=${r.code} başlık=${h.keys.joinToString(",")}")
+            } catch (e: Exception) {
+                d("m3u8 probe hata ${e.javaClass.simpleName}")
+            }
+        }
+        return null
     }
 
     // ---- bysejikuar.com (Byse) oynatıcısı: API şifreli (AES-256-GCM) JSON döndürür ----
@@ -837,6 +855,12 @@ class SezonlukDizi : MainAPI() {
         // Alan adı sık değişir: önce gelen adres, olmazsa aynı kimlikle diğer alan adları denenir
         val hosts = (listOf(host0) + listOf("vidmoly.biz", "vidmoly.to", "vidmoly.me", "vidmoly.net")).distinct()
 
+        // Hiçbir başlık kombinasyonu doğrulanamazsa son çare olarak yine de verilir
+        var fbLink: String? = null
+        var fbTag = label
+        var fbOrigin = ""
+        var fbHdr: Map<String, String> = emptyMap()
+
         for (host in hosts) {
             val url = when {
                 host == host0 -> embed
@@ -863,20 +887,43 @@ class SezonlukDizi : MainAPI() {
                 continue
             }
             val link = m3u8.replace("&amp;", "&")
-            val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
             // Sayfada: label: "720p HD"
             val q = Regex("""label\s*:\s*["'](\d{3,4})p""").find(clean)?.groupValues?.get(1)
             val tag = if (q != null) "$label ${q}p" else label
 
+            val variants = listOf(
+                mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin),
+                mapOf("User-Agent" to ua, "Referer" to "$origin/"),
+                mapOf("User-Agent" to ua, "Referer" to url),
+                mapOf("Referer" to "$origin/", "Origin" to origin)
+            )
+            val good = probeM3u8(link, variants)
+            if (good == null) {
+                d("vidmoly $host m3u8 doğrulanamadı")
+                if (fbLink == null) {
+                    fbLink = link
+                    fbTag = tag
+                    fbOrigin = origin
+                    fbHdr = variants[0]
+                }
+                continue
+            }
+
             // Ana (master) liste: oynatıcı kaliteyi kendi seçer
-            emitM3u8(link, tag, "$origin/", callback)
+            emitM3u8(link, tag, "$origin/", callback, good)
             // Kalite adlarını (720p vb.) görebilmek için alt listeler de eklenir
             try {
-                M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
+                M3u8Helper.generateM3u8(name, link, "$origin/", headers = good)
                     .forEach { callback(relabel(it, label)) }
             } catch (e: Exception) {
             }
-            d("vidmoly $host tamam")
+            d("vidmoly $host tamam (başlık=${good.keys.joinToString(",")})")
+            return true
+        }
+        val fl = fbLink
+        if (fl != null) {
+            emitM3u8(fl, fbTag, "$fbOrigin/", callback, fbHdr)
+            d("vidmoly doğrulanamayan bağlantı yine de eklendi")
             return true
         }
         return false
@@ -884,8 +931,9 @@ class SezonlukDizi : MainAPI() {
 
     // Bir gömülü oynatıcı adresini çözer. Sırayla:
     // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
-    // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
+    // 2) Sayfayı açıp içindeki .m3u8 / .mp4 adresini bulmak
     // 3) Görünmez WebView ile sayfayı çalıştırıp ağdan geçen .m3u8'i yakalamak
+    // Başarısız olursa nedeni d() ile kaydedilir (DEBUG satırında görünür).
     private suspend fun emitEmbed(
         embed: String,
         label: String,
@@ -898,6 +946,7 @@ class SezonlukDizi : MainAPI() {
             else -> embed
         }
         if (!u.startsWith("http")) return false
+        val why = StringBuilder()
 
         // 0) Byse (bysejikuar.com): CloudStream'de hazır çözücü yok, kendi çözücümüz
         if (u.contains("byse", ignoreCase = true)) {
@@ -908,6 +957,7 @@ class SezonlukDizi : MainAPI() {
                 false
             }
             if (okByse) return true
+            why.append("byse yok; ")
         }
 
         // 0b) Vidmoly: kendi çözücümüz; olmazsa aşağıdaki hazır çözücüye düşer
@@ -919,6 +969,7 @@ class SezonlukDizi : MainAPI() {
                 false
             }
             if (okVm) return true
+            why.append("vidmoly yok; ")
         }
 
         // 1) hazır çözücüler
@@ -926,13 +977,15 @@ class SezonlukDizi : MainAPI() {
         try {
             loadExtractor(u, "$mainUrl/", subtitleCallback) { synchronized(tmp) { tmp.add(it) } }
         } catch (e: Exception) {
+            why.append("çözücü hata ${e.javaClass.simpleName}; ")
         }
         if (tmp.isNotEmpty()) {
             tmp.forEach { callback(relabel(it, label)) }
             return true
         }
+        why.append("çözücü=0; ")
 
-        // 2) CloudflareKiller ile sayfayı aç, .m3u8 ara
+        // 2) sayfayı aç, .m3u8 / .mp4 ara
         try {
             val page = app.get(u, referer = "$mainUrl/", timeout = 10L)
                 .text.replace("\\/", "/").replace("\\u002F", "/").replace("\\u0026", "&")
@@ -956,7 +1009,9 @@ class SezonlukDizi : MainAPI() {
                 )
                 return true
             }
+            why.append("sayfa=${page.length} m3u8/mp4 yok; ")
         } catch (e: Exception) {
+            why.append("sayfa hata ${e.javaClass.simpleName}; ")
         }
 
         // 3) WebView ile yakala
@@ -971,9 +1026,14 @@ class SezonlukDizi : MainAPI() {
                     emitM3u8(r.url, label, u, callback)
                     return true
                 }
+                why.append("webview m3u8 yakalamadı; ")
             } catch (e: Exception) {
+                why.append("webview hata ${e.javaClass.simpleName}; ")
             }
+        } else {
+            why.append("webview hakkı bitti; ")
         }
+        d("emit ${hostLabel(u)} yok: $why")
         return false
     }
 
@@ -1086,7 +1146,7 @@ class SezonlukDizi : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        webviewLeft.set(3)
+        webviewLeft.set(4)
         gateProbed.set(false)
         dbg.clear()
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
@@ -1194,9 +1254,12 @@ class SezonlukDizi : MainAPI() {
         // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
         var gatedSeen = false
         var lastGateUrl: String? = null
-        suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
+        val nameOf = HashMap<String, String>()   // kaynak id -> sitedeki adı (Dzen, Pixel, Okru ...)
+        suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm0: String = "", idx: Int = -1) {
+            val nm = nm0.ifBlank { nameOf[id].orEmpty() }
+            if (nm.isNotBlank()) nameOf[id] = nm
             val (f, raw) = fetchEmbed(id, ref)
-            val tag = "$tagPrefix$dil:$id"
+            val tag = "$tagPrefix${if (dil == "0") "D" else "A"}:${nm.ifBlank { id }}"
             if (f.isNullOrBlank()) {
                 srcLog.add("$tag BOŞ[${short(raw)}]")
                 retryQ.add(Triple(dil, id, ref))
@@ -1329,20 +1392,37 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir
-        if (gatedSeen && listOf("0", "1").any { it !in got } && System.currentTimeMillis() >= gateFailUntil) {
-            solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
+        // 3) Captcha kapısına takılan / boş dönen kaynaklar (Dzen, Pixel, Okru, Vidmoly ...): kapı bir kez çözülür
+        //    (WebView), sonra bekleyen BÜTÜN kaynaklar yeniden istenir. Doğrulama çerezi 15 dk saklanır, sonraki bölümler hızlı açılır.
+        run {
+            val pending = retryQ.distinctBy { it.first + "|" + it.second }
+            if (pending.isEmpty()) return@run
+            retryQ.clear()
+            val gated = gatedSeen
+            if (gated && System.currentTimeMillis() >= gateFailUntil) {
+                solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
+            }
+            val okBefore = okCnt.values.sum()
+            for ((dil, id, ref) in pending) {
+                try { Thread.sleep(800) } catch (e: Exception) { }
+                tryId(dil, id, ref, "R ")
+            }
+            if (gated) {
+                if (okCnt.values.sum() > okBefore) {
+                    gateCookies = sessionCookies
+                    gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+                } else {
+                    gateFailUntil = System.currentTimeMillis() + 90_000L
+                }
+            }
         }
+        // Hâlâ kaynağı çıkmayan dil kaldıysa bekleyerek bir kez daha denenir
         for (dil in listOf("0", "1")) {
             if (dil in got) continue
-            val todo = retryQ.filter { it.first == dil }.take(4)
-            for (attempt in 1..2) {
+            for ((_, id, ref) in retryQ.filter { it.first == dil }.take(4)) {
                 if (dil in got) break
-                for ((_, id, ref) in todo) {
-                    if (dil in got) break
-                    try { Thread.sleep(1500L * attempt) } catch (e: Exception) { }
-                    tryId(dil, id, ref, "R$attempt ")
-                }
+                try { Thread.sleep(1500L) } catch (e: Exception) { }
+                tryId(dil, id, ref, "R2 ")
             }
         }
 
@@ -1351,6 +1431,7 @@ class SezonlukDizi : MainAPI() {
         //    (b) olmazsa kapının tam adresi WebView'de açılıp çözülür (useOkhttp = false), adres yeniden istenir.
         if (vidmolyExtra) {
             for (dil in listOf("0", "1")) {
+                if (emitted.contains("$dil|vidmoly")) continue
                 val cand = queues[dil]?.firstOrNull { it.second.contains("vidmoly", true) } ?: continue
                 val ref = refs[dil] ?: data
                 var f = fetchEmbed(cand.first, ref).first
@@ -1406,6 +1487,24 @@ class SezonlukDizi : MainAPI() {
                     )
                     any = true
                 }
+            }
+        }
+
+        // Çalışmayan kaynak varsa nedeni kısa DEBUG satırlarıyla göster (ekran görüntüsü yeter)
+        if (showSrcDebug && srcLog.any { it.contains(" yok") || it.contains("BOŞ") }) {
+            val dl = listOf(
+                "kaynaklar: " + srcLog.joinToString(" ; "),
+                "neden: " + dbg.filter { it.startsWith("emit") || it.startsWith("byse") || it.startsWith("vidmoly") || it.startsWith("m3u8") }
+                    .takeLast(10).joinToString(" / "),
+                "kapı: " + dbg.filter { it.startsWith("captcha") }.takeLast(6).joinToString(" / ")
+            )
+            for ((i, line) in dl.withIndex()) {
+                callback(
+                    newExtractorLink(name, "DEBUG ${i + 1} " + line.take(520), "https://debug.invalid/s$i", ExtractorLinkType.VIDEO) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
