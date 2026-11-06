@@ -1,5 +1,5 @@
 // Sürüm numarası: her güncellemede 1 artır
-version = 21
+version = 22
 
 android {
     namespace = "com.bymesut1.sezonlukdizi"
