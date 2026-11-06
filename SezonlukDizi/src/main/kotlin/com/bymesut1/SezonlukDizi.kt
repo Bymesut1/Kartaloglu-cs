@@ -520,79 +520,43 @@ class SezonlukDizi : MainAPI() {
     }
 
     // ---- Turnstile kapisi (Vidmoly kaynagi bu kapinin arkasinda) ----
-    // /ajax/reCAPTCHADATA.asp tek basina bir sayfa degil, bolum sayfasinin icine gomulen bir parca; bu yuzden
-    // kapi adresi tek basina acilinca Vidmoly istegi hic gelmiyordu. Simdi gorunmez WebView'de BOLUM SAYFASININ
-    // kendisi acilir, enjekte edilen JS "VidMoly" alternatifine tiklar ve sitenin kendi akisi (kapi -> iframe)
-    // calisir. Vidmoly'ye giden .m3u8 (ya da embed) istegi yakalanir.
-    // useOkhttp = false: WebView kendi ag yigini ve cerez yoneticisini kullanir; dogrulama cerezi
-    // WebView'in CookieManager'ina yazilir, sonra geri alinip oturum cerezlerine eklenir.
-    private val vmM3u8 = Regex("""(?i)\.m3u8""")
-    private val vmEmbed = Regex("""(?i)vidmoly\.[a-z]+/(?:embed-|embed/|w/|e/)""")
+    // Calisan surumdeki yontem: dataEmbed'in dondurdugu kapi adresi (/ajax/reCAPTCHADATA.asp) gorunmez WebView'de
+    // BIR SAYFA OLARAK acilir; Turnstile kendi kendine cozulur ve dogrulama cerezi WebView'in CookieManager'ina yazilir.
+    // useOkhttp = false: WebView kendi ag yigini ve cerez yoneticisini kullanir (gercek tarayici gibi).
+    // Sonra cerezler geri alinir ve cagiran taraf embed adresini yeniden isteyip dogrular.
     @Volatile private var vmRef: String = "https://vidmoly.biz/"
 
-    // Alternatifler ajax ile gec geldigi icin 0,7 sn arayla ~42 sn boyunca "VidMoly" dugmesi aranir; bulununca bir kez tiklanir
-    private val vmClickJs = """
-        (function(){
-          if (window.__vmGo) return 'zaten';
-          window.__vmGo = 1;
-          var n = 0;
-          var t = setInterval(function(){
-            n++;
-            if (n > 60) { clearInterval(t); return; }
-            var all = document.querySelectorAll('a,button,div,span,li,label');
-            var hit = null;
-            for (var i = 0; i < all.length; i++) {
-              var el = all[i];
-              var tx = (el.textContent || '').trim().toLowerCase();
-              if (tx.indexOf('vidmoly') === 0 && tx.length < 20 && (!hit || hit.contains(el))) hit = el;
-            }
-            if (hit) {
-              clearInterval(t);
-              ['mousedown','mouseup','click'].forEach(function(e){
-                hit.dispatchEvent(new MouseEvent(e, {bubbles:true, cancelable:true, view:window}));
-              });
-            }
-          }, 700);
-          return 'basladi';
-        })();
-    """.trimIndent()
-
-    private suspend fun solveGate(ref: String, gateUrl: String): String? {
+    private suspend fun solveGate(ref: String, gateUrl: String) {
+        val gate = when {
+            gateUrl.startsWith("//") -> "https:$gateUrl"
+            gateUrl.startsWith("/") -> mainUrl + gateUrl
+            else -> gateUrl
+        }
         val cm = try { android.webkit.CookieManager.getInstance() } catch (e: Throwable) { null }
         try {
             cm?.setAcceptCookie(true)
             sessionCookies.forEach { (k, v) -> cm?.setCookie(mainUrl, "$k=$v; Path=/") }
-            // Site VidMoly alternatifini bu cerezle hatirliyor (DevTools'ta goruldu)
-            cm?.setCookie(mainUrl, "alternatif=VidMoly; Path=/")
             cm?.flush()
         } catch (e: Throwable) {
+            note("captcha cerez hata ${e.javaClass.simpleName}")
         }
-        var captured: String? = null
+        note("captcha kapi=${gate.take(120)}")
+        val t0 = System.currentTimeMillis()
         try {
-            val r = WebViewResolver(
-                vmM3u8,
-                additionalUrls = listOf(vmEmbed),
-                userAgent = null,
-                useOkhttp = false,
-                script = vmClickJs,
-                timeout = 50_000L
-            ).resolveUsingWebView(ref, "$mainUrl/")
-            val req = r.first
-                ?: r.second.firstOrNull {
-                    val s = it.url.toString()
-                    !s.contains("sezonlukdizi", true) && vmEmbed.containsMatchIn(s)
-                }
-            val u = req?.url?.toString().orEmpty()
-            if (u.isNotEmpty() && !u.contains("sezonlukdizi", true)) {
-                captured = u
-                val rf = req?.header("Referer").orEmpty()
-                if (rf.contains("vidmoly", true)) vmRef = rf
-                note("kapi yakalama tamam: ${u.take(110)}")
-            } else {
-                note("kapi yakalama bos (50 sn icinde Vidmoly istegi gelmedi)")
-            }
+            app.get(
+                gate,
+                headers = hdr(),
+                referer = ref,
+                cookies = sessionCookies,
+                interceptor = WebViewResolver(
+                    Regex("""zz-asla-eslesmez-zz"""),
+                    userAgent = null,
+                    useOkhttp = false,
+                    timeout = 12_000L
+                )
+            )
         } catch (e: Exception) {
-            note("kapi yakalama hata: ${e.message}")
+            note("captcha webview ${e.javaClass.simpleName}")
         }
         try {
             val before = sessionCookies.size
@@ -600,10 +564,10 @@ class SezonlukDizi : MainAPI() {
                 val kv = c.trim().split("=", limit = 2)
                 if (kv.size == 2 && kv[0].isNotBlank()) sessionCookies = sessionCookies + (kv[0] to kv[1])
             }
-            lg("kapi webview bitti cerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",")}")
+            note("captcha cozum denendi sure=${System.currentTimeMillis() - t0}ms cerez $before->${sessionCookies.size}")
         } catch (e: Throwable) {
+            note("captcha cerez geri alma hata ${e.javaClass.simpleName}")
         }
-        return captured
     }
 
     // Kapi adresinin icinde ya da (oturum cerezleriyle acilan) sayfasinda gercek oynatici adresi var mi bakar
@@ -629,14 +593,14 @@ class SezonlukDizi : MainAPI() {
     }
 
     // Embed adresini ister (Cloudflare 1015 hiz siniri gelirse kisa bekleyip tekrar dener).
-    // vm=true ise "alternatif=VidMoly" cerezi eklenir; bos donerse cevap govdesi DEBUG'a yazilir.
+    // vm=true ve cevap bossa govde DEBUG'a yazilir.
     private suspend fun embedSrc(id: Int, ref: String, vm: Boolean = false): String {
         for (att in 0..2) {
             val r = try {
                 app.post(
                     "${mainUrl}/ajax/dataEmbed22.asp",
                     headers = mapOf("User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
-                    cookies = if (vm) sessionCookies + ("alternatif" to "VidMoly") else sessionCookies,
+                    cookies = sessionCookies,
                     data = mapOf("id" to "$id")
                 )
             } catch (e: Exception) {
@@ -659,39 +623,36 @@ class SezonlukDizi : MainAPI() {
 
     // Kapi (reCAPTCHA / Turnstile) donen bir Vidmoly adresinden gercek oynatici adresini cikarir
     private suspend fun resolveGate(gateUrl: String, ref: String, id: Int): String? {
-        lg("vidmoly kapi url=$gateUrl")
+        note("vidmoly kapi url=${gateUrl.take(100)}")
         // baska bir kaynak kapiyi az once cozduyse, cerezlerle dogrudan yeniden dene
         if (System.currentTimeMillis() < gateOkUntil) {
             val again = embedSrc(id, ref, true)
             if (again.isNotEmpty() && !again.contains("reCAPTCHA", true)) return again
         }
+        // (a) adresin icinde / sayfasinda gercek adres var mi
         var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
         if (!inner.isNullOrBlank()) {
-            lg("vidmoly kapidan adres cikti: $inner")
+            note("vidmoly kapidan adres cikti")
             return inner
         }
         if (System.currentTimeMillis() < gateFailUntil) {
-            lg("vidmoly kapi yakin zamanda cozulemedi, atlandi")
+            note("vidmoly kapi yakin zamanda cozulemedi, atlandi")
             return null
         }
-        val cap = solveGate(ref, gateUrl)
-        if (!cap.isNullOrBlank()) {
-            gateCookies = sessionCookies
-            gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
-            lg("vidmoly kapi cozuldu (yakalandi): $cap")
-            return cap
-        }
+        // (b) kapiyi WebView'de coz, adresi yeniden iste
+        solveGate(ref, gateUrl)
         val f2 = embedSrc(id, ref, true)
+        note("vidmoly kapi sonrasi src=${f2.take(100)}")
         inner = if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) f2
         else try { captchaInner(f2.ifEmpty { gateUrl }, ref, true) } catch (e: Exception) { null }
         if (inner.isNullOrBlank()) {
-            gateFailUntil = System.currentTimeMillis() + 3 * 60_000L
-            lg("vidmoly kapi COZULEMEDI (sonraki deneme 3 dk sonra) f2=$f2")
+            gateFailUntil = System.currentTimeMillis() + 90_000L
+            note("vidmoly kapi COZULEMEDI")
             return null
         }
         gateCookies = sessionCookies
         gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
-        lg("vidmoly kapi cozuldu: $inner")
+        note("vidmoly kapi cozuldu")
         return inner
     }
 
