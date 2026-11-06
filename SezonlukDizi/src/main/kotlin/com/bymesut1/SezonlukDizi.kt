@@ -4,10 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -368,13 +364,12 @@ class SezonlukDizi : MainAPI() {
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
                     // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    // Hız: en çok 1,5 sn beklenir; yetişmeyen afişte sitenin afişi kalır (liste anında gelir)
-                    withTimeoutOrNull(1500L) {
-                        list.take(12).amap { c ->
-                            val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
-                            if (!tp.isNullOrBlank()) c.posterUrl = tp
-                            c
-                        }
+                    // Hız: her afiş isteğinin kendi kısa zaman aşımı (2 sn) var ve istekler paralel gider;
+                    // yetişmeyen afişte sitenin afişi kalır (kotlinx.coroutines bağımlılığı gerekmez)
+                    list.take(12).amap { c ->
+                        val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
+                        if (!tp.isNullOrBlank()) c.posterUrl = tp
+                        c
                     }
                 }
                 val out = newSearchResponseList(list, page < maxPage(doc))
@@ -1564,7 +1559,7 @@ class SezonlukDizi : MainAPI() {
     // Cloudflare "tarayıcı kontrolü" eklenti yüklenir yüklenmez arka planda geçilir; ilk arama 12-15 sn beklemez.
     // (Sınıfın en sonunda: tüm alanlar hazır olduktan sonra çalışır.)
     init {
-        CoroutineScope(Dispatchers.IO).launch {
+        ioSafe {
             try {
                 get(mainUrl, t = 10L)
             } catch (e: Throwable) {
