@@ -562,6 +562,8 @@ class SezonlukDizi : MainAPI() {
         try {
             cm?.setAcceptCookie(true)
             sessionCookies.forEach { (k, v) -> cm?.setCookie(mainUrl, "$k=$v; Path=/") }
+            // Site VidMoly alternatifini bu cerezle hatirliyor (DevTools'ta goruldu)
+            cm?.setCookie(mainUrl, "alternatif=VidMoly; Path=/")
             cm?.flush()
         } catch (e: Throwable) {
         }
@@ -626,23 +628,28 @@ class SezonlukDizi : MainAPI() {
         return null
     }
 
-    // Embed adresini ister (Cloudflare 1015 hiz siniri gelirse kisa bekleyip tekrar dener)
-    private suspend fun embedSrc(id: Int, ref: String): String {
+    // Embed adresini ister (Cloudflare 1015 hiz siniri gelirse kisa bekleyip tekrar dener).
+    // vm=true ise "alternatif=VidMoly" cerezi eklenir; bos donerse cevap govdesi DEBUG'a yazilir.
+    private suspend fun embedSrc(id: Int, ref: String, vm: Boolean = false): String {
         for (att in 0..2) {
             val r = try {
                 app.post(
                     "${mainUrl}/ajax/dataEmbed22.asp",
                     headers = mapOf("User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest", "Referer" to ref),
-                    cookies = sessionCookies,
+                    cookies = if (vm) sessionCookies + ("alternatif" to "VidMoly") else sessionCookies,
                     data = mapOf("id" to "$id")
                 )
             } catch (e: Exception) {
                 null
             }
             if (r != null && r.cookies.isNotEmpty()) sessionCookies = sessionCookies + r.cookies
-            val src = r?.document?.selectFirst("iframe")?.attr("src")?.trim().orEmpty()
-            if (src.isNotEmpty()) return src
             val raw = r?.text.orEmpty()
+            val src = r?.document?.selectFirst("iframe")?.attr("src")?.trim().orEmpty()
+                .ifEmpty {
+                    Regex("""(?:src|href)\s*=\s*["']([^"']+)["']""").find(raw)?.groupValues?.get(1)?.trim().orEmpty()
+                }
+            if (src.isNotEmpty()) return src
+            if (vm) note("embed bos id=$id http=${r?.code} govde=${raw.take(150)}")
             val limited = raw.contains("1015") || raw.contains("rate limit", true) || raw.contains("too many", true)
             if (!limited || att == 2) break
             try { Thread.sleep(3000L * (att + 1)) } catch (e: Exception) { }
@@ -655,7 +662,7 @@ class SezonlukDizi : MainAPI() {
         lg("vidmoly kapi url=$gateUrl")
         // baska bir kaynak kapiyi az once cozduyse, cerezlerle dogrudan yeniden dene
         if (System.currentTimeMillis() < gateOkUntil) {
-            val again = embedSrc(id, ref)
+            val again = embedSrc(id, ref, true)
             if (again.isNotEmpty() && !again.contains("reCAPTCHA", true)) return again
         }
         var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
@@ -674,7 +681,7 @@ class SezonlukDizi : MainAPI() {
             lg("vidmoly kapi cozuldu (yakalandi): $cap")
             return cap
         }
-        val f2 = embedSrc(id, ref)
+        val f2 = embedSrc(id, ref, true)
         inner = if (f2.isNotEmpty() && !f2.contains("reCAPTCHA", true)) f2
         else try { captchaInner(f2.ifEmpty { gateUrl }, ref, true) } catch (e: Exception) { null }
         if (inner.isNullOrBlank()) {
@@ -788,7 +795,7 @@ class SezonlukDizi : MainAPI() {
         try {
             val vm = veri.baslik.contains("vidmoly", ignoreCase = true)
             val kaynakAdi = "$etiket - $gorunenAd"
-            var src = embedSrc(veri.id, ref)
+            var src = embedSrc(veri.id, ref, vm)
             if (vm) note("$etiket vidmoly id=${veri.id} src=${src.take(90)}")
 
             // bazi alternatifler (Pixel) reCAPTCHA kapisi dondurur, atla; Vidmoly icin kapi asilmaya calisilir
