@@ -10,9 +10,6 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -74,7 +71,7 @@ class SezonlukDizi : MainAPI() {
     private suspend fun tmdbSearch(q: String): List<TmdbTvResult> = try {
         app.get(
             "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(q, "UTF-8")}",
-            timeout = 6L
+            timeout = 5L
         ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
     } catch (e: Exception) {
         emptyList()
@@ -83,14 +80,14 @@ class SezonlukDizi : MainAPI() {
     // Dizi ayrıntıları (Türkçe); özet Türkçe boşsa İngilizceden tamamlanır
     private suspend fun tmdbDetails(id: Int): TmdbTvDetails? {
         val tr = try {
-            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 6L)
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 5L)
                 .parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
             null
         } ?: return null
         if (!tr.overview.isNullOrBlank()) return tr
         val en = try {
-            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 6L).parsedSafe<TmdbTvDetails>()
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 5L).parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
             null
         }
@@ -127,7 +124,7 @@ class SezonlukDizi : MainAPI() {
     }
 
     private suspend fun tmdbSeason(id: Int, sn: Int, lang: String): Map<Int, TmdbEpisode> = try {
-        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 6L)
+        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 5L)
             .parsedSafe<TmdbSeasonDetails>()?.episodes.orEmpty()
             .mapNotNull { e -> e.episode_number?.let { it to e } }.toMap()
     } catch (e: Exception) {
@@ -216,26 +213,18 @@ class SezonlukDizi : MainAPI() {
         }
 
     // Ana sayfa ("/") "Son Çıkan" ve "Popüler" bölümlerinde ortak kullanılır: tek istek atılır, kısa süre önbellekte tutulur
-    private val homeMutex = Mutex()
     @Volatile private var homeDoc: Document? = null
     @Volatile private var homeAt = 0L
 
     private suspend fun homeDocument(): Document {
         val c = homeDoc
         if (c != null && System.currentTimeMillis() - homeAt < 120_000L) return c
-        return homeMutex.withLock {
-            val c2 = homeDoc
-            if (c2 != null && System.currentTimeMillis() - homeAt < 120_000L) {
-                c2
-            } else {
-                val d0 = fast(mainUrl).document
-                if (d0.select("a[href]").size > 5) {
-                    homeDoc = d0
-                    homeAt = System.currentTimeMillis()
-                }
-                d0
-            }
+        val d0 = fast(mainUrl).document
+        if (d0.select("a[href]").size > 5) {
+            homeDoc = d0
+            homeAt = System.currentTimeMillis()
         }
+        return d0
     }
 
     // Daha önce çalışan kaynakların adı / sırası: sonraki bölümlerde önce onlar denenir (hız için)
@@ -592,8 +581,8 @@ class SezonlukDizi : MainAPI() {
         var trMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
         var enMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
         if (tmdbOn && siteEps.isNotEmpty()) {
-            // TMDB yavaş / erişilemezse sayfa açılışını geciktirmesin: toplam 8 sn sınır
-            withTimeoutOrNull(8_000L) {
+            // TMDB istekleri kısa zaman aşımlı (5 sn) ve paralel; erişilemezse sayfa sitedeki bilgilerle açılır
+            run {
                 try {
                     val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
                     val m0 = tmdbMatch(title, counts)
@@ -811,7 +800,7 @@ class SezonlukDizi : MainAPI() {
         // Çalışan eklentideki gibi: sadece UA + Referer
         val h = mapOf("User-Agent" to ua, "Referer" to embed)
         val txt = try {
-            app.get("$origin/api/videos/$id", headers = h, timeout = 6L).text
+            app.get("$origin/api/videos/$id", headers = h, timeout = 5L).text
         } catch (e: Exception) {
             d("byse api hata: ${e.message}")
             return false
