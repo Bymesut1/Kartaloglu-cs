@@ -10,6 +10,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -71,7 +74,7 @@ class SezonlukDizi : MainAPI() {
     private suspend fun tmdbSearch(q: String): List<TmdbTvResult> = try {
         app.get(
             "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(q, "UTF-8")}",
-            timeout = 15L
+            timeout = 6L
         ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
     } catch (e: Exception) {
         emptyList()
@@ -80,14 +83,14 @@ class SezonlukDizi : MainAPI() {
     // Dizi ayrıntıları (Türkçe); özet Türkçe boşsa İngilizceden tamamlanır
     private suspend fun tmdbDetails(id: Int): TmdbTvDetails? {
         val tr = try {
-            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 15L)
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits", timeout = 6L)
                 .parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
             null
         } ?: return null
         if (!tr.overview.isNullOrBlank()) return tr
         val en = try {
-            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 15L).parsedSafe<TmdbTvDetails>()
+            app.get("$tmdbApi/tv/$id?api_key=$tmdbKey&language=en-US", timeout = 6L).parsedSafe<TmdbTvDetails>()
         } catch (e: Exception) {
             null
         }
@@ -124,7 +127,7 @@ class SezonlukDizi : MainAPI() {
     }
 
     private suspend fun tmdbSeason(id: Int, sn: Int, lang: String): Map<Int, TmdbEpisode> = try {
-        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 15L)
+        app.get("$tmdbApi/tv/$id/season/$sn?api_key=$tmdbKey&language=$lang", timeout = 6L)
             .parsedSafe<TmdbSeasonDetails>()?.episodes.orEmpty()
             .mapNotNull { e -> e.episode_number?.let { it to e } }.toMap()
     } catch (e: Exception) {
@@ -200,6 +203,40 @@ class SezonlukDizi : MainAPI() {
         } catch (e: Exception) {
             app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
         }
+
+    // HIZLI istek (liste / ana sayfa): önce doğrudan, kısa zaman aşımıyla denenir; WebView'li CloudflareKiller'a
+    // sadece gerçekten Cloudflare kontrol sayfası gelirse ya da istek hata verirse düşülür.
+    private suspend fun fast(url: String, referer: String = "$mainUrl/", t: Long = 8L) =
+        try {
+            val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
+            if (isChallenge(r.code, r.text)) throw Exception("cf")
+            r
+        } catch (e: Exception) {
+            get(url, referer)
+        }
+
+    // Ana sayfa ("/") "Son Çıkan" ve "Popüler" bölümlerinde ortak kullanılır: tek istek atılır, kısa süre önbellekte tutulur
+    private val homeMutex = Mutex()
+    @Volatile private var homeDoc: Document? = null
+    @Volatile private var homeAt = 0L
+
+    private suspend fun homeDocument(): Document {
+        val c = homeDoc
+        if (c != null && System.currentTimeMillis() - homeAt < 120_000L) return c
+        return homeMutex.withLock {
+            val c2 = homeDoc
+            if (c2 != null && System.currentTimeMillis() - homeAt < 120_000L) {
+                c2
+            } else {
+                val d0 = fast(mainUrl).document
+                if (d0.select("a[href]").size > 5) {
+                    homeDoc = d0
+                    homeAt = System.currentTimeMillis()
+                }
+                d0
+            }
+        }
+    }
 
     // Daha önce çalışan kaynakların adı / sırası: sonraki bölümlerde önce onlar denenir (hız için)
     private val goodKeys: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
@@ -309,7 +346,7 @@ class SezonlukDizi : MainAPI() {
         val key = request.data
         if (key == "soncikan" || key == "populer") {
             if (page > 1) return homeOf(request.name, emptyList(), false)
-            val doc = get(mainUrl).document
+            val doc = homeDocument()
             val list = if (key == "soncikan") {
                 cards(doc.selectFirst("#soncikan"))
             } else {
@@ -317,7 +354,7 @@ class SezonlukDizi : MainAPI() {
             }
             return homeOf(request.name, list, false)
         }
-        val doc = get("$key&s=$page").document
+        val doc = fast("$key&s=$page").document
         val list = cards(doc.selectFirst(".afis") ?: doc.body())
         return homeOf(request.name, list, list.isNotEmpty() && page < maxPage(doc))
     }
@@ -327,12 +364,80 @@ class SezonlukDizi : MainAPI() {
     // Aynı aramayı tekrar yapınca anında göstermek için önbellek
     private val searchCache = java.util.concurrent.ConcurrentHashMap<String, SearchResponseList>()
 
+    // Arama kartlarının afişini TMDB'den almak istemezsen false yap (arama biraz daha hızlı olur, sitenin afişi kalır)
+    private val searchTmdbPoster = true
+
+    // Ajax arama sonuçları tek sayfada gelir; bu sorgular için 2. sayfa boş döner
+    private val ajaxQueries: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private val reYearEnd = Regex("""\s*\((?:19|20)\d{2}\)\s*$""")
+
+    // /ajax/arama.asp (POST q=) -> {status, results:{<kategori>:{name, results:[{title,url,image}]}}}
+    // Bu uç Cloudflare'siz çalışıyor ve sitedeki TÜM dizileri (ör. Ben 10, Ben 10: Alien Force ...) döndürüyor.
+    private suspend fun ajaxSearch(q: String): List<SearchResponse> {
+        val arama = try {
+            app.post(
+                "$mainUrl/ajax/arama.asp",
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/"),
+                data = mapOf("q" to q),
+                timeout = 10L
+            ).parsedSafe<SzAramaYanit>()
+        } catch (e: Exception) {
+            d("ajax arama hata ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+        val out = LinkedHashMap<String, SearchResponse>()
+        arama?.results?.values?.forEach { g ->
+            g.results.orEmpty().forEach { r ->
+                val raw = r.url.trim()
+                if (!raw.contains("/diziler/")) return@forEach
+                val link = reSeries.find(raw)?.let { mainUrl + it.groupValues[1] } ?: abs(raw)
+                if (out.containsKey(link)) return@forEach
+                val title = r.title.replace(reYearEnd, "").trim()
+                if (title.isEmpty()) return@forEach
+                val img = r.image.trim().takeIf { it.isNotBlank() && !it.startsWith("data:") }?.let { abs(it) }
+                out[link] = newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
+                    this.posterUrl = img
+                }
+            }
+        }
+        d("ajax arama sonuç=${out.size}")
+        return out.values.toList()
+    }
+
+    // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
+    private suspend fun applyTmdbPosters(list: List<SearchResponse>) {
+        if (!tmdbOn || !searchTmdbPoster) return
+        list.take(12).amap { c ->
+            val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
+            if (!tp.isNullOrBlank()) c.posterUrl = tp
+            c
+        }
+    }
+
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
         val cacheKey = q.lowercase() + "|" + page
         searchCache[cacheKey]?.let { return it }
         dbg.clear()
+
+        // 1) Ajax arama (hızlı ve eksiksiz). Bulursa sayfalama gerekmez.
+        if (page == 1) {
+            val a = ajaxSearch(q)
+            if (a.isNotEmpty()) {
+                applyTmdbPosters(a)
+                val out = newSearchResponseList(a, false)
+                ajaxQueries.add(q.lowercase())
+                if (searchCache.size > 30) searchCache.clear()
+                searchCache[cacheKey] = out
+                return out
+            }
+        } else if (q.lowercase() in ajaxQueries) {
+            return newSearchResponseList(emptyList(), false)
+        }
+
+        // 2) Yedek: eski liste sayfası (diziler.asp?adi=)
         val sfx = if (page > 1) "&s=$page" else ""
         val urls = listOf(
             "$liste?adi=${encQ(q)}$sfx",
@@ -352,14 +457,7 @@ class SezonlukDizi : MainAPI() {
             val list = cards(doc.selectFirst(".afis") ?: doc.body())
             d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
             if (list.isNotEmpty()) {
-                if (tmdbOn) {
-                    // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    list.take(12).amap { c ->
-                        val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
-                        if (!tp.isNullOrBlank()) c.posterUrl = tp
-                        c
-                    }
-                }
+                applyTmdbPosters(list)
                 val out = newSearchResponseList(list, page < maxPage(doc))
                 if (searchCache.size > 30) searchCache.clear()
                 searchCache[cacheKey] = out
@@ -425,7 +523,18 @@ class SezonlukDizi : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val seriesUrl = resolveSeriesUrl(url)
-        val res = get(seriesUrl)
+        // Dizi sayfası ile bölümler sayfası aynı anda istenir (hız için). Bölümler sayfası tüm sezonları tek istekte verir.
+        val bolumUrl = "$mainUrl/bolumler/${seriesUrl.substringAfterLast("/")}"
+        val fetched = listOf(seriesUrl, bolumUrl).amap { u ->
+            try {
+                if (u == seriesUrl) get(u)
+                else app.get(u, headers = hdr(), referer = seriesUrl, timeout = 10L)
+            } catch (e: Exception) {
+                null
+            }
+        }
+        val res = fetched[0] ?: get(seriesUrl)
+        val bolumDoc = fetched[1]?.takeIf { it.code in 200..299 }?.document
         val html = res.text
         val doc = res.document
         val hint = slugOf(seriesUrl)
@@ -441,12 +550,15 @@ class SezonlukDizi : MainAPI() {
 
         val eps = LinkedHashMap<String, Episode>()
         parseEpisodes(doc, eps, hint)
+        // Hızlı yol: bölümler sayfasında bölüm bulunduysa sezon sezon ajax isteklerine gerek kalmaz
+        val bolumFound = bolumDoc?.let { parseEpisodes(it, eps, hint) } ?: 0
+        val fastOk = bolumFound > 0
 
         // Dizi numarası (did): sayfadaki did özelliği ya da poster adresinden (/i/dizi/y/b/2595.jpg)
         val did = Regex("""did\s*[=:]\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
             ?: Regex("""/i/dizi/(?:[a-z]/)+(\d+)\.jpg""").find(html)?.groupValues?.get(1)
 
-        if (did != null) {
+        if (did != null && !fastOk) {
             val endpoint = Regex("""/ajax/dataIzleBolumler\w*\.asp""").find(html)?.value
                 ?: "/ajax/dataIzleBolumler.asp"
 
@@ -480,18 +592,23 @@ class SezonlukDizi : MainAPI() {
         var trMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
         var enMap: Map<Int, Map<Int, TmdbEpisode>> = emptyMap()
         if (tmdbOn && siteEps.isNotEmpty()) {
-            try {
-                val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
-                tm = tmdbMatch(title, counts)
-                val tid = tm?.id
-                if (tid != null) {
-                    val rows = counts.keys.filter { it > 0 }.amap { sn ->
-                        Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+            // TMDB yavaş / erişilemezse sayfa açılışını geciktirmesin: toplam 8 sn sınır
+            withTimeoutOrNull(8_000L) {
+                try {
+                    val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
+                    val m0 = tmdbMatch(title, counts)
+                    val tid = m0?.id
+                    if (tid != null) {
+                        // Türkçe ve İngilizce sezon bilgileri hep birlikte (paralel) istenir
+                        val jobs = counts.keys.filter { it > 0 }
+                            .flatMap { sn -> listOf(sn to "tr-TR", sn to "en-US") }
+                        val got = jobs.amap { (sn, lg) -> Triple(sn, lg, tmdbSeason(tid, sn, lg)) }
+                        trMap = got.filter { it.second == "tr-TR" }.associate { it.first to it.third }
+                        enMap = got.filter { it.second == "en-US" }.associate { it.first to it.third }
                     }
-                    trMap = rows.associate { it.first to it.second }
-                    enMap = rows.associate { it.first to it.third }
+                    tm = m0
+                } catch (e: Exception) {
                 }
-            } catch (e: Exception) {
             }
         }
 
@@ -694,7 +811,7 @@ class SezonlukDizi : MainAPI() {
         // Çalışan eklentideki gibi: sadece UA + Referer
         val h = mapOf("User-Agent" to ua, "Referer" to embed)
         val txt = try {
-            app.get("$origin/api/videos/$id", headers = h, timeout = 15L).text
+            app.get("$origin/api/videos/$id", headers = h, timeout = 6L).text
         } catch (e: Exception) {
             d("byse api hata: ${e.message}")
             return false
@@ -1464,4 +1581,22 @@ data class TmdbEpisode(
 
 data class TmdbSeasonDetails(
     val episodes: List<TmdbEpisode>? = null
+)
+
+// ---------------- Ajax arama JSON veri sınıfları ----------------
+data class SzAramaSonuc(
+    val title: String = "",
+    val description: String = "",
+    val url: String = "",
+    val image: String = ""
+)
+
+data class SzAramaGrup(
+    val name: String = "",
+    val results: List<SzAramaSonuc>? = null
+)
+
+data class SzAramaYanit(
+    val status: String = "",
+    val results: Map<String, SzAramaGrup>? = null
 )
