@@ -1555,17 +1555,6 @@ class SezonlukDizi : MainAPI() {
         }
         return any
     }
-
-    // Cloudflare "tarayıcı kontrolü" eklenti yüklenir yüklenmez arka planda geçilir; ilk arama 12-15 sn beklemez.
-    // (Sınıfın en sonunda: tüm alanlar hazır olduktan sonra çalışır.)
-    init {
-        ioSafe {
-            try {
-                get(mainUrl, t = 10L)
-            } catch (e: Throwable) {
-            }
-        }
-    }
 }
 
 // ---------------- TMDB JSON veri sınıfları ----------------
