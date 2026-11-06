@@ -30,7 +30,7 @@ class SezonlukDizi : MainAPI() {
 
     // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
     // Her şey düzelince false yap.
-    private val debug = false
+    private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
@@ -360,17 +360,140 @@ class SezonlukDizi : MainAPI() {
                         c
                     }
                 }
-                val out = newSearchResponseList(list, page < maxPage(doc))
+                val films = if (page == 1) searchFilms(q) else emptyList()
+                val have = list.map { it.url }.toSet()
+                val out = newSearchResponseList(list + films.filter { it.url !in have }, page < maxPage(doc))
                 if (searchCache.size > 30) searchCache.clear()
                 searchCache[cacheKey] = out
                 return out
             }
+        }
+        val onlyFilms = if (page == 1) searchFilms(q) else emptyList()
+        if (onlyFilms.isNotEmpty()) {
+            val out = newSearchResponseList(onlyFilms, false)
+            searchCache[cacheKey] = out
+            return out
         }
         if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
         return newSearchResponseList(emptyList(), false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
+
+    // ---------------- "Filmler" grubu (sitenin arama kutusunda Diziler + Filmler birlikte çıkıyor) ----------------
+    // diziler.asp?adi=... sadece dizi döndürür; Ben 10 Alien Swarm gibi başlıklar sitenin arama kutusunun
+    // ajax yanıtında "Filmler" grubunda gelir. Adres şablonu ({query}) site.min.js içinden otomatik okunur.
+    // Bunlar CloudStream'de dizi olarak (tek bölümlü) gösterilir.
+    @Volatile private var searchTemplates: List<String>? = null
+
+    private suspend fun discoverSearchTemplates(): List<String> {
+        searchTemplates?.let { return it }
+        val res = get(mainUrl)
+        val sb = StringBuilder(res.text)
+        res.document.select("script[src]").map { it.attr("src") }.filter { it.contains("site") }.take(3).forEach { src ->
+            try { sb.append('\n').append(get(abs(src)).text) } catch (e: Exception) { }
+        }
+        val all = sb.toString()
+        val found = Regex("""["']([^"'\s]*\{query\}[^"'\s]*)["']""").findAll(all).map { it.groupValues[1] }.distinct().toList()
+        val fallback = Regex("""/ajax/\w*(?:ara|search)\w*\.asp""", RegexOption.IGNORE_CASE)
+            .findAll(all).map { it.value + "?q={query}" }.distinct().toList()
+        val list = (found + fallback).distinct()
+        d("arama şablonları=${list.joinToString(",").take(200)}")
+        if (list.isNotEmpty()) searchTemplates = list
+        return list
+    }
+
+    // Yanıttaki (JSON) "Filmler" grubunu çıkarır; diğer gruplar (Diziler, Oyuncular...) atlanır
+    private fun parseFilmResults(txt0: String): List<SearchResponse> {
+        val txt = txt0.trim()
+        val out = LinkedHashMap<String, SearchResponse>()
+        if (!(txt.startsWith("{") || txt.startsWith("["))) return emptyList()
+        fun walk(node: Any?, cat: String) {
+            when (node) {
+                is JSONArray -> for (i in 0 until node.length()) walk(node.opt(i), cat)
+                is JSONObject -> {
+                    val url = node.optString("url").ifBlank { node.optString("link") }
+                    val title = node.optString("title").ifBlank { node.optString("name") }
+                    if (url.isNotBlank() && title.isNotBlank() && !node.has("results")) {
+                        val all = cat + " " + node.optString("category") + " " + node.optString("type")
+                        if (all.contains("film", true)) {
+                            val link = abs(url.replace("\\/", "/"))
+                            val img = listOf("image", "poster", "img", "resim")
+                                .map { node.optString(it) }.firstOrNull { it.isNotBlank() }
+                            val nm = cleanTitle(title).replace(Regex("""\s*\(\d{4}\)\s*$"""), "")
+                            out[link] = newTvSeriesSearchResponse(nm, link, TvType.TvSeries) {
+                                this.posterUrl = img?.let { abs(it) }
+                            }
+                        }
+                    } else {
+                        val keys = node.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            val child = node.opt(k)
+                            val c = if (child is JSONObject && child.has("results"))
+                                child.optString("name").ifBlank { k } else cat
+                            walk(child, c)
+                        }
+                    }
+                }
+            }
+        }
+        try { walk(if (txt.startsWith("[")) JSONArray(txt) else JSONObject(txt), "") } catch (e: Exception) { }
+        return out.values.toList()
+    }
+
+    private suspend fun searchFilms(q: String): List<SearchResponse> {
+        val enc = URLEncoder.encode(q, "UTF-8")
+        val tpls = try { discoverSearchTemplates() } catch (e: Exception) { d("şablon hata ${e.javaClass.simpleName}"); emptyList() }
+        for (tpl in tpls.take(4)) {
+            val u = tpl.replace("{query}", enc).let {
+                when {
+                    it.startsWith("http") -> it
+                    it.startsWith("/") -> mainUrl + it
+                    else -> "$mainUrl/$it"
+                }
+            }
+            val txt = try {
+                try {
+                    app.get(u, headers = ajaxHdr("$mainUrl/"), cookies = sessionCookies, timeout = 10L).text
+                } catch (e: Exception) {
+                    app.get(u, headers = ajaxHdr("$mainUrl/"), interceptor = cf, timeout = 15L).text
+                }
+            } catch (e: Exception) {
+                d("film ajax hata ${e.javaClass.simpleName}")
+                continue
+            }
+            val l = parseFilmResults(txt)
+            d("film ajax ${u.take(80)} sonuç=${l.size} yanıt='${txt.replace(Regex("""\s+"""), " ").take(80)}'")
+            if (l.isNotEmpty()) return l
+        }
+        return emptyList()
+    }
+
+    // Film sayfası: tek bölümlü dizi olarak gösterilir (bölüm adresi = film sayfası)
+    private suspend fun loadFilm(url: String): LoadResponse? {
+        val res = get(url)
+        val doc = res.document
+        val title = (doc.selectFirst("h1")?.text()?.let { cleanTitle(it) }?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.let { cleanTitle(it) }
+            ?: cleanTitle(doc.title())).ifBlank { return null }
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
+        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+        val year = Regex("""\((\d{4})\)""").find(doc.title() + " " + (doc.selectFirst("h1")?.text() ?: ""))
+            ?.groupValues?.get(1)?.toIntOrNull()
+        val ep = newEpisode(url) {
+            this.season = 1
+            this.episode = 1
+            this.name = title
+        }
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(ep)) {
+            this.posterUrl = poster?.let { abs(it) }
+            this.plot = plot
+            if (year != null) this.year = year
+        }
+    }
+
 
     // ---------------- Dizi sayfası ----------------
 
@@ -424,6 +547,8 @@ class SezonlukDizi : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        // Dizi ya da bölüm adresi değilse "Filmler" grubundan gelen sayfadır
+        if (!reSeries.containsMatchIn(url) && !reEp.containsMatchIn(url)) return loadFilm(abs(url))
         val seriesUrl = resolveSeriesUrl(url)
         val res = get(seriesUrl)
         val html = res.text
