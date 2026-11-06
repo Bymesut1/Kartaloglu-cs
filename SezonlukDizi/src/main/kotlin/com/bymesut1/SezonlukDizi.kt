@@ -132,20 +132,11 @@ class SezonlukDizi : MainAPI() {
     }
 
     // Arama kartı için TMDB afişi (sadece adı birebir eşleşen dizi); bulunamazsa null (sitenin afişi kalır)
-    // Hız için kısa zaman aşımı (2 sn): TMDB yavaşsa beklemeden sitenin afişi kullanılır; başarısız sonuç önbelleğe yazılmaz.
     private suspend fun tmdbPosterFor(title: String): String? {
         val key = norm(title)
         if (key.isEmpty()) return null
         posterCache[key]?.let { return it.ifBlank { null } }
-        val res = try {
-            app.get(
-                "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(title, "UTF-8")}",
-                timeout = 2L
-            ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
-        } catch (e: Exception) {
-            return null
-        }
-        val best = res
+        val best = tmdbSearch(title)
             .filter {
                 !it.poster_path.isNullOrBlank() &&
                     (norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key)
@@ -185,17 +176,10 @@ class SezonlukDizi : MainAPI() {
             body.contains("cf-browser-verification", true) ||
             body.contains("/cdn-cgi/challenge-platform/h/b/orchestrate", true)
 
-    // Site Cloudflare kontrolü istediyse bir sonraki istekler boşuna düz denenmeden doğrudan CloudflareKiller ile atılır
-    @Volatile private var needCf = false
-
-    private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 15L) =
+    private suspend fun get(url: String, referer: String = "$mainUrl/") =
         try {
-            if (needCf) throw Exception("cf")
-            val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
-            if (isChallenge(r.code, r.text)) {
-                needCf = true
-                throw Exception("cf")
-            }
+            val r = app.get(url, headers = hdr(), referer = referer, timeout = 15L)
+            if (isChallenge(r.code, r.text)) throw Exception("cf")
             r
         } catch (e: Exception) {
             app.get(url, headers = hdr(), referer = referer, interceptor = cf, timeout = 20L)
@@ -240,7 +224,7 @@ class SezonlukDizi : MainAPI() {
         Regex("""/diziler/([^/?#]+)\.html""").find(seriesUrl)?.groupValues?.get(1)?.removeSuffix("-izle") ?: ""
 
     private fun cleanTitle(t: String): String =
-        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*Sezonluk\s*Dizi.*$""", RegexOption.IGNORE_CASE), "")
+        t.replace(Regex("""\s*(izle)?\s*[-|–]\s*SezonlukDizi.*$""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\s+izle$""", RegexOption.IGNORE_CASE), "")
             .trim()
 
@@ -324,176 +308,42 @@ class SezonlukDizi : MainAPI() {
 
     // ---------------- Arama ----------------
 
-    // Aynı aramayı tekrar yapınca anında göstermek için önbellek
-    private val searchCache = java.util.concurrent.ConcurrentHashMap<String, SearchResponseList>()
-
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val q = query.trim()
         if (q.length < 2) return newSearchResponseList(emptyList(), false)   // site en az 2 karakter istiyor
-        val cacheKey = q.lowercase() + "|" + page
-        searchCache[cacheKey]?.let { return it }
         dbg.clear()
         val sfx = if (page > 1) "&s=$page" else ""
         val urls = listOf(
             "$liste?adi=${encQ(q)}$sfx",
             "$liste?adi=${URLEncoder.encode(q, "UTF-8")}$sfx"
         ).distinct()
-        val responses = urls.amap { u ->
-            try {
-                get(u, t = 10L)
+        for (u in urls) {
+            val r = try {
+                get(u)
             } catch (e: Exception) {
                 d("istek hatası ${e.javaClass.simpleName}: ${e.message}")
                 null
-            }
-        }
-        for (r in responses) {
-            if (r == null) continue
+            } ?: continue
             val doc = r.document
             val list = cards(doc.selectFirst(".afis") ?: doc.body())
             d("kod=${r.code} uzunluk=${r.text.length} başlık='${doc.title()}' afis=${doc.select(".afis").size} kart=${list.size}")
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
                     // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    list.take(12).amap { c ->
+                    list.amap { c ->
                         val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
                         if (!tp.isNullOrBlank()) c.posterUrl = tp
                         c
                     }
                 }
-                val films = if (page == 1) searchFilms(q) else emptyList()
-                val have = list.map { it.url }.toSet()
-                val out = newSearchResponseList(list + films.filter { it.url !in have }, page < maxPage(doc))
-                if (searchCache.size > 30) searchCache.clear()
-                searchCache[cacheKey] = out
-                return out
+                return newSearchResponseList(list, page < maxPage(doc))
             }
-        }
-        val onlyFilms = if (page == 1) searchFilms(q) else emptyList()
-        if (onlyFilms.isNotEmpty()) {
-            val out = newSearchResponseList(onlyFilms, false)
-            searchCache[cacheKey] = out
-            return out
         }
         if (debug) throw ErrorLoadingException("Arama boş: " + dbgText())
         return newSearchResponseList(emptyList(), false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> = search(query, 1).items
-
-    // ---------------- "Filmler" grubu (sitenin arama kutusunda Diziler + Filmler birlikte çıkıyor) ----------------
-    // diziler.asp?adi=... sadece dizi döndürür; Ben 10 Alien Swarm gibi başlıklar sitenin arama kutusunun
-    // ajax yanıtında "Filmler" grubunda gelir. Adres şablonu ({query}) site.min.js içinden otomatik okunur.
-    // Bunlar CloudStream'de dizi olarak (tek bölümlü) gösterilir.
-    @Volatile private var searchTemplates: List<String>? = null
-
-    private suspend fun discoverSearchTemplates(): List<String> {
-        searchTemplates?.let { return it }
-        val res = get(mainUrl)
-        val sb = StringBuilder(res.text)
-        res.document.select("script[src]").map { it.attr("src") }.filter { it.contains("site") }.take(3).forEach { src ->
-            try { sb.append('\n').append(get(abs(src)).text) } catch (e: Exception) { }
-        }
-        val all = sb.toString()
-        val found = Regex("""["']([^"'\s]*\{query\}[^"'\s]*)["']""").findAll(all).map { it.groupValues[1] }.distinct().toList()
-        val fallback = Regex("""/ajax/\w*(?:ara|search)\w*\.asp""", RegexOption.IGNORE_CASE)
-            .findAll(all).map { it.value + "?q={query}" }.distinct().toList()
-        val list = (found + fallback).distinct()
-        d("arama şablonları=${list.joinToString(",").take(200)}")
-        if (list.isNotEmpty()) searchTemplates = list
-        return list
-    }
-
-    // Yanıttaki (JSON) "Filmler" grubunu çıkarır; diğer gruplar (Diziler, Oyuncular...) atlanır
-    private fun parseFilmResults(txt0: String): List<SearchResponse> {
-        val txt = txt0.trim()
-        val out = LinkedHashMap<String, SearchResponse>()
-        if (!(txt.startsWith("{") || txt.startsWith("["))) return emptyList()
-        fun walk(node: Any?, cat: String) {
-            when (node) {
-                is JSONArray -> for (i in 0 until node.length()) walk(node.opt(i), cat)
-                is JSONObject -> {
-                    val url = node.optString("url").ifBlank { node.optString("link") }
-                    val title = node.optString("title").ifBlank { node.optString("name") }
-                    if (url.isNotBlank() && title.isNotBlank() && !node.has("results")) {
-                        val all = cat + " " + node.optString("category") + " " + node.optString("type")
-                        if (all.contains("film", true)) {
-                            val link = abs(url.replace("\\/", "/"))
-                            val img = listOf("image", "poster", "img", "resim")
-                                .map { node.optString(it) }.firstOrNull { it.isNotBlank() }
-                            val nm = cleanTitle(title).replace(Regex("""\s*\(\d{4}\)\s*$"""), "")
-                            out[link] = newTvSeriesSearchResponse(nm, link, TvType.TvSeries) {
-                                this.posterUrl = img?.let { abs(it) }
-                            }
-                        }
-                    } else {
-                        val keys = node.keys()
-                        while (keys.hasNext()) {
-                            val k = keys.next()
-                            val child = node.opt(k)
-                            val c = if (child is JSONObject && child.has("results"))
-                                child.optString("name").ifBlank { k } else cat
-                            walk(child, c)
-                        }
-                    }
-                }
-            }
-        }
-        try { walk(if (txt.startsWith("[")) JSONArray(txt) else JSONObject(txt), "") } catch (e: Exception) { }
-        return out.values.toList()
-    }
-
-    private suspend fun searchFilms(q: String): List<SearchResponse> {
-        val enc = URLEncoder.encode(q, "UTF-8")
-        val tpls = try { discoverSearchTemplates() } catch (e: Exception) { d("şablon hata ${e.javaClass.simpleName}"); emptyList() }
-        for (tpl in tpls.take(4)) {
-            val u = tpl.replace("{query}", enc).let {
-                when {
-                    it.startsWith("http") -> it
-                    it.startsWith("/") -> mainUrl + it
-                    else -> "$mainUrl/$it"
-                }
-            }
-            val txt = try {
-                try {
-                    app.get(u, headers = ajaxHdr("$mainUrl/"), cookies = sessionCookies, timeout = 10L).text
-                } catch (e: Exception) {
-                    app.get(u, headers = ajaxHdr("$mainUrl/"), interceptor = cf, timeout = 15L).text
-                }
-            } catch (e: Exception) {
-                d("film ajax hata ${e.javaClass.simpleName}")
-                continue
-            }
-            val l = parseFilmResults(txt)
-            d("film ajax ${u.take(80)} sonuç=${l.size} yanıt='${txt.replace(Regex("""\s+"""), " ").take(80)}'")
-            if (l.isNotEmpty()) return l
-        }
-        return emptyList()
-    }
-
-    // Film sayfası: tek bölümlü dizi olarak gösterilir (bölüm adresi = film sayfası)
-    private suspend fun loadFilm(url: String): LoadResponse? {
-        val res = get(url)
-        val doc = res.document
-        val title = (doc.selectFirst("h1")?.text()?.let { cleanTitle(it) }?.takeIf { it.isNotBlank() }
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.let { cleanTitle(it) }
-            ?: cleanTitle(doc.title())).ifBlank { return null }
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")?.takeIf { it.isNotBlank() }
-        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
-            ?: doc.selectFirst("meta[name=description]")?.attr("content")
-        val year = Regex("""\((\d{4})\)""").find(doc.title() + " " + (doc.selectFirst("h1")?.text() ?: ""))
-            ?.groupValues?.get(1)?.toIntOrNull()
-        val ep = newEpisode(url) {
-            this.season = 1
-            this.episode = 1
-            this.name = title
-        }
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, listOf(ep)) {
-            this.posterUrl = poster?.let { abs(it) }
-            this.plot = plot
-            if (year != null) this.year = year
-        }
-    }
-
 
     // ---------------- Dizi sayfası ----------------
 
@@ -547,8 +397,6 @@ class SezonlukDizi : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        // Dizi ya da bölüm adresi değilse "Filmler" grubundan gelen sayfadır
-        if (!reSeries.containsMatchIn(url) && !reEp.containsMatchIn(url)) return loadFilm(abs(url))
         val seriesUrl = resolveSeriesUrl(url)
         val res = get(seriesUrl)
         val html = res.text
@@ -620,10 +468,7 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        // Henüz yayınlanmamış bölümler (TMDB yayın tarihi bugünden sonra ya da belli değil) listeden çıkarılır
-        val now = System.currentTimeMillis()
-        val lastSeason = siteEps.maxOfOrNull { it.season ?: 0 } ?: 0
-        val list0 = siteEps.mapNotNull { old ->
+        val list = siteEps.map { old ->
             val sn = old.season ?: 0
             val en = old.episode ?: 0
             val tr = trMap[sn]?.get(en)
@@ -636,11 +481,6 @@ class SezonlukDizi : MainAPI() {
             val still = (tr?.still_path ?: us?.still_path)?.let { "$tmdbImg/w500$it" }
             val runtime = tr?.runtime ?: us?.runtime
             val airMs = dateMs(tr?.air_date ?: us?.air_date)
-            // Bölüm TMDB'de varsa: tarihi gelecekteyse gizle; tarihi hiç yoksa sadece son sezonda gizle
-            if (tm != null && (tr != null || us != null)) {
-                if (airMs != null && airMs > now) return@mapNotNull null
-                if (airMs == null && sn == lastSeason) return@mapNotNull null
-            }
             if (tm == null) old else newEpisode(old.data) {
                 this.season = old.season
                 this.episode = old.episode
@@ -651,8 +491,6 @@ class SezonlukDizi : MainAPI() {
                 if (airMs != null) this.date = airMs
             }
         }
-        // Güvenlik: hepsi elenirse (TMDB hatalıysa) sitedeki tüm bölümler gösterilir
-        val list = list0.ifEmpty { siteEps }
 
         val t = tm
         val tPoster = t?.poster_path?.let { "$tmdbImg/w500$it" }
@@ -669,8 +507,7 @@ class SezonlukDizi : MainAPI() {
             this.plot = tPlot ?: plot
             if (tYear != null) this.year = tYear
             if (tTags != null) this.tags = tTags
-            // addActors yeni CloudStream sürümlerinde kaldırıldı; actors doğrudan atanır
-            if (tActors.isNotEmpty()) this.actors = tActors.map { ActorData(actor = it) }
+            if (tActors.isNotEmpty()) addActors(tActors)
         }
     }
 
@@ -745,18 +582,6 @@ class SezonlukDizi : MainAPI() {
 
     // WebView yedeği yavaş olduğu için bir bölümde en fazla bu kadar kaynakta denenir
     private val webviewLeft = AtomicInteger(0)
-
-    // Byse'ye ek olarak Vidmoly bağlantısı da verilsin (site bu kaynağı Turnstile kapısının arkasında tutuyor).
-    // İstemezsen false yap; o zaman Vidmoly sadece Byse çalışmazsa yedek olarak denenir.
-    private val vidmolyExtra = true
-
-    // Turnstile kapısı: doğrulanmış oturum çerezleri bir süre saklanır, çözülemezse kısa bir süre tekrar denenmez
-    @Volatile private var gateCookies: Map<String, String> = emptyMap()
-    @Volatile private var gateOkUntil = 0L
-    @Volatile private var gateFailUntil = 0L
-
-    // Captcha kapı sayfası bölüm başına yalnızca bir kez incelenir (hız için)
-    private val gateProbed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private fun originOf(u: String): String =
         Regex("""^(https?://[^/]+)""").find(u)?.groupValues?.get(1) ?: mainUrl
@@ -922,63 +747,6 @@ class SezonlukDizi : MainAPI() {
         return ok
     }
 
-    // ---- Vidmoly (vidmoly.biz / .to / .me / .net): oynatıcı sayfasında açık .m3u8 var ----
-    // Örnek adres: https://vidmoly.biz/embed-m90baavtu9m6.html
-    private suspend fun extractVidmoly(
-        embed: String,
-        label: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val host0 = Regex("""^https?://([^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
-        val id = Regex("""(?:embed-|/w/|/e/|/embed/)([A-Za-z0-9]{6,})""").find(embed)?.groupValues?.get(1)
-        // Alan adı sık değişir: önce gelen adres, olmazsa aynı kimlikle diğer alan adları denenir
-        val hosts = (listOf(host0) + listOf("vidmoly.biz", "vidmoly.to", "vidmoly.me", "vidmoly.net")).distinct()
-
-        for (host in hosts) {
-            val url = when {
-                host == host0 -> embed
-                id != null -> "https://$host/embed-$id.html"
-                else -> continue
-            }
-            val origin = "https://$host"
-            val html = try {
-                app.get(
-                    url,
-                    referer = "$mainUrl/",
-                    headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
-                    timeout = 12L
-                ).text
-            } catch (e: Exception) {
-                d("vidmoly $host hata: ${e.javaClass.simpleName}")
-                continue
-            }
-            val clean = html.replace("\\/", "/")
-            val m3u8 = Regex("""file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(clean)?.groupValues?.get(1)
-                ?: Regex("""["'](https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)["']""").find(clean)?.groupValues?.get(1)
-            if (m3u8.isNullOrBlank()) {
-                d("vidmoly $host m3u8 yok uzunluk=${html.length} '${html.replace(Regex("""\s+"""), " ").take(60)}'")
-                continue
-            }
-            val link = m3u8.replace("&amp;", "&")
-            val headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
-            // Sayfada: label: "720p HD"
-            val q = Regex("""label\s*:\s*["'](\d{3,4})p""").find(clean)?.groupValues?.get(1)
-            val tag = if (q != null) "$label ${q}p" else label
-
-            // Ana (master) liste: oynatıcı kaliteyi kendi seçer
-            emitM3u8(link, tag, "$origin/", callback)
-            // Kalite adlarını (720p vb.) görebilmek için alt listeler de eklenir
-            try {
-                M3u8Helper.generateM3u8(name, link, "$origin/", headers = headers)
-                    .forEach { callback(relabel(it, label)) }
-            } catch (e: Exception) {
-            }
-            d("vidmoly $host tamam")
-            return true
-        }
-        return false
-    }
-
     // Bir gömülü oynatıcı adresini çözer. Sırayla:
     // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
     // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
@@ -1005,17 +773,6 @@ class SezonlukDizi : MainAPI() {
                 false
             }
             if (okByse) return true
-        }
-
-        // 0b) Vidmoly: kendi çözücümüz; olmazsa aşağıdaki hazır çözücüye düşer
-        if (u.contains("vidmoly", ignoreCase = true)) {
-            val okVm = try {
-                extractVidmoly(u, label, callback)
-            } catch (e: Exception) {
-                d("vidmoly istisna ${e.javaClass.simpleName}: ${e.message}")
-                false
-            }
-            if (okVm) return true
         }
 
         // 1) hazır çözücüler
@@ -1079,61 +836,8 @@ class SezonlukDizi : MainAPI() {
         return out.toList().take(3)
     }
 
-    // Kapı sayfası (/ajax/reCAPTCHADATA.asp) Cloudflare Turnstile yükler; token çözülünce
-    // $.post("/ajax/reCAPTCHA.asp", {'cf-turnstile-response': token}) ile oturumu doğrular.
-    // Kapı adresi (dataEmbed'in döndürdüğü tam adres) görünmez WebView'de açılır ve kendi kendine çözmesi için süre tanınır.
-    // ÖNEMLİ: useOkhttp = false. WebView kendi ağ yığınını ve çerez yöneticisini kullanır; böylece Turnstile
-    // gerçek tarayıcı gibi çalışır ve doğrulama çerezi WebView'in CookieManager'ına yazılır.
-    // Oturum çerezleri WebView'e verilir, sonra WebView'in çerezleri geri alınır. Sonucu çağıran taraf,
-    // aynı kaynağı yeniden isteyerek doğrular.
-    private suspend fun solveGate(ref: String, gateUrl: String? = null) {
-        val gate = gateUrl?.let { g ->
-            when {
-                g.startsWith("//") -> "https:$g"
-                g.startsWith("/") -> mainUrl + g
-                else -> g
-            }
-        } ?: "$mainUrl/ajax/reCAPTCHADATA.asp"
-        val cm = try { android.webkit.CookieManager.getInstance() } catch (e: Throwable) { null }
-        try {
-            cm?.setAcceptCookie(true)
-            sessionCookies.forEach { (k, v) -> cm?.setCookie(mainUrl, "$k=$v; Path=/") }
-            cm?.flush()
-        } catch (e: Throwable) {
-            d("captcha çerez hata ${e.javaClass.simpleName}")
-        }
-        d("captcha kapı=${gate.take(140)}")
-        val t0 = System.currentTimeMillis()
-        try {
-            app.get(
-                gate,
-                headers = hdr(),
-                referer = ref,
-                cookies = sessionCookies,
-                interceptor = WebViewResolver(
-                    Regex("""zz-asla-eslesmez-zz"""),
-                    userAgent = null,      // eskiden: ua
-                    useOkhttp = false,
-                    timeout = 12_000L      // eskiden: 18_000L
-                )
-            )
-        } catch (e: Exception) {
-            d("captcha webview ${e.javaClass.simpleName}")
-        }
-        try {
-            val before = sessionCookies.size
-            cm?.getCookie(mainUrl)?.split(";")?.forEach { c ->
-                val kv = c.trim().split("=", limit = 2)
-                if (kv.size == 2 && kv[0].isNotBlank()) sessionCookies = sessionCookies + (kv[0] to kv[1])
-            }
-            d("captcha çözüm denendi süre=${System.currentTimeMillis() - t0}ms çerez $before->${sessionCookies.size} adlar=${sessionCookies.keys.joinToString(",").take(80)}")
-        } catch (e: Throwable) {
-            d("captcha çerez geri alma hata ${e.javaClass.simpleName}")
-        }
-    }
-
     // reCAPTCHA kapısı dönen adresin içinde ya da (oturum çerezleriyle açılan) sayfasında gerçek oynatıcı adresi var mı bakar
-    private suspend fun captchaInner(u: String, ref: String, force: Boolean = false): String? {
+    private suspend fun captchaInner(u: String, ref: String): String? {
         val full = when {
             u.startsWith("//") -> "https:$u"
             u.startsWith("/") -> mainUrl + u
@@ -1143,23 +847,7 @@ class SezonlukDizi : MainAPI() {
         Regex("""https?://[^\s"'&<>]+""").findAll(dec.substringAfter("?", "")).map { it.value }
             .firstOrNull { !it.contains("sezonlukdizi", true) && !it.contains("recaptcha", true) }
             ?.let { return it }
-        // Kapı sayfasını bölüm başına BİR kez açıp yapısını hata ayıklamaya yazar; gerçek oynatıcı adresi
-        // sayfada açıkça yazıyorsa (Vidmoly vb.) onu kullanır.
-        if (force || gateProbed.compareAndSet(false, true)) {
-            try {
-                val h = app.get(full, headers = hdr(), referer = ref, cookies = sessionCookies, timeout = 10L).text
-                val ajax = Regex("""/ajax/[A-Za-z0-9_]+\.asp""").findAll(h).map { it.value }.distinct().take(6).toList()
-                val key = Regex("""sitekey["']?\s*[:=]\s*["']([^"']+)""").find(h)?.groupValues?.get(1)
-                val post = Regex("""\$\.(?:post|ajax)\([^;]{0,150}""").find(h)?.value?.replace(Regex("""\s+"""), " ")
-                d("captcha sayfa uzunluk=${h.length} ajax=$ajax sitekey=$key post=$post")
-                d("captcha sayfa başı='${h.replace(Regex("""\s+"""), " ").take(110)}'")
-                Regex("""https?://[^\s"'<>\\]*(?:vidmoly|embed-)[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
-                    .find(h.replace("\\/", "/"))?.value?.let { return it }
-            } catch (e: Exception) {
-                d("captcha sayfa hata ${e.javaClass.simpleName}")
-            }
-        }
-        return null
+        return null   // captcha sayfasından gerçek adres çıkmıyor; ek istek atılmaz (Cloudflare hız sınırını tetikler)
     }
 
     override suspend fun loadLinks(
@@ -1169,9 +857,8 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webviewLeft.set(2)
-        gateProbed.set(false)
         dbg.clear()
-        sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
+        sessionCookies = emptyMap()
 
         fun dilName(x: String) = if (x == "0") "Dublaj" else "Altyazı"
         var any = false
@@ -1274,8 +961,6 @@ class SezonlukDizi : MainAPI() {
         }
 
         // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
-        var gatedSeen = false
-        var lastGateUrl: String? = null
         suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
             val (f, raw) = fetchEmbed(id, ref)
             val tag = "$tagPrefix$dil:$id"
@@ -1287,12 +972,7 @@ class SezonlukDizi : MainAPI() {
             val cap = f.contains("reCAPTCHA", true)
             val host = if (cap) "CAPTCHA" else (Regex("""^(?:https?:)?//([^/]+)""").find(f)?.groupValues?.get(1)
                 ?: short(f, 25))
-            if (cap) {
-                gatedSeen = true
-                lastGateUrl = f
-            }
             val ok = emit(dil, f)
-            if (cap && !ok) retryQ.add(Triple(dil, id, ref))
             if (ok) {
                 if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
                 if (idx >= 0) goodKeys.add("i:$dil:$idx")
@@ -1355,7 +1035,7 @@ class SezonlukDizi : MainAPI() {
         fun prio(dil: String, idx: Int, nm: String): Int {
             val n = nm.trim().lowercase()
             return when {
-                n.contains("byse") || n.contains("filemoon") -> 0
+                n.contains("byse") -> 0
                 "i:$dil:$idx" in goodKeys -> 1
                 n.isNotBlank() && "n:$n" in goodKeys -> 2
                 else -> 3
@@ -1413,9 +1093,6 @@ class SezonlukDizi : MainAPI() {
         }
 
         // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir
-        if (gatedSeen && listOf("0", "1").any { it !in got } && System.currentTimeMillis() >= gateFailUntil) {
-            solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
-        }
         for (dil in listOf("0", "1")) {
             if (dil in got) continue
             val todo = retryQ.filter { it.first == dil }.take(4)
@@ -1425,69 +1102,6 @@ class SezonlukDizi : MainAPI() {
                     if (dil in got) break
                     try { Thread.sleep(1500L * attempt) } catch (e: Exception) { }
                     tryId(dil, id, ref, "R$attempt ")
-                }
-            }
-        }
-
-        // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa:
-        //    (a) kapı adresinin içinde / kapı sayfasında gerçek adres aranır,
-        //    (b) olmazsa kapının tam adresi WebView'de açılıp çözülür (useOkhttp = false), adres yeniden istenir.
-        if (vidmolyExtra) {
-            for (dil in listOf("0", "1")) {
-                val cand = queues[dil]?.firstOrNull { it.second.contains("vidmoly", true) } ?: continue
-                val ref = refs[dil] ?: data
-                var f = fetchEmbed(cand.first, ref).first
-                if (f != null && f.contains("reCAPTCHA", true)) {
-                    val gateUrl: String = f
-                    d("vidmoly kapı url=${short(gateUrl, 170)}")
-                    // (a) adresin içinde / sayfasında gerçek adres var mı
-                    var inner: String? = try { captchaInner(gateUrl, ref, true) } catch (e: Exception) { null }
-                    if (inner.isNullOrBlank()) {
-                        if (System.currentTimeMillis() < gateFailUntil) {
-                            d("vidmoly dil=$dil kapı yakın zamanda çözülemedi, atlandı")
-                            continue
-                        }
-                        // (b) kapıyı WebView'de çöz, adresi yeniden iste
-                        solveGate(ref, gateUrl)
-                        val f2 = fetchEmbed(cand.first, ref).first
-                        d("vidmoly kapı sonrası url=${short(f2, 170)}")
-                        inner = if (f2 != null && !f2.contains("reCAPTCHA", true)) f2
-                        else try { captchaInner(f2 ?: gateUrl, ref, true) } catch (e: Exception) { null }
-                        if (inner.isNullOrBlank()) {
-                            gateFailUntil = System.currentTimeMillis() + 90_000L
-                            d("vidmoly dil=$dil kapı çözülemedi")
-                            continue
-                        }
-                        gateCookies = sessionCookies
-                        gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
-                        d("vidmoly dil=$dil kapı çözüldü")
-                    } else {
-                        d("vidmoly dil=$dil gerçek adres kapıdan çıkarıldı")
-                    }
-                    f = inner
-                }
-                if (f.isNullOrBlank() || f.contains("reCAPTCHA", true) || f in seen) continue
-                val buf = ArrayList<ExtractorLink>()
-                val ok = try {
-                    emitEmbed(abs(f), "Türkçe ${dilName(dil)}", subtitleCallback) { l -> synchronized(buf) { buf.add(l) } }
-                } catch (e: Exception) {
-                    false
-                }
-                d("vidmoly dil=$dil ${short(f, 40)} -> $ok")
-                if (ok && buf.isNotEmpty()) {
-                    val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
-                        ?: buf.maxByOrNull { it.quality }
-                        ?: buf.first()
-                    val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
-                        .maxOrNull()
-                    callback(
-                        newExtractorLink(pick.source, "Türkçe ${dilName(dil)} - Vidmoly" + (res?.let { " (${it}p)" } ?: ""), pick.url, pick.type) {
-                            this.referer = pick.referer
-                            this.quality = Qualities.P720.value
-                            this.headers = pick.headers
-                        }
-                    )
-                    any = true
                 }
             }
         }
@@ -1502,14 +1116,13 @@ class SezonlukDizi : MainAPI() {
                 "sayfalar: " + pageLog.joinToString(" | "),
                 "dublaj: " + srcLog.filter { it.contains("0:") && !it.contains("1:") }.joinToString(" ; "),
                 "altyazı: " + srcLog.filter { it.contains("1:") }.joinToString(" ; "),
-                "byse: " + dbg.filter { it.startsWith("byse") }.takeLast(4).joinToString(" / "),
-                "kapı: " + dbg.filter { it.startsWith("captcha") || it.startsWith("vidmoly") }.takeLast(10).joinToString(" / ")
+                "byse: " + dbg.filter { it.startsWith("byse") || it.startsWith("captcha") }.takeLast(6).joinToString(" / ")
             )
             for ((i, line) in lines.withIndex()) {
                 callback(
                     newExtractorLink(
                         name,
-                        "DEBUG ${i + 1} [$eksik yok] " + line.take(520),
+                        "DEBUG ${i + 1} [$eksik yok] " + line.take(420),
                         "https://debug.invalid/$i",
                         ExtractorLinkType.VIDEO
                     ) {
