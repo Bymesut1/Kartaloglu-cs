@@ -394,7 +394,11 @@ class EksenLoadExtractor : ExtractorApi() {
 
         tracks.forEach { (lbl, file) ->
             try {
-                subtitleCallback(SubtitleFile(lbl, file, mapOf("Referer" to playerUrl)))
+                subtitleCallback(
+                    newSubtitleFile(lbl, file) {
+                        this.headers = mapOf("Referer" to playerUrl)
+                    }
+                )
             } catch (e: Exception) {
                 dbg("subtitle error: ${e.message}")
             }
