@@ -182,12 +182,10 @@ class FilmEkseni : MainAPI() {
     ): Boolean {
         val text = unescape(app.get(data, referer = mainUrl).text)
 
-        // eksenload player id'leri: https://eksenload.top/eplayer/<id>
         val eksenIds = LinkedHashSet<String>()
         Regex("""eksenload\.top/eplayer/([A-Za-z0-9]+)""")
             .findAll(text).forEach { eksenIds += it.groupValues[1] }
 
-        // JSON içindeki diğer embed linkleri (YouTube hariç)
         val others = LinkedHashSet<String>()
         Regex(""""(?:iframeSrc|embedUrlWithLang|embedUrl|videoLink)"\s*:\s*"([^"]+)"""")
             .findAll(text).forEach {
@@ -212,5 +210,33 @@ class FilmEkseni : MainAPI() {
         }
 
         return found
+    }
+}
+
+class EksenLoadExtractor : ExtractorApi() {
+    override val name = "EksenLoad"
+    override val mainUrl = "https://eksenload.top"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val html = app.get(url, referer = referer ?: "https://filmekseni.vip/").text
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+
+        val m3u8 = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
+            .find(html)?.value ?: return
+
+        M3u8Helper.generateM3u8(
+            source = name,
+            streamUrl = m3u8,
+            referer = "$mainUrl/",
+            headers = mapOf("Origin" to mainUrl)
+        ).forEach(callback)
     }
 }
