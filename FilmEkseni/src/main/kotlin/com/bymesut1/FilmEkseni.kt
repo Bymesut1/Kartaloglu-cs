@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -199,16 +200,6 @@ class FilmEkseni : MainAPI() {
         Regex("""\.(jpg|jpeg|png|webp|svg|gif|css|js|ico|woff2?)(\?.*)?$""", RegexOption.IGNORE_CASE)
             .containsMatchIn(u)
 
-    private fun collectStrings(node: Any?, out: MutableSet<String>) {
-        when (node) {
-            is JSONObject -> node.keys().forEach { k -> collectStrings(node.opt(k), out) }
-            is JSONArray -> for (i in 0 until node.length()) collectStrings(node.opt(i), out)
-            is String -> if (node.startsWith("http") || node.startsWith("//") ||
-                node.contains("/eplayer/")
-            ) out += node
-        }
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -218,11 +209,22 @@ class FilmEkseni : MainAPI() {
         dbg("loadLinks data=$data")
         val raw = app.get(data, referer = mainUrl).text
         dbg("page length=${raw.length}")
-        val decoded = Parser.unescapeEntities(raw, false)
 
-        val found = LinkedHashSet<String>()
+        // base url -> tag'li url (örn. https://eksenload.top/eplayer/ID#dublaj)
+        val entries = LinkedHashMap<String, String>()
 
-        // 1) videoPlayerData(JSON.parse('...')) -> HTML-decode -> JS-unescape -> JSON
+        fun add(u0: String, tag: String = "") {
+            var u = u0.trim()
+            if (u.startsWith("//")) u = "https:$u"
+            else if (u.startsWith("/")) u = mainUrl + u
+            if (!u.startsWith("http") || isYoutube(u) || isAsset(u)) return
+            val base = u.substringBefore('#')
+            if (base.startsWith(mainUrl) && !base.contains("/eplayer/")) return
+            val full = if (tag.isNotBlank() && !u.contains('#')) "$base#$tag" else u
+            entries.putIfAbsent(base, full)
+        }
+
+        // 1) videoPlayerData JSON: {"dual":[{link, template(base64), slug, ...}], ...}
         val jsonRaw = Regex("""videoPlayerData\(JSON\.parse\('([^']+)'\)""")
             .find(raw)?.groupValues?.get(1)
         dbg("videoPlayerData found=${jsonRaw != null}")
@@ -230,43 +232,59 @@ class FilmEkseni : MainAPI() {
             val json = unescape(Parser.unescapeEntities(jsonRaw, false))
             dbg("json=${json.take(2000)}")
             try {
-                val t = json.trim()
-                collectStrings(if (t.startsWith("[")) JSONArray(t) else JSONObject(t), found)
+                val root = JSONObject(json)
+                for (group in root.keys()) {
+                    val arr = root.optJSONArray(group) ?: continue
+                    val tag = when {
+                        group.equals("dual", true) -> "dublaj"
+                        group.contains("sub", true) || group.contains("alt", true) -> "altyazi"
+                        else -> ""
+                    }
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val link = o.optString("link")
+                        val slug = o.optString("slug")
+                        val tpl = o.optString("template")
+                        if (link.isBlank() || tpl.isBlank()) continue
+                        try {
+                            val html = String(Base64.decode(tpl, Base64.DEFAULT), Charsets.UTF_8)
+                            val src = Regex("""(?:data-src|src)\s*=\s*"([^"]+)"""")
+                                .find(html)?.groupValues?.get(1) ?: continue
+                            val embed = src.replace("{url}", link).replace("{slug}", slug)
+                            dbg("group=$group service=${o.optString("service_name")} embed=$embed")
+                            add(embed, tag)
+                        } catch (e: Exception) {
+                            dbg("template error: ${e.message}")
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 dbg("json parse error: ${e.message}")
             }
         }
 
-        // 2) Düz regex yedekleri
-        val text = unescape(decoded)
-        Regex("""(?:https?:)?//eksenload\.top/eplayer/[A-Za-z0-9]+[^"'\s<>\\]*""")
-            .findAll(text).forEach { found += it.value }
+        // 2) Yedekler
+        val text = unescape(Parser.unescapeEntities(raw, false))
+        Regex("""(?:https?:)?//eksenload\.top/eplayer/[A-Za-z0-9]+""")
+            .findAll(text).forEach { add(it.value) }
         Regex("""https?://vidmoly\.[a-z]+/[^"'\s<>\\]+""")
-            .findAll(text).forEach { found += it.value }
-
-        // 3) iframe'ler
+            .findAll(text).forEach { add(it.value) }
         Jsoup.parse(raw, data).select("iframe[src], iframe[data-src]").forEach {
-            found += it.attr("src").ifBlank { it.attr("data-src") }
+            add(it.attr("src").ifBlank { it.attr("data-src") })
         }
 
-        val sources = found.map { it.trim() }
-            .map { if (it.startsWith("//")) "https:$it" else if (it.startsWith("/")) mainUrl + it else it }
-            .filter { it.startsWith("http") && !isYoutube(it) && !isAsset(it) }
-            .filter { !it.startsWith(mainUrl) || it.contains("/eplayer/") }
-            .distinct()
-
-        dbg("sources=$sources")
-        if (sources.isEmpty()) dumpHints(raw)
+        dbg("sources=${entries.values}")
+        if (entries.isEmpty()) dumpHints(raw)
 
         var count = 0
         val cb: (ExtractorLink) -> Unit = { count++; callback(it) }
 
-        sources.forEach { u ->
+        entries.values.forEach { u ->
             try {
                 if (u.contains("eksenload.top")) {
                     EksenLoadExtractor().getUrl(u, "$mainUrl/", subtitleCallback, cb)
                 } else {
-                    loadExtractor(u, mainUrl, subtitleCallback, cb)
+                    loadExtractor(u.substringBefore('#'), mainUrl, subtitleCallback, cb)
                 }
             } catch (e: Exception) {
                 dbg("extractor error for $u : ${e.message}")
@@ -279,12 +297,14 @@ class FilmEkseni : MainAPI() {
 }
 
 class EksenLoadExtractor : ExtractorApi() {
-    override val name = "EksenLoad"
+    override val name = "Eksenload"
     override val mainUrl = "https://eksenload.top"
     override val requiresReferer = true
 
     private fun clean(s: String) = s
         .replace("\\/", "/")
+        .replace("\\u002F", "/", ignoreCase = true)
+        .replace("\\x2F", "/", ignoreCase = true)
         .replace("\\u0026", "&")
         .replace("&amp;", "&")
 
@@ -297,9 +317,16 @@ class EksenLoadExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val ref = referer ?: "https://filmekseni.vip/"
-        val html = clean(app.get(url, referer = ref).text)
-        dbg("eksenload url=$url len=${html.length}")
+        val tag = url.substringAfter('#', "")
+        val playerUrl = url.substringBefore('#')
+        val label = when (tag) {
+            "dublaj" -> " - Türkçe Dublaj"
+            "altyazi" -> " - Türkçe Altyazılı"
+            else -> ""
+        }
+
+        val html = clean(app.get(playerUrl, referer = referer ?: "https://filmekseni.vip/").text)
+        dbg("eksenload url=$playerUrl len=${html.length}")
 
         var m3u8 = findM3u8(html)
         if (m3u8 == null && html.contains("eval(function(p,a,c,k")) {
@@ -313,24 +340,11 @@ class EksenLoadExtractor : ExtractorApi() {
         }
         dbg("m3u8=$m3u8")
 
-        val playerRef = "$mainUrl/"
-        val links = M3u8Helper.generateM3u8(
-            source = name,
-            streamUrl = m3u8,
-            referer = playerRef,
-            headers = mapOf("Origin" to mainUrl)
+        callback(
+            newExtractorLink(name, name + label, m3u8, ExtractorLinkType.M3U8) {
+                this.referer = playerUrl
+                this.quality = Qualities.Unknown.value
+            }
         )
-
-        if (links.isNotEmpty()) {
-            links.forEach(callback)
-        } else {
-            callback(
-                newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
-                    this.referer = playerRef
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("Origin" to mainUrl)
-                }
-            )
-        }
     }
 }
