@@ -2,7 +2,6 @@
 
 package com.bymesut1
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
@@ -105,14 +104,13 @@ class SetFilmIzle : MainAPI() {
 
         val title = cleanTitle(rawTitle)
 
-        val sitePoster = fixUrlNull(
-            document.selectFirst("meta[property='og:image']")?.attr("content")
-                ?: document.selectFirst("div.poster img, img.img-fluid, img[src*='uploads']")?.let {
-                    it.attr("data-src").ifBlank { it.attr("src") }
-                }
-        )
+        val ogImage: String? = document.selectFirst("meta[property='og:image']")?.attr("content")
+        val imgEl: Element? = document.selectFirst("div.poster img, img.img-fluid, img[src*='uploads']")
+        val imgSrc: String? = imgEl?.attr("data-src")?.ifBlank { null } ?: imgEl?.attr("src")
+        val sitePoster: String? = fixUrlNull(ogImage?.ifBlank { null } ?: imgSrc)
 
-        val siteDesc = document.selectFirst("meta[property='og:description']")?.attr("content")
+        val ogDesc: String? = document.selectFirst("meta[property='og:description']")?.attr("content")
+        val siteDesc: String? = ogDesc?.ifBlank { null }
             ?: document.selectFirst("div.content-desc, div.story, p.desc")?.text()?.trim()
 
         val isTvSeries = url.contains("/dizi/")
@@ -336,19 +334,19 @@ class SetFilmIzle : MainAPI() {
     }
 
     // ---------------- Kaynaklar ----------------
-    private data class StreamData(
-        @JsonProperty("type") val type: String? = null,
-        @JsonProperty("url") val url: String? = null,
-        @JsonProperty("provider") val provider: String? = null
+    data class StreamData(
+        val type: String? = null,
+        val url: String? = null,
+        val provider: String? = null
     )
 
-    private data class VideoData(
-        @JsonProperty("stream") val stream: StreamData? = null
+    data class VideoData(
+        val stream: StreamData? = null
     )
 
-    private data class VideoResponse(
-        @JsonProperty("success") val success: Boolean = false,
-        @JsonProperty("data") val data: VideoData? = null
+    data class VideoResponse(
+        val success: Boolean = false,
+        val data: VideoData? = null
     )
 
     override suspend fun loadLinks(
