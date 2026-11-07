@@ -30,7 +30,7 @@ class SezonlukDizi : MainAPI() {
 
     // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
     // Her şey düzelince false yap.
-    private val debug = true
+    private val debug = false
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
@@ -871,6 +871,9 @@ class SezonlukDizi : MainAPI() {
             .replace("\\/", "/")
             .replace("&amp;", "&")
 
+    private suspend fun extractDzenAny(embed: String, label: String, callback: (ExtractorLink) -> Unit): Boolean =
+        extractDzen(embed, label, callback)
+
     private suspend fun extractDzen(
         embed: String,
         label: String,
@@ -1193,6 +1196,7 @@ class SezonlukDizi : MainAPI() {
         val captchaSeen = HashSet<String>()
         val got = HashSet<String>()            // kaynağı bulunan diller: "0" = dublaj, "1" = altyazı
         val retryQ = ArrayList<Triple<String, String, String>>()   // captcha / boş dönenler: (dil, id, referer)
+        val dzenDone = HashSet<String>()       // Dzen bağlantısı verilen diller
         val emitted = HashSet<String>()        // bağlantısı listeye verilen diller (dil başına tek bağlantı)
         val okCnt = HashMap<String, Int>()     // dil başına çalışan kaynak sayısı
         val srcLog = ArrayList<String>()       // kaynak başına kısa sonuç (hata ayıklama)
@@ -1264,6 +1268,7 @@ class SezonlukDizi : MainAPI() {
                 any = true
                 got.add(dil)
                 okCnt[dil] = (okCnt[dil] ?: 0) + 1
+                if (embed.contains("dzen.ru", true)) dzenDone.add(dil)
             }
             return ok
         }
@@ -1516,6 +1521,56 @@ class SezonlukDizi : MainAPI() {
                     )
                     any = true
                 }
+            }
+        }
+
+        // 5) Dzen: dilin ilk çalışan kaynağı başka bir yerden bulunduysa Dzen tek başına denenmez ve hiç görünmezdi.
+        //    Dzen alternatifi varsa (ve henüz verilmediyse) ek bağlantı olarak ayrıca alınır.
+        for (dil in listOf("0", "1")) {
+            if (dil in dzenDone) continue
+            val cand = queues[dil]?.firstOrNull { it.second.contains("dzen", true) } ?: continue
+            val ref = refs[dil] ?: data
+            var f = fetchEmbed(cand.first, ref).first
+            if (f != null && f.contains("reCAPTCHA", true)) {
+                // Kapı hâlâ açık: bir kez çözmeyi dene, sonra adresi yeniden iste
+                if (System.currentTimeMillis() < gateFailUntil) {
+                    d("dzen dil=$dil kapı yakın zamanda çözülemedi, atlandı")
+                    continue
+                }
+                solveGate(ref, f)
+                f = fetchEmbed(cand.first, ref).first
+                if (f == null || f.contains("reCAPTCHA", true)) {
+                    gateFailUntil = System.currentTimeMillis() + 90_000L
+                    d("dzen dil=$dil kapı çözülemedi")
+                    continue
+                }
+                gateCookies = sessionCookies
+                gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+            }
+            if (f.isNullOrBlank()) {
+                d("dzen dil=$dil adres yok")
+                continue
+            }
+            val buf = ArrayList<ExtractorLink>()
+            val ok = try {
+                extractDzenAny(abs(f), dilName(dil)) { l -> synchronized(buf) { buf.add(l) } }
+            } catch (e: Exception) {
+                d("dzen ek istisna ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+            d("dzen ek dil=$dil ${short(f, 40)} -> $ok")
+            if (ok) {
+                for (l in buf) {
+                    callback(
+                        newExtractorLink(l.source, "Türkçe ${dilName(dil)} - " + l.name.substringAfter(" - "), l.url, l.type) {
+                            this.referer = l.referer
+                            this.quality = l.quality
+                            this.headers = l.headers
+                        }
+                    )
+                }
+                dzenDone.add(dil)
+                any = true
             }
         }
 
