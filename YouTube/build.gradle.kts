@@ -1,5 +1,9 @@
 version = 5
 
+android {
+    namespace = "com.bymesut1"
+}
+
 cloudstream {
     authors     = listOf("bymesut1")
     language    = "tr"
