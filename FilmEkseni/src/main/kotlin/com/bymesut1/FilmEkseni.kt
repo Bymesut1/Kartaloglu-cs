@@ -210,7 +210,6 @@ class FilmEkseni : MainAPI() {
         val raw = app.get(data, referer = mainUrl).text
         dbg("page length=${raw.length}")
 
-        // base url -> tag'li url (örn. https://eksenload.top/eplayer/ID#dublaj)
         val entries = LinkedHashMap<String, String>()
 
         fun add(u0: String, tag: String = "") {
@@ -224,13 +223,11 @@ class FilmEkseni : MainAPI() {
             entries.putIfAbsent(base, full)
         }
 
-        // 1) videoPlayerData JSON: {"dual":[{link, template(base64), slug, ...}], ...}
         val jsonRaw = Regex("""videoPlayerData\(JSON\.parse\('([^']+)'\)""")
             .find(raw)?.groupValues?.get(1)
         dbg("videoPlayerData found=${jsonRaw != null}")
         if (jsonRaw != null) {
             val json = unescape(Parser.unescapeEntities(jsonRaw, false))
-            dbg("json=${json.take(2000)}")
             try {
                 val root = JSONObject(json)
                 for (group in root.keys()) {
@@ -263,7 +260,6 @@ class FilmEkseni : MainAPI() {
             }
         }
 
-        // 2) Yedekler
         val text = unescape(Parser.unescapeEntities(raw, false))
         Regex("""(?:https?:)?//eksenload\.top/eplayer/[A-Za-z0-9]+""")
             .findAll(text).forEach { add(it.value) }
@@ -301,12 +297,40 @@ class EksenLoadExtractor : ExtractorApi() {
     override val mainUrl = "https://eksenload.top"
     override val requiresReferer = true
 
-    private fun clean(s: String) = s
-        .replace("\\/", "/")
-        .replace("\\u002F", "/", ignoreCase = true)
-        .replace("\\x2F", "/", ignoreCase = true)
-        .replace("\\u0026", "&")
-        .replace("&amp;", "&")
+    // JavaScript string kaçışlarını (\uXXXX, \xXX, \\, \/ ...) gerçek karakterlere çevirir
+    private fun jsUnescape(s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '\\' && i + 1 < s.length) {
+                val n = s[i + 1]
+                if (n == 'u' && i + 6 <= s.length) {
+                    val code = s.substring(i + 2, i + 6).toIntOrNull(16)
+                    if (code != null) {
+                        sb.append(code.toChar()); i += 6; continue
+                    }
+                }
+                if (n == 'x' && i + 4 <= s.length) {
+                    val code = s.substring(i + 2, i + 4).toIntOrNull(16)
+                    if (code != null) {
+                        sb.append(code.toChar()); i += 4; continue
+                    }
+                }
+                when (n) {
+                    'n' -> sb.append('\n')
+                    't' -> sb.append('\t')
+                    'r' -> sb.append('\r')
+                    else -> sb.append(n)
+                }
+                i += 2
+                continue
+            }
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
 
     private fun findM3u8(s: String): String? =
         Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""").find(s)?.value
@@ -325,23 +349,59 @@ class EksenLoadExtractor : ExtractorApi() {
             else -> ""
         }
 
-        val html = clean(app.get(playerUrl, referer = referer ?: "https://filmekseni.vip/").text)
-        dbg("eksenload url=$playerUrl len=${html.length}")
+        val raw = app.get(playerUrl, referer = referer ?: "https://filmekseni.vip/").text
+        dbg("eksenload url=$playerUrl len=${raw.length}")
 
-        var m3u8 = findM3u8(html)
-        if (m3u8 == null && html.contains("eval(function(p,a,c,k")) {
-            val unpacked = try { clean(getAndUnpack(html)) } catch (e: Exception) { "" }
-            m3u8 = findM3u8(unpacked)
+        var m3u8: String? = null
+        val tracks = ArrayList<Pair<String, String>>()
+
+        // jwplayer('player').setup(JSON.parse('{...}'))
+        try {
+            val payload = Regex("""setup\(JSON\.parse\('(.*?)'\)\)""", RegexOption.DOT_MATCHES_ALL)
+                .find(raw)?.groupValues?.get(1)
+            if (payload != null) {
+                val obj = JSONObject(jsUnescape(payload))
+                m3u8 = obj.optString("file").takeIf { it.startsWith("http") }
+                val arr = obj.optJSONArray("tracks")
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val t = arr.optJSONObject(i) ?: continue
+                        val f = t.optString("file")
+                        val kind = t.optString("kind")
+                        if (f.isBlank() || !f.contains(".vtt")) continue
+                        if (kind.equals("thumbnails", true)) continue
+                        tracks += t.optString("label").ifBlank { "Altyazı" } to f
+                    }
+                }
+            } else {
+                dbg("setup(JSON.parse(...)) bulunamadi")
+            }
+        } catch (e: Exception) {
+            dbg("player json error: ${e.message}")
         }
 
+        // Yedek: tüm sayfayı çözüp m3u8 ara
         if (m3u8 == null) {
-            dbg("m3u8 NOT found. html=${html.take(3000)}")
+            m3u8 = findM3u8(jsUnescape(raw).replace("\\/", "/"))
+        }
+
+        val link = m3u8
+        if (link == null) {
+            dbg("m3u8 NOT found. html=${raw.take(3000)}")
             return
         }
-        dbg("m3u8=$m3u8")
+        dbg("m3u8=$link tracks=${tracks.size}")
+
+        tracks.forEach { (lbl, file) ->
+            try {
+                subtitleCallback(SubtitleFile(lbl, file, mapOf("Referer" to playerUrl)))
+            } catch (e: Exception) {
+                dbg("subtitle error: ${e.message}")
+            }
+        }
 
         callback(
-            newExtractorLink(name, name + label, m3u8, ExtractorLinkType.M3U8) {
+            newExtractorLink(name, name + label, link, ExtractorLinkType.M3U8) {
                 this.referer = playerUrl
                 this.quality = Qualities.Unknown.value
             }
