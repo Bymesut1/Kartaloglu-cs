@@ -1,7 +1,6 @@
 package com.bymesut1
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -109,17 +108,25 @@ class FilmEkseni : MainAPI() {
         val doc = app.get(url, referer = mainUrl).document
 
         val title = doc.selectFirst("h1")?.text()?.trim() ?: return null
+
+        val imgPoster = doc.select("img")
+            .firstOrNull { it.attr("alt").trim().equals(title, true) }
+            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         val poster = fixUrlNull(
-            doc.selectFirst("meta[property=og:image]")?.attr("content")
-                ?: doc.selectFirst("img")?.attr("src")
+            imgPoster?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+                ?: doc.selectFirst("meta[name=twitter:image]")?.attr("content")
         )
+
         val plot = doc.selectFirst("meta[name=description]")?.attr("content")?.trim()
-        val tags = doc.select("a[href*='/tur/']").map { it.text().trim() }
-            .filter { it.isNotBlank() }.distinct()
-        val year = Regex("""\b(19|20)\d{2}\b""")
-            .find(doc.select("a[href*='/yil/'], span").text())?.value?.toIntOrNull()
-        val actors = doc.select("span.text-accent span:last-child")
-            .map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
+        val tags = Regex("""yapımı\s+(.+?)\s+türündeki""")
+            .find(plot ?: "")?.groupValues?.get(1)
+            ?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }
+            ?: emptyList()
+        val year = Regex("""\((19|20)\d{2}\)""")
+            .find(plot ?: "")?.value?.trim('(', ')')?.toIntOrNull()
+            ?: Regex("""\b(19|20)\d{2}\b""").find(doc.select("h1, h2, time").text())
+                ?.value?.toIntOrNull()
 
         val epEls = doc.select("a[href*='/sezon-'][href*='/bolum-']")
         val isSeries = url.contains("/dizi/") || epEls.isNotEmpty()
@@ -137,18 +144,18 @@ class FilmEkseni : MainAPI() {
             }.distinctBy { it.data }
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
+                this.posterHeaders = mapOf("Referer" to mainUrl)
                 this.plot = plot
                 this.tags = tags
                 this.year = year
-                addActors(actors)
             }
         } else {
             newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
+                this.posterHeaders = mapOf("Referer" to mainUrl)
                 this.plot = plot
                 this.tags = tags
                 this.year = year
-                addActors(actors)
             }
         }
     }
@@ -164,28 +171,46 @@ class FilmEkseni : MainAPI() {
         return s.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
     }
 
+    private fun isYoutube(u: String) =
+        u.contains("youtube.com", true) || u.contains("youtu.be", true)
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, referer = mainUrl).text
-        val raw = Regex("""videoPlayerData\(JSON\.parse\('([^']+)'\)""")
-            .find(html)?.groupValues?.get(1)
+        val text = unescape(app.get(data, referer = mainUrl).text)
 
-        val urls = LinkedHashSet<String>()
-        if (raw != null) {
-            val json = unescape(raw)
-            Regex(""""(?:iframeSrc|embedUrlWithLang|embedUrl|videoLink)"\s*:\s*"([^"]+)"""")
-                .findAll(json).forEach { urls += fixUrl(it.groupValues[1].replace("\\/", "/")) }
-        }
-        if (urls.isEmpty()) {
-            app.get(data, referer = mainUrl).document.select("iframe[src]")
-                .forEach { urls += fixUrl(it.attr("src")) }
+        // eksenload player id'leri: https://eksenload.top/eplayer/<id>
+        val eksenIds = LinkedHashSet<String>()
+        Regex("""eksenload\.top/eplayer/([A-Za-z0-9]+)""")
+            .findAll(text).forEach { eksenIds += it.groupValues[1] }
+
+        // JSON içindeki diğer embed linkleri (YouTube hariç)
+        val others = LinkedHashSet<String>()
+        Regex(""""(?:iframeSrc|embedUrlWithLang|embedUrl|videoLink)"\s*:\s*"([^"]+)"""")
+            .findAll(text).forEach {
+                val u = fixUrl(it.groupValues[1])
+                if (!isYoutube(u) && !u.contains("eksenload.top")) others += u
+            }
+        Regex("""https?://vidmoly\.[a-z]+/[^"'\s<>\\]+""")
+            .findAll(text).forEach { others += it.value }
+
+        var found = false
+
+        eksenIds.forEach { id ->
+            EksenLoadExtractor().getUrl(
+                "https://eksenload.top/eplayer/$id", data, subtitleCallback, callback
+            )
+            found = true
         }
 
-        urls.forEach { loadExtractor(it, mainUrl, subtitleCallback, callback) }
-        return urls.isNotEmpty()
+        others.forEach { u ->
+            loadExtractor(u, mainUrl, subtitleCallback, callback)
+            found = true
+        }
+
+        return found
     }
 }
