@@ -30,7 +30,7 @@ class SezonlukDizi : MainAPI() {
 
     // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
     // Her şey düzelince false yap.
-    private val debug = false
+    private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
