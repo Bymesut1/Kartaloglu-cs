@@ -30,7 +30,7 @@ class SezonlukDizi : MainAPI() {
 
     // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
     // Her şey düzelince false yap.
-    private val debug = true
+    private val debug = false
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(300)) }
     private fun dbgText(): String = dbg.joinToString(" | ").take(1800)
@@ -649,11 +649,7 @@ class SezonlukDizi : MainAPI() {
         // Dzen: yanıt iframe değil, "<script>var vid = 'oVUYjD9YIAAA'; ..." şeklinde bir betik; oynatıcı adresi
         // https://dzen.ru/embed/<vid> olarak kurulur. Betikte tam adres açıkça yazıyorsa o kullanılır.
         Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/embed/[A-Za-z0-9_-]+""").find(txt)?.let { return it.value }
-        Regex("""\b(?:var\s+|let\s+|const\s+)?vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(txt)
-            ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
-        Regex("""["']vid["']\s*:\s*["']([A-Za-z0-9_-]{6,})["']""").find(txt)
-            ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
-        Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/video/watch/([A-Za-z0-9_-]+)""").find(txt)
+        Regex("""\bvar\s+vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(txt)
             ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
         // iframe yoksa src / data-src / file gibi alanlardaki adresler (göreli olanlar dahil)
         Regex("""(?:src|data-src|file|source|url)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
@@ -1161,7 +1157,7 @@ class SezonlukDizi : MainAPI() {
                 out.add(u)
             }
         }
-        return out.toList().sortedBy { if (it.contains("dzen", true)) 0 else 1 }.take(3)
+        return out.toList().take(3)
     }
 
     // Kapı sayfası (/ajax/reCAPTCHADATA.asp) Cloudflare Turnstile yükler; token çözülünce
@@ -1537,7 +1533,8 @@ class SezonlukDizi : MainAPI() {
         fun prio(dil: String, idx: Int, nm: String): Int {
             val n = nm.trim().lowercase()
             return when {
-                n.contains("byse") || n.contains("filemoon") || n.contains("dzen") -> 0
+                n.contains("byse") || n.contains("filemoon") -> 0
+                n.contains("dzen") -> 5          // Dzen en sona: diğer kaynaklar çalışmazsa denenir (geç gelir)
                 n.contains("okru") || n.contains("ok.ru") -> 4
                 "i:$dil:$idx" in goodKeys -> 1
                 n.isNotBlank() && "n:$n" in goodKeys -> 2
@@ -1705,7 +1702,10 @@ class SezonlukDizi : MainAPI() {
 
         if (!any) {
             if (debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
-            throw ErrorLoadingException("Kaynak yok: " + pageLog.joinToString(" | ").take(120) + " || " + srcLog.joinToString(" ; ").take(300))
+            throw ErrorLoadingException(
+                "Kaynak yok: " + pageLog.joinToString(" | ").take(120) + " || " + srcLog.joinToString(" ; ").take(300) +
+                    " || " + dbg.filter { it.startsWith("dzen") }.joinToString(" / ").take(700)
+            )
         }
         return any
     }
