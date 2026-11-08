@@ -11,8 +11,6 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -315,17 +313,13 @@ class SezonlukDizi : MainAPI() {
 
     // Ana sayfa ve liste sayfaları kısa süre önbellekte tutulur: iki ana sayfa satırı aynı sayfayı bir kez indirir, geri dönüşte anında açılır
     private val pageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Document>>()
-    private val pageLock = Mutex()
 
     private suspend fun cachedDoc(url: String, ttlMs: Long = 180_000L): Document {
         pageCache[url]?.let { if (System.currentTimeMillis() - it.first < ttlMs) return it.second }
-        return pageLock.withLock {
-            pageCache[url]?.let { if (System.currentTimeMillis() - it.first < ttlMs) return@withLock it.second }
-            val d = get(url).document
-            if (pageCache.size > 40) pageCache.clear()
-            pageCache[url] = System.currentTimeMillis() to d
-            d
-        }
+        val d = get(url).document
+        if (pageCache.size > 40) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to d
+        return d
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
