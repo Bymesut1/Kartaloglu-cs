@@ -494,7 +494,7 @@ class SetFilmIzle : MainAPI() {
 }
 
 // Hata ayiklama: kaynak cikmazsa sebebi kaynak listesinde "DEBUG" satirlari olarak gorunur. Sorun cozulunce false yap.
-internal const val SF_DEBUG = true
+internal const val SF_DEBUG = false
 
 internal suspend fun emitDebug(callback: (ExtractorLink) -> Unit, tag: String, notes: List<String>) {
     var i = 0
