@@ -1672,6 +1672,40 @@ class SezonlukDizi : MainAPI() {
             gateFailUntil = 0L
         }
 
+        // 3b) Filemoon (Byse): başka kaynak (Dzen vb.) önce açıldığı için hiç denenmediyse ek bağlantı olarak eklenir.
+        //     Zaten denenmiş kaynaklar (seen) atlanır, yani boşa istek / bekleme olmaz.
+        for (dil in listOf("0", "1")) {
+            val cand = queues[dil]?.firstOrNull {
+                it.second.contains("filemoon", true) || it.second.contains("byse", true)
+            } ?: continue
+            val f = fetchEmbed(cand.first, refs[dil] ?: data).first
+            if (f.isNullOrBlank() || f.contains("reCAPTCHA", true) || f in seen) continue
+            seen.add(f)
+            val buf = ArrayList<ExtractorLink>()
+            val ok = try {
+                emitEmbed(abs(f), "Türkçe ${dilName(dil)}", subtitleCallback) { l -> synchronized(buf) { buf.add(l) } }
+            } catch (e: Exception) {
+                false
+            }
+            d("filemoon ekstra dil=$dil ${short(f, 40)} -> $ok")
+            if (ok && buf.isNotEmpty()) {
+                val pick = buf.firstOrNull { it.url.contains("master.m3u8", true) }
+                    ?: buf.maxByOrNull { it.quality }
+                    ?: buf.first()
+                val res = buf.mapNotNull { Regex("""(\d{3,4})p""").find(it.name)?.groupValues?.get(1)?.toIntOrNull() }
+                    .maxOrNull()
+                callback(
+                    newExtractorLink(pick.source, "Türkçe ${dilName(dil)} - Filemoon" + (res?.let { " (${it}p)" } ?: ""), pick.url, pick.type) {
+                        this.referer = pick.referer
+                        this.quality = if (dil == "0") Qualities.P1080.value else Qualities.P720.value
+                        this.headers = pick.headers
+                    }
+                )
+                any = true
+                got.add(dil)
+            }
+        }
+
         // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa:
         //    (a) kapı adresinin içinde / kapı sayfasında gerçek adres aranır,
         //    (b) olmazsa kapının tam adresi WebView'de açılıp çözülür (useOkhttp = false), adres yeniden istenir.
