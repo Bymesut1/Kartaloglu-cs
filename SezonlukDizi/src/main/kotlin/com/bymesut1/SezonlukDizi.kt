@@ -1259,7 +1259,7 @@ class SezonlukDizi : MainAPI() {
                     l.url,
                     headers = l.headers + mapOf("Range" to "bytes=0-1023"),
                     referer = l.referer,
-                    timeout = 8L
+                    timeout = 4L
                 )
                 if (r.code in 400..599) {
                     bad++
@@ -1562,8 +1562,7 @@ class SezonlukDizi : MainAPI() {
         fun prio(dil: String, idx: Int, nm: String): Int {
             val n = nm.trim().lowercase()
             return when {
-                n.contains("byse") || n.contains("filemoon") -> 0
-                n.contains("dzen") -> 5          // Dzen en sona: diğer kaynaklar çalışmazsa denenir (geç gelir)
+                n.contains("byse") || n.contains("filemoon") || n.contains("dzen") -> 0   // eski dosyadaki sıra: Dzen, Filemoon ile aynı öncelik
                 n.contains("okru") || n.contains("ok.ru") -> 4
                 "i:$dil:$idx" in goodKeys -> 1
                 n.isNotBlank() && "n:$n" in goodKeys -> 2
