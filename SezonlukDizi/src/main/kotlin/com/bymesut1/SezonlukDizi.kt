@@ -1303,7 +1303,36 @@ class SezonlukDizi : MainAPI() {
             return true
         }
 
-        // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
+        // Genel çözücülerden (Ok.ru vb.) gelen bağlantı gerçekten açılıyor mu? İmzasız okcdn adresleri 400 döndürüyor ve
+    // bozuk bağlantı o dilin yerini kapatıp sıradaki (Dzen gibi) çalışan kaynağın denenmesini engelliyordu.
+    // Sadece açık HTTP hatası (400-599) bozuk sayılır; zaman aşımı / istisna durumunda bağlantı korunur.
+    // Byse / Filemoon / Vidmoly / Dzen kendi çözücüleriyle çalıştığı için kontrol edilmez.
+    private suspend fun linkAlive(buf: List<ExtractorLink>, embed: String): Boolean {
+        if (buf.isEmpty()) return false
+        if (listOf("byse", "filemoon", "vidmoly", "dzen.ru").any { embed.contains(it, true) }) return true
+        val probe = buf.distinctBy { it.url }.take(2)
+        var anyOk = false
+        var bad = 0
+        for (l in probe) {
+            try {
+                val r = app.get(
+                    l.url,
+                    headers = l.headers + mapOf("Range" to "bytes=0-1023"),
+                    referer = l.referer,
+                    timeout = 8L
+                )
+                if (r.code in 400..599) {
+                    bad++
+                    d("bağlantı bozuk kod=${r.code} ${l.url.take(80)}")
+                } else anyOk = true
+            } catch (e: Exception) {
+                anyOk = true
+            }
+        }
+        return anyOk || bad == 0
+    }
+
+    // Bir gömülü oynatıcıyı verilen dil etiketiyle yayınlar (captcha kapısıysa içindeki adresi arar)
         suspend fun emit(dil: String, embed0: String): Boolean {
             var embed = embed0
             if (embed.isBlank()) return false
@@ -1322,10 +1351,10 @@ class SezonlukDizi : MainAPI() {
             if (Regex("""\.m3u8(\?|$)""").containsMatchIn(embed)) {
                 val full = abs(embed)
                 emitM3u8(full, dilName(dil), full, collect)
-                ok = flush(dil, buf)
+                ok = linkAlive(buf, full) && flush(dil, buf)
             } else {
                 val r = emitEmbed(embed, dilName(dil), subtitleCallback, collect)
-                ok = r && flush(dil, buf)
+                ok = r && linkAlive(buf, embed) && flush(dil, buf)
             }
             d("kaynak ${dilName(dil)} $embed -> $ok")
             if (ok) {
