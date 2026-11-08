@@ -30,10 +30,10 @@ class SezonlukDizi : MainAPI() {
 
     // Hata ayıklama: true iken arama / oynatma başarısız olursa sebep ekranda hata mesajı olarak görünür.
     // Her şey düzelince false yap.
-    private val debug = false
+    private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
-    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(260)) }
-    private fun dbgText(): String = dbg.joinToString(" | ").take(1200)
+    private fun d(m: String) { dbg.add(m.replace("\n", " ").take(300)) }
+    private fun dbgText(): String = dbg.joinToString(" | ").take(1800)
 
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -649,7 +649,11 @@ class SezonlukDizi : MainAPI() {
         // Dzen: yanıt iframe değil, "<script>var vid = 'oVUYjD9YIAAA'; ..." şeklinde bir betik; oynatıcı adresi
         // https://dzen.ru/embed/<vid> olarak kurulur. Betikte tam adres açıkça yazıyorsa o kullanılır.
         Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/embed/[A-Za-z0-9_-]+""").find(txt)?.let { return it.value }
-        Regex("""\bvar\s+vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(txt)
+        Regex("""\b(?:var\s+|let\s+|const\s+)?vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(txt)
+            ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
+        Regex("""["']vid["']\s*:\s*["']([A-Za-z0-9_-]{6,})["']""").find(txt)
+            ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
+        Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/video/watch/([A-Za-z0-9_-]+)""").find(txt)
             ?.let { return "https://dzen.ru/embed/" + it.groupValues[1] }
         // iframe yoksa src / data-src / file gibi alanlardaki adresler (göreli olanlar dahil)
         Regex("""(?:src|data-src|file|source|url)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
@@ -662,6 +666,9 @@ class SezonlukDizi : MainAPI() {
 
     // WebView yedeği yavaş olduğu için bir bölümde en fazla bu kadar kaynakta denenir
     private val webviewLeft = AtomicInteger(0)
+
+    // Dzen'in KENDİ WebView hakkı: Pixel gibi yavaş kaynaklar webviewLeft'i bitirince Dzen'in yedeği çalışmıyordu
+    private val dzenWebviewLeft = AtomicInteger(0)
 
     // Byse'ye ek olarak Vidmoly bağlantısı da verilsin (site bu kaynağı Turnstile kapısının arkasında tutuyor).
     // İstemezsen false yap; o zaman Vidmoly sadece Byse çalışmazsa yedek olarak denenir.
@@ -966,29 +973,51 @@ class SezonlukDizi : MainAPI() {
                 .filter { u ->
                     !u.contains("/ads/") && !u.contains("yandex.ru/ads") && !u.contains("adfox") &&
                         (u.contains(".m3u8") || u.contains(".mpd") || u.contains("dzen_dash") ||
-                            Regex("""okcdn\.ru/\?""").containsMatchIn(u) ||
+                            Regex("""(?:okcdn\.ru|mycdn\.me|vkuser\.net)/\?""").containsMatchIn(u) ||
+                            (u.contains("strm.yandex") && !u.contains("/ads")) ||
                             Regex("""\.mp4(\?|$)""").containsMatchIn(u))
                 }
                 .toList()
 
-        val html = try {
-            app.get(
-                embed,
-                referer = "$mainUrl/",
-                headers = mapOf(
-                    "User-Agent" to ua,
-                    "Sec-Fetch-Dest" to "iframe",
-                    "Sec-Fetch-Mode" to "navigate",
-                    "Sec-Fetch-Site" to "cross-site"
-                ),
-                timeout = 15L
-            ).text
-        } catch (e: Exception) {
-            d("dzen sayfa hata ${e.javaClass.simpleName}: ${e.message}")
-            ""
+        // Oynatıcı sayfasını birkaç farklı başlıkla dener (Referer sezonlukdizi / dzen.ru); ilk medya adresi bulunan kazanır
+        var html = ""
+        var found: List<String> = emptyList()
+        val tries = listOf(
+            Triple("sd", "$mainUrl/", ua),
+            Triple("dz", "$origin/", ua),
+            Triple("mb", "$mainUrl/", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36")
+        )
+        for ((tag, ref, agent) in tries) {
+            try {
+                val r = app.get(
+                    embed,
+                    referer = ref,
+                    headers = mapOf(
+                        "User-Agent" to agent,
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language" to "ru-RU,ru;q=0.9,tr;q=0.8,en;q=0.7",
+                        "Sec-Fetch-Dest" to "iframe",
+                        "Sec-Fetch-Mode" to "navigate",
+                        "Sec-Fetch-Site" to "cross-site"
+                    ),
+                    timeout = 15L
+                )
+                html = r.text
+                found = media(html)
+                val cap = html.contains("showcaptcha", true) || html.contains("smartcaptcha", true) ||
+                    r.url.contains("captcha", true)
+                d("dzen[$tag] kod=${r.code} url=${r.url.take(70)} uzunluk=${html.length} adres=${found.size} captcha=$cap '${html.replace(Regex("""\s+"""), " ").take(70)}'")
+                if (found.isNotEmpty()) break
+            } catch (e: Exception) {
+                d("dzen[$tag] hata ${e.javaClass.simpleName}: ${e.message}")
+            }
         }
-        val found = media(html)
-        d("dzen sayfa uzunluk=${html.length} adres=${found.size} '${html.replace(Regex("""\s+"""), " ").take(60)}'")
+        if (found.isEmpty() && html.isNotEmpty()) {
+            // Sayfada adres yoksa sayfanın hangi anahtar sözcükleri içerdiğini kaydet (teşhis için)
+            val kw = listOf("okcdn", "m3u8", "mpd", "mp4", "strm.yandex", "streams", "videos", "vmap", "captcha")
+                .filter { html.contains(it, true) }
+            d("dzen sayfada anahtarlar=$kw")
+        }
         // Önce HLS ve DASH, sonra MP4 (DASH tüm kaliteleri içerir; MP4 yedek)
         var ok = false
         for (u in found.sortedBy { if (it.contains(".m3u8")) 0 else if (it.contains(".mpd") || it.contains("dzen_dash")) 1 else 2 }) {
@@ -999,23 +1028,28 @@ class SezonlukDizi : MainAPI() {
             return true
         }
 
-        // Yedek: sayfa adresleri açık yazmıyorsa görünmez WebView'de çalıştırıp ağdan geçen ilk medya isteğini yakala
-        if (webviewLeft.getAndDecrement() > 0) {
+        // Yedek: sayfa adresleri açık yazmıyorsa görünmez WebView'de çalıştırıp ağdan geçen ilk medya isteğini yakala.
+        // useOkhttp = false: sayfa WebView'in kendi ağ yığınıyla açılır (gerçek tarayıcı gibi), kendi UA'sı kullanılır.
+        if (dzenWebviewLeft.getAndDecrement() > 0) {
             try {
                 val r = app.get(
                     embed,
                     referer = "$mainUrl/",
                     interceptor = WebViewResolver(
-                        Regex("""okcdn\.ru/\?|\.m3u8|\.mpd"""),
-                        timeout = 20_000L
+                        Regex("""(?:okcdn\.ru|mycdn\.me|vkuser\.net)/\?|\.m3u8|\.mpd|strm\.yandex"""),
+                        userAgent = null,
+                        useOkhttp = false,
+                        timeout = 25_000L
                     )
                 )
                 val hit = media(r.url).firstOrNull()
-                d("dzen webview url=${r.url.take(120)} -> ${hit != null}")
+                d("dzen webview url=${r.url.take(140)} -> ${hit != null}")
                 if (hit != null && add(hit)) return true
             } catch (e: Exception) {
-                d("dzen webview ${e.javaClass.simpleName}")
+                d("dzen webview ${e.javaClass.simpleName}: ${e.message}")
             }
+        } else {
+            d("dzen webview hakkı bitti")
         }
         return false
     }
@@ -1127,7 +1161,7 @@ class SezonlukDizi : MainAPI() {
                 out.add(u)
             }
         }
-        return out.toList().take(3)
+        return out.toList().sortedBy { if (it.contains("dzen", true)) 0 else 1 }.take(3)
     }
 
     // Kapı sayfası (/ajax/reCAPTCHADATA.asp) Cloudflare Turnstile yükler; token çözülünce
@@ -1220,6 +1254,7 @@ class SezonlukDizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         webviewLeft.set(2)
+        dzenWebviewLeft.set(2)
         gateProbed.set(false)
         dbg.clear()
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
