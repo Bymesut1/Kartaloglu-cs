@@ -565,13 +565,13 @@ open class FastPlay : ExtractorApi() {
         return "$spT.$r.$h"
     }
 
-    private suspend fun tokenliCek(url: String, sp: String, spT: Long): String? {
+    private suspend fun tokenliCek(url: String, sp: String, spT: Long, origin: String): String? {
         for (deneme in 1..3) {
             try {
                 val r = app.get(
                     url,
                     headers = mapOf("Accept" to "*/*", "X-Sp" to xSp(sp, spT)),
-                    referer = "$mainUrl/"
+                    referer = "$origin/"
                 )
                 if (r.code == 200 && r.text.isNotBlank()) return r.text
                 Log.e(name, "HTTP ${r.code}: ${r.text.take(120)}")
@@ -635,6 +635,9 @@ open class FastPlay : ExtractorApi() {
             )
         ).text
 
+        // Sayfanin kendi alan adi (FastPlay ya da SetPlay); goreli adresler buna gore cozulur
+        val origin = Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: mainUrl
+
         val spg = Regex("""window\.SPG_A=(\{.*?\});""").find(html)?.groupValues?.get(1).orEmpty()
         val sp = Regex(""""sp":"([^"]*)"""").find(spg)?.groupValues?.get(1).orEmpty()
         val spT = Regex(""""spT":(\d+)""").find(spg)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
@@ -647,14 +650,14 @@ open class FastPlay : ExtractorApi() {
         val subSeen = HashSet<String>()
         for (m in Regex(""""file":"([^"]+\.vtt)","label":"([^"]+)"""").findAll(html)) {
             var u = unescape(m.groupValues[1])
-            if (!u.startsWith("http")) u = mainUrl + (if (u.startsWith("/")) "" else "/") + u
+            if (!u.startsWith("http")) u = resolveUrl(url, u)
             if (!subSeen.add(u)) continue
             subtitleCallback.invoke(newSubtitleFile(uniDecode(m.groupValues[2]), u))
         }
 
         if (!src.isNullOrBlank()) {
-            val masterUrl = if (src.startsWith("http")) src else mainUrl + (if (src.startsWith("/")) "" else "/") + src
-            val master = tokenliCek(masterUrl, sp, spT) ?: throw ErrorLoadingException("FastPlay master alinamadi")
+            val masterUrl = resolveUrl(url, src)
+            val master = tokenliCek(masterUrl, sp, spT, origin) ?: throw ErrorLoadingException("FastPlay master alinamadi")
 
             val port = FastPlayServer.baslat()
             val prefix = "p" + base36(Random.nextLong(Long.MAX_VALUE)) + "_"
@@ -681,7 +684,7 @@ open class FastPlay : ExtractorApi() {
                             continue
                         }
                         val abs = resolveUrl(masterUrl, m.groupValues[1].replace("&amp;", "&"))
-                        val body = tokenliCek(abs, sp, spT)
+                        val body = tokenliCek(abs, sp, spT, origin)
                         if (body == null) {
                             Log.e(name, "URI alinamadi: ${abs.take(100)}")
                             continue
@@ -691,7 +694,7 @@ open class FastPlay : ExtractorApi() {
                         out.append(line.replace(m.value, "URI=\"http://127.0.0.1:$port/$key\"")).append('\n')
                     } else {
                         val abs = resolveUrl(masterUrl, line.trim().replace("&amp;", "&"))
-                        val body = tokenliCek(abs, sp, spT)
+                        val body = tokenliCek(abs, sp, spT, origin)
                         if (body == null) {
                             Log.e(name, "Varyant alinamadi: ${abs.take(100)}")
                             pendingInf = null
@@ -714,7 +717,7 @@ open class FastPlay : ExtractorApi() {
             callback.invoke(
                 newExtractorLink(name, name, local, ExtractorLinkType.M3U8) {
                     this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("Referer" to "$mainUrl/")
+                    this.headers = mapOf("Referer" to "$origin/")
                 }
             )
             return
@@ -910,7 +913,14 @@ open class SetPlay : ExtractorApi() {
             notes.add("SPG.<fn>(...) bulunamadi")
         }
 
-        // 2) Sayfada acik adresler
+        // 2) Sayfa FastPlay ile ayni bicimde (SPG_A + STF_KOPRU src=manifest.php?t=...) -> ayni akis
+        if (html.contains("STF_KOPRU") && html.contains("SPG_A")) {
+            Log.d(name, "STF_KOPRU bulundu, FastPlay akisi: ${url.take(80)}")
+            FastPlay().getUrl(url, referer, subtitleCallback, callback)
+            return
+        }
+
+        // 2b) Sayfada acik adresler
         val urls = Regex("""https?://[^\s"'<>\\]+""").findAll(clean).map { it.value.replace("&amp;", "&") }.distinct().toList()
         val fastUrl = urls.firstOrNull { it.contains("fastplay", true) && it.contains("?") }
         if (fastUrl != null) {
