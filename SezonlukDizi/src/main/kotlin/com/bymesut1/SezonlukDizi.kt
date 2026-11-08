@@ -231,7 +231,7 @@ class SezonlukDizi : MainAPI() {
 
     // /mobland/2-sezon-5-bolum.html  veya  /mobland/dublaj/2-sezon-5-bolum.html
     private val reEp =
-        Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?/([a-z0-9-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
+        Regex("""^(?:https?://sezonlukdizi\.[a-z]+)?/([A-Za-z0-9._~%-]+)/(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
 
     // 2-sezon-5-bolum.html (başında dizi adı olmayan göreli bağlantı)
     private val reEpBare = Regex("""^(?:\./)?(?:dublaj/)?(\d+)-sezon-(\d+)-bolum\.html""")
@@ -388,6 +388,15 @@ class SezonlukDizi : MainAPI() {
         return url
     }
 
+    // Sayfadaki TAM bölüm bağlantılarının dizi adlarını sayar (gerçek adı bulmak için)
+    private fun slugVotes(doc: Document, votes: MutableMap<String, Int>) {
+        for (a in doc.select("a[href]")) {
+            val m = reEp.find(a.attr("href").trim()) ?: continue
+            val sl = m.groupValues[1]
+            votes[sl] = (votes[sl] ?: 0) + 1
+        }
+    }
+
     // Bulunan bölüm bağlantısı sayısını döndürür (sezon dolu mu boş mu anlamak için)
     private fun parseEpisodes(doc: Document, into: MutableMap<String, Episode>, slugHint: String): Int {
         var matched = 0
@@ -471,6 +480,34 @@ class SezonlukDizi : MainAPI() {
                 if (lastCount == 0) break
                 start += 8
             }
+        }
+
+        // Bölüm adresindeki dizi adı, dizi sayfası adresindekinden farklı olabilir
+        // (örn. /diziler/yu-gi-oh-izle.html -> /yu-gi-oh-duel-monsters/1-sezon-1-bolum.html).
+        // Dizi sayfasındaki, sezon yanıtlarındaki ve /bolumler/ sayfasındaki TAM bağlantılardan gerçek ad bulunur;
+        // göreli bağlantılardan türetilen yanlış adlı adresler düzeltilir.
+        try {
+            val votes = HashMap<String, Int>()
+            slugVotes(doc, votes)
+            try {
+                val bol = get("$mainUrl/bolumler/" + seriesUrl.substringAfterLast("/"), seriesUrl)
+                if (bol.code in 200..299) slugVotes(bol.document, votes)
+            } catch (e: Exception) {
+            }
+            val real = votes.maxByOrNull { it.value }?.key
+            if (real != null && real != hint) {
+                for (k in eps.keys.toList()) {
+                    val old = eps[k] ?: continue
+                    if (old.data.contains("/$hint/")) {
+                        eps[k] = newEpisode(old.data.replace("/$hint/", "/$real/")) {
+                            this.season = old.season
+                            this.episode = old.episode
+                            this.name = old.name
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
         }
 
         // Liste SADECE sitede yayınlanmış bölümlerden oluşur; yeni bölüm sitede çıkınca listeye kendiliğinden eklenir.
@@ -1339,40 +1376,124 @@ class SezonlukDizi : MainAPI() {
         } else listOf(data)
 
         val pages = ArrayList<Triple<String, String, String>>()   // (sayfa adresi, bid, aktif dil)
-        // İki sayfa aynı anda istenir (hız için)
-        val fetched = pageUrls.amap { pu ->
-            try {
-                Pair(pu, get(pu))
-            } catch (e: Exception) {
-                d("sayfa hata ${pu.takeLast(40)} ${e.javaClass.simpleName}: ${e.message}")
-                null
+
+        // Verilen bölüm sayfalarını (normal + /dublaj/) açar; bid ve açık oynatıcıları toplar
+        suspend fun processPages(urls: List<String>) {
+            // İki sayfa aynı anda istenir (hız için)
+            val fetched = urls.amap { pu ->
+                try {
+                    Pair(pu, get(pu))
+                } catch (e: Exception) {
+                    d("sayfa hata ${pu.takeLast(40)} ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
+            }
+            for (item in fetched) {
+                if (item == null) {
+                    pageLog.add("HATA")
+                    continue
+                }
+                val pu = item.first
+                val res = item.second
+                if (res.code !in 200..299) {
+                    d("sayfa kod=${res.code} $pu")
+                    pageLog.add("kod=${res.code}")
+                    continue
+                }
+                if (res.cookies.isNotEmpty()) sessionCookies = sessionCookies + res.cookies
+                val doc = res.document
+                val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
+                val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil")
+                    ?.takeIf { it == "0" || it == "1" }
+                    ?: if (res.url.contains("/dublaj/")) "0" else "1"
+                discoverEndpoints(doc, res.text)
+                val embeds = pageEmbeds(doc, res.text)
+                d("sayfa kod=${res.code} bid='$bid' dil=$activeDil açık=${embeds.size}")
+                pageLog.add("dil=$activeDil bid=$bid açık=${embeds.size} çerez=${sessionCookies.size}")
+                pages.add(Triple(pu, bid, activeDil))
+                for (f in embeds) emit(activeDil, f)
+                try { Thread.sleep(250) } catch (e: Exception) { }
             }
         }
-        for (item in fetched) {
-            if (item == null) {
-                pageLog.add("HATA")
-                continue
+
+        processPages(pageUrls)
+
+        // Bölüm adresindeki dizi adı yanlışsa (sayfa 404 / bid yok): gerçek adı dizi sayfasından ve aramadan bulup yeniden dene
+        if (m != null && pages.none { it.second.isNotBlank() }) {
+            val slug0 = m.groupValues[1]
+            val sNo = m.groupValues[2]
+            val eNo = m.groupValues[3]
+            val serieCands = LinkedHashSet<String>()
+            serieCands.add("$mainUrl/diziler/$slug0-izle.html")
+            serieCands.add("$mainUrl/diziler/$slug0.html")
+            try {
+                val txt = post("$mainUrl/ajax/arama.asp", mapOf("q" to slug0.replace('-', ' ')), "$mainUrl/").text
+                Regex("""["'](/diziler/[^"'\\\s]+\.html)["']""").findAll(txt.replace("\\/", "/"))
+                    .map { mainUrl + it.groupValues[1] }.take(3).forEach { serieCands.add(it) }
+            } catch (e: Exception) {
+                d("arama hata ${e.message}")
             }
-            val pu = item.first
-            val res = item.second
-            if (res.code !in 200..299) {
-                d("sayfa kod=${res.code} $pu")
-                pageLog.add("kod=${res.code}")
-                continue
+            var realUrls: List<String> = emptyList()
+            for (su in serieCands) {
+                val docs = ArrayList<Document>()
+                try {
+                    val r1 = get(su)
+                    if (r1.code in 200..299) docs.add(r1.document)
+                } catch (e: Exception) {
+                }
+                try {
+                    val r2 = get("$mainUrl/bolumler/" + su.substringAfterLast("/"), su)
+                    if (r2.code in 200..299) docs.add(r2.document)
+                } catch (e: Exception) {
+                }
+                var found: String? = null
+                for (dc in docs) {
+                    for (a in dc.select("a[href]")) {
+                        val mm = reEp.find(a.attr("href").trim()) ?: continue
+                        if (mm.groupValues[2] == sNo && mm.groupValues[3] == eNo) {
+                            found = mm.groupValues[1]
+                            break
+                        }
+                    }
+                    if (found != null) break
+                }
+                // Bağlantılar göreli ("1-sezon-1-bolum.html") ise dizi sayfası adresindeki ad kullanılır (örn. yu-gi-oh-izle)
+                if (found == null && docs.isNotEmpty()) {
+                    val fileSlug = su.substringAfterLast("/").removeSuffix(".html")
+                    val hasBare = docs.any { dc ->
+                        dc.select("a[href]").any { a ->
+                            val b = reEpBare.find(a.attr("href").trim())
+                            b != null && b.groupValues[1] == sNo && b.groupValues[2] == eNo
+                        }
+                    }
+                    if (hasBare) found = fileSlug
+                }
+                if (found != null && found != slug0) {
+                    d("gerçek ad bulundu: $found (eski $slug0)")
+                    realUrls = listOf(
+                        "$mainUrl/$found/$sNo-sezon-$eNo-bolum.html",
+                        "$mainUrl/$found/dublaj/$sNo-sezon-$eNo-bolum.html"
+                    )
+                    break
+                }
             }
-            if (res.cookies.isNotEmpty()) sessionCookies = sessionCookies + res.cookies
-            val doc = res.document
-            val bid = doc.selectFirst("#dilsec")?.attr("data-id").orEmpty()
-            val activeDil = doc.selectFirst("#dilsec .item.active")?.attr("data-dil")
-                ?.takeIf { it == "0" || it == "1" }
-                ?: if (res.url.contains("/dublaj/")) "0" else "1"
-            discoverEndpoints(doc, res.text)
-            val embeds = pageEmbeds(doc, res.text)
-            d("sayfa kod=${res.code} bid='$bid' dil=$activeDil açık=${embeds.size}")
-            pageLog.add("dil=$activeDil bid=$bid açık=${embeds.size} çerez=${sessionCookies.size}")
-            pages.add(Triple(pu, bid, activeDil))
-            for (f in embeds) emit(activeDil, f)
-            try { Thread.sleep(250) } catch (e: Exception) { }
+            if (realUrls.isNotEmpty()) processPages(realUrls)
+
+            // Hâlâ yoksa doğrudan olası adlar denenir: ad-izle ve -izle'siz ad
+            if (pages.none { it.second.isNotBlank() }) {
+                for (cand in listOf("$slug0-izle", slug0.removeSuffix("-izle")).distinct().filter { it != slug0 }) {
+                    processPages(
+                        listOf(
+                            "$mainUrl/$cand/$sNo-sezon-$eNo-bolum.html",
+                            "$mainUrl/$cand/dublaj/$sNo-sezon-$eNo-bolum.html"
+                        )
+                    )
+                    if (pages.any { it.second.isNotBlank() }) {
+                        d("doğrudan ad bulundu: $cand")
+                        break
+                    }
+                }
+            }
         }
 
         // 2) Alternatif kaynak listeleri alınır. Çalışan kaynaklar (Byse / daha önce çalışanlar) öne alınır,
@@ -1547,7 +1668,10 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        if (!any && debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
+        if (!any) {
+            if (debug) throw ErrorLoadingException("Kaynak yok: " + dbgText())
+            throw ErrorLoadingException("Kaynak yok: " + pageLog.joinToString(" | ").take(120) + " || " + srcLog.joinToString(" ; ").take(300))
+        }
         return any
     }
 }
