@@ -11,6 +11,8 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -119,6 +121,12 @@ class SezonlukDizi : MainAPI() {
             val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
             var score = 0
             for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
+            // Sitenin sezon düzeni TMDB'dekinden farklıysa (ör. site 5 sezon, TMDB tek sezon) toplam bölüm sayısına bakılır
+            val covers = siteCounts.keys.filter { it > 0 }.all { cnt.containsKey(it) }
+            if (!covers) {
+                val tmTotal = cnt.filterKeys { it > 0 }.values.sum()
+                score = kotlin.math.abs(siteCounts.filterKeys { it > 0 }.values.sum() - tmTotal)
+            }
             score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
         }
     }
@@ -140,7 +148,7 @@ class SezonlukDizi : MainAPI() {
         val res = try {
             app.get(
                 "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(title, "UTF-8")}",
-                timeout = 2L
+                timeout = 1L
             ).parsedSafe<TmdbSearchResponse>()?.results.orEmpty()
         } catch (e: Exception) {
             return null
@@ -188,7 +196,7 @@ class SezonlukDizi : MainAPI() {
     // Site Cloudflare kontrolü istediyse bir sonraki istekler boşuna düz denenmeden doğrudan CloudflareKiller ile atılır
     @Volatile private var needCf = false
 
-    private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 15L) =
+    private suspend fun get(url: String, referer: String = "$mainUrl/", t: Long = 8L) =
         try {
             if (needCf) throw Exception("cf")
             val r = app.get(url, headers = hdr(), referer = referer, timeout = t)
@@ -305,11 +313,26 @@ class SezonlukDizi : MainAPI() {
             hasNext = hasNext
         )
 
+    // Ana sayfa ve liste sayfaları kısa süre önbellekte tutulur: iki ana sayfa satırı aynı sayfayı bir kez indirir, geri dönüşte anında açılır
+    private val pageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Document>>()
+    private val pageLock = Mutex()
+
+    private suspend fun cachedDoc(url: String, ttlMs: Long = 180_000L): Document {
+        pageCache[url]?.let { if (System.currentTimeMillis() - it.first < ttlMs) return it.second }
+        return pageLock.withLock {
+            pageCache[url]?.let { if (System.currentTimeMillis() - it.first < ttlMs) return@withLock it.second }
+            val d = get(url).document
+            if (pageCache.size > 40) pageCache.clear()
+            pageCache[url] = System.currentTimeMillis() to d
+            d
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val key = request.data
         if (key == "soncikan" || key == "populer") {
             if (page > 1) return homeOf(request.name, emptyList(), false)
-            val doc = get(mainUrl).document
+            val doc = cachedDoc(mainUrl)
             val list = if (key == "soncikan") {
                 cards(doc.selectFirst("#soncikan"))
             } else {
@@ -317,7 +340,7 @@ class SezonlukDizi : MainAPI() {
             }
             return homeOf(request.name, list, false)
         }
-        val doc = get("$key&s=$page").document
+        val doc = cachedDoc("$key&s=$page")
         val list = cards(doc.selectFirst(".afis") ?: doc.body())
         return homeOf(request.name, list, list.isNotEmpty() && page < maxPage(doc))
     }
@@ -340,7 +363,7 @@ class SezonlukDizi : MainAPI() {
         ).distinct()
         val responses = urls.amap { u ->
             try {
-                get(u, t = 10L)
+                get(u, t = 6L)
             } catch (e: Exception) {
                 d("istek hatası ${e.javaClass.simpleName}: ${e.message}")
                 null
@@ -354,7 +377,7 @@ class SezonlukDizi : MainAPI() {
             if (list.isNotEmpty()) {
                 if (tmdbOn) {
                     // Sadece sitede bulunan diziler listelenir; afişleri TMDB'den alınır (bulunamazsa sitenin afişi kalır)
-                    list.take(12).amap { c ->
+                    list.take(8).amap { c ->
                         val tp = try { tmdbPosterFor(c.name) } catch (e: Exception) { null }
                         if (!tp.isNullOrBlank()) c.posterUrl = tp
                         c
@@ -450,6 +473,8 @@ class SezonlukDizi : MainAPI() {
 
         val eps = LinkedHashMap<String, Episode>()
         parseEpisodes(doc, eps, hint)
+        val votes = HashMap<String, Int>()
+        slugVotes(doc, votes)
 
         // Dizi numarası (did): sayfadaki did özelliği ya da poster adresinden (/i/dizi/y/b/2595.jpg)
         val did = Regex("""did\s*[=:]\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
@@ -473,6 +498,7 @@ class SezonlukDizi : MainAPI() {
                 var lastCount = 0
                 docs.forEachIndexed { i, d ->
                     if (d != null) {
+                        slugVotes(d, votes)
                         val c = parseEpisodes(d, eps, hint)
                         if (i == chunk.lastIndex) lastCount = c
                     }
@@ -487,14 +513,33 @@ class SezonlukDizi : MainAPI() {
         // Dizi sayfasındaki, sezon yanıtlarındaki ve /bolumler/ sayfasındaki TAM bağlantılardan gerçek ad bulunur;
         // göreli bağlantılardan türetilen yanlış adlı adresler düzeltilir.
         try {
-            val votes = HashMap<String, Int>()
-            slugVotes(doc, votes)
             try {
                 val bol = get("$mainUrl/bolumler/" + seriesUrl.substringAfterLast("/"), seriesUrl)
                 if (bol.code in 200..299) slugVotes(bol.document, votes)
             } catch (e: Exception) {
             }
-            val real = votes.maxByOrNull { it.value }?.key
+            var real = votes.maxByOrNull { it.value }?.key
+            if (real == null) {
+                // Hiç TAM bağlantı yok (hepsi göreli): gerçek ad dizi sayfası dosya adı (örn. yu-gi-oh-izle) ya da -izle'siz ad olabilir.
+                // Adaylar gerçek bir bölüm sayfası açılarak doğrulanır.
+                val fileSlug = seriesUrl.substringAfterLast("/").removeSuffix(".html")
+                val sample = eps.values.minWithOrNull(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+                if (sample != null) {
+                    for (c in listOf(hint, fileSlug).distinct()) {
+                        val u = sample.data.replace("/$hint/", "/$c/")
+                        val ok = try {
+                            val r = get(u)
+                            r.code in 200..299 && r.document.selectFirst("#dilsec") != null
+                        } catch (e: Exception) {
+                            false
+                        }
+                        if (ok) {
+                            real = c
+                            break
+                        }
+                    }
+                }
+            }
             if (real != null && real != hint) {
                 for (k in eps.keys.toList()) {
                     val old = eps[k] ?: continue
@@ -520,13 +565,40 @@ class SezonlukDizi : MainAPI() {
             try {
                 val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
                 tm = tmdbMatch(title, counts)
-                val tid = tm?.id
+                val tmv = tm
+                val tid = tmv?.id
                 if (tid != null) {
-                    val rows = counts.keys.filter { it > 0 }.amap { sn ->
-                        Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+                    val tmNums = tmv?.seasons.orEmpty().mapNotNull { it.season_number }.filter { it > 0 }.sorted()
+                    val siteNums = counts.keys.filter { it > 0 }
+                    if (tmNums.isEmpty() || siteNums.all { it in tmNums }) {
+                        // Sezon düzeni aynı: sezon sezon eşle
+                        val rows = siteNums.amap { sn ->
+                            Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+                        }
+                        trMap = rows.associate { it.first to it.second }
+                        enMap = rows.associate { it.first to it.third }
+                    } else {
+                        // Site sezonları TMDB'dekinden farklı bölünmüş (ör. site 5 sezon, TMDB tek sezon 224 bölüm):
+                        // TMDB bölümleri tek sıra yapılır, sitedeki bölümler sırayla bunlara eşlenir.
+                        val rows = tmNums.amap { sn ->
+                            Triple(sn, tmdbSeason(tid, sn, "tr-TR"), tmdbSeason(tid, sn, "en-US"))
+                        }.sortedBy { it.first }
+                        val flat = ArrayList<Pair<TmdbEpisode?, TmdbEpisode?>>()
+                        for ((_, trS, enS) in rows) {
+                            for (n in (trS.keys + enS.keys).toSortedSet()) flat.add(Pair(trS[n], enS[n]))
+                        }
+                        val trM = HashMap<Int, HashMap<Int, TmdbEpisode>>()
+                        val enM = HashMap<Int, HashMap<Int, TmdbEpisode>>()
+                        siteEps.forEachIndexed { i, e ->
+                            val p = flat.getOrNull(i) ?: return@forEachIndexed
+                            val sn = e.season ?: 0
+                            val en = e.episode ?: 0
+                            p.first?.let { trM.getOrPut(sn) { HashMap() }[en] = it }
+                            p.second?.let { enM.getOrPut(sn) { HashMap() }[en] = it }
+                        }
+                        trMap = trM
+                        enMap = enM
                     }
-                    trMap = rows.associate { it.first to it.second }
-                    enMap = rows.associate { it.first to it.third }
                 }
             } catch (e: Exception) {
             }
@@ -1725,6 +1797,23 @@ class SezonlukDizi : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
+            }
+        }
+
+        // Hâlâ kaynak yoksa bölüm adresindeki dizi adının -izle'li / -izle'siz biçimleri bir kez denenir
+        if (!any && m != null && !data.contains("#alt")) {
+            val slug0 = m.groupValues[1]
+            val alts = listOf("$slug0-izle", slug0.removeSuffix("-izle")).distinct().filter { it != slug0 }
+            for (a in alts) {
+                val r = try {
+                    loadLinks(
+                        "$mainUrl/$a/${m.groupValues[2]}-sezon-${m.groupValues[3]}-bolum.html#alt",
+                        isCasting, subtitleCallback, callback
+                    )
+                } catch (e: Exception) {
+                    false
+                }
+                if (r) return true
             }
         }
 
