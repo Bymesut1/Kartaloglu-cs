@@ -33,7 +33,10 @@ class SezonlukDizi : MainAPI() {
     private val debug = true
     private val dbg = java.util.Collections.synchronizedList(ArrayList<String>())
     private fun d(m: String) { dbg.add(m.replace("\n", " ").take(300)) }
-    private fun dbgText(): String = dbg.joinToString(" | ").take(1800)
+    private fun dbgText(): String {
+        val s = dbg.joinToString(" | ")
+        return if (s.length <= 1800) s else s.take(500) + " … " + s.takeLast(1300)
+    }
 
     private val ua =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -732,6 +735,9 @@ class SezonlukDizi : MainAPI() {
     // Dzen'in KENDİ WebView hakkı: Pixel gibi yavaş kaynaklar webviewLeft'i bitirince Dzen'in yedeği çalışmıyordu
     private val dzenWebviewLeft = AtomicInteger(0)
 
+    // Pixel (sitenin kendi oynatıcısı) için ayrı WebView hakkı; Dzen / genel haklara dokunmaz
+    private val pixelWebviewLeft = AtomicInteger(0)
+
     // Byse'ye ek olarak Vidmoly bağlantısı da verilsin (site bu kaynağı Turnstile kapısının arkasında tutuyor).
     // İstemezsen false yap; o zaman Vidmoly sadece Byse çalışmazsa yedek olarak denenir.
     private val vidmolyExtra = true
@@ -1116,6 +1122,134 @@ class SezonlukDizi : MainAPI() {
         return false
     }
 
+    // ---- Pixel (/player/pixel.asp?v=...): sitenin kendi playerjs oynatıcısı ----
+    // Captcha kapısı çözüldükten sonra (ya da bazı bölümlerde doğrudan) bu adres geliyor. Sayfa Dzen oynatıcısını
+    // sarmalıyorsa Dzen çözücüsüne devredilir; değilse playerjs "file:" alanı / sayfadaki medya adresleri okunur.
+    // Bulunamazsa 1 kez WebView ile ağdan geçen ilk medya isteği yakalanır.
+    private fun mediaIn(txt: String): List<String> =
+        Regex("""https?://[^"'\s<>\\,\[\]]+""").findAll(dzUnescape(txt))
+            .map { it.value.trimEnd(';', ')') }
+            .filter { u ->
+                !u.contains("/ads/") && !u.contains("adfox") && !u.contains("yandex.ru/ads") &&
+                    (u.contains(".m3u8") || u.contains(".mpd") || u.contains("dzen_dash") ||
+                        Regex("""(?:okcdn\.ru|mycdn\.me|vkuser\.net)/\?""").containsMatchIn(u) ||
+                        Regex("""\.(?:mp4|mkv|webm)(?:\?|$|#)""").containsMatchIn(u))
+            }.toList()
+
+    private suspend fun extractPixel(
+        embed: String,
+        label: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val origin = originOf(embed)
+        val hdrs = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+        var html = ""
+        try {
+            val r = app.get(
+                embed,
+                referer = "$mainUrl/",
+                headers = mapOf("User-Agent" to ua, "Sec-Fetch-Dest" to "iframe"),
+                cookies = sessionCookies,
+                timeout = 12L
+            )
+            html = r.text
+            d("pixel kod=${r.code} uzunluk=${html.length} '${html.replace(Regex("""\s+"""), " ").take(90)}'")
+        } catch (e: Exception) {
+            d("pixel hata ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        val cands = LinkedHashMap<String, String>()   // adres -> kalite yazısı
+        fun addFrom(txt: String) {
+            Regex("""\[([^\]]*)\]\s*(https?://[^,\s"'\[\]]+)""").findAll(txt)
+                .forEach { cands.putIfAbsent(it.groupValues[2], it.groupValues[1]) }
+            mediaIn(txt).forEach { cands.putIfAbsent(it, "") }
+        }
+
+        if (html.isNotEmpty()) {
+            val clean = dzUnescape(html)
+            // Pixel, Dzen oynatıcısını sarmalıyorsa Dzen çözücüsüne devret
+            val dz = Regex("""(?:https?:)?//(?:www\.)?dzen\.ru/embed/[A-Za-z0-9_-]+""").find(clean)?.value
+                ?: Regex("""\bvar\s+vid\s*=\s*['"]([A-Za-z0-9_-]{6,})['"]""").find(clean)
+                    ?.let { "https://dzen.ru/embed/" + it.groupValues[1] }
+            if (dz != null) {
+                d("pixel -> dzen")
+                if (extractDzen(if (dz.startsWith("//")) "https:$dz" else dz, label, callback)) return true
+            }
+            addFrom(clean)
+            if (cands.isEmpty()) {
+                val fileVals = Regex("""["']?file["']?\s*:\s*["']([^"']+)["']""").findAll(clean)
+                    .map { it.groupValues[1] }.toList()
+                d("pixel file=${fileVals.joinToString(",") { it.take(40) }}")
+                for (fv in fileVals.take(2)) {
+                    if (fv.startsWith("#")) {
+                        d("pixel file şifreli")
+                        continue
+                    }
+                    val fu = when {
+                        fv.startsWith("//") -> "https:$fv"
+                        fv.startsWith("/") -> origin + fv
+                        fv.startsWith("http") -> fv
+                        else -> continue
+                    }
+                    try {
+                        val t = app.get(fu, referer = embed, headers = hdrs, timeout = 10L).text
+                        addFrom(t)
+                    } catch (e: Exception) {
+                        d("pixel file istek hata ${e.javaClass.simpleName}")
+                    }
+                    if (cands.isEmpty() && fv.startsWith("http")) cands[fv] = ""
+                    if (cands.isNotEmpty()) break
+                }
+            }
+        }
+
+        // Yedek: görünmez WebView ile ağdan geçen ilk medya isteğini yakala
+        if (cands.isEmpty() && pixelWebviewLeft.getAndDecrement() > 0) {
+            try {
+                val r = app.get(
+                    embed,
+                    referer = "$mainUrl/",
+                    interceptor = WebViewResolver(
+                        Regex("""\.m3u8|\.mp4|\.mpd|okcdn\.ru/\?|mycdn\.me/\?|strm\.yandex"""),
+                        timeout = 15_000L
+                    )
+                )
+                val hit = mediaIn(r.url).firstOrNull()
+                d("pixel webview url=${r.url.take(120)} -> ${hit != null}")
+                if (hit != null) cands[hit] = ""
+            } catch (e: Exception) {
+                d("pixel webview ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+
+        var ok = false
+        for ((u0, q) in cands.entries.take(6)) {
+            val u = u0.replace("&amp;", "&")
+            val ql = Regex("""(\d{3,4})""").find(q)?.groupValues?.get(1)?.toIntOrNull()
+            val tag = if (ql != null) "$label ${ql}p" else label
+            when {
+                u.contains(".m3u8") -> emitM3u8(u, tag, "$origin/", callback)
+                u.contains(".mpd") || u.contains("dzen_dash") -> callback(
+                    newExtractorLink(name, "$tag - Pixel DASH", u, ExtractorLinkType.DASH) {
+                        this.referer = "$origin/"
+                        this.quality = ql ?: Qualities.Unknown.value
+                        this.headers = hdrs
+                    }
+                )
+                else -> callback(
+                    newExtractorLink(name, "$tag - Pixel", u, ExtractorLinkType.VIDEO) {
+                        this.referer = "$origin/"
+                        this.quality = ql ?: Qualities.Unknown.value
+                        this.headers = hdrs
+                    }
+                )
+            }
+            ok = true
+        }
+        d("pixel sonuç adres=${cands.size} ok=$ok")
+        return ok
+    }
+
     // Bir gömülü oynatıcı adresini çözer. Sırayla:
     // 1) CloudStream'in hazır çözücüleri (Filemoon, Vidmoly, Ok.ru ...)
     // 2) Sayfayı CloudflareKiller ile açıp içindeki .m3u8 adresini bulmak
@@ -1161,6 +1295,16 @@ class SezonlukDizi : MainAPI() {
                 extractDzen(u, label, callback)
             } catch (e: Exception) {
                 d("dzen istisna ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
+        }
+
+        // 0d) Pixel (sitenin kendi oynatıcısı): kendi çözücümüz
+        if (u.contains("/player/pixel", ignoreCase = true)) {
+            return try {
+                extractPixel(u, label, callback)
+            } catch (e: Exception) {
+                d("pixel istisna ${e.javaClass.simpleName}: ${e.message}")
                 false
             }
         }
@@ -1312,10 +1456,10 @@ class SezonlukDizi : MainAPI() {
     // Genel çözücülerden (Ok.ru vb.) gelen bağlantı gerçekten açılıyor mu? İmzasız okcdn adresleri 400 döndürüyor ve
     // bozuk bağlantı o dilin yerini kapatıp sıradaki (Dzen gibi) çalışan kaynağın denenmesini engelliyordu.
     // Sadece açık HTTP hatası (400-599) bozuk sayılır; zaman aşımı / istisna durumunda bağlantı korunur.
-    // Byse / Filemoon / Vidmoly / Dzen kendi çözücüleriyle çalıştığı için kontrol edilmez.
+    // Byse / Filemoon / Vidmoly / Dzen / Pixel kendi çözücüleriyle çalıştığı için kontrol edilmez.
     private suspend fun linkAlive(buf: List<ExtractorLink>, embed: String): Boolean {
         if (buf.isEmpty()) return false
-        if (listOf("byse", "filemoon", "vidmoly", "dzen.ru").any { embed.contains(it, true) }) return true
+        if (listOf("byse", "filemoon", "vidmoly", "dzen.ru", "/player/pixel").any { embed.contains(it, true) }) return true
         val probe = buf.distinctBy { it.url }.take(2)
         var anyOk = false
         var bad = 0
@@ -1346,6 +1490,7 @@ class SezonlukDizi : MainAPI() {
     ): Boolean {
         webviewLeft.set(2)
         dzenWebviewLeft.set(2)
+        pixelWebviewLeft.set(1)
         gateProbed.set(false)
         dbg.clear()
         sessionCookies = if (System.currentTimeMillis() < gateOkUntil) gateCookies else emptyMap()
@@ -1387,6 +1532,16 @@ class SezonlukDizi : MainAPI() {
             emitted.add(dil)
             // Dzen: seçilen bağlantıya ek olarak diğer biçimler (MP4 / DASH / HLS) de ayrı bağlantı olarak verilir
             buf.filter { it !== pick && it.name.contains("Dzen") }.forEach { l ->
+                callback(
+                    newExtractorLink(l.source, "Türkçe ${dilName(dil)} - " + l.name.substringAfter(" - "), l.url, l.type) {
+                        this.referer = l.referer
+                        this.quality = l.quality
+                        this.headers = l.headers
+                    }
+                )
+            }
+            // Pixel: birden fazla kalite / biçim varsa onlar da ayrı bağlantı olarak verilir
+            buf.filter { it !== pick && it.name.contains("Pixel") }.forEach { l ->
                 callback(
                     newExtractorLink(l.source, "Türkçe ${dilName(dil)} - " + l.name.substringAfter(" - "), l.url, l.type) {
                         this.referer = l.referer
@@ -1467,6 +1622,7 @@ class SezonlukDizi : MainAPI() {
         var lastGateUrl: String? = null
         suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
             val (f, raw) = fetchEmbed(id, ref)
+            d("kaynak id=$id dil=$dil ad='${short(nm, 12)}' ham='${short(raw, 80)}'")
             val tag = "$tagPrefix$dil:$id"
             if (f.isNullOrBlank()) {
                 srcLog.add("$tag BOŞ[${short(raw)}]")
