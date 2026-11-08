@@ -1533,7 +1533,12 @@ class SezonlukDizi : MainAPI() {
         // Bir kaynağı dener ve sonucunu kısa bir satır olarak kaydeder
         var gatedSeen = false
         var lastGateUrl: String? = null
+        // Dzen kaynağı kapıya (Turnstile) takılırsa: kimlikleri, kapı adresi ve kapının çözülüp çözülmediği
+        val dzenIds = HashSet<String>()
+        var dzenGateUrl: String? = null
+        var gateSolvedOk = false
         suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
+            if (nm.contains("dzen", true)) dzenIds.add(id)
             val (f, raw) = fetchEmbed(id, ref)
             val tag = "$tagPrefix$dil:$id"
             if (f.isNullOrBlank()) {
@@ -1547,8 +1552,10 @@ class SezonlukDizi : MainAPI() {
             if (cap) {
                 gatedSeen = true
                 lastGateUrl = f
+                if (id in dzenIds) dzenGateUrl = f
             }
             val ok = emit(dil, f)
+            if (ok && cap && tagPrefix.isNotEmpty()) gateSolvedOk = true
             if (cap && !ok) retryQ.add(Triple(dil, id, ref))
             if (ok) {
                 if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
@@ -1754,13 +1761,20 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
-        // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir
-        if (gatedSeen && listOf("0", "1").any { it !in got } && System.currentTimeMillis() >= gateFailUntil) {
-            solveGate(refs.values.firstOrNull() ?: data, lastGateUrl)
+        // 3) Hâlâ kaynağı çıkmayan dil varsa captcha'ya takılan / boş dönen kaynaklar bekleyerek yeniden denenir.
+        //    Dzen kaynağı kapıya takıldıysa, önceki bölümden kalan "çözülemedi" kilidi (gateFailUntil) yok sayılır
+        //    ve kapı Dzen'in kendi adresiyle çözülür (Dark Angel'daki yöntemin aynısı).
+        if (gatedSeen && listOf("0", "1").any { it !in got } &&
+            (dzenGateUrl != null || System.currentTimeMillis() >= gateFailUntil)
+        ) {
+            solveGate(refs.values.firstOrNull() ?: data, dzenGateUrl ?: lastGateUrl)
         }
         for (dil in listOf("0", "1")) {
             if (dil in got) continue
-            val todo = retryQ.filter { it.first == dil }.take(4)
+            // Dzen önce denensin
+            val todo = retryQ.filter { it.first == dil }
+                .sortedBy { if (it.second in dzenIds) 0 else 1 }
+                .take(4)
             for (attempt in 1..2) {
                 if (dil in got) break
                 for ((_, id, ref) in todo) {
@@ -1771,8 +1785,17 @@ class SezonlukDizi : MainAPI() {
             }
         }
 
+        // Kapı çözüldüyse (yeniden denemede kaynak açıldı) çerezler saklanır, sonraki bölümlerde direkt kullanılır
+        if (gateSolvedOk) {
+            gateCookies = sessionCookies
+            gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+            gateFailUntil = 0L
+        }
+
         // Kapı bu bölümde çözülemediyse Vidmoly adımında aynı kapı için bir daha beklenmez
-        if (gatedSeen && listOf("0", "1").any { it !in got }) gateFailUntil = System.currentTimeMillis() + 90_000L
+        if (gatedSeen && listOf("0", "1").any { it !in got } && !gateSolvedOk) {
+            gateFailUntil = System.currentTimeMillis() + 90_000L
+        }
 
         // 4) Vidmoly: Byse'ye ek bağlantı. Site kaynağı Turnstile kapısının arkasında tutuyorsa:
         //    (a) kapı adresinin içinde / kapı sayfasında gerçek adres aranır,
