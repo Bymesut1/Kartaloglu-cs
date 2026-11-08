@@ -559,7 +559,7 @@ open class FastPlay : ExtractorApi() {
             } catch (e: Exception) {
                 Log.e(name, "Istek hatasi ($deneme): ${e.message}")
             }
-            try { kotlinx.coroutines.delay(400L * deneme) } catch (e: Exception) { }
+            try { Thread.sleep(400L * deneme) } catch (e: Exception) { }
         }
         return null
     }
