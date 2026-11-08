@@ -1417,6 +1417,8 @@ class SezonlukDizi : MainAPI() {
         val dzenIds = HashSet<String>()
         var dzenGateUrl: String? = null
         var gateSolvedOk = false
+        var gateSolvedRun = false              // bu bölümde kapı çözme denendi mi
+        val dzenOkDil = HashSet<String>()      // Dzen'in zaten açıldığı diller
         suspend fun tryId(dil: String, id: String, ref: String, tagPrefix: String, nm: String = "", idx: Int = -1) {
             if (nm.contains("dzen", true)) dzenIds.add(id)
             val (f, raw) = fetchEmbed(id, ref)
@@ -1436,6 +1438,7 @@ class SezonlukDizi : MainAPI() {
             }
             val ok = emit(dil, f)
             if (ok && cap && tagPrefix.isNotEmpty()) gateSolvedOk = true
+            if (ok && id in dzenIds) dzenOkDil.add(dil)
             if (cap && !ok) retryQ.add(Triple(dil, id, ref))
             if (ok) {
                 if (nm.isNotBlank()) goodKeys.add("n:${nm.trim().lowercase()}")
@@ -1648,6 +1651,7 @@ class SezonlukDizi : MainAPI() {
             (dzenGateUrl != null || System.currentTimeMillis() >= gateFailUntil)
         ) {
             solveGate(refs.values.firstOrNull() ?: data, dzenGateUrl ?: lastGateUrl)
+            gateSolvedRun = true
         }
         for (dil in listOf("0", "1")) {
             if (dil in got) continue
@@ -1670,6 +1674,51 @@ class SezonlukDizi : MainAPI() {
             gateCookies = sessionCookies
             gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
             gateFailUntil = 0L
+        }
+
+        // 3c) Dzen HER ZAMAN eklenir: başka kaynak (Filemoon / Vidmoly ...) açılmış olsa bile Dzen kaynağı varsa
+        //     ek bağlantı olarak verilir. Dzen kapıya (Turnstile) takılıyorsa kapı bu bölümde bir kez çözülür (~12 sn).
+        for (dil in listOf("0", "1")) {
+            if (dil in dzenOkDil) continue
+            val cand = queues[dil]?.firstOrNull { it.second.contains("dzen", true) } ?: continue
+            val ref = refs[dil] ?: data
+            var f = fetchEmbed(cand.first, ref).first
+            if (f != null && f.contains("reCAPTCHA", true)) {
+                val gateUrl: String = f
+                if (!gateSolvedRun) {
+                    solveGate(ref, dzenGateUrl ?: gateUrl)
+                    gateSolvedRun = true
+                }
+                f = fetchEmbed(cand.first, ref).first
+                if (f != null && !f.contains("reCAPTCHA", true)) {
+                    gateCookies = sessionCookies
+                    gateOkUntil = System.currentTimeMillis() + 15 * 60_000L
+                    gateFailUntil = 0L
+                }
+            }
+            if (f.isNullOrBlank() || f.contains("reCAPTCHA", true) || f in seen) continue
+            seen.add(f)
+            val buf = ArrayList<ExtractorLink>()
+            val ok = try {
+                emitEmbed(abs(f), "Türkçe ${dilName(dil)}", subtitleCallback) { l -> synchronized(buf) { buf.add(l) } }
+            } catch (e: Exception) {
+                false
+            }
+            d("dzen ekstra dil=$dil ${short(f, 40)} -> $ok")
+            if (ok && buf.isNotEmpty()) {
+                buf.forEach { l ->
+                    callback(
+                        newExtractorLink(l.source, "Türkçe ${dilName(dil)} - " + l.name.substringAfter(" - "), l.url, l.type) {
+                            this.referer = l.referer
+                            this.quality = l.quality
+                            this.headers = l.headers
+                        }
+                    )
+                }
+                any = true
+                got.add(dil)
+                dzenOkDil.add(dil)
+            }
         }
 
         // 3b) Filemoon (Byse): başka kaynak (Dzen vb.) önce açıldığı için hiç denenmediyse ek bağlantı olarak eklenir.
