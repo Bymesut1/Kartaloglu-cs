@@ -109,6 +109,14 @@ class SetFilmIzle : MainAPI() {
         }
     }
 
+    // Canli aramadaki kucuk onizleme resimlerini buyuk surume cevirir (TMDB boyutu / WordPress -300x450 eki)
+    private fun hiRes(u: String?): String? {
+        if (u.isNullOrBlank()) return u
+        var x = Regex("""(image\.tmdb\.org/t/p/)(?:w|h)\d+(/)""").replace(u) { it.groupValues[1] + "w500" + it.groupValues[2] }
+        x = Regex("""-\d{2,4}x\d{2,4}(\.(?:jpe?g|png|webp))((?:\?.*)?)$""").replace(x) { it.groupValues[1] + it.groupValues[2] }
+        return x
+    }
+
     // ---------------- Arama: admin-ajax stf_live_search (JSON) ----------------
     private fun collectItems(node: Any?, out: MutableList<JSONObject>) {
         when (node) {
@@ -140,7 +148,7 @@ class SetFilmIzle : MainAPI() {
                 val title = o.optString("title").trim().takeIf { it.isNotBlank() } ?: continue
                 val href = fixUrlNull(o.optString("url").trim()) ?: continue
                 if (!href.contains("/film/") && !href.contains("/dizi/")) continue
-                val img = fixUrlNull(o.optString("img").trim().takeIf { it.isNotBlank() })
+                val img = hiRes(fixUrlNull(o.optString("img").trim().takeIf { it.isNotBlank() }))
                 val year = reYear.find(o.optJSONObject("extra")?.optString("date").orEmpty())?.value?.toIntOrNull()
                 if (href.contains("/dizi/")) {
                     results.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = img; this.year = year })
@@ -152,13 +160,19 @@ class SetFilmIzle : MainAPI() {
             Log.e("SetFilmIzle", "Arama JSON hatasi: ${e.message}")
         }
 
-        // Yedek: normal arama sayfasi
-        if (results.isEmpty()) {
-            try {
-                val doc = app.get("$mainUrl/?s=${java.net.URLEncoder.encode(q, "UTF-8")}", headers = browserHeaders).document
-                doc.select("div.fgrid a.card-link").mapNotNullTo(results) { toMainPageResult(it) }
-            } catch (e: Exception) {
+        // Normal arama sayfasi: kartlardaki afisler ana sayfadakiyle ayni (net). Varsa onlar kullanilir; JSON'da olmayanlar eklenir.
+        try {
+            val doc = app.get("$mainUrl/?s=${java.net.URLEncoder.encode(q, "UTF-8")}", headers = browserHeaders).document
+            val htmlItems = doc.select("div.fgrid a.card-link").mapNotNull { toMainPageResult(it) }.distinctBy { it.url }
+            val byUrl = htmlItems.associateBy { it.url }
+            for (r in results) {
+                val hp = byUrl[r.url]?.posterUrl
+                if (!hp.isNullOrBlank()) r.posterUrl = hp
             }
+            val have = results.map { it.url }.toHashSet()
+            for (h in htmlItems) if (h.url !in have) results.add(h)
+        } catch (e: Exception) {
+            Log.e("SetFilmIzle", "HTML arama hatasi: ${e.message}")
         }
         return newSearchResponseList(results.distinctBy { it.url }, hasNext = false)
     }
