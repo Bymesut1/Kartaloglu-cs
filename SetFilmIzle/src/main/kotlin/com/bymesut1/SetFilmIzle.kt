@@ -460,12 +460,16 @@ class SetFilmIzle : MainAPI() {
                 ).text
                 val streamUrl = JSONObject(text).optJSONObject("data")?.optJSONObject("stream")?.optString("url")?.trim().orEmpty()
                 Log.d("SetFilmIzle", "postId=$postId | kaynak=$playerName -> ${streamUrl.take(120)}")
-                if (streamUrl.isBlank()) return@amap
+                if (streamUrl.isBlank()) {
+                    if (SF_DEBUG) emitDebug(callback, "SetFilmIzle", listOf("$playerName: stream url bos, yanit=${text.take(200)}"))
+                    return@amap
+                }
                 val full = fixUrl(streamUrl)
                 val sink: (ExtractorLink) -> Unit = { l -> callback(l); found.set(true) }
                 routeLink(full, "$mainUrl/", subtitleCallback, sink)
             } catch (e: Exception) {
                 Log.e("SetFilmIzle", "$playerName hata: ${e.message}")
+                if (SF_DEBUG) emitDebug(callback, "SetFilmIzle", listOf("$playerName hata: ${e.message}"))
             }
         }
         return found.get()
@@ -486,6 +490,21 @@ class SetFilmIzle : MainAPI() {
                 emitDirectM3u8(url, url, "SetPlay", callback)
             else -> loadExtractor(url, referer, subtitleCallback, callback)
         }
+    }
+}
+
+// Hata ayiklama: kaynak cikmazsa sebebi kaynak listesinde "DEBUG" satirlari olarak gorunur. Sorun cozulunce false yap.
+internal const val SF_DEBUG = true
+
+internal suspend fun emitDebug(callback: (ExtractorLink) -> Unit, tag: String, notes: List<String>) {
+    var i = 0
+    for (n in notes.take(8)) {
+        i++
+        callback(
+            newExtractorLink("DEBUG", "DEBUG $i [$tag] " + n.replace("\n", " ").take(300), "https://debug.invalid/$i", ExtractorLinkType.VIDEO) {
+                this.quality = Qualities.Unknown.value
+            }
+        )
     }
 }
 
@@ -820,6 +839,22 @@ open class SetPlay : ExtractorApi() {
         emptyList()
     }
 
+    private val cerceve = Regex(
+        "SPG\\.\\w+\\(\\s*\"[^\"]*\"\\s*,\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*,\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*\\)"
+    )
+
+    private fun baglam(text: String, anahtar: String, adet: Int = 2, pay: Int = 90): List<String> {
+        val out = ArrayList<String>()
+        var from = 0
+        while (out.size < adet) {
+            val i = text.indexOf(anahtar, from, ignoreCase = true)
+            if (i < 0) break
+            out.add("[" + anahtar + "] " + text.substring(maxOf(0, i - pay / 3), minOf(text.length, i + pay)).replace("\n", " "))
+            from = i + anahtar.length
+        }
+        return out
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -832,24 +867,27 @@ open class SetPlay : ExtractorApi() {
             return
         }
 
-        val html = app.get(
+        val notes = ArrayList<String>()
+        val resp = app.get(
             url,
             referer = referer,
             headers = mapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
             )
-        ).text
-
-        val cerceve = Regex(
-            "SPG\\.cerceve\\(\\s*\"[^\"]*\"\\s*,\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*,\\s*\"((?:[^\"\\\\]|\\\\.)*)\"\\s*\\)"
         )
+        val html = resp.text
+        val clean = html.replace("\\/", "/")
+        notes.add("sayfa kod=${resp.code} uzunluk=${html.length} url=${url.take(60)}")
+
+        // 1) SPG.<fonksiyon>("..", "<veri>", "<anahtar>") -> XOR
         val m = cerceve.find(html)
         if (m != null) {
             val parts = xorCoz(
                 m.groupValues[1].replace("\\/", "/"),
                 m.groupValues[2].replace("\\/", "/")
             ).map { it.trim() }.filter { it.startsWith("http") }
+            notes.add("XOR parca=${parts.size}: " + parts.joinToString(" , ") { it.take(60) })
 
             val fast = parts.firstOrNull { it.contains("fastplay", true) }
             if (fast != null) {
@@ -867,24 +905,59 @@ open class SetPlay : ExtractorApi() {
                 for (p in parts) loadExtractor(p, url, subtitleCallback, callback)
                 return
             }
-            Log.e(name, "XOR cozulemedi (${parts.size} parca)")
         } else {
             Log.e(name, "SPG.cerceve bulunamadi")
+            notes.add("SPG.<fn>(...) bulunamadi")
         }
 
-        // Sayfada acik manifest.php adresi
-        val direct = Regex("""https?:\\?/\\?/[^\s"'<>\\]+?/player/manifest\.php\?t=[^\s"'<>\\]+""")
-            .find(html)?.value?.replace("\\/", "/")
-        if (direct != null) {
-            emitDirectM3u8(direct, url, name, callback)
+        // 2) Sayfada acik adresler
+        val urls = Regex("""https?://[^\s"'<>\\]+""").findAll(clean).map { it.value.replace("&amp;", "&") }.distinct().toList()
+        val fastUrl = urls.firstOrNull { it.contains("fastplay", true) && it.contains("?") }
+        if (fastUrl != null) {
+            Log.d(name, "sayfada fastplay -> $fastUrl")
+            FastPlay().getUrl(fastUrl, url, subtitleCallback, callback)
+            return
+        }
+        val manUrl = urls.firstOrNull { it.contains("manifest.php", true) || it.contains(".m3u8", true) }
+        if (manUrl != null) {
+            Log.d(name, "sayfada manifest -> $manUrl")
+            emitDirectM3u8(manUrl, url, name, callback)
             return
         }
 
-        // iframe yedegi
+        // 3) stfplay.php?t=TOKEN -> manifest.php?t=TOKEN (ayni belirtec) dene
+        val derived = url.replace("stfplay.php", "manifest.php")
+        if (derived != url) {
+            try {
+                val r = app.get(derived, referer = url, cookies = resp.cookies, headers = mapOf("Accept" to "*/*"))
+                val body = r.text
+                notes.add("manifest kod=${r.code} govde=${body.take(160).replace("\n", " ")}")
+                if (r.code == 200 && body.trimStart().startsWith("#EXTM3U")) {
+                    Log.d(name, "turetilmis manifest -> $derived")
+                    emitDirectM3u8(derived, url, name, callback)
+                    return
+                }
+            } catch (e: Exception) {
+                notes.add("manifest hata: ${e.message}")
+            }
+        }
+
+        // 4) iframe yedegi
         val iframe = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
         if (!iframe.isNullOrBlank() && iframe.startsWith("http")) {
             Log.d(name, "iframe -> $iframe")
             loadExtractor(iframe, url, subtitleCallback, callback)
+            return
+        }
+
+        // Hata ayiklama: sayfa hakkinda ipuclari
+        if (SF_DEBUG) {
+            val scripts = Regex("""<script[^>]+src=["']([^"']+)["']""").findAll(html).map { it.groupValues[1] }.take(6).toList()
+            notes.add("script src: " + scripts.joinToString(" , "))
+            notes.addAll(baglam(clean, "SPG", 2))
+            notes.addAll(baglam(clean, "manifest", 2))
+            notes.add("govde: " + html.replace(Regex("""\s+"""), " ").take(250))
+            emitDebug(callback, name, notes)
             return
         }
         throw ErrorLoadingException("SetPlay player bulunamadi")
