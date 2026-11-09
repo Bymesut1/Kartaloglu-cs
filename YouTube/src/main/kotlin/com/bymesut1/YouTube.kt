@@ -45,7 +45,7 @@ class YouTube : MainAPI() {
 
     // true  -> once DASH (en yuksek kalite) denenir, olmazsa duz mp4/HLS yedekleri.
     // false -> once duz mp4 (360p/720p, en guvenilir), DASH en sonda listelenir.
-    private val preferDash = false
+    private val preferDash = true
 
     // Arama/ana sayfadan gelen basliklari hatirlar; load() API'si cevap vermezse bile baslik gosterilir.
     private val titleCache = ConcurrentHashMap<String, String>()
