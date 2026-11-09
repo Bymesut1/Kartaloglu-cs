@@ -26,6 +26,10 @@ class YouTube : MainAPI() {
 
     private fun isJson(body: String) = body.startsWith("[") || body.startsWith("{")
 
+    // true  -> once DASH (en yuksek kalite) denenir, olmazsa duz mp4/HLS yedekleri.
+    // false -> once duz mp4 (360p/720p, en guvenilir), DASH en sonda listelenir.
+    private val preferDash = false
+
     private suspend fun apiText(path: String): String? {
         for (host in instances) {
             try {
@@ -37,16 +41,26 @@ class YouTube : MainAPI() {
         return null
     }
 
-    private suspend fun dashManifest(videoId: String): String? {
-        val path = "/api/manifest/dash/id/$videoId"
-        for (host in instances) {
-            try {
-                val res = app.get("https://$host$path")
-                if (res.code == 200 && res.text.startsWith("<")) return "https://$host$path"
-            } catch (_: Exception) { }
-        }
-        return null
+    // Canli yayinlarda DASH manifest "PTNaNS" suresi uretiyor ve ExoPlayer coker
+    // (ERROR_CODE_IO_UNSPECIFIED 2000). Bu yuzden gecersiz manifest'i eleriz.
+    private suspend fun validDash(host: String, videoId: String): String? {
+        val url = "https://$host/api/manifest/dash/id/$videoId"
+        return try {
+            val res = app.get(url)
+            val t   = res.text
+            if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
+        } catch (_: Exception) { null }
     }
+
+    private fun absUrl(host: String, u: String): String = when {
+        u.startsWith("http") -> u
+        u.startsWith("//")   -> "https:$u"
+        u.startsWith("/")    -> "https://$host$u"
+        else                 -> "https://$host/$u"
+    }
+
+    private fun withLocal(u: String): String =
+        if (u.contains("local=true")) u else u + (if (u.contains("?")) "&" else "?") + "local=true"
 
     fun thumb(videoId: String, size: String) = "https://i.ytimg.com/vi/$videoId/$size.jpg"
 
@@ -89,7 +103,7 @@ class YouTube : MainAPI() {
         return tryParseJson<VideoEntry>(body)?.toLoadResponse(this)
     }
 
-    private data class SearchEntry(val title: String, val videoId: String) {
+    private data class SearchEntry(val title: String = "", val videoId: String = "") {
         fun toSearchResponse(provider: YouTube): SearchResponse {
             return provider.newMovieSearchResponse(
                 title,
@@ -102,12 +116,12 @@ class YouTube : MainAPI() {
     }
 
     private data class VideoEntry(
-        val title: String,
-        val description: String,
-        val videoId: String,
-        val recommendedVideos: List<SearchEntry>,
-        val author: String,
-        val authorThumbnails: List<Thumbnail>
+        val title: String = "",
+        val description: String? = null,
+        val videoId: String = "",
+        val recommendedVideos: List<SearchEntry>? = null,
+        val author: String? = null,
+        val authorThumbnails: List<Thumbnail>? = null
     ) {
         suspend fun toLoadResponse(provider: YouTube): LoadResponse {
             return provider.newMovieLoadResponse(
@@ -118,35 +132,109 @@ class YouTube : MainAPI() {
             ) {
                 plot            = description
                 posterUrl       = provider.thumb(videoId, "hqdefault")
-                recommendations = recommendedVideos.map { it.toSearchResponse(provider) }
+                recommendations = recommendedVideos?.map { it.toSearchResponse(provider) }
                 actors          = listOf(ActorData(Actor(
-                    author,
-                    if (authorThumbnails.isNotEmpty()) authorThumbnails.last().url else ""
+                    author ?: "",
+                    authorThumbnails?.lastOrNull()?.url ?: ""
                 )))
             }
         }
     }
 
-    private data class Thumbnail(val url: String)
+    private data class Thumbnail(val url: String = "")
+
+    private data class FormatStream(
+        val url: String? = null,
+        val itag: String? = null,
+        val qualityLabel: String? = null,
+        val quality: String? = null
+    )
+
+    private data class LinkInfo(
+        val liveNow: Boolean? = null,
+        val hlsUrl: String? = null,
+        val formatStreams: List<FormatStream>? = null
+    )
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val manifest = dashManifest(data)
-        if (manifest != null) {
-            callback(
-                ExtractorLink(
-                    "YouTube",
-                    "YouTube",
-                    manifest,
-                    "",
-                    Qualities.Unknown.value,
-                    false,
-                    mapOf(),
-                    null,
-                    true
+        var found = false
+
+        for (host in instances) {
+            // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
+            val body = try {
+                val res = app.get("https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,formatStreams")
+                if (res.code == 200 && isJson(res.text)) res.text else null
+            } catch (_: Exception) { null } ?: continue
+
+            val info   = tryParseJson<LinkInfo>(body) ?: continue
+            val isLive = info.liveNow == true || !info.hlsUrl.isNullOrBlank()
+
+            // --- CANLI YAYIN: HLS ---
+            if (isLive && !info.hlsUrl.isNullOrBlank()) {
+                callback(
+                    ExtractorLink(
+                        "YouTube",
+                        "YouTube Canlı (HLS)",
+                        withLocal(absUrl(host, info.hlsUrl)),
+                        "",
+                        Qualities.Unknown.value,
+                        true,
+                        mapOf(),
+                        null,
+                        false
+                    )
                 )
-            )
+                found = true
+            }
+
+            // --- NORMAL VIDEO: duz mp4 (video+ses birlikte) ---
+            if (!isLive) {
+                info.formatStreams.orEmpty()
+                    .filter { !it.url.isNullOrBlank() }
+                    .forEach { f ->
+                        val label = f.qualityLabel ?: f.quality ?: ""
+                        val q     = Regex("(\\d{3,4})").find(label)?.groupValues?.get(1)?.toIntOrNull()
+                            ?: Qualities.Unknown.value
+                        callback(
+                            ExtractorLink(
+                                "YouTube",
+                                "YouTube $label".trim(),
+                                absUrl(host, f.url!!),
+                                "",
+                                if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
+                                false,
+                                mapOf(),
+                                null,
+                                false
+                            )
+                        )
+                        found = true
+                    }
+
+                // --- NORMAL VIDEO: DASH (yuksek kalite), sadece gecerliyse ---
+                val dash = validDash(host, data)
+                if (dash != null) {
+                    callback(
+                        ExtractorLink(
+                            "YouTube",
+                            "YouTube DASH (Yüksek Kalite)",
+                            dash,
+                            "",
+                            if (preferDash) 20000 else Qualities.Unknown.value,
+                            false,
+                            mapOf(),
+                            null,
+                            true
+                        )
+                    )
+                    found = true
+                }
+            }
+
+            if (found) break // calisan instance bulundu
         }
-        return true
+
+        return found
     }
 
 }
