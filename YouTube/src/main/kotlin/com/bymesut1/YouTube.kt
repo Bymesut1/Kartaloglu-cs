@@ -238,102 +238,130 @@ class YouTube : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         var found = false
 
-        for (host in instances) {
-            // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
-            val body = fetchText(
-                "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams",
-                playHeaders(host)
-            ) ?: continue
-
-            val info   = tryParseJson<LinkInfo>(body) ?: continue
-            // DIKKAT: Invidious normal videolarda da hlsUrl dondurur (ama bu HLS 3001 hatasi verir).
-            // Bu yuzden canli yayin tespiti sadece liveNow / yt_live_broadcast ile yapilir.
-            val isLive = info.liveNow == true || info.hlsUrl?.contains("yt_live_broadcast") == true
-
-            // --- CANLI YAYIN: HLS ---
-            if (isLive && !info.hlsUrl.isNullOrBlank()) {
-                callback(
-                    ExtractorLink(
-                        "YouTube",
-                        "YouTube",
-                        withLocal(absUrl(host, info.hlsUrl)),
-                        "",
-                        Qualities.Unknown.value,
-                        true,
-                        mapOf(),
-                        null,
-                        false
-                    )
+        // Tum ornekleri 2 tur deniyoruz: gecici hata (zaman asimi / 429 / "bot kontrolu" sayfasi) alan
+        // ornek ikinci turda tekrar sorulur. Bu, ilk basista "Baglanti bulunamadi" cikmasini onler.
+        for (round in 1..2) {
+            for (host in instances) {
+                // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
+                val body = fetchText(
+                    "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams",
+                    playHeaders(host),
+                    attempts = 1
                 )
-                found = true
-            }
+                // API bilgisi gelmese bile DASH manifest'i dogrudan denenir (asagida).
+                val info = body?.let { tryParseJson<LinkInfo>(it) }
 
-            // --- NORMAL VIDEO: duz mp4 (video+ses birlikte) ---
-            if (!isLive) {
-                info.formatStreams.orEmpty()
-                    .filter { !it.url.isNullOrBlank() }
-                    .forEach { f ->
-                        val label = f.qualityLabel ?: f.quality ?: ""
-                        val q     = Regex("(\\d{3,4})").find(label)?.groupValues?.get(1)?.toIntOrNull()
-                            ?: Qualities.Unknown.value
+                // DIKKAT: Invidious normal videolarda da hlsUrl dondurur (ama bu HLS 3001 hatasi verir).
+                // Bu yuzden canli yayin tespiti sadece liveNow / yt_live_broadcast ile yapilir.
+                val isLive = info?.liveNow == true || info?.hlsUrl?.contains("yt_live_broadcast") == true
+
+                // --- CANLI YAYIN: HLS ---
+                if (isLive && !info?.hlsUrl.isNullOrBlank()) {
+                    callback(
+                        ExtractorLink(
+                            "YouTube",
+                            "YouTube",
+                            withLocal(absUrl(host, info!!.hlsUrl!!)),
+                            "",
+                            Qualities.Unknown.value,
+                            true,
+                            mapOf(),
+                            null,
+                            false
+                        )
+                    )
+                    found = true
+                }
+
+                // --- NORMAL VIDEO ---
+                if (!isLive) {
+                    // duz mp4 (video+ses birlikte)
+                    info?.formatStreams.orEmpty()
+                        .filter { !it.url.isNullOrBlank() }
+                        .forEach { f ->
+                            val label = f.qualityLabel ?: f.quality ?: ""
+                            val q     = Regex("(\\d{3,4})").find(label)?.groupValues?.get(1)?.toIntOrNull()
+                                ?: Qualities.Unknown.value
+                            callback(
+                                ExtractorLink(
+                                    "YouTube",
+                                    "YouTube",
+                                    absUrl(host, f.url!!),
+                                    "https://$host/",
+                                    if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
+                                    false,
+                                    playHeaders(host),
+                                    null,
+                                    false
+                                )
+                            )
+                            found = true
+                        }
+
+                    // tarayicidaki companion DASH (calisan yol)
+                    val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
+                    if (comp != null) {
                         callback(
                             ExtractorLink(
                                 "YouTube",
                                 "YouTube",
-                                absUrl(host, f.url!!),
+                                comp,
                                 "https://$host/",
-                                if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
+                                if (preferDash) 30000 else Qualities.Unknown.value,
                                 false,
                                 playHeaders(host),
                                 null,
-                                false
+                                true
                             )
                         )
                         found = true
                     }
 
-                // --- NORMAL VIDEO: tarayicidaki companion DASH (calisan yol) ---
-                val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
-                if (comp != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            comp,
-                            "https://$host/",
-                            if (preferDash) 30000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
+                    // ana sunucu DASH (yedek), sadece gecerliyse
+                    val dash = if (comp == null) validDash(host, data, info?.dashUrl) else null
+                    if (dash != null) {
+                        callback(
+                            ExtractorLink(
+                                "YouTube",
+                                "YouTube",
+                                dash,
+                                "https://$host/",
+                                if (preferDash) 20000 else Qualities.Unknown.value,
+                                false,
+                                playHeaders(host),
+                                null,
+                                true
+                            )
                         )
-                    )
-                    found = true
+                        found = true
+                    }
                 }
 
-                // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
-                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
-                if (dash != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            dash,
-                            "https://$host/",
-                            if (preferDash) 20000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
-                        )
-                    )
-                    found = true
-                }
+                // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
+                // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
+                if (found && isLive) break
             }
+            if (found) break
+        }
 
-            // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
-            // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
-            if (found && isLive) break
+        // SON CARE: hicbir ornek zamaninda cevap vermediyse "Baglanti bulunamadi" yerine manifest'i
+        // dogrulamadan veriyoruz; oynatici kendi yeniden denemesini yapar (ikinci basista zaten aciliyordu).
+        if (!found) {
+            val host = instances.first()
+            callback(
+                ExtractorLink(
+                    "YouTube",
+                    "YouTube",
+                    dashWithLocal("https://$host/api/manifest/dash/id/$data"),
+                    "https://$host/",
+                    Qualities.Unknown.value,
+                    false,
+                    playHeaders(host),
+                    null,
+                    true
+                )
+            )
+            found = true
         }
 
         return found
