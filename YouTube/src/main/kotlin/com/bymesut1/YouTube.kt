@@ -30,25 +30,13 @@ class YouTube : MainAPI() {
     // false -> once duz mp4 (360p/720p, en guvenilir), DASH en sonda listelenir.
     private val preferDash = false
 
-    // "Ilk seferde baglanti yok, ikinci seferde acilir" sorunu: sunucu ilk istekte yavas/hatali
-    // (soguk onbellek, companion'un videoyu YouTube'dan ilk kez cekmesi) donuyor, ikinci seferde
-    // onbellekten hizli geliyor. Uygulama tek denemeyle vazgeciyordu; simdi birkac kez deniyoruz.
-    private suspend fun <T> retry(times: Int = 3, block: suspend () -> T?): T? {
-        for (i in 0 until times) {
-            val r = try { block() } catch (_: Exception) { null }
-            if (r != null) return r
-            if (i < times - 1) kotlinx.coroutines.delay(700L * (i + 1))
-        }
-        return null
-    }
-
     private suspend fun apiText(path: String): String? {
         for (host in instances) {
-            val body = retry(2) {
-                val res = app.get("https://$host$path", timeout = 30L)
-                if (res.code == 200 && isJson(res.text)) res.text else null
-            }
-            if (body != null) return body
+            try {
+                val res  = app.get("https://$host$path")
+                val body = res.text
+                if (res.code == 200 && isJson(body)) return body
+            } catch (_: Exception) { }
         }
         return null
     }
@@ -63,24 +51,24 @@ class YouTube : MainAPI() {
     }
 
     // Manifest gecerli mi? (canli yayinda "PTNaNS" suresi uretiliyor -> ExoPlayer cokuyor)
-    private suspend fun checkDash(host: String, url: String): String? = retry(3) {
-        val res = app.get(url, headers = playHeaders(host), timeout = 30L)
+    private suspend fun checkDash(host: String, url: String): String? = try {
+        val res = app.get(url, headers = playHeaders(host))
         val t   = res.text
         if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
-    }
+    } catch (_: Exception) { null }
 
     // TARAYICININ KULLANDIGI MANIFEST: video sayfasi parcalari yt-comp*.chocolatemoo53.com
     // uzerinden proxy'leyen "companion" manifest'ini ve her sayfa acilisinda degisen "check=" imzasini
     // kullaniyor:
     //   https://yt-comp3.../companion/api/manifest/dash/id/ID?local=true&unique_res=1&check=...
     // check imzasini hesaplayamayiz; o yuzden watch sayfasindan okuyoruz.
-    private suspend fun companionDashUrl(host: String, videoId: String): String? = retry(3) {
-        val res  = app.get("https://$host/watch?v=$videoId", headers = playHeaders(host), timeout = 30L)
+    private suspend fun companionDashUrl(host: String, videoId: String): String? = try {
+        val res  = app.get("https://$host/watch?v=$videoId", headers = playHeaders(host))
         val html = res.text.replace("&amp;", "&").replace("\\u0026", "&").replace("\\/", "/")
         val rx   = Regex("""(https?://[A-Za-z0-9.\-]+)?(/companion/api/manifest/dash/id/$videoId\?[^"'<>\s\\]+)""")
         val m    = rx.find(html)
         if (m == null) null else m.groupValues[1].ifBlank { "https://$host" } + m.groupValues[2]
-    }
+    } catch (_: Exception) { null }
 
     private suspend fun validDash(host: String, videoId: String, apiDashUrl: String?): String? {
         val base = if (!apiDashUrl.isNullOrBlank()) absUrl(host, apiDashUrl)
@@ -227,14 +215,12 @@ class YouTube : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         var found = false
 
-        var attempt = 0
-        while (!found && attempt < 2) {
         for (host in instances) {
             // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
-            val body = retry(3) {
-                val res = app.get(headers = playHeaders(host), timeout = 30L, url = "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams")
+            val body = try {
+                val res = app.get(headers = playHeaders(host), url = "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams")
                 if (res.code == 200 && isJson(res.text)) res.text else null
-            } ?: continue
+            } catch (_: Exception) { null } ?: continue
 
             val info   = tryParseJson<LinkInfo>(body) ?: continue
             // DIKKAT: Invidious normal videolarda da hlsUrl dondurur (ama bu HLS 3001 hatasi verir).
@@ -246,7 +232,7 @@ class YouTube : MainAPI() {
                 callback(
                     ExtractorLink(
                         "YouTube",
-                        "YouTube",
+                        "YouTube Canlı (HLS)",
                         withLocal(absUrl(host, info.hlsUrl)),
                         "",
                         Qualities.Unknown.value,
@@ -270,7 +256,7 @@ class YouTube : MainAPI() {
                         callback(
                             ExtractorLink(
                                 "YouTube",
-                                "YouTube",
+                                "YouTube $label".trim(),
                                 absUrl(host, f.url!!),
                                 "https://$host/",
                                 if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
@@ -289,7 +275,7 @@ class YouTube : MainAPI() {
                     callback(
                         ExtractorLink(
                             "YouTube",
-                            "YouTube",
+                            "YouTube DASH companion ($host)",
                             comp,
                             "https://$host/",
                             if (preferDash) 30000 else Qualities.Unknown.value,
@@ -303,12 +289,12 @@ class YouTube : MainAPI() {
                 }
 
                 // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
-                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
+                val dash = validDash(host, data, info.dashUrl)
                 if (dash != null) {
                     callback(
                         ExtractorLink(
                             "YouTube",
-                            "YouTube",
+                            "YouTube DASH ($host)",
                             dash,
                             "https://$host/",
                             if (preferDash) 20000 else Qualities.Unknown.value,
@@ -325,9 +311,6 @@ class YouTube : MainAPI() {
             // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
             // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
             if (found && isLive) break
-        }
-            attempt++
-            if (!found && attempt < 2) kotlinx.coroutines.delay(1000L)
         }
 
         return found
