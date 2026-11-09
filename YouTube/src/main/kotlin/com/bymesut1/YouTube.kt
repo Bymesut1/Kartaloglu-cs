@@ -46,7 +46,7 @@ class YouTube : MainAPI() {
     private suspend fun validDash(host: String, videoId: String): String? {
         val url = "https://$host/api/manifest/dash/id/$videoId"
         return try {
-            val res = app.get(url)
+            val res = app.get(url, headers = playHeaders(host))
             val t   = res.text
             if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
         } catch (_: Exception) { null }
@@ -56,11 +56,22 @@ class YouTube : MainAPI() {
     // Tarayicinin gonderdigi UA / Referer / Origin basliklarini ExoPlayer'a da veriyoruz.
     private val browserUa = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 
-    private fun playHeaders(host: String) = mapOf(
-        "User-Agent" to browserUa,
-        "Referer"    to "https://$host/",
-        "Origin"     to "https://$host",
-    )
+    // Sunucu videoplayback isteklerini "captcha_verified" cerezi olmadan 403 ile reddediyor
+    // (tarayicidaki istekte bu cerez var, uygulamadakinde yoktu). Cerez ~1 haftada doluyor:
+    // 1794810006 = 16 Kasim 2026. Dolunca tarayicida siteyi ac, DevTools > Ag > istek basliklari >
+    // Cookie icindeki captcha_verified=... degerini buraya yapistir.
+    private val captchaCookie =
+        "captcha_verified=1794810006.full..b45f6030ddcb2c5d2dac0b1b41dbad2a926141a6f2d36125971c1c75edfb59a0"
+
+    private fun playHeaders(host: String): Map<String, String> {
+        val h = mutableMapOf(
+            "User-Agent" to browserUa,
+            "Referer"    to "https://$host/",
+            "Origin"     to "https://$host",
+        )
+        if (captchaCookie.isNotBlank() && host.endsWith("chocolatemoo53.com")) h["Cookie"] = captchaCookie
+        return h
+    }
 
     private fun absUrl(host: String, u: String): String = when {
         u.startsWith("http") -> u
@@ -182,7 +193,7 @@ class YouTube : MainAPI() {
         for (host in instances) {
             // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
             val body = try {
-                val res = app.get("https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,formatStreams")
+                val res = app.get(headers = playHeaders(host), url = "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,formatStreams")
                 if (res.code == 200 && isJson(res.text)) res.text else null
             } catch (_: Exception) { null } ?: continue
 
