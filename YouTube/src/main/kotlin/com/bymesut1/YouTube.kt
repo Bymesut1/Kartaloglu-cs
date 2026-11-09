@@ -3,6 +3,7 @@
 
 package com.bymesut1
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -26,9 +27,16 @@ class YouTube : MainAPI() {
 
     private fun isJson(body: String) = body.startsWith("[") || body.startsWith("{")
 
-    // true  -> once DASH (en yuksek kalite) denenir, olmazsa duz mp4/HLS yedekleri.
-    // false -> once duz mp4 (360p/720p, en guvenilir), DASH en sonda listelenir.
-    private val preferDash = false
+    // DASH manifest icindeki video kodekleri. Manifest'te ayni cozunurlukten birden fazla
+    // (VP9 / AV1 / H264) var; hangisinin hizli aktigini kaynak listesinde ayri ayri gorebilmen icin
+    // her kodek icin AYRI kaynak uretiyoruz. Siradaki ilk kaynak otomatik secilir.
+    // Hangisi iyi akiyorsa bana soyle, digerlerini listeden cikaririm (ya da sirayi degistir).
+    // Format: gorunen ad to kodek on ekleri
+    private val codecGroups = listOf(
+        "VP9"  to listOf("vp09", "vp9"),   // 720p / 1080p / 1440p / 4K
+        "AV1"  to listOf("av01"),          // 720p / 1080p / 1440p / 4K
+        "H264" to listOf("avc1"),          // en fazla 1080p
+    )
 
     private suspend fun apiText(path: String): String? {
         for (host in instances) {
@@ -51,10 +59,11 @@ class YouTube : MainAPI() {
     }
 
     // Manifest gecerli mi? (canli yayinda "PTNaNS" suresi uretiliyor -> ExoPlayer cokuyor)
-    private suspend fun checkDash(host: String, url: String): String? = try {
+    // Gecerliyse manifest METNINI dondurur.
+    private suspend fun mpdBody(host: String, url: String): String? = try {
         val res = app.get(url, headers = playHeaders(host))
         val t   = res.text
-        if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
+        if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) t else null
     } catch (_: Exception) { null }
 
     // TARAYICININ KULLANDIGI MANIFEST: video sayfasi parcalari yt-comp*.chocolatemoo53.com
@@ -70,10 +79,42 @@ class YouTube : MainAPI() {
         if (m == null) null else m.groupValues[1].ifBlank { "https://$host" } + m.groupValues[2]
     } catch (_: Exception) { null }
 
-    private suspend fun validDash(host: String, videoId: String, apiDashUrl: String?): String? {
-        val base = if (!apiDashUrl.isNullOrBlank()) absUrl(host, apiDashUrl)
-                   else "https://$host/api/manifest/dash/id/$videoId"
-        return checkDash(host, dashWithLocal(base))
+    private val setRx   = Regex("<AdaptationSet.*?</AdaptationSet>", RegexOption.DOT_MATCHES_ALL)
+    private val repRx   = Regex("<Representation.*?</Representation>", RegexOption.DOT_MATCHES_ALL)
+    private val codecRx = Regex("codecs=\"([^\"]+)\"")
+    private val baseRx  = Regex("<BaseURL>\\s*(?!https?://)([^<]+?)\\s*</BaseURL>")
+
+    // Manifest'ten sadece istenen kodegin video varyantlarini birakir (ses parcalari aynen kalir).
+    // Boylece oynaticida sadece o kaynagin 720p/1080p/1440p/4K varyantlari gorunur.
+    // BaseURL'ler gocut olarak mutlak adrese cevrilir (manifest data: adresi olarak verilecek).
+    private fun filterMpd(mpd: String, prefixes: List<String>, origin: String): String? {
+        var kept = 0
+        var out = setRx.replace(mpd) { sm ->
+            val set     = sm.value
+            val isVideo = set.contains("mimeType=\"video") || set.contains("contentType=\"video")
+            if (!isVideo) {
+                set
+            } else {
+                val newSet = repRx.replace(set) { rm ->
+                    val c = codecRx.find(rm.value)?.groupValues?.get(1)
+                        ?: codecRx.find(set)?.groupValues?.get(1)
+                        ?: ""
+                    if (prefixes.any { c.startsWith(it) }) { kept++; rm.value } else ""
+                }
+                if (repRx.containsMatchIn(newSet)) newSet else ""
+            }
+        }
+        if (kept == 0) return null
+        out = baseRx.replace(out) { m ->
+            val u = m.groupValues[1]
+            val abs = when {
+                u.startsWith("//") -> "https:$u"
+                u.startsWith("/")  -> origin + u
+                else               -> "$origin/$u"
+            }
+            "<BaseURL>$abs</BaseURL>"
+        }
+        return out
     }
 
     // Tarayicida (Chrome) calisan videoplayback istekleri uygulamada 403 veriyordu.
@@ -245,71 +286,105 @@ class YouTube : MainAPI() {
                 found = true
             }
 
-            // --- NORMAL VIDEO: duz mp4 (video+ses birlikte) ---
             if (!isLive) {
-                info.formatStreams.orEmpty()
-                    .filter { !it.url.isNullOrBlank() }
-                    .forEach { f ->
-                        val label = f.qualityLabel ?: f.quality ?: ""
-                        val q     = Regex("(\\d{3,4})").find(label)?.groupValues?.get(1)?.toIntOrNull()
-                            ?: Qualities.Unknown.value
+                var dashOk = false
+
+                // --- NORMAL VIDEO: DASH manifest (once tarayicidaki companion, olmazsa ana sunucu) ---
+                var mpdUrl: String? = null
+                var mpd: String?    = null
+
+                val compUrl  = companionDashUrl(host, data)
+                val compBody = compUrl?.let { mpdBody(host, it) }
+                if (compUrl != null && compBody != null) {
+                    mpdUrl = compUrl
+                    mpd    = compBody
+                } else {
+                    val apiDash = info.dashUrl
+                    val base    = if (!apiDash.isNullOrBlank()) absUrl(host, apiDash)
+                                  else "https://$host/api/manifest/dash/id/$data"
+                    val u       = dashWithLocal(base)
+                    val b       = mpdBody(host, u)
+                    if (b != null) {
+                        mpdUrl = u
+                        mpd    = b
+                    }
+                }
+
+                if (mpd != null && mpdUrl != null) {
+                    val origin = Regex("^(https?://[^/]+)").find(mpdUrl)?.groupValues?.get(1) ?: "https://$host"
+
+                    // Her kodek icin ayri, sadece o kodegin varyantlarini iceren kaynak.
+                    // Ilk siradaki en yuksek oncelikli oldugu icin video acilisinda o otomatik secilir.
+                    for ((i, g) in codecGroups.withIndex()) {
+                        val filtered = filterMpd(mpd, g.second, origin) ?: continue
+                        val b64 = Base64.encodeToString(filtered.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                        callback(
+                            ExtractorLink(
+                                "YouTube",
+                                "YouTube ${g.first}",
+                                "data:application/dash+xml;base64,$b64",
+                                "https://$host/",
+                                40000 - (i * 1000),
+                                false,
+                                playHeaders(host),
+                                null,
+                                true
+                            )
+                        )
+                        dashOk = true
+                        found  = true
+                    }
+
+                    // Filtre hicbir kodek bulamazsa: filtrelenmemis orijinal manifest (yedek)
+                    if (!dashOk) {
                         callback(
                             ExtractorLink(
                                 "YouTube",
                                 "YouTube",
-                                absUrl(host, f.url!!),
+                                mpdUrl,
                                 "https://$host/",
-                                if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
+                                30000,
                                 false,
                                 playHeaders(host),
                                 null,
-                                false
+                                true
                             )
                         )
-                        found = true
+                        dashOk = true
+                        found  = true
                     }
-
-                // --- NORMAL VIDEO: tarayicidaki companion DASH (calisan yol) ---
-                val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
-                if (comp != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            comp,
-                            "https://$host/",
-                            if (preferDash) 30000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
-                        )
-                    )
-                    found = true
                 }
 
-                // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
-                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
-                if (dash != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            dash,
-                            "https://$host/",
-                            if (preferDash) 20000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
-                        )
-                    )
-                    found = true
+                // --- SON YEDEK: duz mp4 (video+ses birlikte, 360p/720p). Sadece DASH hic calismazsa eklenir ---
+                if (!dashOk) {
+                    info.formatStreams.orEmpty()
+                        .filter { !it.url.isNullOrBlank() }
+                        .forEach { f ->
+                            val label = f.qualityLabel ?: f.quality ?: ""
+                            val q     = Regex("(\\d{3,4})").find(label)?.groupValues?.get(1)?.toIntOrNull()
+                                ?: Qualities.Unknown.value
+                            callback(
+                                ExtractorLink(
+                                    "YouTube",
+                                    "YouTube mp4",
+                                    absUrl(host, f.url!!),
+                                    "https://$host/",
+                                    q,
+                                    false,
+                                    playHeaders(host),
+                                    null,
+                                    false
+                                )
+                            )
+                            found = true
+                        }
                 }
+
+                // DASH bulunan ilk instance yeter (yavas yedek kaynaklar listeyi kirletmesin)
+                if (dashOk) break
             }
 
-            // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
-            // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
+            // Canli yayinda ilk calisan instance yeter.
             if (found && isLive) break
         }
 
