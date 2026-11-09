@@ -1,5 +1,5 @@
 // Sürüm numarasını her güncellemede 1 artır
-version = 41
+version = 42
 
 android {
     namespace = "com.bymesut1"
