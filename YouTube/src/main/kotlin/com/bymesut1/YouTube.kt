@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.StringUtils.encodeUri
-import kotlinx.coroutines.delay
 
 class YouTube : MainAPI() {
     override var mainUrl              = "https://yt.chocolatemoo53.com"
@@ -44,13 +43,12 @@ class YouTube : MainAPI() {
         attempts: Int = retryCount,
         ok: (Int, String) -> Boolean = { code, body -> code == 200 && isJson(body) }
     ): String? {
-        repeat(attempts) { i ->
+        repeat(attempts) {
             try {
                 val res  = app.get(url, headers = headers, timeout = requestTimeout)
                 val body = res.text
                 if (ok(res.code, body)) return body
             } catch (_: Exception) { }
-            if (i < attempts - 1) delay(700L)
         }
         return null
     }
