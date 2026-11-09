@@ -232,7 +232,7 @@ class YouTube : MainAPI() {
                 callback(
                     ExtractorLink(
                         "YouTube",
-                        "YouTube Canlı (HLS)",
+                        "YouTube",
                         withLocal(absUrl(host, info.hlsUrl)),
                         "",
                         Qualities.Unknown.value,
@@ -256,7 +256,7 @@ class YouTube : MainAPI() {
                         callback(
                             ExtractorLink(
                                 "YouTube",
-                                "YouTube $label".trim(),
+                                "YouTube",
                                 absUrl(host, f.url!!),
                                 "https://$host/",
                                 if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
@@ -275,7 +275,7 @@ class YouTube : MainAPI() {
                     callback(
                         ExtractorLink(
                             "YouTube",
-                            "YouTube DASH companion ($host)",
+                            "YouTube",
                             comp,
                             "https://$host/",
                             if (preferDash) 30000 else Qualities.Unknown.value,
@@ -289,12 +289,12 @@ class YouTube : MainAPI() {
                 }
 
                 // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
-                val dash = validDash(host, data, info.dashUrl)
+                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
                 if (dash != null) {
                     callback(
                         ExtractorLink(
                             "YouTube",
-                            "YouTube DASH ($host)",
+                            "YouTube",
                             dash,
                             "https://$host/",
                             if (preferDash) 20000 else Qualities.Unknown.value,
