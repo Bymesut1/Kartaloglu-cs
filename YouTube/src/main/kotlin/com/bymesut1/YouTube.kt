@@ -41,6 +41,15 @@ class YouTube : MainAPI() {
         return null
     }
 
+    // KOK NEDEN (403): /api/manifest/dash/id/ID adresi "local=true" olmadan parca adreslerini
+    // dogrudan googlevideo.com'a verir (sunucu IP'sine kilitli -> telefondan 403).
+    private fun dashWithLocal(u: String): String {
+        var r = u
+        if (!r.contains("local=true"))   r += (if (r.contains("?")) "&" else "?") + "local=true"
+        if (!r.contains("unique_res=1")) r += "&unique_res=1"
+        return r
+    }
+
     // Manifest gecerli mi? (canli yayinda "PTNaNS" suresi uretiliyor -> ExoPlayer cokuyor)
     private suspend fun checkDash(host: String, url: String): String? = try {
         val res = app.get(url, headers = playHeaders(host))
