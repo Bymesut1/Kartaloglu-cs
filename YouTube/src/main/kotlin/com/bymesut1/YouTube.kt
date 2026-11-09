@@ -41,15 +41,30 @@ class YouTube : MainAPI() {
         return null
     }
 
-    // Canli yayinlarda DASH manifest "PTNaNS" suresi uretiyor ve ExoPlayer coker
-    // (ERROR_CODE_IO_UNSPECIFIED 2000). Bu yuzden gecersiz manifest'i eleriz.
-    private suspend fun validDash(host: String, videoId: String): String? {
-        val url = "https://$host/api/manifest/dash/id/$videoId"
-        return try {
-            val res = app.get(url, headers = playHeaders(host))
-            val t   = res.text
-            if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
-        } catch (_: Exception) { null }
+    // Manifest gecerli mi? (canli yayinda "PTNaNS" suresi uretiliyor -> ExoPlayer cokuyor)
+    private suspend fun checkDash(host: String, url: String): String? = try {
+        val res = app.get(url, headers = playHeaders(host))
+        val t   = res.text
+        if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
+    } catch (_: Exception) { null }
+
+    // TARAYICININ KULLANDIGI MANIFEST: video sayfasi parcalari yt-comp*.chocolatemoo53.com
+    // uzerinden proxy'leyen "companion" manifest'ini ve her sayfa acilisinda degisen "check=" imzasini
+    // kullaniyor:
+    //   https://yt-comp3.../companion/api/manifest/dash/id/ID?local=true&unique_res=1&check=...
+    // check imzasini hesaplayamayiz; o yuzden watch sayfasindan okuyoruz.
+    private suspend fun companionDashUrl(host: String, videoId: String): String? = try {
+        val res  = app.get("https://$host/watch?v=$videoId", headers = playHeaders(host))
+        val html = res.text.replace("&amp;", "&").replace("\\u0026", "&").replace("\\/", "/")
+        val rx   = Regex("""(https?://[A-Za-z0-9.\-]+)?(/companion/api/manifest/dash/id/$videoId\?[^"'<>\s\\]+)""")
+        val m    = rx.find(html)
+        if (m == null) null else m.groupValues[1].ifBlank { "https://$host" } + m.groupValues[2]
+    } catch (_: Exception) { null }
+
+    private suspend fun validDash(host: String, videoId: String, apiDashUrl: String?): String? {
+        val base = if (!apiDashUrl.isNullOrBlank()) absUrl(host, apiDashUrl)
+                   else "https://$host/api/manifest/dash/id/$videoId"
+        return checkDash(host, dashWithLocal(base))
     }
 
     // Tarayicida (Chrome) calisan videoplayback istekleri uygulamada 403 veriyordu.
@@ -184,6 +199,7 @@ class YouTube : MainAPI() {
     private data class LinkInfo(
         val liveNow: Boolean? = null,
         val hlsUrl: String? = null,
+        val dashUrl: String? = null,
         val formatStreams: List<FormatStream>? = null
     )
 
@@ -193,7 +209,7 @@ class YouTube : MainAPI() {
         for (host in instances) {
             // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
             val body = try {
-                val res = app.get(headers = playHeaders(host), url = "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,formatStreams")
+                val res = app.get(headers = playHeaders(host), url = "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams")
                 if (res.code == 200 && isJson(res.text)) res.text else null
             } catch (_: Exception) { null } ?: continue
 
@@ -244,8 +260,27 @@ class YouTube : MainAPI() {
                         found = true
                     }
 
-                // --- NORMAL VIDEO: DASH (yuksek kalite), sadece gecerliyse ---
-                val dash = validDash(host, data)
+                // --- NORMAL VIDEO: tarayicidaki companion DASH (calisan yol) ---
+                val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
+                if (comp != null) {
+                    callback(
+                        ExtractorLink(
+                            "YouTube",
+                            "YouTube DASH companion ($host)",
+                            comp,
+                            "https://$host/",
+                            if (preferDash) 30000 else Qualities.Unknown.value,
+                            false,
+                            playHeaders(host),
+                            null,
+                            true
+                        )
+                    )
+                    found = true
+                }
+
+                // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
+                val dash = validDash(host, data, info.dashUrl)
                 if (dash != null) {
                     callback(
                         ExtractorLink(
