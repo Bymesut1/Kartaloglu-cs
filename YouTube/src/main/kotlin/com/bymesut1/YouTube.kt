@@ -7,14 +7,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.StringUtils.encodeUri
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 
 class YouTube : MainAPI() {
@@ -37,9 +30,17 @@ class YouTube : MainAPI() {
     // uzun surebiliyor. Uygulamanin varsayilan zaman asimi 10 sn oldugu icin ilk tikta
     // "Error loading" / "Baglanti bulunamadi" cikiyor, ikinci tikta instance onbellekten cevap veriyordu.
     // Cozum: uzun zaman asimi + tekrar deneme + instance'lari paralel yarıstirma + load() yedegi.
-    private val apiTimeout = 25L   // saniye
-    private val playTimeout = 20L  // saniye
-    private val retryCount = 2     // her istek en fazla bu kadar denenir
+    // Ana instance (ilk sira) uzun bekler ve tekrar dener; yedek instance'lar kisa bekler,
+    // boylece olu bir yedek sunucu butun islemi geciktirmez.
+    private val apiTimeout = 25L   // saniye (ana instance)
+    private val playTimeout = 20L  // saniye (ana instance)
+    private val retryCount = 2     // ana instance icin deneme sayisi
+    private val backupTimeout = 8L // saniye (yedek instance'lar)
+
+    private fun isPrimary(host: String) = host == instances.first()
+    private fun apiTimeoutFor(host: String)  = if (isPrimary(host)) apiTimeout else backupTimeout
+    private fun playTimeoutFor(host: String) = if (isPrimary(host)) playTimeout else backupTimeout
+    private fun attemptsFor(host: String)    = if (isPrimary(host)) retryCount else 1
 
     private fun isJson(body: String) = body.startsWith("[") || body.startsWith("{")
 
@@ -50,38 +51,25 @@ class YouTube : MainAPI() {
     // Arama/ana sayfadan gelen basliklari hatirlar; load() API'si cevap vermezse bile baslik gosterilir.
     private val titleCache = ConcurrentHashMap<String, String>()
 
-    // Tum instance'larda ayni anda calisir, ilk BASARILI (null olmayan) sonucu dondurur.
-    // Ayri bir scope kullanilir: yavas instance'in bitmesini beklemeyiz.
+    // Tum instance'lari AYNI ANDA calistirir (CloudStream'in amap'i), ilk BASARILI sonucu dondurur.
+    // Sira korunur: ana instance basariliysa o secilir.
     private suspend fun <T : Any> firstSuccess(block: suspend (String) -> T?): T? {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val ch    = Channel<T?>(Channel.UNLIMITED)
-        try {
-            instances.forEach { host ->
-                scope.launch {
-                    val r = try {
-                        block(host)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        null
-                    }
-                    ch.send(r)
-                }
+        val results = instances.amap { host ->
+            try {
+                block(host)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
             }
-            for (i in instances.indices) {
-                val r = ch.receive()
-                if (r != null) return r
-            }
-            return null
-        } finally {
-            scope.cancel()
         }
+        return results.firstOrNull { it != null }
     }
 
     private suspend fun apiText(path: String): String? {
-        for (attempt in 0 until retryCount) {
+        for (round in 0 until retryCount) {
             val body = firstSuccess { host ->
-                val res = app.get("https://$host$path", headers = playHeaders(host), timeout = apiTimeout)
+                val res = app.get("https://$host$path", headers = playHeaders(host), timeout = apiTimeoutFor(host))
                 if (res.code == 200 && isJson(res.text)) res.text else null
             }
             if (body != null) return body
@@ -100,7 +88,7 @@ class YouTube : MainAPI() {
 
     // Manifest gecerli mi? (canli yayinda "PTNaNS" suresi uretiliyor -> ExoPlayer cokuyor)
     private suspend fun checkDash(host: String, url: String): String? = try {
-        val res = app.get(url, headers = playHeaders(host), timeout = playTimeout)
+        val res = app.get(url, headers = playHeaders(host), timeout = playTimeoutFor(host))
         val t   = res.text
         if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
     } catch (e: CancellationException) {
@@ -113,7 +101,7 @@ class YouTube : MainAPI() {
     //   https://yt-comp3.../companion/api/manifest/dash/id/ID?local=true&unique_res=1&check=...
     // check imzasini hesaplayamayiz; o yuzden watch sayfasindan okuyoruz.
     private suspend fun companionDashUrl(host: String, videoId: String): String? = try {
-        val res  = app.get("https://$host/watch?v=$videoId", headers = playHeaders(host), timeout = playTimeout)
+        val res  = app.get("https://$host/watch?v=$videoId", headers = playHeaders(host), timeout = playTimeoutFor(host))
         val html = res.text.replace("&amp;", "&").replace("\\u0026", "&").replace("\\/", "/")
         val rx   = Regex("""(https?://[A-Za-z0-9.\-]+)?(/companion/api/manifest/dash/id/$videoId\?[^"'<>\s\\]+)""")
         val m    = rx.find(html)
@@ -285,12 +273,12 @@ class YouTube : MainAPI() {
 
         // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
         var info: LinkInfo? = null
-        for (attempt in 0 until retryCount) {
+        for (attempt in 0 until attemptsFor(host)) {
             info = try {
                 val res = app.get(
                     "https://$host/api/v1/videos/$data?local=true&region=${lang.uppercase()}&fields=liveNow,hlsUrl,dashUrl,formatStreams",
                     headers = playHeaders(host),
-                    timeout = apiTimeout
+                    timeout = apiTimeoutFor(host)
                 )
                 if (res.code == 200 && isJson(res.text)) tryParseJson<LinkInfo>(res.text) else null
             } catch (e: CancellationException) {
@@ -388,51 +376,20 @@ class YouTube : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         // Tum instance'lar AYNI ANDA calisir (eskisi sirayla deniyordu: biri 10 sn takilinca
         // digerlerine sira gelmeden "Baglanti bulunamadi" cikiyordu).
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val ch    = Channel<HostLinks>(Channel.UNLIMITED)
-        val all   = mutableListOf<HostLinks>()
-
-        try {
-            instances.forEach { host ->
-                scope.launch {
-                    val r = try {
-                        fetchHostLinks(host, data)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        HostLinks(host, false, emptyList())
-                    }
-                    ch.send(r)
-                }
+        val all = instances.amap { host ->
+            try {
+                fetchHostLinks(host, data)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                HostLinks(host, false, emptyList())
             }
-
-            val start    = System.currentTimeMillis()
-            var graceEnd = Long.MAX_VALUE
-            while (all.size < instances.size) {
-                val limit = minOf(start + 70_000L, graceEnd)
-                val left  = limit - System.currentTimeMillis()
-                if (left <= 0) break
-                val r = withTimeoutOrNull(left) { ch.receive() } ?: break
-                all.add(r)
-
-                // Ana instance bitti ve elimizde kaynak var -> digerlerine kisa bir sure taninir, sonra oynat.
-                val primaryDone = all.any { it.host == instances.first() }
-                val anyLinks    = all.any { it.links.isNotEmpty() }
-                if (primaryDone && anyLinks && graceEnd == Long.MAX_VALUE) {
-                    graceEnd = System.currentTimeMillis() + 3_000L
-                }
-            }
-        } finally {
-            scope.cancel()
         }
-
-        // Instance sirasina gore (ana instance once) sirala.
-        val ordered = all.sortedBy { instances.indexOf(it.host) }
 
         // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
         // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
-        val live  = ordered.firstOrNull { it.live && it.links.isNotEmpty() }
-        val final = if (live != null) listOf(live) else ordered
+        val live  = all.firstOrNull { it.live && it.links.isNotEmpty() }
+        val final = if (live != null) listOf(live) else all
 
         var found = false
         for (h in final) {
