@@ -26,16 +26,27 @@ class YouTube : MainAPI() {
 
     private fun isJson(body: String) = body.startsWith("[") || body.startsWith("{")
 
-    // true  -> once DASH (en yuksek kalite) denenir, olmazsa duz mp4/HLS yedekleri.
-    // false -> once duz mp4 (360p/720p, en guvenilir), DASH en sonda listelenir.
-    private val preferDash = false
-
     private suspend fun apiText(path: String): String? {
         for (host in instances) {
             try {
                 val res  = app.get("https://$host$path")
                 val body = res.text
                 if (res.code == 200 && isJson(body)) return body
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    // ANA YONTEM (2. dosyadaki): duz DASH manifest. Baslik / cerez / local=true YOK.
+    // Acilan videolarda en iyi kaliteyi (1080p'ye kadar) veriyor. Canli yayinda "NaN" suresi
+    // uretildigi icin bozuk manifest elenir.
+    private suspend fun dashManifest(videoId: String): String? {
+        val path = "/api/manifest/dash/id/$videoId"
+        for (host in instances) {
+            try {
+                val res = app.get("https://$host$path")
+                val t   = res.text
+                if (res.code == 200 && t.contains("<MPD") && !t.contains("NaN")) return "https://$host$path"
             } catch (_: Exception) { }
         }
         return null
@@ -215,6 +226,26 @@ class YouTube : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         var found = false
 
+        // 1) ANA KAYNAK: duz DASH (2. dosyanin yontemi). Listenin en ustunde cikar.
+        val plain = dashManifest(data)
+        if (plain != null) {
+            callback(
+                ExtractorLink(
+                    "YouTube",
+                    "YouTube",
+                    plain,
+                    "",
+                    30000,
+                    false,
+                    mapOf(),
+                    null,
+                    true
+                )
+            )
+            found = true
+        }
+
+        // 2) YEDEK KAYNAKLAR (1. dosyanin yontemleri): ana kaynak acilmayan videolar icin.
         for (host in instances) {
             // local=true -> URL'ler instance uzerinden proxy'lenir (googlevideo IP-kilidi 403/2004 hatasini onler)
             val body = try {
@@ -232,7 +263,7 @@ class YouTube : MainAPI() {
                 callback(
                     ExtractorLink(
                         "YouTube",
-                        "YouTube",
+                        "YouTube Canli",
                         withLocal(absUrl(host, info.hlsUrl)),
                         "",
                         Qualities.Unknown.value,
@@ -245,8 +276,46 @@ class YouTube : MainAPI() {
                 found = true
             }
 
-            // --- NORMAL VIDEO: duz mp4 (video+ses birlikte) ---
             if (!isLive) {
+                // --- YEDEK 1: tarayicidaki companion DASH ---
+                val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
+                if (comp != null) {
+                    callback(
+                        ExtractorLink(
+                            "YouTube",
+                            "YouTube Yedek DASH",
+                            comp,
+                            "https://$host/",
+                            20000,
+                            false,
+                            playHeaders(host),
+                            null,
+                            true
+                        )
+                    )
+                    found = true
+                }
+
+                // --- YEDEK 2: sunucu DASH (local=true), companion yoksa ---
+                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
+                if (dash != null) {
+                    callback(
+                        ExtractorLink(
+                            "YouTube",
+                            "YouTube Yedek DASH",
+                            dash,
+                            "https://$host/",
+                            15000,
+                            false,
+                            playHeaders(host),
+                            null,
+                            true
+                        )
+                    )
+                    found = true
+                }
+
+                // --- YEDEK 3: duz mp4 (video+ses birlikte, 360p/720p, en guvenilir) ---
                 info.formatStreams.orEmpty()
                     .filter { !it.url.isNullOrBlank() }
                     .forEach { f ->
@@ -256,10 +325,10 @@ class YouTube : MainAPI() {
                         callback(
                             ExtractorLink(
                                 "YouTube",
-                                "YouTube",
+                                "YouTube MP4",
                                 absUrl(host, f.url!!),
                                 "https://$host/",
-                                if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
+                                q,
                                 false,
                                 playHeaders(host),
                                 null,
@@ -268,44 +337,6 @@ class YouTube : MainAPI() {
                         )
                         found = true
                     }
-
-                // --- NORMAL VIDEO: tarayicidaki companion DASH (calisan yol) ---
-                val comp = companionDashUrl(host, data)?.let { checkDash(host, it) }
-                if (comp != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            comp,
-                            "https://$host/",
-                            if (preferDash) 30000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
-                        )
-                    )
-                    found = true
-                }
-
-                // --- NORMAL VIDEO: ana sunucu DASH (yedek), sadece gecerliyse ---
-                val dash = if (comp == null) validDash(host, data, info.dashUrl) else null
-                if (dash != null) {
-                    callback(
-                        ExtractorLink(
-                            "YouTube",
-                            "YouTube",
-                            dash,
-                            "https://$host/",
-                            if (preferDash) 20000 else Qualities.Unknown.value,
-                            false,
-                            playHeaders(host),
-                            null,
-                            true
-                        )
-                    )
-                    found = true
-                }
             }
 
             // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
