@@ -64,25 +64,35 @@ class YouTube : MainAPI() {
 
     fun thumb(videoId: String, size: String) = "https://i.ytimg.com/vi/$videoId/$size.jpg"
 
+    private suspend fun entries(path: String): List<SearchEntry> {
+        val body = apiText(path) ?: return emptyList()
+        return tryParseJson<List<SearchEntry>>(body) ?: emptyList()
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val region = lang.uppercase()
+        val fields = "fields=videoId,title"
 
-        suspend fun section(name: String, type: String): HomePageList {
-            val items = tryParseJson<List<SearchEntry>>(
-                apiText("/api/v1/trending?region=$region&type=$type&fields=videoId,title") ?: return HomePageList(name, emptyList(), true)
-            )
-            return HomePageList(name, items?.map { it.toSearchResponse(this) } ?: emptyList(), true)
+        // Bazi Invidious surumleri trending "type" parametresini yok sayip her kategoride
+        // ayni listeyi donduruyor. Ayni liste gelirse o bolumu arama sonucuyla dolduruyoruz.
+        val trend = entries("/api/v1/trending?region=$region&type=news&$fields")
+        val lists = mutableListOf(HomePageList("Trend", trend.map { it.toSearchResponse(this) }, true))
+
+        val extra = listOf(
+            Triple("Müzik", "music", "müzik klip"),
+            Triple("Film", "movies", "film fragman"),
+            Triple("Oyun", "gaming", "oyun gameplay"),
+        )
+        for ((name, type, query) in extra) {
+            var items = entries("/api/v1/trending?region=$region&type=$type&$fields")
+            val same = items.take(5).map { it.videoId } == trend.take(5).map { it.videoId }
+            if (items.isEmpty() || same) {
+                items = entries("/api/v1/search?q=${query.encodeUri()}&region=$region&page=1&type=video&$fields")
+            }
+            lists.add(HomePageList(name, items.map { it.toSearchResponse(this) }, true))
         }
 
-        return newHomePageResponse(
-            listOf(
-                section("Trend", "news"),
-                section("Müzik", "music"),
-                section("Film", "movies"),
-                section("Oyun", "gaming"),
-            ),
-            false
-        )
+        return newHomePageResponse(lists, false)
     }
 
     // this function gets called when you search for something
@@ -167,7 +177,9 @@ class YouTube : MainAPI() {
             } catch (_: Exception) { null } ?: continue
 
             val info   = tryParseJson<LinkInfo>(body) ?: continue
-            val isLive = info.liveNow == true || !info.hlsUrl.isNullOrBlank()
+            // DIKKAT: Invidious normal videolarda da hlsUrl dondurur (ama bu HLS 3001 hatasi verir).
+            // Bu yuzden canli yayin tespiti sadece liveNow / yt_live_broadcast ile yapilir.
+            val isLive = info.liveNow == true || info.hlsUrl?.contains("yt_live_broadcast") == true
 
             // --- CANLI YAYIN: HLS ---
             if (isLive && !info.hlsUrl.isNullOrBlank()) {
