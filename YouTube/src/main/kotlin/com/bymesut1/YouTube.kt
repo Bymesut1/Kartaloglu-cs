@@ -52,6 +52,16 @@ class YouTube : MainAPI() {
         } catch (_: Exception) { null }
     }
 
+    // Tarayicida (Chrome) calisan videoplayback istekleri uygulamada 403 veriyordu.
+    // Tarayicinin gonderdigi UA / Referer / Origin basliklarini ExoPlayer'a da veriyoruz.
+    private val browserUa = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+
+    private fun playHeaders(host: String) = mapOf(
+        "User-Agent" to browserUa,
+        "Referer"    to "https://$host/",
+        "Origin"     to "https://$host",
+    )
+
     private fun absUrl(host: String, u: String): String = when {
         u.startsWith("http") -> u
         u.startsWith("//")   -> "https:$u"
@@ -212,10 +222,10 @@ class YouTube : MainAPI() {
                                 "YouTube",
                                 "YouTube $label".trim(),
                                 absUrl(host, f.url!!),
-                                "",
+                                "https://$host/",
                                 if (preferDash) q else q + 10000, // preferDash=false iken duz mp4 once denenir
                                 false,
-                                mapOf(),
+                                playHeaders(host),
                                 null,
                                 false
                             )
@@ -229,12 +239,12 @@ class YouTube : MainAPI() {
                     callback(
                         ExtractorLink(
                             "YouTube",
-                            "YouTube DASH (Yüksek Kalite)",
+                            "YouTube DASH ($host)",
                             dash,
-                            "",
+                            "https://$host/",
                             if (preferDash) 20000 else Qualities.Unknown.value,
                             false,
-                            mapOf(),
+                            playHeaders(host),
                             null,
                             true
                         )
@@ -243,7 +253,9 @@ class YouTube : MainAPI() {
                 }
             }
 
-            if (found) break // calisan instance bulundu
+            // Canli yayinda ilk calisan instance yeter. Normal videoda tum instance'larin
+            // kaynaklarini ekliyoruz: biri 403 verirse digerini secebilesin.
+            if (found && isLive) break
         }
 
         return found
