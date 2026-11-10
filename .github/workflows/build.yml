@@ -53,6 +53,7 @@ jobs:
           cp SetFilmIzle/build/*.cs3 out/
           cp FilmizleHell/build/*.cs3 out/
           cp WebDramaTurkey2/build/*.cs3 out/
+          cp DiziPod/build/*.cs3 out/
           cp FilmEkseni/build/*.cs3 out/
           cp YouTube/build/*.cs3 out/
           cp build/plugins.json out/
