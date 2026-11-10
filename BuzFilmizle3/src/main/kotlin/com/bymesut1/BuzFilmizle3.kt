@@ -70,6 +70,13 @@ class BuzFilmizle3 : MainAPI() {
     //  "Source error / ERROR_CODE_IO_NETWORK_CONNECTION_FAILED" veriyordu.)
     private val dbgBuf = java.util.Collections.synchronizedList(mutableListOf<String>())
 
+    // getVideo ile alınan kaynak adresi -> o oturumun çerezleri (master.txt çerezsiz "security error" veriyor)
+    private val fireCookies = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var vidmolyTried = false
+    @Volatile private var vidmolyOk = false
+    private val UA_FLOW =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
     private fun dbg(msg: String) {
         Log.d(TAG, msg)
         if (DEBUG) dbgBuf.add(msg)
@@ -266,7 +273,6 @@ class BuzFilmizle3 : MainAPI() {
         headers: Map<String, String> = emptyMap(),
         single: Boolean = false
     ): Boolean {
-        // single=true: kalitelere bölmeden TEK master link verilir (listede aynı isimden tek satır)
         val links = if (single) null else try {
             M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer, headers = headers)
         } catch (e: Exception) {
@@ -315,26 +321,58 @@ class BuzFilmizle3 : MainAPI() {
         val l = url.lowercase()
         val hls = l.contains(".m3u8") || Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
         if (hls && name.equals("Vidmoly", true)) {
-            val ua = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-            val refs = listOf(referer, "https://vidmoly.to/", "https://vidmoly.net/", "https://vidmoly.me/").distinct()
-            var good = referer
-            var verified = false
-            for (r in refs) {
-                val head = try {
-                    app.get(url, referer = r, headers = mapOf("Origin" to r.trimEnd('/'), "User-Agent" to ua), timeout = 10L)
-                        .text.take(300)
-                } catch (e: Exception) {
-                    "HATA ${e.message}"
-                }
-                val ok = head.contains("#EXTM3U")
-                dbg("vidmoly probe ref=$r ok=$ok ${if (ok) "" else head.take(60).replace("\n", " ")}")
-                if (ok) { good = r; verified = true; break }
+            vidmolyTried = true
+            val ck = fireCookies[url]?.takeIf { it.isNotBlank() }
+                ?: runCatching { android.webkit.CookieManager.getInstance().getCookie(url) }.getOrNull().orEmpty()
+            val refs = listOf(referer, originOf(url), "https://vidmoly.to/").distinct()
+            fun mk(r: String, withOrigin: Boolean): Map<String, String> {
+                val h = LinkedHashMap<String, String>()
+                h["User-Agent"] = UA_FLOW
+                if (ck.isNotBlank()) h["Cookie"] = ck
+                if (withOrigin) h["Origin"] = originOf(r).trimEnd('/')
+                return h
             }
-            dbg("vidmoly medya=$url verified=$verified ref=$good")
-            return emitM3u8(name, url, good, callback, mapOf("Origin" to good.trimEnd('/'), "User-Agent" to ua), single = true)
+            var goodRef = refs.first()
+            var goodHdr: Map<String, String> = mk(goodRef, false)
+            var verified = false
+            probe@ for (r in refs) {
+                for (withOrigin in listOf(false, true)) {
+                    val h = mk(r, withOrigin)
+                    val head = try {
+                        app.get(url, referer = r, headers = h, timeout = 10L).text.take(300)
+                    } catch (e: Exception) {
+                        "HATA ${e.message}"
+                    }
+                    val ok = head.contains("#EXTM3U")
+                    dbg("vidmoly probe ref=$r origin=$withOrigin cookie=${ck.isNotBlank()} ok=$ok ${if (ok) "" else head.take(60).replace("\n", " ")}")
+                    if (ok) {
+                        goodRef = r; goodHdr = h; verified = true
+                        break@probe
+                    }
+                }
+            }
+            vidmolyOk = verified
+            dbg("vidmoly medya=$url verified=$verified")
+            return emitM3u8(name, url, goodRef, callback, goodHdr, single = true)
         }
         return if (hls) emitM3u8(name, url, referer, callback, emptyMap(), name.contains("bronz", true)) // m3u8 / master.txt / playlist.txt
         else emitVideo(name, url, referer, callback)
+    }
+
+    private fun fixUtf8Url(u: String): String {
+        var s = u
+        if (s.all { it.code <= 0xFF }) {
+            val re = String(s.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+            if (!re.contains('\uFFFD')) s = re
+        }
+        if (s.contains('?')) return s
+        val idx = s.lastIndexOf('/')
+        if (idx < 8) return s
+        val name = s.substring(idx + 1)
+        val enc = runCatching {
+            java.net.URLEncoder.encode(java.net.URLDecoder.decode(name, "UTF-8"), "UTF-8").replace("+", "%20")
+        }.getOrDefault(name)
+        return s.substring(0, idx + 1) + enc
     }
 
     // FirePlayer: sayfa videoyu "?do=getVideo" POST isteğiyle veriyor.
@@ -348,7 +386,7 @@ class BuzFilmizle3 : MainAPI() {
         var cookies: Map<String, String> = emptyMap()
         val apis = LinkedHashSet<String>()
         try {
-            val page = app.get(clean, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe"), timeout = 15L)
+            val page = app.get(clean, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe", "User-Agent" to UA_FLOW), timeout = 15L)
             cookies = page.cookies
             val html = page.text.replace("\\/", "/")
             log("fireplayer sayfa kod=${page.code} uzunluk=${html.length}")
@@ -367,19 +405,23 @@ class BuzFilmizle3 : MainAPI() {
         val refs = listOf(referer, "").distinct()
         for (api in apis) {
             for (r in refs) {
+                var postCk: Map<String, String> = emptyMap()
                 val body = try {
-                    app.post(
+                    val pr = app.post(
                         api,
                         data = mapOf("hash" to id, "r" to r),
                         headers = mapOf(
                             "X-Requested-With" to "XMLHttpRequest",
                             "Accept" to "*/*",
+                            "User-Agent" to UA_FLOW,
                             "Origin" to origin.trimEnd('/')
                         ),
                         referer = clean,
                         cookies = cookies,
                         timeout = 15L
-                    ).text
+                    )
+                    postCk = pr.cookies
+                    pr.text
                 } catch (e: Exception) {
                     dbg("fireplayer istek hatası: ${e.message}")
                     ""
@@ -390,7 +432,10 @@ class BuzFilmizle3 : MainAPI() {
                     Regex("\"$k\"\\s*:\\s*\"(https?:[^\"]+)\"").find(txt)?.groupValues?.get(1)
                 }.firstOrNull { it.isNotBlank() }
                     ?: mediaRegex.find(txt)?.value
-                if (src != null) return src
+                if (src != null) {
+                    fireCookies[src] = (cookies + postCk).entries.joinToString("; ") { "${it.key}=${it.value}" }
+                    return src
+                }
                 dbg("fireplayer boş: ${body.take(120).replace("\n", " ")}")
             }
         }
@@ -418,7 +463,7 @@ class BuzFilmizle3 : MainAPI() {
             dumpBody("hexload", page.text, 8000)
             val txt = expand(page.text)
             val m = mediaRegex.find(txt)?.value
-            if (m != null) return emitMedia(name, m, "$origin/", callback)
+            if (m != null) return emitMedia(name, fixUtf8Url(m), "$origin/", callback)
         } catch (e: Exception) {
             dbg("hexload sayfa hatası: ${e.message}")
         }
@@ -445,12 +490,76 @@ class BuzFilmizle3 : MainAPI() {
             val txt = body.replace("\\/", "/").replace("\\u0026", "&")
             val src = Regex("\"url\"\\s*:\\s*\"(https?:[^\"]+)\"").find(txt)?.groupValues?.get(1)
                 ?: mediaRegex.find(txt)?.value
-            if (src != null) return emitMedia(name, src, "$origin/", callback)
+            if (src != null) return emitMedia(name, fixUtf8Url(src), "$origin/", callback)
         } catch (e: Exception) {
             dbg("hexload istek hatası: ${e.message}")
         }
 
         return viaWebView(name, hexUrl, referer, callback)
+    }
+
+    // Vidmoly (matrudas): master.txt sunucu tarafında başlık/çerez kontrolü yapıyor ("security error").
+    // Link şifreli değil; WebView'in gerçek isteği (UA, Referer, Origin, Sec-*, çerez) birebir yakalanıp
+    // oynatıcıya aynen verilir. Hangi başlıkların gerekli olduğu logcat'e yazılır.
+    private suspend fun vidmolyViaCapturedRequest(
+        name: String,
+        playerUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            log("Vidmoly: WebView isteği yakalanıyor: $playerUrl")
+            val resolver = WebViewResolver(
+                Regex("""(?i)/(?:master|playlist|index)\.txt|\.m3u8"""),
+                timeout = 20_000L
+            )
+            val (req, _) = resolver.resolveUsingWebView(url = playerUrl, referer = referer) { true }
+            if (req == null) {
+                dbg("Vidmoly: WebView master isteği yakalayamadı")
+                return false
+            }
+            val media = req.url.toString()
+            val hdr = LinkedHashMap<String, String>()
+            for (i in 0 until req.headers.size) {
+                val k = req.headers.name(i)
+                val v = req.headers.value(i)
+                if (k.equals("Accept-Encoding", true) || k.equals("Host", true) ||
+                    k.equals("Connection", true) || k.equals("Range", true) ||
+                    k.equals("Content-Length", true)
+                ) continue
+                hdr[k] = v
+            }
+            val cm = android.webkit.CookieManager.getInstance()
+            val ck = listOf(media, playerUrl).mapNotNull { runCatching { cm.getCookie(it) }.getOrNull() }
+                .filter { it.isNotBlank() }.joinToString("; ")
+            if (ck.isNotBlank() && hdr.keys.none { it.equals("Cookie", true) }) hdr["Cookie"] = ck
+
+            dbg("Vidmoly yakalanan istek: $media")
+            dbg("Vidmoly başlıklar: " + hdr.entries.joinToString(" | ") {
+                if (it.key.equals("Cookie", true)) "Cookie=<${it.value.length} karakter>" else "${it.key}=${it.value.take(80)}"
+            })
+
+            val ref = hdr.entries.firstOrNull { it.key.equals("Referer", true) }?.value ?: playerUrl
+            hdr.keys.removeAll { it.equals("Referer", true) }
+            if (hdr.keys.none { it.equals("User-Agent", true) }) hdr["User-Agent"] = UA_FLOW
+
+            // Yakalanan başlıklarla uygulama tarafında doğrulama
+            val head = try {
+                app.get(media, referer = ref, headers = hdr, timeout = 10L).text.take(300)
+            } catch (e: Exception) {
+                "HATA ${e.message}"
+            }
+            val ok = head.contains("#EXTM3U")
+            dbg("Vidmoly yakalanan istekle doğrulama ok=$ok ${if (ok) "" else head.take(80).replace("\n", " ")}")
+            vidmolyTried = true
+            vidmolyOk = ok
+            // Doğrulansa da doğrulanmasa da aynı başlıklarla ver (ExoPlayer bazen farklı davranır)
+            emitM3u8(name, media, ref, callback, hdr, single = true)
+            true
+        } catch (e: Exception) {
+            dbg("Vidmoly yakalama hatası: ${e.message}")
+            false
+        }
     }
 
     // Son çare: gizli WebView (sadece bir kez, kısa süreli)
@@ -460,6 +569,9 @@ class BuzFilmizle3 : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        if (name.equals("Vidmoly", true)) {
+            if (vidmolyViaCapturedRequest(name, url, referer, callback)) return true
+        }
         return try {
             log("WebView deneniyor: $url")
             val resolver = WebViewResolver(
@@ -469,7 +581,7 @@ class BuzFilmizle3 : MainAPI() {
             val captured = app.get(url, referer = referer, interceptor = resolver).url
             log("WebView yakaladı: $captured")
             if (mediaRegex.containsMatchIn(captured)) {
-                emitMedia(name, captured, originOf(url), callback)
+                emitMedia(name, captured, if (name.equals("Vidmoly", true)) url else originOf(url), callback)
             } else {
                 dbg("WebView medya yakalayamadı ($name)")
                 false
@@ -521,7 +633,7 @@ class BuzFilmizle3 : MainAPI() {
 
         // FirePlayer: getVideo cevabındaki adres (matrudas / vevocloud / bronze ...) ayrıca çözülür
         var fireTried = false
-        if (lower.contains("/fireplayer/video/") || lower.contains("do=getvideo")) {
+        if (lower.contains("/fireplayer/video/") || lower.contains("do=getvideo") || (lower.contains("matrudas") && lower.contains("/video/"))) {
             fireTried = true
             val src = fireGetVideo(url, referer)
             if (src != null) {
@@ -677,6 +789,8 @@ class BuzFilmizle3 : MainAPI() {
     ): Boolean {
         log("loadLinks data=$data")
         dbgBuf.clear()
+        vidmolyTried = false
+        vidmolyOk = false
 
         // Sıra: 1 = Vidmoly, 2 = FASTM, 3 = BRONZ
         val base = data.trimEnd('/').removeSuffix("/1")
@@ -692,7 +806,7 @@ class BuzFilmizle3 : MainAPI() {
 
         val seen: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
-        // Üç kaynak AYNI ANDA denenir; linkler önce kovalarda toplanır, sonra sırayla verilir
+        // Üç kaynak AYNI ANDA denenir; linkler kovalarda toplanır, sonra sırayla verilir
         val entries = pages.entries.toList()
         val buckets = entries.map { java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>()) }
         val results = entries.indices.toList().amap { i ->
@@ -703,9 +817,11 @@ class BuzFilmizle3 : MainAPI() {
                 false
             }
         }
-        val found = results.any { it }
+        // Gerçekten link üretip üretmediğine bakılır (bazı çıkarıcılar link vermeden "true" döner)
+        val hasLinks = buckets.map { it.isNotEmpty() }
+        val found = hasLinks.any { it }
 
-        // Sıra: Vidmoly, FASTM, BRONZ. Aynı link iki kez, BRONZ ise birden fazla gösterilmez.
+        // Sıra: Vidmoly, FASTM, BRONZ. Aynı link iki kez, BRONZ birden fazla gösterilmez.
         val emitted = HashSet<String>()
         var bronzDone = false
         buckets.forEach { b ->
@@ -718,9 +834,9 @@ class BuzFilmizle3 : MainAPI() {
             }
         }
 
-        // Çözülemeyen kaynaklar en sona, sadece adıyla eklenir (sitedeki gibi; seçilince oynamaz)
+        // Link üretemeyen kaynaklar en sona, sadece adıyla eklenir (sitedeki gibi; seçilince oynamaz)
         entries.forEachIndexed { i, e ->
-            if (!results[i]) {
+            if (!hasLinks[i]) {
                 callback(
                     newExtractorLink(e.value, e.value, e.key, ExtractorLinkType.VIDEO) {
                         this.referer = "$base/"
@@ -730,7 +846,7 @@ class BuzFilmizle3 : MainAPI() {
             }
         }
 
-        if ((!found || !results[0]) && DEBUG && SHOW_DEBUG_LINKS) {
+        if ((!found || !hasLinks[0] || (vidmolyTried && !vidmolyOk)) && DEBUG && SHOW_DEBUG_LINKS) {
             dbgBuf.toList().takeLast(6).forEach { msg ->
                 callback(
                     newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
