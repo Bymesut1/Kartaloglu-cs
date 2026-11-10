@@ -44,8 +44,11 @@ class BuzFilmizle3 : MainAPI() {
     // ---------------------------------------------------------------- Yardımcılar
 
     private val mediaRegex = Regex(
-        """https?://[^\s"'<>\\]+?(?:\.(?:m3u8|mp4|mpd)|/(?:master|playlist|index)\.txt)[^\s"'<>\\]*"""
+        """https?://[^\s"'<>\\]+?(?:\.(?:m3u8|mp4|mpd)|/(?:master|playlist|index)\.txt|/hls/[A-Za-z0-9%_=+-]{40,})[^\s"'<>\\]*"""
     )
+
+    // matrudas.com/hls/<base64> : uzantısız ama doğrudan m3u8 döner
+    private val hlsPathRegex = Regex("""/hls/[A-Za-z0-9%_=+-]{40,}""")
 
     private val urlRegex = Regex("""(?:https?:)?//[^\s"'<>\\)]+""")
 
@@ -319,7 +322,8 @@ class BuzFilmizle3 : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val l = url.lowercase()
-        val hls = l.contains(".m3u8") || Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
+        val hls = l.contains(".m3u8") || hlsPathRegex.containsMatchIn(l) ||
+            Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
         if (hls && name.equals("Vidmoly", true)) {
             vidmolyTried = true
             val ck = fireCookies[url]?.takeIf { it.isNotBlank() }
@@ -428,10 +432,37 @@ class BuzFilmizle3 : MainAPI() {
                 }
                 log("fireplayer $api r=$r -> ${body.take(400).replace("\n", " ")}")
                 val txt = body.replace("\\/", "/").replace("\\u0026", "&")
-                val src = listOf("videoSrc", "videoSource", "securedLink").mapNotNull { k ->
+                val cands = LinkedHashSet<String>()
+                listOf("securedLink", "videoSrc", "videoSource").forEach { k ->
                     Regex("\"$k\"\\s*:\\s*\"(https?:[^\"]+)\"").find(txt)?.groupValues?.get(1)
-                }.firstOrNull { it.isNotBlank() }
-                    ?: mediaRegex.find(txt)?.value
+                        ?.takeIf { it.isNotBlank() }?.let { cands.add(it) }
+                }
+                mediaRegex.findAll(txt).forEach { cands.add(it.value) }
+                // Öncelik: imzalı (md5/expires) -> /hls/ -> imzasız (master.txt)
+                val ordered = cands.sortedBy { u ->
+                    when {
+                        u.contains("md5=") || u.contains("expires=") -> 0
+                        hlsPathRegex.containsMatchIn(u) -> 1
+                        else -> 2
+                    }
+                }
+                val ckStr = (cookies + postCk).entries.joinToString("; ") { "${it.key}=${it.value}" }
+                var src: String? = null
+                val probeLog = StringBuilder()
+                for (c in ordered) {
+                    val h = LinkedHashMap<String, String>()
+                    h["User-Agent"] = UA_FLOW
+                    if (ckStr.isNotBlank()) h["Cookie"] = ckStr
+                    val okc = try {
+                        app.get(c, referer = clean, headers = h, timeout = 10L).text.take(300).contains("#EXTM3U")
+                    } catch (e: Exception) {
+                        false
+                    }
+                    probeLog.append(if (okc) "OK:" else "X:").append(c.substringAfter("//").take(40)).append(" ")
+                    if (okc) { src = c; break }
+                }
+                dbg("fireplayer aday sırası/sonuç: $probeLog")
+                if (src == null) src = ordered.firstOrNull()
                 if (src != null) {
                     fireCookies[src] = (cookies + postCk).entries.joinToString("; ") { "${it.key}=${it.value}" }
                     return src
