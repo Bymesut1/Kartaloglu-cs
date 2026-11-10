@@ -11,7 +11,7 @@ import java.net.URI
 // DEBUG: logcat'e "BuzFilmizle3" etiketiyle kayıt düşer (sorun çözülünce false yap).
 private const val DEBUG = true
 // true yaparsan hiç kaynak bulunamayınca listede "🐞" hata satırları görünür.
-private const val SHOW_DEBUG_LINKS = false
+private const val SHOW_DEBUG_LINKS = true
 private const val TAG = "BuzFilmizle3"
 
 class BuzFilmizle3 : MainAPI() {
@@ -263,9 +263,11 @@ class BuzFilmizle3 : MainAPI() {
         url: String,
         referer: String,
         callback: (ExtractorLink) -> Unit,
-        headers: Map<String, String> = emptyMap()
+        headers: Map<String, String> = emptyMap(),
+        single: Boolean = false
     ): Boolean {
-        val links = try {
+        // single=true: kalitelere bölmeden TEK master link verilir (listede aynı isimden tek satır)
+        val links = if (single) null else try {
             M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer, headers = headers)
         } catch (e: Exception) {
             log("generateM3u8 hata: ${e.message} url=$url")
@@ -313,23 +315,25 @@ class BuzFilmizle3 : MainAPI() {
         val l = url.lowercase()
         val hls = l.contains(".m3u8") || Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
         if (hls && name.equals("Vidmoly", true)) {
-            // Sadece Vidmoly: m3u8'i hangi Referer açıyorsa onu kullan (2004 BAD_HTTP_STATUS)
             val ua = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
             val refs = listOf(referer, "https://vidmoly.to/", "https://vidmoly.net/", "https://vidmoly.me/").distinct()
             var good = referer
+            var verified = false
             for (r in refs) {
-                val ok = try {
+                val head = try {
                     app.get(url, referer = r, headers = mapOf("Origin" to r.trimEnd('/'), "User-Agent" to ua), timeout = 10L)
-                        .text.trimStart().startsWith("#EXTM3U")
+                        .text.take(300)
                 } catch (e: Exception) {
-                    false
+                    "HATA ${e.message}"
                 }
-                log("vidmoly probe referer=$r ok=$ok")
-                if (ok) { good = r; break }
+                val ok = head.contains("#EXTM3U")
+                dbg("vidmoly probe ref=$r ok=$ok ${if (ok) "" else head.take(60).replace("\n", " ")}")
+                if (ok) { good = r; verified = true; break }
             }
-            return emitM3u8(name, url, good, callback, mapOf("Origin" to good.trimEnd('/'), "User-Agent" to ua))
+            dbg("vidmoly medya=$url verified=$verified ref=$good")
+            return emitM3u8(name, url, good, callback, mapOf("Origin" to good.trimEnd('/'), "User-Agent" to ua), single = true)
         }
-        return if (hls) emitM3u8(name, url, referer, callback) // m3u8 / master.txt / playlist.txt
+        return if (hls) emitM3u8(name, url, referer, callback, emptyMap(), name.contains("bronz", true)) // m3u8 / master.txt / playlist.txt
         else emitVideo(name, url, referer, callback)
     }
 
@@ -688,19 +692,34 @@ class BuzFilmizle3 : MainAPI() {
 
         val seen: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
-        // Üç kaynak AYNI ANDA denenir (CloudStream'in amap yardımcısı)
-        val results = pages.entries.toList().amap { entry ->
+        // Üç kaynak AYNI ANDA denenir; linkler önce kovalarda toplanır, sonra sırayla verilir
+        val entries = pages.entries.toList()
+        val buckets = entries.map { java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>()) }
+        val results = entries.indices.toList().amap { i ->
             try {
-                processPage(entry.key, entry.value, firstDoc, base, seen, subtitleCallback, callback)
+                processPage(entries[i].key, entries[i].value, firstDoc, base, seen, subtitleCallback) { buckets[i].add(it) }
             } catch (e: Exception) {
-                dbg("kaynak hatası (${entry.value}): ${e.message}")
+                dbg("kaynak hatası (${entries[i].value}): ${e.message}")
                 false
             }
         }
         val found = results.any { it }
 
-        // Çözülemeyen kaynaklar en sona, sadece adıyla eklenir (sitedeki gibi görünsün, seçilince oynamaz)
-        pages.entries.toList().forEachIndexed { i, e ->
+        // Sıra: Vidmoly, FASTM, BRONZ. Aynı link iki kez, BRONZ ise birden fazla gösterilmez.
+        val emitted = HashSet<String>()
+        var bronzDone = false
+        buckets.forEach { b ->
+            b.toList().forEach { link ->
+                if (link.name.contains("bronz", true)) {
+                    if (bronzDone) return@forEach
+                    bronzDone = true
+                }
+                if (emitted.add(link.name + "|" + link.url)) callback(link)
+            }
+        }
+
+        // Çözülemeyen kaynaklar en sona, sadece adıyla eklenir (sitedeki gibi; seçilince oynamaz)
+        entries.forEachIndexed { i, e ->
             if (!results[i]) {
                 callback(
                     newExtractorLink(e.value, e.value, e.key, ExtractorLinkType.VIDEO) {
@@ -711,8 +730,8 @@ class BuzFilmizle3 : MainAPI() {
             }
         }
 
-        if (!found && DEBUG && SHOW_DEBUG_LINKS) {
-            dbgBuf.toList().takeLast(8).forEach { msg ->
+        if ((!found || !results[0]) && DEBUG && SHOW_DEBUG_LINKS) {
+            dbgBuf.toList().takeLast(6).forEach { msg ->
                 callback(
                     newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
                         this.quality = Qualities.Unknown.value
