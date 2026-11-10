@@ -1,10 +1,16 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
+
+// Hata ayıklama: true iken kaynak listesinde "🐞 DEBUG" satırları görünür
+// ve logcat'e "BuzFilmizle3" etiketiyle kayıt düşer. Bitince false yap.
+private const val DEBUG = true
+private const val TAG = "BuzFilmizle3"
 
 class BuzFilmizle3 : MainAPI() {
     override var mainUrl = "https://www.buzfilmizle3.com"
@@ -44,6 +50,22 @@ class BuzFilmizle3 : MainAPI() {
         "google", "facebook", "doubleclick", "aarems", "wargamings",
         "disqus", "youtube", "twitter", "cloudflare"
     )
+
+    private fun log(msg: String) {
+        if (DEBUG) Log.d(TAG, msg)
+    }
+
+    // Logcat'e yazar + DEBUG açıksa kaynak listesine görünür satır ekler
+    private suspend fun dbg(callback: (ExtractorLink) -> Unit, msg: String) {
+        Log.d(TAG, msg)
+        if (DEBUG) {
+            callback(
+                newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
+    }
 
     private fun cleanTitle(t: String): String =
         t.replace(
@@ -91,12 +113,15 @@ class BuzFilmizle3 : MainAPI() {
         val url = if (page <= 1) request.data else "${request.data}page/$page/"
         val doc = app.get(url, referer = "$mainUrl/").document
         val items = doc.select("div.moviefilm").mapNotNull { it.toSearchResult() }
+        log("getMainPage url=$url kart=${items.size}")
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get("$mainUrl/", params = mapOf("s" to query), referer = "$mainUrl/").document
-        return doc.select("div.moviefilm").mapNotNull { it.toSearchResult() }
+        val items = doc.select("div.moviefilm").mapNotNull { it.toSearchResult() }
+        log("search q=$query sonuç=${items.size}")
+        return items
     }
 
     // ---------------------------------------------------------------- Detay
@@ -106,7 +131,10 @@ class BuzFilmizle3 : MainAPI() {
 
         val rawTitle = doc.selectFirst("h1")?.text()?.trim()?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?: return null
+            ?: run {
+                log("load: başlık bulunamadı url=$url")
+                return null
+            }
         val title = cleanTitle(rawTitle)
 
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
@@ -118,6 +146,8 @@ class BuzFilmizle3 : MainAPI() {
 
         val year = yearRegex.findAll(rawTitle).lastOrNull()?.value?.toIntOrNull()
         val tags = doc.select("a[rel=category tag]").map { it.text().trim() }.filter { it.isNotBlank() }
+
+        log("load: title=$title year=$year poster=$poster iframe=${doc.select("iframe").size}")
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = fixUrlNull(poster)
@@ -157,13 +187,18 @@ class BuzFilmizle3 : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val links = runCatching {
+        val links = try {
             M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer)
-        }.getOrNull()
+        } catch (e: Exception) {
+            log("generateM3u8 hata: ${e.message} url=$url")
+            null
+        }
 
         if (!links.isNullOrEmpty()) {
+            log("m3u8 ($name) ${links.size} kalite")
             links.forEach(callback)
         } else {
+            log("m3u8 ($name) tek link olarak veriliyor: $url")
             callback(
                 newExtractorLink(name, name, url, ExtractorLinkType.M3U8) {
                     this.referer = referer
@@ -179,6 +214,7 @@ class BuzFilmizle3 : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit
     ) {
+        log("video ($name): $url")
         callback(
             newExtractorLink(name, name, url, ExtractorLinkType.VIDEO) {
                 this.referer = referer
@@ -197,6 +233,7 @@ class BuzFilmizle3 : MainAPI() {
     ): Boolean {
         val name = sourceName(url, label)
         val lower = url.lowercase()
+        log("handleEmbed[$depth] $name -> $url (referer=$referer)")
 
         // Doğrudan medya adresi (FASTM m3u8 / Bronz mp4)
         if (lower.contains(".m3u8")) {
@@ -209,19 +246,30 @@ class BuzFilmizle3 : MainAPI() {
         }
 
         // Hazır çıkarıcılar (Vidmoly vb.)
-        val extracted = runCatching {
+        val extracted = try {
             loadExtractor(url, referer, subtitleCallback, callback)
-        }.getOrDefault(false)
+        } catch (e: Exception) {
+            log("loadExtractor hata: ${e.message}")
+            false
+        }
+        log("loadExtractor sonuç=$extracted url=$url")
         if (extracted) return true
 
-        if (depth > 2) return false
+        if (depth > 2) {
+            dbg(callback, "derinlik sınırı aşıldı: $url")
+            return false
+        }
 
         // matrudas gibi sarmalayıcılar: Referer ile sayfayı açıp içinden çıkar
-        val res = runCatching {
+        val res = try {
             app.get(url, referer = referer, headers = mapOf("Accept" to "*/*"))
-        }.getOrNull() ?: return false
+        } catch (e: Exception) {
+            dbg(callback, "istek hatası ($name): ${e.message}")
+            return false
+        }
 
         val finalUrl = res.url
+        log("fetch kod=${res.code} final=$finalUrl")
         if (finalUrl.isNotBlank() && finalUrl != url) {
             if (handleEmbed(finalUrl, label, referer, subtitleCallback, callback, depth + 1)) {
                 return true
@@ -230,13 +278,17 @@ class BuzFilmizle3 : MainAPI() {
 
         var text = res.text.replace("\\/", "/").replace("&amp;", "&")
         if (res.text.contains("eval(function(p,a,c,k,e,d)")) {
-            runCatching { getAndUnpack(res.text) }.getOrNull()?.let {
-                text += "\n" + it.replace("\\/", "/")
+            try {
+                getAndUnpack(res.text).let { text += "\n" + it.replace("\\/", "/") }
+                log("packed JS çözüldü")
+            } catch (e: Exception) {
+                log("unpack hata: ${e.message}")
             }
         }
 
         val embedReferer = originOf(url)
         val medias = mediaRegex.findAll(text).map { it.value }.distinct().toList()
+        log("medya bulundu=${medias.size} $medias")
         if (medias.isNotEmpty()) {
             medias.forEach { m ->
                 if (m.contains(".m3u8", true)) emitM3u8(name, m, embedReferer, callback)
@@ -252,9 +304,17 @@ class BuzFilmizle3 : MainAPI() {
             if (src.isNotBlank() && !src.startsWith("data:") && !src.startsWith("about:")) {
                 val next = runCatching { URI(url).resolve(src).toString() }.getOrDefault(src)
                 if (badFrameHosts.none { next.contains(it, true) }) {
+                    log("iç iframe: $next")
                     if (handleEmbed(next, label, url, subtitleCallback, callback, depth + 1)) any = true
                 }
             }
+        }
+
+        if (!any) {
+            dbg(
+                callback,
+                "medya yok ($name) kod=${res.code} sayfa: ${res.text.take(150).replace("\n", " ")}"
+            )
         }
         return any
     }
@@ -265,6 +325,7 @@ class BuzFilmizle3 : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        log("loadLinks data=$data")
         val base = data.trimEnd('/')
         val firstDoc = app.get(data, referer = "$mainUrl/").document
 
@@ -282,6 +343,7 @@ class BuzFilmizle3 : MainAPI() {
                 }
             }
         }
+        dbg(callback, "kaynak sayfa=${pages.size}: ${pages.entries.joinToString(" | ") { "${it.value}:${it.key}" }}")
 
         var found = false
         val seen = HashSet<String>()
@@ -290,15 +352,28 @@ class BuzFilmizle3 : MainAPI() {
             val doc = if (pageUrl == data) {
                 firstDoc
             } else {
-                runCatching { app.get(pageUrl, referer = data).document }.getOrNull() ?: continue
+                try {
+                    app.get(pageUrl, referer = data).document
+                } catch (e: Exception) {
+                    dbg(callback, "part sayfası açılamadı $pageUrl: ${e.message}")
+                    continue
+                }
             }
 
-            for (frame in extractFrames(doc)) {
+            val frames = extractFrames(doc)
+            dbg(callback, "[${label.ifBlank { "ana" }}] iframe=${frames.size}: ${frames.joinToString(" | ")}")
+
+            for (frame in frames) {
                 if (!seen.add(frame)) continue
-                if (handleEmbed(frame, label, pageUrl, subtitleCallback, callback)) found = true
+                if (handleEmbed(frame, label, pageUrl, subtitleCallback, callback)) {
+                    found = true
+                } else {
+                    dbg(callback, "BAŞARISIZ: $frame")
+                }
             }
         }
 
+        log("loadLinks bitti found=$found")
         return found
     }
 }
