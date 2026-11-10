@@ -1,5 +1,5 @@
 // BuzFilmizle3 sürümünü her güncellemede artır
-version = 10
+version = 12
 
 android {
     namespace = "com.bymesut1"
