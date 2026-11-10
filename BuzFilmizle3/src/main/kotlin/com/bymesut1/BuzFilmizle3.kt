@@ -11,7 +11,7 @@ import java.net.URI
 // DEBUG: logcat'e "BuzFilmizle3" etiketiyle kayıt düşer (sorun çözülünce false yap).
 private const val DEBUG = true
 // true yaparsan hiç kaynak bulunamayınca listede "🐞" hata satırları görünür.
-private const val SHOW_DEBUG_LINKS = true
+private const val SHOW_DEBUG_LINKS = false
 private const val TAG = "BuzFilmizle3"
 
 class BuzFilmizle3 : MainAPI() {
@@ -262,10 +262,11 @@ class BuzFilmizle3 : MainAPI() {
         name: String,
         url: String,
         referer: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        headers: Map<String, String> = emptyMap()
     ): Boolean {
         val links = try {
-            M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer)
+            M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer, headers = headers)
         } catch (e: Exception) {
             log("generateM3u8 hata: ${e.message} url=$url")
             null
@@ -279,6 +280,7 @@ class BuzFilmizle3 : MainAPI() {
             callback(
                 newExtractorLink(name, name, url, ExtractorLinkType.M3U8) {
                     this.referer = referer
+                    this.headers = headers
                     this.quality = Qualities.Unknown.value
                 }
             )
@@ -302,6 +304,29 @@ class BuzFilmizle3 : MainAPI() {
         return true
     }
 
+    private val UA =
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+
+    // m3u8'i hangi Referer ile açabiliyorsak onu bulur (Vidmoly 2004 BAD_HTTP_STATUS çözümü)
+    private suspend fun probeReferer(url: String, candidates: List<String>): String? {
+        for (r in candidates) {
+            val ok = try {
+                val t = app.get(
+                    url,
+                    referer = r,
+                    headers = mapOf("Origin" to r.trimEnd('/'), "User-Agent" to UA),
+                    timeout = 10L
+                ).text
+                t.trimStart().startsWith("#EXTM3U")
+            } catch (e: Exception) {
+                false
+            }
+            log("probe referer=$r ok=$ok")
+            if (ok) return r
+        }
+        return null
+    }
+
     private suspend fun emitMedia(
         name: String,
         url: String,
@@ -310,8 +335,23 @@ class BuzFilmizle3 : MainAPI() {
     ): Boolean {
         val l = url.lowercase()
         val hls = l.contains(".m3u8") || Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
-        return if (hls) emitM3u8(name, url, referer, callback) // m3u8 / master.txt / playlist.txt
-        else emitVideo(name, url, referer, callback)
+
+        val refs = LinkedHashSet<String>()
+        refs.add(referer)
+        if (name.equals("Vidmoly", true)) {
+            refs.add("https://vidmoly.to/")
+            refs.add("https://vidmoly.net/")
+            refs.add("https://vidmoly.me/")
+        }
+        refs.add("$mainUrl/")
+
+        return if (hls) {
+            val good = probeReferer(url, refs.toList()) ?: referer
+            val hdr = mapOf("Origin" to good.trimEnd('/'), "User-Agent" to UA)
+            emitM3u8(name, url, good, callback, hdr)
+        } else {
+            emitVideo(name, url, referer, callback)
+        }
     }
 
     // FirePlayer: sayfa videoyu "?do=getVideo" POST isteğiyle veriyor.
@@ -602,6 +642,12 @@ class BuzFilmizle3 : MainAPI() {
                 app.get(pageUrl, referer = "$base/").document
             } catch (e: Exception) {
                 dbg("part sayfası açılamadı $pageUrl: ${e.message}")
+                callback(
+                    newExtractorLink(label, label, pageUrl, ExtractorLinkType.VIDEO) {
+                        this.referer = "$base/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
                 return false
             }
         }
@@ -619,6 +665,15 @@ class BuzFilmizle3 : MainAPI() {
                 false
             }
             if (r) ok = true else dbg("BAŞARISIZ [$label]: $frame")
+        }
+        // Çözülemese bile kaynak listede görünsün (sitedeki gibi: çalışanı kullanıcı seçer)
+        if (!ok) {
+            callback(
+                newExtractorLink(label, label, frames.firstOrNull() ?: pageUrl, ExtractorLinkType.VIDEO) {
+                    this.referer = pageUrl
+                    this.quality = Qualities.Unknown.value
+                }
+            )
         }
         return ok
     }
