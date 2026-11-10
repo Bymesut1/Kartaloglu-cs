@@ -7,10 +7,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 
 // Hata ayıklama: true iken kaynak listesinde "🐞 DEBUG" satırları görünür
 // ve logcat'e "BuzFilmizle3" etiketiyle kayıt düşer. Bitince false yap.
@@ -329,7 +325,7 @@ class BuzFilmizle3 : MainAPI() {
         var cookies: Map<String, String> = emptyMap()
         val apis = LinkedHashSet<String>()
         try {
-            val page = app.get(clean, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe"))
+            val page = app.get(clean, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe"), timeout = 15L)
             cookies = page.cookies
             val html = page.text.replace("\\/", "/")
             log("fireplayer sayfa kod=${page.code} uzunluk=${html.length}")
@@ -358,7 +354,8 @@ class BuzFilmizle3 : MainAPI() {
                             "Origin" to origin.trimEnd('/')
                         ),
                         referer = clean,
-                        cookies = cookies
+                        cookies = cookies,
+                        timeout = 15L
                     ).text
                 } catch (e: Exception) {
                     dbg("fireplayer istek hatası: ${e.message}")
@@ -464,7 +461,8 @@ class BuzFilmizle3 : MainAPI() {
                 headers = mapOf(
                     "Accept" to "text/html,application/xhtml+xml,*/*",
                     "Sec-Fetch-Dest" to "iframe"
-                )
+                ),
+                timeout = 15L
             )
         } catch (e: Exception) {
             dbg("istek hatası ($name): ${e.message}")
@@ -595,15 +593,14 @@ class BuzFilmizle3 : MainAPI() {
 
         val seen: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
-        // Üç kaynak AYNI ANDA denenir, her biri en fazla 30 sn
-        val results = coroutineScope {
-            pages.entries.map { (pageUrl, label) ->
-                async {
-                    withTimeoutOrNull(30_000L) {
-                        processPage(pageUrl, label, firstDoc, base, seen, subtitleCallback, callback)
-                    } ?: false
-                }
-            }.awaitAll()
+        // Üç kaynak AYNI ANDA denenir (CloudStream'in amap yardımcısı)
+        val results = pages.entries.toList().amap { entry ->
+            try {
+                processPage(entry.key, entry.value, firstDoc, base, seen, subtitleCallback, callback)
+            } catch (e: Exception) {
+                dbg("kaynak hatası (${entry.value}): ${e.message}")
+                false
+            }
         }
         val found = results.any { it }
 
