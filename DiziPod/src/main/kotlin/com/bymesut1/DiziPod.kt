@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.text.Normalizer
 
@@ -94,55 +95,153 @@ class DiziPod : MainAPI() {
 
     // --------------------------------------------------------------- kartlar
 
-    private fun parseCards(doc: Document): List<SearchResponse> {
-        val seen = LinkedHashSet<String>()
-        val out = ArrayList<SearchResponse>()
+    private class RawCard(val url: String, var title: String, var poster: String?, var year: Int?)
+
+    private val badImgRx = Regex(
+        "(?i)(^data:|placeholder|blank\\.|spacer|loading|lazy\\.|noimage|no-image|default\\.(?:jpg|jpeg|png|webp)|\\.svg(?:$|\\?)|1x1)"
+    )
+
+    private fun badImg(v: String): Boolean = v.isBlank() || badImgRx.containsMatchIn(v)
+
+    /** Kart içinden gerçek afiş adresini bulur (lazy-load / srcset / noscript / background destekli). */
+    private fun pickPoster(card: Element, a: Element): String? {
+        val imgs = LinkedHashSet<Element>()
+        imgs.addAll(a.select("img"))
+        imgs.addAll(card.select("img"))
+
+        val attrs = listOf(
+            "data-original", "data-src", "data-lazy-src", "data-lazy", "data-image",
+            "data-poster", "data-thumb", "src"
+        )
+        for (img in imgs) {
+            for (k in attrs) {
+                val v = img.attr(k).trim()
+                if (!badImg(v)) return v
+            }
+            for (k in listOf("data-srcset", "data-lazy-srcset", "srcset")) {
+                val first = img.attr(k).trim().split(",").firstOrNull()
+                    ?.trim()?.substringBefore(" ")?.trim().orEmpty()
+                if (!badImg(first)) return first
+            }
+        }
+
+        // <noscript><img src="..."></noscript>
+        val srcRx = Regex("src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
+        for (ns in card.select("noscript")) {
+            val m = srcRx.find(ns.html() + " " + ns.data())
+            val v = m?.groupValues?.get(1)?.trim().orEmpty()
+            if (!badImg(v)) return v
+        }
+
+        // background-image
+        val bgRx = Regex("url\\((['\"]?)([^)'\"]+)\\1\\)", RegexOption.IGNORE_CASE)
+        for (el in card.select("[data-bg],[data-background],[style*=url(]")) {
+            val raw = el.attr("data-bg").ifBlank { el.attr("data-background") }
+                .ifBlank { bgRx.find(el.attr("style"))?.groupValues?.get(2).orEmpty() }
+                .trim()
+            if (!badImg(raw)) return raw
+        }
+        return null
+    }
+
+    private fun insideChrome(a: Element): Boolean =
+        a.parents().any { it.tagName() in setOf("nav", "header", "footer", "aside") }
+
+    private val posterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Siteden afiş çıkmayan kartlar için TMDB afişi (önbellekli). */
+    private suspend fun tmdbPosterFor(title: String, isMovie: Boolean): String? {
+        val key = (if (isMovie) "m:" else "t:") + norm(title)
+        posterCache[key]?.let { return it.ifBlank { null } }
+        val path: String? = try {
+            val q = titleVariants(title).firstOrNull() ?: title
+            val k = norm(q)
+            if (isMovie) {
+                val r = tmdbSearchMovie(q)
+                (r.firstOrNull { norm(it.title.orEmpty()) == k || norm(it.original_title.orEmpty()) == k }
+                    ?: r.firstOrNull())?.poster_path
+            } else {
+                val r = tmdbSearchTv(q)
+                (r.firstOrNull { norm(it.name.orEmpty()) == k || norm(it.original_name.orEmpty()) == k }
+                    ?: r.firstOrNull())?.poster_path
+            }
+        } catch (e: Exception) {
+            null
+        }
+        val full = path?.takeIf { it.isNotBlank() }?.let { "$tmdbImg/w500$it" }
+        posterCache[key] = full.orEmpty()
+        return full
+    }
+
+    private fun collectCards(doc: Document, strict: Boolean): List<RawCard> {
+        val map = LinkedHashMap<String, RawCard>()
 
         for (a in doc.select("a[href*=/diziler/], a[href*=/film/]")) {
             val href = a.attr("href").trim()
             if (href.isBlank()) continue
             // /diziler/ ya da /filmler/ liste sayfalarının kendisini atla
             if (href.trimEnd('/').endsWith("/diziler") || href.trimEnd('/').endsWith("/filmler")) continue
+            // menü / üst bilgi / alt bilgi / yan panel bağlantıları kart değildir
+            if (strict && insideChrome(a)) continue
 
             val url = absolute(href)
-            if (!seen.add(url)) continue
 
             val card = a.closest("article, .item, .post, .movie, .series, .video-card, .card") ?: a
-            val img = card.selectFirst("img") ?: a.selectFirst("img")
+            val img = a.selectFirst("img") ?: card.selectFirst("img")
 
             val title = a.attr("title").trim()
                 .ifBlank { card.selectFirst("h2,h3,h4,.title,.name")?.text()?.trim().orEmpty() }
                 .ifBlank { img?.attr("alt")?.trim().orEmpty() }
                 .ifBlank { a.text().trim() }
-            if (title.isBlank()) continue
 
-            var posterRaw = ""
-            if (img != null) {
-                for (k in listOf("data-original", "data-src", "data-lazy-src", "src")) {
-                    val v: String = img.attr(k).trim()
-                    if (v.isNotBlank()) {
-                        posterRaw = v
-                        break
-                    }
-                }
-            }
-            val posterUrl: String? = if (posterRaw.isNotBlank()) absolute(posterRaw) else null
-
+            val posterRaw = pickPoster(card, a)
+            val posterUrl: String? = posterRaw?.let { absolute(it) }
             val year = Regex("(?:19|20)\\d{2}").find(card.text())?.value?.toIntOrNull()
 
-            if (typeOf(url) == TvType.Movie) {
-                out += newMovieSearchResponse(title, url, TvType.Movie) {
-                    this.posterUrl = posterUrl
-                    this.year = year
+            val old = map[url]
+            if (old == null) {
+                if (title.isBlank() && posterUrl == null) continue
+                map[url] = RawCard(url, title, posterUrl, year)
+            } else {
+                // Aynı adres birden fazla yerde geçiyorsa (metin bağlantısı + gerçek kart) afişli olanı tut
+                if (old.poster == null && posterUrl != null) old.poster = posterUrl
+                if (old.title.isBlank() && title.isNotBlank()) old.title = title
+                if (old.year == null && year != null) old.year = year
+            }
+        }
+        return map.values.filter { it.title.isNotBlank() }
+    }
+
+    private suspend fun parseCards(doc: Document): List<SearchResponse> {
+        var cards = collectCards(doc, strict = true)
+        if (cards.isEmpty()) cards = collectCards(doc, strict = false)
+
+        // Afişli kartlar varsa afişsiz metin bağlantıları (popüler/öneri listeleri) gürültüdür
+        val withPoster = cards.count { it.poster != null }
+        val kept = if (withPoster > 0) cards.filter { it.poster != null } else cards
+
+        // Hâlâ afişi olmayanlar için TMDB yedeği
+        kept.filter { it.poster == null }.amap { c ->
+            c.poster = tmdbPosterFor(c.title, typeOf(c.url) == TvType.Movie)
+        }
+
+        val posterHdr = mapOf("Referer" to "$mainUrl/", "User-Agent" to ua)
+
+        return kept.map { c ->
+            if (typeOf(c.url) == TvType.Movie) {
+                newMovieSearchResponse(c.title, c.url, TvType.Movie) {
+                    this.posterUrl = c.poster
+                    this.posterHeaders = posterHdr
+                    this.year = c.year
                 }
             } else {
-                out += newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                    this.posterUrl = posterUrl
-                    this.year = year
+                newTvSeriesSearchResponse(c.title, c.url, TvType.TvSeries) {
+                    this.posterUrl = c.poster
+                    this.posterHeaders = posterHdr
+                    this.year = c.year
                 }
             }
         }
-        return out
     }
 
     // -------------------------------------------------------------- ana sayfa
@@ -836,6 +935,7 @@ data class TmdbTvResult(
     val id: Int? = null,
     val name: String? = null,
     val original_name: String? = null,
+    val poster_path: String? = null,
     val popularity: Double? = null
 )
 
@@ -846,6 +946,7 @@ data class TmdbMovieResult(
     val title: String? = null,
     val original_title: String? = null,
     val release_date: String? = null,
+    val poster_path: String? = null,
     val popularity: Double? = null
 )
 
