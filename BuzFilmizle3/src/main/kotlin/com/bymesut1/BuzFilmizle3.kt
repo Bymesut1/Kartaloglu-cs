@@ -2,6 +2,7 @@ package com.bymesut1
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -41,8 +42,14 @@ class BuzFilmizle3 : MainAPI() {
 
     // ---------------------------------------------------------------- Yardımcılar
 
-    private val mediaRegex =
-        Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*""")
+    private val mediaRegex = Regex(
+        """https?://[^\s"'<>\\]+?(?:\.(?:m3u8|mp4|mpd)|/(?:master|playlist|index)\.txt)[^\s"'<>\\]*"""
+    )
+
+    private val urlRegex = Regex("""(?:https?:)?//[^\s"'<>\\)]+""")
+
+    private val assetRegex =
+        Regex("""(?i)\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|otf|map)(?:[?#].*)?$""")
 
     private val yearRegex = Regex("""\b(?:19|20)\d{2}\b""")
 
@@ -55,16 +62,20 @@ class BuzFilmizle3 : MainAPI() {
         if (DEBUG) Log.d(TAG, msg)
     }
 
-    // Logcat'e yazar + DEBUG açıksa kaynak listesine görünür satır ekler
-    private suspend fun dbg(callback: (ExtractorLink) -> Unit, msg: String) {
+    // Hata satırları tampona yazılır; sadece HİÇ kaynak bulunamazsa listeye eklenir.
+    // (Eskiden her zaman ekleniyordu, oynatıcı sahte "debug.local" linkini açıp
+    //  "Source error / ERROR_CODE_IO_NETWORK_CONNECTION_FAILED" veriyordu.)
+    private val dbgBuf = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    private fun dbg(msg: String) {
         Log.d(TAG, msg)
-        if (DEBUG) {
-            callback(
-                newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-        }
+        if (DEBUG) dbgBuf.add(msg)
+    }
+
+    // Uzun sayfa gövdesini logcat'e parça parça yazar (logcat ~4000 karakterde keser)
+    private fun dumpBody(tag: String, text: String) {
+        val t = text.take(30000)
+        t.chunked(3000).forEachIndexed { i, c -> Log.d(TAG, "BODY[$tag#$i] $c") }
     }
 
     private fun cleanTitle(t: String): String =
@@ -174,12 +185,64 @@ class BuzFilmizle3 : MainAPI() {
 
         // Script ile yazılan / gizli kalan oynatıcı adresleri
         val html = doc.html().replace("\\/", "/").replace("&amp;", "&")
-        Regex("""https?://[^\s"'<>\\]*(?:matrudas|vidmoly|drewimplemnt)[^\s"'<>\\]*""")
+        Regex("""https?://[^\s"'<>\\]*(?:oynat\.buzfilmizle3|matrudas|vidmoly|drewimplemnt)[^\s"'<>\\]*""")
             .findAll(html)
             .forEach { out.add(it.value) }
 
         return out.toList()
     }
+
+    // \/ \uXXXX \xXX kaçışlarını açar, packed JS'i çözer, base64 içindeki adresleri ortaya çıkarır
+    private fun expand(raw: String): String {
+        var t = raw.replace("\\/", "/").replace("&amp;", "&")
+        t = Regex("""\\u([0-9a-fA-F]{4})""").replace(t) {
+            it.groupValues[1].toInt(16).toChar().toString()
+        }
+        t = Regex("""\\x([0-9a-fA-F]{2})""").replace(t) {
+            it.groupValues[1].toInt(16).toChar().toString()
+        }
+
+        val extra = StringBuilder()
+
+        if (raw.contains("eval(function(p,a,c,k,e,d)")) {
+            try {
+                extra.append("\n").append(getAndUnpack(raw).replace("\\/", "/"))
+                log("packed JS çözüldü")
+            } catch (e: Exception) {
+                log("unpack hata: ${e.message}")
+            }
+        }
+
+        // atob("...") ve uzun base64 dizeleri
+        val b64 = Regex("""["']([A-Za-z0-9+/_-]{24,}={0,2})["']""")
+        b64.findAll(t).take(40).forEach { m ->
+            try {
+                val s = m.groupValues[1].replace('-', '+').replace('_', '/')
+                val dec = String(android.util.Base64.decode(s, android.util.Base64.DEFAULT), Charsets.UTF_8)
+                if (dec.contains("http") || dec.contains(".m3u8") || dec.contains(".mp4")) {
+                    extra.append("\n").append(dec.replace("\\/", "/"))
+                }
+            } catch (ignored: Exception) {
+            }
+        }
+
+        return t + extra.toString()
+    }
+
+    private fun candidates(text: String, selfUrl: String): List<String> =
+        urlRegex.findAll(text)
+            .map { it.value.trimEnd('.', ',', ';', '\\') }
+            .map { if (it.startsWith("//")) "https:$it" else it }
+            .filter { u ->
+                u != selfUrl &&
+                    badFrameHosts.none { u.contains(it, true) } &&
+                    !assetRegex.containsMatchIn(u) &&
+                    !u.contains("w3.org") &&
+                    !u.contains("schema.org") &&
+                    !u.contains("www.buzfilmizle3.com")
+            }
+            .distinct()
+            .toList()
 
     private suspend fun emitM3u8(
         name: String,
@@ -223,6 +286,82 @@ class BuzFilmizle3 : MainAPI() {
         )
     }
 
+    private suspend fun emitMedia(
+        name: String,
+        url: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val l = url.lowercase()
+        if (l.contains(".mp4")) emitVideo(name, url, referer, callback)
+        else emitM3u8(name, url, referer, callback) // m3u8 / master.txt / playlist.txt
+    }
+
+    // Sayfa JS ile oynatıcı kuruyorsa: gizli WebView ile açıp ağdan m3u8/mp4 isteğini yakalar
+    private suspend fun viaWebView(
+        name: String,
+        url: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            log("WebView deneniyor: $url")
+            val resolver = WebViewResolver(
+                Regex("""(?i)\.(?:m3u8|mp4|mpd)(?:[?#].*)?$|/(?:master|playlist|index)\.txt"""),
+                timeout = 25_000L
+            )
+            val captured = app.get(url, referer = referer, interceptor = resolver).url
+            log("WebView yakaladı: $captured")
+            if (mediaRegex.containsMatchIn(captured)) {
+                emitMedia(name, captured, originOf(url), callback)
+                true
+            } else {
+                dbg("WebView medya yakalayamadı ($name) son=$captured")
+                false
+            }
+        } catch (e: Exception) {
+            dbg("WebView hata ($name): ${e.message}")
+            false
+        }
+    }
+
+    // Sayfadaki JS'in çağırdığı olası API adreslerini dener (fetch / ajax / url:)
+    private suspend fun probeApis(
+        text: String,
+        pageUrl: String,
+        referer: String
+    ): String {
+        val paths = LinkedHashSet<String>()
+        listOf(
+            Regex("""fetch\(\s*["']([^"']+)["']"""),
+            Regex("""\.(?:get|post|getJSON)\(\s*["']([^"']+)["']"""),
+            Regex("""url\s*:\s*["']([^"']+)["']"""),
+            Regex("""["'](/(?:api|source|sources|player|embed|get|video|stream)[^"'\s]*)["']""")
+        ).forEach { r -> r.findAll(text).forEach { paths.add(it.groupValues[1]) } }
+
+        val sb = StringBuilder()
+        for (p in paths.filter { !assetRegex.containsMatchIn(it) && !it.startsWith("data:") }.take(5)) {
+            val full = runCatching { URI(pageUrl).resolve(p).toString() }.getOrNull() ?: continue
+            if (badFrameHosts.any { full.contains(it, true) }) continue
+            val hdr = mapOf("X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*")
+            val body = try {
+                app.get(full, referer = pageUrl, headers = hdr).text
+            } catch (e: Exception) {
+                try {
+                    app.post(full, referer = pageUrl, headers = hdr).text
+                } catch (e2: Exception) {
+                    log("api hata $full: ${e2.message}")
+                    ""
+                }
+            }
+            if (body.isNotBlank()) {
+                log("api $full -> ${body.take(200).replace("\n", " ")}")
+                sb.append("\n").append(expand(body))
+            }
+        }
+        return sb.toString()
+    }
+
     private suspend fun handleEmbed(
         url: String,
         label: String,
@@ -235,88 +374,94 @@ class BuzFilmizle3 : MainAPI() {
         val lower = url.lowercase()
         log("handleEmbed[$depth] $name -> $url (referer=$referer)")
 
-        // Doğrudan medya adresi (FASTM m3u8 / Bronz mp4)
-        if (lower.contains(".m3u8")) {
-            emitM3u8(name, url, referer, callback)
-            return true
-        }
-        if (lower.contains(".mp4")) {
-            emitVideo(name, url, referer, callback)
+        // Doğrudan medya adresi
+        if (mediaRegex.containsMatchIn(lower)) {
+            emitMedia(name, url, referer, callback)
             return true
         }
 
-        // Hazır çıkarıcılar (Vidmoly vb.)
-        val extracted = try {
-            loadExtractor(url, referer, subtitleCallback, callback)
-        } catch (e: Exception) {
-            log("loadExtractor hata: ${e.message}")
-            false
+        // Hazır çıkarıcılar (Vidmoly vb.) - oynat.buzfilmizle3 sarmalayıcısı için atlanır
+        if (!lower.contains("oynat.buzfilmizle3")) {
+            val extracted = try {
+                loadExtractor(url, referer, subtitleCallback, callback)
+            } catch (e: Exception) {
+                log("loadExtractor hata: ${e.message}")
+                false
+            }
+            log("loadExtractor sonuç=$extracted url=$url")
+            if (extracted) return true
         }
-        log("loadExtractor sonuç=$extracted url=$url")
-        if (extracted) return true
 
-        if (depth > 2) {
-            dbg(callback, "derinlik sınırı aşıldı: $url")
+        if (depth > 3) {
+            dbg("derinlik sınırı aşıldı: $url")
             return false
         }
 
-        // matrudas gibi sarmalayıcılar: Referer ile sayfayı açıp içinden çıkar
         val res = try {
-            app.get(url, referer = referer, headers = mapOf("Accept" to "*/*"))
+            app.get(
+                url,
+                referer = referer,
+                headers = mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,*/*",
+                    "Sec-Fetch-Dest" to "iframe"
+                )
+            )
         } catch (e: Exception) {
-            dbg(callback, "istek hatası ($name): ${e.message}")
-            return false
+            dbg("istek hatası ($name): ${e.message}")
+            return viaWebView(name, url, referer, callback)
         }
 
         val finalUrl = res.url
         log("fetch kod=${res.code} final=$finalUrl")
         if (finalUrl.isNotBlank() && finalUrl != url) {
-            if (handleEmbed(finalUrl, label, referer, subtitleCallback, callback, depth + 1)) {
-                return true
-            }
+            if (handleEmbed(finalUrl, label, referer, subtitleCallback, callback, depth + 1)) return true
         }
 
-        var text = res.text.replace("\\/", "/").replace("&amp;", "&")
-        if (res.text.contains("eval(function(p,a,c,k,e,d)")) {
-            try {
-                getAndUnpack(res.text).let { text += "\n" + it.replace("\\/", "/") }
-                log("packed JS çözüldü")
-            } catch (e: Exception) {
-                log("unpack hata: ${e.message}")
-            }
-        }
+        if (depth == 0) dumpBody(name, res.text)
 
+        var text = expand(res.text)
         val embedReferer = originOf(url)
-        val medias = mediaRegex.findAll(text).map { it.value }.distinct().toList()
+
+        // 1) Sayfada doğrudan medya var mı
+        var medias = mediaRegex.findAll(text).map { it.value }.distinct().toList()
+        if (medias.isEmpty()) {
+            // 2) JS'in çağırdığı API'ler
+            val api = probeApis(res.text, url, referer)
+            if (api.isNotBlank()) {
+                text += "\n$api"
+                medias = mediaRegex.findAll(text).map { it.value }.distinct().toList()
+            }
+        }
         log("medya bulundu=${medias.size} $medias")
         if (medias.isNotEmpty()) {
-            medias.forEach { m ->
-                if (m.contains(".m3u8", true)) emitM3u8(name, m, embedReferer, callback)
-                else emitVideo(name, m, embedReferer, callback)
-            }
+            medias.forEach { emitMedia(name, it, embedReferer, callback) }
             return true
         }
 
-        // İç içe iframe
-        var any = false
+        // 3) Sayfadaki iframe'ler + metin içindeki tüm dış adresler (Vidmoly, matrudas vb.)
+        val next = LinkedHashSet<String>()
         res.document.select("iframe").forEach { f ->
             val src = (f.attr("src").ifBlank { f.attr("data-src") }).trim()
             if (src.isNotBlank() && !src.startsWith("data:") && !src.startsWith("about:")) {
-                val next = runCatching { URI(url).resolve(src).toString() }.getOrDefault(src)
-                if (badFrameHosts.none { next.contains(it, true) }) {
-                    log("iç iframe: $next")
-                    if (handleEmbed(next, label, url, subtitleCallback, callback, depth + 1)) any = true
-                }
+                runCatching { URI(url).resolve(src).toString() }.getOrNull()?.let { next.add(it) }
             }
         }
+        next.addAll(candidates(text, url))
 
-        if (!any) {
-            dbg(
-                callback,
-                "medya yok ($name) kod=${res.code} sayfa: ${res.text.take(150).replace("\n", " ")}"
-            )
+        var any = false
+        for (n in next.take(6)) {
+            if (badFrameHosts.any { n.contains(it, true) }) continue
+            log("aday: $n")
+            if (handleEmbed(n, label, url, subtitleCallback, callback, depth + 1)) {
+                any = true
+                break
+            }
         }
-        return any
+        if (any) return true
+
+        // 4) Son çare: gerçek tarayıcı motoru (JS çalıştır, ağdan medya adresini yakala)
+        dbg("statik çıkarım başarısız ($name) kod=${res.code} aday=${next.size} -> WebView")
+        return viaWebView(name, url, referer, callback)
     }
 
     override suspend fun loadLinks(
@@ -326,50 +471,70 @@ class BuzFilmizle3 : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         log("loadLinks data=$data")
-        val base = data.trimEnd('/')
-        val firstDoc = app.get(data, referer = "$mainUrl/").document
+        dbgBuf.clear()
 
-        // Keremiya teması: kaynaklar (Vidmoly / Bronz / FASTM) ayrı "part" sayfalarında olabilir
+        // Sıra: 1 = Vidmoly, 2 = FASTM, 3 = BRONZ
+        val base = data.trimEnd('/').removeSuffix("/1")
+        val firstDoc = app.get("$base/", referer = "$mainUrl/").document
+
         val pages = LinkedHashMap<String, String>()
-        pages[data] = ""
+        pages["$base/"] = "Vidmoly"
+        pages["$base/2/"] = "FASTM"
+        pages["$base/3/"] = "BRONZ"
+
+        // Sitede başka "part" sayfaları varsa onları da ekle
         firstDoc.select(
             ".keremiya_part a, div.keremiya_part a, .pagination a, .post-page-numbers, .sources a, .part a"
         ).forEach { a ->
             val href = fixUrlNull(a.attr("href"))
             if (href != null) {
                 val h = href.trimEnd('/')
-                if (h.startsWith(base) && h != base) {
-                    pages.putIfAbsent(href, a.text().trim())
+                val known = pages.keys.any { it.trimEnd('/') == h } || h == "$base/1".trimEnd('/')
+                if (h.startsWith(base) && h != base && !known) {
+                    pages[href] = a.text().trim()
                 }
             }
         }
-        dbg(callback, "kaynak sayfa=${pages.size}: ${pages.entries.joinToString(" | ") { "${it.value}:${it.key}" }}")
+        log("kaynak sayfa=${pages.size}: ${pages.entries.joinToString(" | ") { "${it.value}:${it.key}" }}")
 
         var found = false
         val seen = HashSet<String>()
 
         for ((pageUrl, label) in pages) {
-            val doc = if (pageUrl == data) {
+            val doc = if (pageUrl == "$base/") {
                 firstDoc
             } else {
                 try {
-                    app.get(pageUrl, referer = data).document
+                    app.get(pageUrl, referer = "$base/").document
                 } catch (e: Exception) {
-                    dbg(callback, "part sayfası açılamadı $pageUrl: ${e.message}")
+                    dbg("part sayfası açılamadı $pageUrl: ${e.message}")
                     continue
                 }
             }
 
             val frames = extractFrames(doc)
-            dbg(callback, "[${label.ifBlank { "ana" }}] iframe=${frames.size}: ${frames.joinToString(" | ")}")
+            log("[$label] iframe=${frames.size}: ${frames.joinToString(" | ")}")
 
             for (frame in frames) {
                 if (!seen.add(frame)) continue
-                if (handleEmbed(frame, label, pageUrl, subtitleCallback, callback)) {
-                    found = true
-                } else {
-                    dbg(callback, "BAŞARISIZ: $frame")
+                val ok = try {
+                    handleEmbed(frame, label, pageUrl, subtitleCallback, callback)
+                } catch (e: Exception) {
+                    dbg("handleEmbed istisna ($label): ${e.message}")
+                    false
                 }
+                if (ok) found = true else dbg("BAŞARISIZ [$label]: $frame")
+            }
+        }
+
+        // Hiç kaynak yoksa, nedenini gösteren satırları listeye ekle (gerçek kaynak varsa eklenmez)
+        if (!found && DEBUG) {
+            dbgBuf.toList().takeLast(8).forEach { msg ->
+                callback(
+                    newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
