@@ -344,30 +344,169 @@ class DiziPod : MainAPI() {
 
     // ------------------------------------------------------------------- load
 
-    private fun episodes(doc: Document): List<Episode> {
-        val rx = Regex("-(\\d+)-sezon-(\\d+)-bolum/?(?:$|[?#])", RegexOption.IGNORE_CASE)
-        val list = ArrayList<Episode>()
-        val seen = HashSet<Pair<Int, Int>>()
+    private val epRx = Regex("-(\\d+)-sezon-(\\d+)-bolum", RegexOption.IGNORE_CASE)
+    private val epSuffixRx = Regex("^/?(?:[?#].*)?$")
+    private val rawEpRx = Regex(
+        """(?:https?://[A-Za-z0-9.-]+)?/[^"'\s<>\\()]*?-\d+-sezon-\d+-bolum/?(?:\?[^"'\s<>\\()]*)?""",
+        RegexOption.IGNORE_CASE
+    )
 
+    private class EpHit(
+        val url: String,
+        val prefix: String,
+        val suffix: String,
+        val season: Int,
+        val ep: Int,
+        val label: String
+    )
+
+    /** Bölüm adresi şablonu: prefix-{sezon}-sezon-{bölüm}-bolum+suffix */
+    private class EpTemplate(val prefix: String, val suffix: String) {
+        fun url(season: Int, ep: Int) = "$prefix-$season-sezon-$ep-bolum$suffix"
+    }
+
+    private fun hitOf(rawUrl: String, label: String): EpHit? {
+        val url = absolute(rawUrl)
+        val m = epRx.findAll(url).lastOrNull() ?: return null
+        val suffix = url.substring(m.range.last + 1)
+        if (!epSuffixRx.matches(suffix)) return null
+        val s = m.groupValues[1].toIntOrNull() ?: return null
+        val e = m.groupValues[2].toIntOrNull() ?: return null
+        return EpHit(url, url.substring(0, m.range.first), suffix, s, e, label)
+    }
+
+    /** Sayfadaki bağlantılar + ham HTML/JSON içinde gömülü bölüm adresleri. */
+    private fun collectHits(doc: Document, html: String): List<EpHit> {
+        val hits = ArrayList<EpHit>()
         for (a in doc.select("a[href]")) {
-            val href = a.attr("href")
-            val m = rx.find(href) ?: continue
-            val season = m.groupValues[1].toIntOrNull() ?: continue
-            val ep = m.groupValues[2].toIntOrNull() ?: continue
-            if (!seen.add(season to ep)) continue
+            hitOf(a.attr("href"), a.text().trim())?.let { hits += it }
+        }
+        val raw = html.replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+        for (m in rawEpRx.findAll(raw)) {
+            hitOf(m.value, "")?.let { hits += it }
+        }
+        return hits
+    }
 
-            val label = a.text().trim()
-            list += newEpisode(absolute(href)) {
-                this.name = label.ifBlank { "$ep. Bölüm" }
-                this.season = season
-                this.episode = ep
+    private fun cleanEpName(label: String, title: String): String? {
+        val l = label.trim()
+        if (l.isBlank() || l.length > 45) return null
+        if (l.contains("sezon", true) || l.contains("izle", true)) return null
+        if (l.contains(title, true) || l[0].isDigit()) return null
+        return l
+    }
+
+    private fun episodes(doc: Document, html: String, pageUrl: String, title: String): Pair<List<Episode>, EpTemplate?> {
+        val hits = collectHits(doc, html)
+        if (hits.isEmpty()) return emptyList<Episode>() to null
+
+        // Yan panel / "son eklenen" gibi başka dizilerin bölümlerini ele: en kalabalık şablonu seç
+        val slug = pageUrl.trimEnd('/').substringAfterLast('/')
+        val best = hits.groupBy { it.prefix + "|" + it.suffix }.values.maxByOrNull { g ->
+            g.map { it.season to it.ep }.distinct().size +
+                (if (slug.isNotBlank() && g.first().prefix.contains(slug)) 1000 else 0)
+        } ?: return emptyList<Episode>() to null
+
+        val template = EpTemplate(best.first().prefix, best.first().suffix)
+        val byKey = LinkedHashMap<Pair<Int, Int>, EpHit>()
+        for (h in best) {
+            val k = h.season to h.ep
+            val old = byKey[k]
+            if (old == null || (old.label.isBlank() && h.label.isNotBlank())) byKey[k] = h
+        }
+
+        val list = byKey.values.map { h ->
+            newEpisode(h.url) {
+                this.name = cleanEpName(h.label, title)
+                this.season = h.season
+                this.episode = h.ep
+            }
+        }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+        return list to template
+    }
+
+    /** Sayfadaki "N. Sezon" butonlarından sezon numaralarını okur. */
+    private fun seasonButtons(doc: Document): Set<Int> {
+        val out = sortedSetOf<Int>()
+        val rx = Regex("^\\s*(\\d{1,2})\\s*\\.?\\s*sezon\\s*$", RegexOption.IGNORE_CASE)
+        for (el in doc.select("button, a, li, span, div, option, label")) {
+            if (el.children().size > 2) continue
+            val t = el.text().trim()
+            if (t.length > 14) continue
+            val n = rx.find(t)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+            if (n in 1..60) out += n
+        }
+        for (el in doc.select("[data-season],[data-sezon]")) {
+            val n = el.attr("data-season").ifBlank { el.attr("data-sezon") }.trim().toIntOrNull() ?: continue
+            if (n in 1..60) out += n
+        }
+        return out
+    }
+
+    private suspend fun urlExists(url: String): org.jsoup.nodes.Document? {
+        val res = runCatching { app.get(url, headers = headers()) }.getOrNull() ?: return null
+        if (res.code !in 200..299) return null
+        if (!epRx.containsMatchIn(res.url)) return null
+        return res.document
+    }
+
+    private suspend fun fetchSeason(sn: Int, tpl: EpTemplate, tmdbCount: Int, title: String): List<Episode> {
+        val firstDoc = urlExists(tpl.url(sn, 1)) ?: return emptyList()
+
+        // Bölüm sayfası aynı sezonun listesini veriyorsa onu da kullan
+        val found = collectHits(firstDoc, firstDoc.outerHtml())
+            .filter { it.prefix == tpl.prefix && it.season == sn }
+        var n = maxOf(tmdbCount, found.maxOfOrNull { it.ep } ?: 0)
+
+        if (n == 0) {
+            // Ne TMDB ne sayfa sayı verdi: ardışık dene
+            n = 1
+            for (e in 2..40) {
+                if (urlExists(tpl.url(sn, e)) == null) break
+                n = e
             }
         }
-        return list.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+
+        val labels = found.associate { it.ep to it.label }
+        return (1..n).map { e ->
+            newEpisode(tpl.url(sn, e)) {
+                this.name = cleanEpName(labels[e].orEmpty(), title)
+                this.season = sn
+                this.episode = e
+            }
+        }
+    }
+
+    /** Sitede görünmeyen sezonları (buton + TMDB) şablon adresleriyle tamamlar. */
+    private suspend fun expandSeasons(
+        siteEps: List<Episode>,
+        tpl: EpTemplate?,
+        buttons: Set<Int>,
+        tmdbCounts: Map<Int, Int>,
+        title: String
+    ): List<Episode> {
+        if (tpl == null) return siteEps
+        val have = siteEps.mapNotNull { it.season }.toSet()
+        val wanted = (buttons + tmdbCounts.keys + have).filter { it > 0 }.toSortedSet()
+        val missing = wanted.filter { it !in have }
+        if (missing.isEmpty()) return siteEps
+
+        val extra = missing.amap { sn ->
+            try {
+                fetchSeason(sn, tpl, tmdbCounts[sn] ?: 0, title)
+            } catch (e: Exception) {
+                Log.w(TAG, "SEASON $sn alınamadı: ${e.message}")
+                emptyList()
+            }
+        }.flatten()
+        Log.d(TAG, "SEASONS site=$have eksik=$missing eklenen=${extra.size}")
+        return (siteEps + extra).sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers()).document
+        val res = app.get(url, headers = headers())
+        val doc = res.document
+        val html = res.text
         val title = cleanTitle(doc)
         val poster = poster(doc)
         val plot = plot(doc)
@@ -384,8 +523,22 @@ class DiziPod : MainAPI() {
                 this.tags = info?.tags
             }
         } else {
-            val siteEps = episodes(doc)
-            val info = try { tmdbDizi(title, year, siteEps) } catch (e: Exception) { null }
+            val (siteEps0, template) = episodes(doc, html, url, title)
+            val buttons = seasonButtons(doc)
+            val counts0 = siteEps0.groupBy { it.season ?: 0 }.mapValues { it.value.size }
+
+            val tm = try { tmdbMatch(title, year, counts0) } catch (e: Exception) { null }
+            val tmdbCounts: Map<Int, Int> = tm?.seasons.orEmpty()
+                .filter { (it.season_number ?: 0) > 0 && (it.episode_count ?: 0) > 0 }
+                .associate { it.season_number!! to it.episode_count!! }
+
+            val siteEps = try {
+                expandSeasons(siteEps0, template, buttons, tmdbCounts, title)
+            } catch (e: Exception) {
+                siteEps0
+            }
+
+            val info = try { tmdbDizi(tm, siteEps) } catch (e: Exception) { null }
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, info?.episodes ?: siteEps) {
                 this.posterUrl = info?.poster ?: poster
                 this.backgroundPosterUrl = info?.backdrop
@@ -419,9 +572,10 @@ class DiziPod : MainAPI() {
         null
     }
 
-    private suspend fun tmdbSearchTv(q: String): List<TmdbTvResult> = try {
+    private suspend fun tmdbSearchTv(q: String, year: Int? = null): List<TmdbTvResult> = try {
+        val y = if (year != null) "&first_air_date_year=$year" else ""
         app.get(
-            "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false&query=${URLEncoder.encode(q, "UTF-8")}",
+            "$tmdbApi/search/tv?api_key=$tmdbKey&language=tr-TR&include_adult=false$y&query=${URLEncoder.encode(q, "UTF-8")}",
             timeout = 15L
         ).parsedSafe<TmdbTvSearch>()?.results.orEmpty()
     } catch (e: Exception) {
@@ -481,38 +635,73 @@ class DiziPod : MainAPI() {
         return null
     }
 
-    // Ayni adli diziler (Ben 10 gibi) icin sezon basina bolum sayisi ve yil en yakin olan secilir
+    private fun tokenOverlap(a: String, b: String): Double {
+        val ta = norm(a).split(' ').filter { it.length > 1 }.toSet()
+        val tb = norm(b).split(' ').filter { it.length > 1 }.toSet()
+        if (ta.isEmpty() || tb.isEmpty()) return 0.0
+        return ta.intersect(tb).size.toDouble() / minOf(ta.size, tb.size)
+    }
+
+    private fun searchQueries(title: String): List<String> {
+        val out = LinkedHashSet<String>()
+        for (v in titleVariants(title)) {
+            out += v
+            out += v.replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+            out += v.substringBefore(",").trim()
+            out += v.substringBefore(":").trim()
+        }
+        return out.filter { it.length >= 2 }
+    }
+
+    // Ayni adli diziler (Ben 10 gibi) icin sezon basina bolum sayisi ve yil en yakin olan secilir.
+    // 1. tur: ad eslesmesi (tam / iceren / kelime ortusmesi). 2. tur (Kore/Asya dizileri gibi adi
+    // TMDB'de farkli yazilanlar): ayni yila filtrelenmis aramanin ilk sonucu.
     private suspend fun tmdbMatch(title: String, year: Int?, siteCounts: Map<Int, Int>): TmdbTvDetails? {
-        for (q in titleVariants(title)) {
-            val key = norm(q)
-            if (key.isEmpty()) continue
-            val results = tmdbSearchTv(q)
-            if (results.isEmpty()) continue
-            val exact = results.filter { norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key }
-            val cands = if (exact.isNotEmpty()) exact.take(3) else listOfNotNull(
-                results.firstOrNull {
-                    val n = norm(it.name.orEmpty())
-                    n.isNotEmpty() && (n.contains(key) || key.contains(n))
+        val queries = searchQueries(title)
+        val years = listOf(year, null).distinct()
+        val cache = HashMap<String, List<TmdbTvResult>>()
+
+        for (pass in 0..1) {
+            for (q in queries) {
+                val key = norm(q)
+                if (key.isEmpty()) continue
+                for (yr in years) {
+                    if (pass == 1 && yr == null) continue
+                    val results = cache.getOrPut("$q|$yr") { tmdbSearchTv(q, yr) }
+                    if (results.isEmpty()) continue
+                    val exact = results.filter { norm(it.name.orEmpty()) == key || norm(it.original_name.orEmpty()) == key }
+                    val cands: List<TmdbTvResult> = if (exact.isNotEmpty()) exact.take(3) else listOfNotNull(
+                        results.firstOrNull {
+                            val n = norm(it.name.orEmpty())
+                            n.isNotEmpty() && (n.contains(key) || key.contains(n))
+                        } ?: results.firstOrNull {
+                            maxOf(tokenOverlap(q, it.name.orEmpty()), tokenOverlap(q, it.original_name.orEmpty())) >= 0.6
+                        } ?: (if (pass == 1) results.first() else null)
+                    )
+                    if (cands.isEmpty()) continue
+                    if (cands.size == 1) {
+                        val d = cands[0].id?.let { tmdbTvDetails(it, "tr-TR") }
+                        if (d != null) return d
+                        continue
+                    }
+                    val details = cands.amap { c -> c.id?.let { tmdbTvDetails(it, "tr-TR") } }.filterNotNull()
+                    if (details.isEmpty()) continue
+                    return details.minByOrNull { d ->
+                        val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
+                        var score = 0
+                        for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
+                        if (year != null && yearOf(d.first_air_date) == year) score -= 5
+                        score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
+                    }
                 }
-            )
-            if (cands.isEmpty()) continue
-            if (cands.size == 1) return cands[0].id?.let { tmdbTvDetails(it, "tr-TR") }
-            val details = cands.amap { c -> c.id?.let { tmdbTvDetails(it, "tr-TR") } }.filterNotNull()
-            if (details.isEmpty()) continue
-            return details.minByOrNull { d ->
-                val cnt = d.seasons.orEmpty().associate { (it.season_number ?: -1) to (it.episode_count ?: 0) }
-                var score = 0
-                for ((sn, c) in siteCounts) score += kotlin.math.abs(c - (cnt[sn] ?: 0))
-                if (year != null && yearOf(d.first_air_date) == year) score -= 5
-                score * 1000 - (d.popularity ?: 0.0).toInt().coerceAtMost(999)
             }
         }
         return null
     }
 
-    private suspend fun tmdbDizi(title: String, year: Int?, siteEps: List<Episode>): TmdbInfo? {
+    private suspend fun tmdbDizi(tm: TmdbTvDetails?, siteEps: List<Episode>): TmdbInfo? {
+        if (tm == null) return null
         val counts = siteEps.groupBy { it.season ?: 0 }.mapValues { it.value.size }
-        val tm = tmdbMatch(title, year, counts) ?: return null
         val tid = tm.id ?: return null
         val en = if (tm.overview.isNullOrBlank()) tmdbTvDetails(tid, "en-US") else null
 
