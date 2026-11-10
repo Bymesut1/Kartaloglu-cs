@@ -8,9 +8,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 
-// Hata ayıklama: true iken kaynak listesinde "🐞 DEBUG" satırları görünür
-// ve logcat'e "BuzFilmizle3" etiketiyle kayıt düşer. Bitince false yap.
+// DEBUG: logcat'e "BuzFilmizle3" etiketiyle kayıt düşer (sorun çözülünce false yap).
 private const val DEBUG = true
+// true yaparsan hiç kaynak bulunamayınca listede "🐞" hata satırları görünür.
+private const val SHOW_DEBUG_LINKS = true
 private const val TAG = "BuzFilmizle3"
 
 class BuzFilmizle3 : MainAPI() {
@@ -75,13 +76,13 @@ class BuzFilmizle3 : MainAPI() {
     }
 
     // Uzun sayfa gövdesini logcat'e parça parça yazar (logcat ~4000 karakterde keser)
-    private fun dumpBody(tag: String, text: String) {
-        val t = text.take(30000)
-        t.chunked(3000).forEachIndexed { i, c -> Log.d(TAG, "BODY[$tag#$i] $c") }
+    private fun dumpBody(tag: String, text: String, limit: Int = 30000) {
+        if (!DEBUG) return
+        text.take(limit).chunked(3000).forEachIndexed { i, c -> Log.d(TAG, "BODY[$tag#$i] $c") }
     }
 
     private fun cleanTitle(t: String): String =
-        t.replace(
+        t.replace(Regex("""\s*Anasayfa\s*>.*$"""), "").replace(
             Regex("""(?i)\s*(Full\s*HD\s*Film|Full\s*Film\s*HD|Full\s*Film|Full\s*HD|Türkçe\s*Dublaj|Türkçe\s*Altyazılı)?\s*izle\s*$"""),
             ""
         ).trim()
@@ -262,7 +263,7 @@ class BuzFilmizle3 : MainAPI() {
         url: String,
         referer: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
         val links = try {
             M3u8Helper.generateM3u8(source = name, streamUrl = url, referer = referer)
         } catch (e: Exception) {
@@ -282,6 +283,7 @@ class BuzFilmizle3 : MainAPI() {
                 }
             )
         }
+        return true
     }
 
     private suspend fun emitVideo(
@@ -289,7 +291,7 @@ class BuzFilmizle3 : MainAPI() {
         url: String,
         referer: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
         log("video ($name): $url")
         callback(
             newExtractorLink(name, name, url, ExtractorLinkType.VIDEO) {
@@ -297,6 +299,7 @@ class BuzFilmizle3 : MainAPI() {
                 this.quality = Qualities.Unknown.value
             }
         )
+        return true
     }
 
     private suspend fun emitMedia(
@@ -304,20 +307,17 @@ class BuzFilmizle3 : MainAPI() {
         url: String,
         referer: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
         val l = url.lowercase()
-        if (l.contains(".mp4")) emitVideo(name, url, referer, callback)
-        else emitM3u8(name, url, referer, callback) // m3u8 / master.txt / playlist.txt
+        val hls = l.contains(".m3u8") || Regex("""/(?:master|playlist|index)\.txt""").containsMatchIn(l)
+        return if (hls) emitM3u8(name, url, referer, callback) // m3u8 / master.txt / playlist.txt
+        else emitVideo(name, url, referer, callback)
     }
 
-    // FirePlayer: sayfa videoyu "?do=getVideo" POST isteğiyle alıyor (loglarda görüldü).
-    // Önce oynatıcı sayfası açılır (çerez + sayfadaki gerçek istek adresi), sonra POST atılır.
-    private suspend fun firePlayer(
-        name: String,
-        url: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    // FirePlayer: sayfa videoyu "?do=getVideo" POST isteğiyle veriyor.
+    // Cevap {"videoSrc":"https://..."} (bazı oynatıcılarda videoSource / securedLink) döner.
+    // Buradan sadece gerçek kaynağın ADRESİ alınır; adresin çözümü handleEmbed'de yapılır.
+    private suspend fun fireGetVideo(url: String, referer: String): String? {
         val clean = url.substringBefore("?").substringBefore("#")
         val id = clean.trimEnd('/').substringAfterLast("/")
         val origin = originOf(clean) // sonunda "/" var
@@ -363,19 +363,71 @@ class BuzFilmizle3 : MainAPI() {
                 }
                 log("fireplayer $api r=$r -> ${body.take(400).replace("\n", " ")}")
                 val txt = body.replace("\\/", "/").replace("\\u0026", "&")
-                val src = listOf("videoSource", "securedLink").mapNotNull { k ->
+                val src = listOf("videoSrc", "videoSource", "securedLink").mapNotNull { k ->
                     Regex("\"$k\"\\s*:\\s*\"(https?:[^\"]+)\"").find(txt)?.groupValues?.get(1)
                 }.firstOrNull { it.isNotBlank() }
                     ?: mediaRegex.find(txt)?.value
-                if (src != null) {
-                    emitMedia(name, src, origin, callback)
-                    return true
-                }
+                if (src != null) return src
                 dbg("fireplayer boş: ${body.take(120).replace("\n", " ")}")
             }
         }
         dbg("fireplayer cevap vermedi: $clean")
-        return false
+        return null
+    }
+
+    // BRONZ kaynağı: myplayersvideo.xyz/bronze/index.php?id=https://hexload.com/<id>
+    // Hexload sayfasından / indirme isteğinden gerçek video adresi alınmaya çalışılır.
+    private suspend fun hexload(
+        name: String,
+        hexUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val id = hexUrl.trimEnd('/').substringAfterLast("/").removePrefix("embed-").substringBefore(".")
+        val origin = originOf(hexUrl).trimEnd('/')
+        log("hexload id=$id url=$hexUrl")
+
+        var cookies: Map<String, String> = emptyMap()
+        try {
+            val page = app.get(hexUrl, referer = referer, timeout = 15L)
+            cookies = page.cookies
+            log("hexload sayfa kod=${page.code} uzunluk=${page.text.length}")
+            dumpBody("hexload", page.text, 8000)
+            val txt = expand(page.text)
+            val m = mediaRegex.find(txt)?.value
+            if (m != null) return emitMedia(name, m, "$origin/", callback)
+        } catch (e: Exception) {
+            dbg("hexload sayfa hatası: ${e.message}")
+        }
+
+        try {
+            val body = app.post(
+                "$origin/download",
+                data = mapOf(
+                    "op" to "download3",
+                    "id" to id,
+                    "ajax" to "1",
+                    "method_free" to "1",
+                    "dataType" to "json"
+                ),
+                headers = mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Origin" to origin
+                ),
+                referer = hexUrl,
+                cookies = cookies,
+                timeout = 15L
+            ).text
+            log("hexload download -> ${body.take(500).replace("\n", " ")}")
+            val txt = body.replace("\\/", "/").replace("\\u0026", "&")
+            val src = Regex("\"url\"\\s*:\\s*\"(https?:[^\"]+)\"").find(txt)?.groupValues?.get(1)
+                ?: mediaRegex.find(txt)?.value
+            if (src != null) return emitMedia(name, src, "$origin/", callback)
+        } catch (e: Exception) {
+            dbg("hexload istek hatası: ${e.message}")
+        }
+
+        return viaWebView(name, hexUrl, referer, callback)
     }
 
     // Son çare: gizli WebView (sadece bir kez, kısa süreli)
@@ -395,7 +447,6 @@ class BuzFilmizle3 : MainAPI() {
             log("WebView yakaladı: $captured")
             if (mediaRegex.containsMatchIn(captured)) {
                 emitMedia(name, captured, originOf(url), callback)
-                true
             } else {
                 dbg("WebView medya yakalayamadı ($name)")
                 false
@@ -419,8 +470,7 @@ class BuzFilmizle3 : MainAPI() {
         log("handleEmbed[$depth] $name -> $url (referer=$referer)")
 
         if (mediaRegex.containsMatchIn(lower)) {
-            emitMedia(name, url, referer, callback)
-            return true
+            return emitMedia(name, url, referer, callback)
         }
 
         // matrudas.com/m3/<base64> gibi adresler: son parça base64 ile gerçek adresi saklıyor
@@ -437,11 +487,29 @@ class BuzFilmizle3 : MainAPI() {
             }
         }
 
-        if (lower.contains("/fireplayer/video/") || lower.contains("do=getvideo")) {
-            if (firePlayer(name, url, referer, callback)) return true
+        // BRONZ: .../bronze/index.php?id=https://hexload.com/<id>
+        val decoded = runCatching { java.net.URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
+        val hexUrl = Regex("""https?://(?:www\.)?hexload\.[a-z]+/[A-Za-z0-9_./-]+""").find(decoded)?.value
+        if (hexUrl != null) {
+            if (hexload(name, hexUrl, url, callback)) return true
+            dbg("hexload çözülemedi ($name): $hexUrl")
+            return false
         }
 
-        if (!lower.contains("oynat.buzfilmizle3")) {
+        // FirePlayer: getVideo cevabındaki adres (matrudas / vevocloud / bronze ...) ayrıca çözülür
+        var fireTried = false
+        if (lower.contains("/fireplayer/video/") || lower.contains("do=getvideo")) {
+            fireTried = true
+            val src = fireGetVideo(url, referer)
+            if (src != null) {
+                log("fireplayer kaynak ($name): $src")
+                if (handleEmbed(src, label, url, subtitleCallback, callback, depth + 1)) return true
+                dbg("fireplayer kaynağı çözülemedi ($name): $src")
+                return false
+            }
+        }
+
+        if (!lower.contains("oynat.buzfilmizle3") && !fireTried) {
             val extracted = try {
                 loadExtractor(url, referer, subtitleCallback, callback)
             } catch (e: Exception) {
@@ -452,7 +520,7 @@ class BuzFilmizle3 : MainAPI() {
             if (extracted) return true
         }
 
-        if (depth > 2) return false
+        if (depth > 4) return false
 
         val res = try {
             app.get(
@@ -470,24 +538,30 @@ class BuzFilmizle3 : MainAPI() {
         }
 
         log("fetch kod=${res.code} final=${res.url}")
-        if (depth == 0) dumpBody(name, res.text)
+        // Asıl oynatıcı sayfaları (matrudas, vevocloud ...) bir sonraki hata ayıklama için loglanır
+        if (depth >= 2) dumpBody("$name-d$depth", res.text, 12000)
 
         val text = expand(res.text)
         val embedReferer = originOf(url)
 
-        val medias = mediaRegex.findAll(text).map { it.value }.distinct().toList()
+        val medias = mediaRegex.findAll(text).map { it.value }.distinct()
+            .sortedByDescending { if (it.contains("master", true)) 1 else 0 }
+            .toList()
         log("medya bulundu=${medias.size} $medias")
-        if (medias.isNotEmpty()) {
-            medias.forEach { emitMedia(name, it, embedReferer, callback) }
-            return true
+        // Aynı kaynaktan tek video yeter (listede çift "Vidmoly" görünmesin)
+        for (m in medias) {
+            if (emitMedia(name, m, embedReferer, callback)) return true
         }
 
         // Sayfa FirePlayer ise doğrudan sor
-        if (text.contains("do=getVideo")) {
-            if (firePlayer(name, url, referer, callback)) return true
+        if (!fireTried && text.contains("do=getVideo")) {
+            val src = fireGetVideo(url, referer)
+            if (src != null && src != url) {
+                if (handleEmbed(src, label, url, subtitleCallback, callback, depth + 1)) return true
+            }
         }
 
-        // İç iframe / adaylar (en fazla 4, sadece ilk iki katmanda)
+        // İç iframe / adaylar (en fazla 4, sadece ilk katmanda aday taraması)
         val next = LinkedHashSet<String>()
         res.document.select("iframe").forEach { f ->
             val src = (f.attr("src").ifBlank { f.attr("data-src") }).trim()
@@ -503,8 +577,10 @@ class BuzFilmizle3 : MainAPI() {
             if (handleEmbed(n, label, url, subtitleCallback, callback, depth + 1)) return true
         }
 
-        if (depth == 0) {
-            dbg("statik çıkarım başarısız ($name) kod=${res.code} aday=${next.size}")
+        // Gerçek oynatıcı sayfasında (matrudas / vevocloud ...) video çıkmadıysa gizli WebView dene.
+        // oynat.buzfilmizle3 ve fireplayer sayfaları tıklama bekleyen kabuklar; onlarda WebView denenmez.
+        if (!lower.contains("oynat.buzfilmizle3") && !lower.contains("/fireplayer/video/")) {
+            dbg("statik çıkarım başarısız ($name) kod=${res.code} aday=${next.size} url=$url")
             return viaWebView(name, url, referer, callback)
         }
         return false
@@ -604,7 +680,7 @@ class BuzFilmizle3 : MainAPI() {
         }
         val found = results.any { it }
 
-        if (!found && DEBUG) {
+        if (!found && DEBUG && SHOW_DEBUG_LINKS) {
             dbgBuf.toList().takeLast(8).forEach { msg ->
                 callback(
                     newExtractorLink("DEBUG", "🐞 ${msg.take(300)}", "https://debug.local/", ExtractorLinkType.VIDEO) {
