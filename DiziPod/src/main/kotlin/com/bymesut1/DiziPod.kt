@@ -116,11 +116,17 @@ class DiziPod : MainAPI() {
                 .ifBlank { a.text().trim() }
             if (title.isBlank()) continue
 
-            val posterUrl = img?.let {
-                listOf("data-original", "data-src", "data-lazy-src", "src")
-                    .map { k -> it.attr(k).trim() }
-                    .firstOrNull { v -> v.isNotBlank() }
-            }?.let { absolute(it) }
+            var posterRaw = ""
+            if (img != null) {
+                for (k in listOf("data-original", "data-src", "data-lazy-src", "src")) {
+                    val v: String = img.attr(k).trim()
+                    if (v.isNotBlank()) {
+                        posterRaw = v
+                        break
+                    }
+                }
+            }
+            val posterUrl: String? = if (posterRaw.isNotBlank()) absolute(posterRaw) else null
 
             val year = Regex("(?:19|20)\\d{2}").find(card.text())?.value?.toIntOrNull()
 
