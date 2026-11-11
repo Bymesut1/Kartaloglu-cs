@@ -2,6 +2,8 @@ package com.bymesut1
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
@@ -20,7 +22,7 @@ private const val HD_TAG = "HDFilmCehennemiland"
 
 // TMDB: https://www.themoviedb.org/settings/api adresinden ücretsiz "API Key (v3)" al,
 // tırnakların içine yapıştır. Boş bırakırsan sadece site bilgileri kullanılır.
-private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
+private const val TMDB_API_KEY = ""
 
 private const val HD_SITE = "https://www.hdfilmcehennemi.land"
 
@@ -332,10 +334,10 @@ class HDFilmCehennemiland : MainAPI() {
     // ---------------------------------------------------------------- Detay
 
     override suspend fun load(url: String): LoadResponse? {
-        val doc = app.get(url, referer = "$mainUrl/").document
+        val doc: Document = app.get(url, referer = "$mainUrl/").document
         val isSeries = url.contains("/dizi/")
 
-        val h1 = doc.selectFirst("h1")
+        val h1: org.jsoup.nodes.Element? = doc.selectFirst("h1")
         val siteTitle = cleanTitle(
             h1?.text()?.takeIf { it.isNotBlank() }
                 ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
@@ -345,7 +347,7 @@ class HDFilmCehennemiland : MainAPI() {
             ?.takeIf { it.isNotBlank() && it.length < 120 && !it.equals(siteTitle, true) }
         val year = doc.selectFirst("meta[name=twitter:data1]")?.attr("content")?.trim()?.toIntOrNull()
             ?: doc.selectFirst("a[href*=/yil/]")?.text()?.trim()?.toIntOrNull()
-        val imdbHref = doc.selectFirst("a[href*=imdb.com/title/]")
+        val imdbHref: org.jsoup.nodes.Element? = doc.selectFirst("a[href*=imdb.com/title/]")
         val imdbId = Regex("""tt\d{6,10}""").find(imdbHref?.attr("href") ?: "")?.value
         val imdbScore = Regex("""\d+(?:[.,]\d+)?""").find(imdbHref?.text() ?: "")
             ?.value?.replace(',', '.')?.toDoubleOrNull()
