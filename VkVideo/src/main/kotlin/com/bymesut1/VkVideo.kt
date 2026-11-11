@@ -737,6 +737,8 @@ class VkVideo : MainAPI() {
     private val tmCache = java.util.concurrent.ConcurrentHashMap<String, ExpandRes>()
     private val shownMap = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
     private val rawStart = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val classicOff = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val emptyStreak = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     private fun findSectionId(root: Any?): String? {
         val o = root as? JSONObject ?: return null
@@ -1160,10 +1162,11 @@ class VkVideo : MainAPI() {
         return out
     }
 
-    // VK'nin klasik video.search yöntemi: sitedeki "Tüm videolar" bloğunu (uzun filmler dahil) yakalar; offset ile sayfa sayfa devam eder
-    private suspend fun vkClassicSearch(q: String, page: Int): Pair<List<JSONObject>, Boolean> {
+    // VK'nin klasik video.search yöntemi: sitedeki "Tüm videolar" bloğunu (uzun filmler dahil) yakalar.
+    // Sunucu "count" kadar vermeyebilir (örn. 30-50): offset, istenen değil GERÇEKTEN dönen sayı kadar ilerletilir.
+    // Döner: (videolar, devam var mı, sonraki offset)
+    private suspend fun vkClassicSearch(q: String, off: Int): Triple<List<JSONObject>, Boolean, Int> {
         return try {
-            val off = (maxOf(page, 1) - 1) * CLASSIC_PAGE
             val r = api(
                 "video.search",
                 mapOf(
@@ -1176,12 +1179,12 @@ class VkVideo : MainAPI() {
             )
             val m = LinkedHashMap<String, JSONObject>()
             collectVideos(r, m)
-            val total = (r as? JSONObject)?.optInt("count") ?: 0
-            val more = if (total > 0) total > off + CLASSIC_PAGE else m.size >= CLASSIC_PAGE
-            m.values.toList() to more
+            val items = (r as? JSONObject)?.optJSONArray("items")
+            val got = items?.length() ?: m.size
+            Triple(m.values.toList(), got > 0, off + got)
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
-            emptyList<JSONObject>() to false
+            Triple(emptyList<JSONObject>(), false, off)
         }
     }
 
@@ -1230,22 +1233,41 @@ class VkVideo : MainAPI() {
             shownMap[sq] = java.util.Collections.synchronizedSet(HashSet<String>())
         }
         val shownKeys = shownMap.getOrPut(sq) { java.util.Collections.synchronizedSet(HashSet<String>()) }
+        if (page <= 1) {
+            classicOff[sq] = 0
+            emptyStreak[sq] = 0
+        }
         var r = if (page <= 1) 1 else (rawStart["$sq|$page"] ?: page)
+        var cOff = classicOff[sq] ?: 0
+        var classicMore = true
+        var catalogMore = true
         val out = ArrayList<SearchResponse>()
-        var hasMore = true
         var loops = 0
-        while (hasMore && out.size < PAGE_TARGET && loops < MAX_PAGE_LOOPS) {
+        while ((classicMore || catalogMore) && out.size < PAGE_TARGET && loops < MAX_PAGE_LOOPS) {
             loops++
             val rr = r
-            var cl: Pair<List<JSONObject>, Boolean> = emptyList<JSONObject>() to false
+            val off = cOff
+            var cl: Triple<List<JSONObject>, Boolean, Int> = Triple(emptyList<JSONObject>(), false, off)
             var rawP = RawPage(LinkedHashMap(), false, "")
             // İki kaynak paralel: video.search (Tüm videolar, uzun filmler dahil) + katalog araması (klipler, kanallar)
+            // Katalog kaynağı bittiyse tekrar sorulmaz
             listOf(0, 1).amap { w ->
-                if (w == 0) cl = vkClassicSearch(sq, rr) else rawP = searchRaw(sq, rr, true)
+                if (w == 0) {
+                    if (classicMore) cl = vkClassicSearch(sq, off)
+                } else if (catalogMore) {
+                    rawP = try {
+                        searchRaw(sq, rr, true)
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        RawPage(LinkedHashMap(), false, "")
+                    }
+                }
                 0
             }
             r++
-            hasMore = rawP.more || cl.second
+            cOff = cl.third
+            if (classicMore) classicMore = cl.second
+            if (catalogMore) catalogMore = rawP.more
             // Katalog sonucu (sitedeki sıra) önce, klasik arama sonra
             val all = (rawP.videos.values + cl.first).filter { shownKeys.add(baseOf(it)) }
             val regular = all.filter { !isClipItem(it) }
@@ -1256,6 +1278,16 @@ class VkVideo : MainAPI() {
             out.addAll(toResponses(ordered))
         }
         rawStart["$sq|${page + 1}"] = r
+        classicOff[sq] = cOff
+        var hasMore = classicMore || catalogMore
+        // Bir sayfa boş çıkarsa hemen bırakma: art arda 4 boş sayfadan sonra dur
+        if (out.isEmpty() && hasMore) {
+            val st = (emptyStreak[sq] ?: 0) + 1
+            emptyStreak[sq] = st
+            if (st >= 4) hasMore = false
+        } else {
+            emptyStreak[sq] = 0
+        }
         return out to hasMore
     }
 
