@@ -43,10 +43,13 @@ class VkVideo : MainAPI() {
         private const val MAX_RESULTS = 40
 
         // Aşağı kaydırınca her yeni sayfada en az kaç sonuç hedeflensin (süzgeçten geçen yoksa arkadan yeni ham sayfa çekilir)
-        private const val PAGE_TARGET = 18
+        private const val PAGE_TARGET = 24
 
         // Bir sayfayı doldurmak için en fazla kaç ham sayfa çekilsin
-        private const val MAX_PAGE_LOOPS = 5
+        private const val MAX_PAGE_LOOPS = 8
+
+        // 1. sayfada ilk 4 videodan sonra gösterilecek klip sayısı (sitedeki Klipler satırı gibi)
+        private const val CLIP_MAX = 8
 
         // Aramada etiketli sorgulardan (ad + "Türkçe Dublaj", "izle" ...) en fazla kaçı denensin
         private const val TAGGED_QUERIES = 12
@@ -313,6 +316,14 @@ class VkVideo : MainAPI() {
     // Boş "Original sound" kartları (açılmayan ses klipleri) listeye alınmaz
     private fun isPlaceholder(o: JSONObject): Boolean =
         o.optString("title").trim().equals("Original sound", ignoreCase = true)
+
+    // Klip (dikey / short_video) mi? Sitede bunlar "Klipler" satırında ayrı gösterilir
+    private fun isClipItem(o: JSONObject): Boolean {
+        if (o.optString("type") == "short_video") return true
+        val w = o.optInt("width")
+        val h = o.optInt("height")
+        return w > 0 && h > w
+    }
 
     // ---------- Başlık analizi (JS sürümüyle aynı mantık) ----------
 
@@ -1235,8 +1246,14 @@ class VkVideo : MainAPI() {
             }
             r++
             hasMore = rawP.more || cl.second
-            val all = (cl.first + rawP.videos.values).filter { shownKeys.add(baseOf(it)) }
-            out.addAll(toResponses(all))
+            // Katalog sonucu (sitedeki sıra) önce, klasik arama sonra
+            val all = (rawP.videos.values + cl.first).filter { shownKeys.add(baseOf(it)) }
+            val regular = all.filter { !isClipItem(it) }
+            // Klipler yalnızca ilk sayfada, ilk 4 videodan sonra gelir; sonraki sayfalarda sadece videolar
+            val clips = if (page <= 1 && loops == 1) all.filter { isClipItem(it) }.take(CLIP_MAX) else emptyList()
+            val ordered = if (clips.isEmpty()) regular
+            else regular.take(4) + clips + regular.drop(4)
+            out.addAll(toResponses(ordered))
         }
         rawStart["$sq|${page + 1}"] = r
         return out to hasMore
