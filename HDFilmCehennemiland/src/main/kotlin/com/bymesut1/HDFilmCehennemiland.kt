@@ -22,7 +22,7 @@ private const val HD_TAG = "HDFilmCehennemiland"
 
 // TMDB: https://www.themoviedb.org/settings/api adresinden ücretsiz "API Key (v3)" al,
 // tırnakların içine yapıştır. Boş bırakırsan sadece site bilgileri kullanılır.
-private const val TMDB_API_KEY = ""
+private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
 
 private const val HD_SITE = "https://www.hdfilmcehennemi.land"
 
@@ -318,7 +318,7 @@ class HDFilmCehennemiland : MainAPI() {
         val actors: List<ActorData>, val trailer: String?, val imdbId: String?, val tmdbId: Int?
     )
 
-    private fun LoadResponse.applyMeta(m: Meta) {
+    private suspend fun LoadResponse.applyMeta(m: Meta) {
         this.posterUrl = m.poster
         this.backgroundPosterUrl = m.backdrop
         this.plot = m.plot
