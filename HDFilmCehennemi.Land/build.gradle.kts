@@ -5,7 +5,7 @@ android {
 }
 
 cloudstream {
-    description = "HDFilmCehennemi - film ve dizi (TMDB bilgileriyle)"
+    description = "HDFilmCehennemi.Land - film ve dizi (TMDB bilgileriyle)"
     authors = listOf("Bymesut1")
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
