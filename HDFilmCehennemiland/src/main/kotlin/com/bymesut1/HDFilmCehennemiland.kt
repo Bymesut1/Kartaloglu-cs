@@ -469,7 +469,7 @@ class HDFilmCehennemiland : MainAPI() {
                     val v = e.attr(a).trim()
                     if (v.startsWith("http") || v.startsWith("//")) {
                         val full = if (v.startsWith("//")) "https:$v" else v
-                        if (!hdAssetRegex.containsMatchIn(full) && hdBlocked.none { full.contains(it, true) } ) out.add(full)
+                        if (!hdAssetRegex.containsMatchIn(full) && hdBlocked.none { full.contains(it, true) }) out.add(full)
                     }
                 }
             }
@@ -477,6 +477,75 @@ class HDFilmCehennemiland : MainAPI() {
         return out.sortedByDescending {
             if (it.contains("fastplay", true) || it.contains("player", true) || it.contains("embed", true)) 1 else 0
         }
+    }
+
+    // Sitenin kendi yöntemi: admin-ajax.php -> action=get_video_url -> data.url (iframe adresi)
+    private suspend fun resolveViaAjax(
+        doc: Document,
+        pageUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val scripts = doc.select("script:not([src])").joinToString("\n") { it.data() }
+        val nonce = Regex("""videoAjax\s*=\s*\{[^}]*?nonce\s*:\s*['"]([^'"]+)['"]""")
+            .find(scripts)?.groupValues?.get(1)
+        val ajaxUrl = Regex("""videoAjax\s*=\s*\{[^}]*?ajaxurl\s*:\s*['"]([^'"]+)['"]""")
+            .find(scripts)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: "$mainUrl/wp-admin/admin-ajax.php"
+        hdLog("ajax nonce=$nonce url=$ajaxUrl")
+        if (nonce == null) {
+            dbg("videoAjax nonce bulunamadı")
+            return false
+        }
+
+        val opts = doc.select("a[data-post-id][data-player-name]").mapNotNull { a ->
+            val pid = a.attr("data-post-id").trim()
+            val pn = a.attr("data-player-name").trim()
+            if (pid.isBlank() || pn.isBlank()) null else Triple(pid, pn, a.attr("data-part-key").trim())
+        }.distinct()
+        hdLog("ajax kaynak seçenekleri=${opts.size}: $opts")
+        if (opts.isEmpty()) {
+            dbg("kaynak butonu (data-player-name) bulunamadı")
+            return false
+        }
+
+        val results = coroutineScope {
+            opts.take(6).map { (pid, pn, pk) ->
+                async {
+                    withTimeoutOrNull(40_000L) {
+                        try {
+                            val res = app.post(
+                                ajaxUrl,
+                                data = mapOf(
+                                    "action" to "get_video_url",
+                                    "nonce" to nonce,
+                                    "post_id" to pid,
+                                    "player_name" to pn,
+                                    "part_key" to pk
+                                ),
+                                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                                referer = pageUrl
+                            )
+                            hdLog("ajax[$pn] kod=${res.code} cevap=${res.text.take(400)}")
+                            val u = runCatching {
+                                JSONObject(res.text).optJSONObject("data")?.str("url")
+                            }.getOrNull()
+                            if (u == null) {
+                                dbg("ajax cevabında url yok ($pn): ${res.text.take(150)}")
+                                false
+                            } else {
+                                val full = if (u.startsWith("//")) "https:$u" else u
+                                resolveEmbed(full, "$mainUrl/", subtitleCallback, callback)
+                            }
+                        } catch (e: Exception) {
+                            dbg("ajax hata ($pn): ${e.message}")
+                            false
+                        }
+                    } ?: false
+                }
+            }.awaitAll()
+        }
+        return results.any { it }
     }
 
     // Teşhis: oynatıcıyı yükleyen script'i bulmak için sayfadaki script'leri tarar, logcat'e yazar
@@ -606,10 +675,23 @@ class HDFilmCehennemiland : MainAPI() {
 
         val doc = app.get(data, referer = "$mainUrl/").document
 
+        // 1) Sitenin kendi yöntemi (admin-ajax get_video_url)
+        val viaAjax = try {
+            resolveViaAjax(doc, data, subtitleCallback, callback)
+        } catch (e: Exception) {
+            dbg("resolveViaAjax hata: ${e.message}")
+            false
+        }
+        if (viaAjax) {
+            hdLog("loadLinks bitti (ajax) found=true")
+            return true
+        }
+
         // Oynatıcı bölümünün HTML'i logcat'e yazılır (kaynak çıkmazsa buna bakılır)
         val playerHtml = doc.select(".player_sist, .playex, #playex, .controlx, .video-wrapper, .playerz").outerHtml()
         playerHtml.take(9000).chunked(3000).forEachIndexed { i, c -> hdLog("PLAYER[$i] $c") }
 
+        // 2) Sayfadaki iframe / adaylar
         val frames = pageEmbeds(doc, data)
         hdLog("embed adayları=${frames.size}: ${frames.take(8).joinToString(" | ")}")
 
@@ -633,7 +715,7 @@ class HDFilmCehennemiland : MainAPI() {
             }
         }
 
-        // Son çare: sayfanın kendisini WebView ile aç, ağdan master.txt / m3u8 yakala
+        // 3) Son çare: sayfanın kendisini WebView ile aç, ağdan master.txt / m3u8 yakala
         if (!found) found = viaWebView("Player", data, "$mainUrl/", callback)
 
         if (!found && HD_DEBUG) {
