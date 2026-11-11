@@ -1,7 +1,8 @@
 package com.bymesut1
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
@@ -45,9 +46,10 @@ class HDFilmCehennemiLand : MainAPI() {
     private fun Element.toSearchResult(): SearchResponse? {
         val href = fixUrlNull(this.attr("href")) ?: return null
         val title = this.selectFirst("strong.poster-title, h4.title")?.text()?.trim() ?: return null
-        val poster = this.selectFirst("img")?.let { img ->
+        val img: Element? = this.selectFirst("img")
+        val poster: String? = if (img != null) {
             fixUrlNull(img.attr("data-src").ifBlank { img.attr("src") })
-        }
+        } else null
         return if (href.contains("/dizi/")) {
             newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
         } else {
@@ -89,10 +91,11 @@ class HDFilmCehennemiLand : MainAPI() {
             ?.trim()
             ?.takeIf { it.isNotBlank() } ?: return null
 
-        val info = doc.selectFirst("div.section-content div.post-info")
-        val sitePoster = info?.selectFirst("img")?.let { img ->
-            fixUrlNull(img.attr("data-src").ifBlank { img.attr("src") })
-        }
+        val info: Element? = doc.selectFirst("div.section-content div.post-info")
+        val siteImg: Element? = info?.selectFirst("img")
+        val sitePoster: String? = if (siteImg != null) {
+            fixUrlNull(siteImg.attr("data-src").ifBlank { siteImg.attr("src") })
+        } else null
         val siteTags = info?.select("div.post-info-genres > a")?.eachText().orEmpty()
         val siteActors = info?.select("div.post-info-cast > a")?.eachText().orEmpty()
         val sitePlot = info?.selectFirst("div.post-info-content > p")?.text()
@@ -103,13 +106,13 @@ class HDFilmCehennemiLand : MainAPI() {
         val cleanTitle = siteTitle.replace(Regex("\\s*\\(\\d{4}\\)\\s*$"), "").trim()
         val tmdb = findTmdb(if (isSeries) "tv" else "movie", cleanTitle, siteYear)
 
-        val poster = tmdb?.posterPath?.let { "$TMDB_IMG/w500$it" } ?: sitePoster
-        val backdrop = tmdb?.backdropPath?.let { "$TMDB_IMG/original$it" }
+        val poster = tmdb?.poster_path?.let { "$TMDB_IMG/w500$it" } ?: sitePoster
+        val backdrop = tmdb?.backdrop_path?.let { "$TMDB_IMG/original$it" }
         val plot = tmdb?.overview?.takeIf { it.isNotBlank() } ?: sitePlot
         val tags = tmdb?.genres?.mapNotNull { it.name }?.takeIf { it.isNotEmpty() } ?: siteTags
-        val year = (tmdb?.releaseDate ?: tmdb?.firstAirDate)?.take(4)?.toIntOrNull() ?: siteYear
+        val year = (tmdb?.release_date ?: tmdb?.first_air_date)?.take(4)?.toIntOrNull() ?: siteYear
         val actors = tmdb?.credits?.cast.orEmpty().take(15).mapNotNull { c ->
-            c.name?.let { Actor(it, c.profilePath?.let { p -> "$TMDB_IMG/w185$p" }) }
+            c.name?.let { Actor(it, c.profile_path?.let { p -> "$TMDB_IMG/w185$p" }) }
         }.takeIf { it.isNotEmpty() } ?: siteActors.map { Actor(it) }
 
         if (!isSeries) {
@@ -147,8 +150,8 @@ class HDFilmCehennemiLand : MainAPI() {
             siteEps.mapNotNull { it.season }.distinct().forEach { s ->
                 val sd = tmdbGet<HdfcTmdbSeason>("tv/$tmdbId/season/$s")
                 seasonMap[s] = sd?.episodes.orEmpty()
-                    .filter { it.episodeNumber != null }
-                    .associateBy { it.episodeNumber!! }
+                    .filter { it.episode_number != null }
+                    .associateBy { it.episode_number!! }
             }
         }
 
@@ -158,9 +161,9 @@ class HDFilmCehennemiLand : MainAPI() {
                 this.name = t?.name?.takeIf { it.isNotBlank() } ?: e.name
                 this.season = e.season
                 this.episode = e.episode
-                this.posterUrl = t?.stillPath?.let { "$TMDB_IMG/w780$it" }
+                this.posterUrl = t?.still_path?.let { "$TMDB_IMG/w780$it" }
                 this.description = t?.overview?.takeIf { it.isNotBlank() }
-                addDate(t?.airDate ?: e.date)
+                addDate(t?.air_date ?: e.date)
             }
         }
 
@@ -170,7 +173,7 @@ class HDFilmCehennemiLand : MainAPI() {
             this.plot = plot
             this.year = year
             this.tags = tags
-            this.duration = tmdb?.episodeRunTime?.firstOrNull()
+            this.duration = tmdb?.episode_run_time?.firstOrNull()
             addActors(actors)
         }
     }
@@ -189,7 +192,7 @@ class HDFilmCehennemiLand : MainAPI() {
         val q = URLEncoder.encode(title, "UTF-8")
         val results = tmdbGet<HdfcTmdbSearch>("search/$type", "&query=$q")?.results.orEmpty()
         val hit = results.firstOrNull {
-            year != null && (it.releaseDate ?: it.firstAirDate)?.startsWith(year.toString()) == true
+            year != null && (it.release_date ?: it.first_air_date)?.startsWith(year.toString()) == true
         } ?: results.firstOrNull() ?: return null
         return tmdbGet<HdfcTmdbDetail>("$type/${hit.id}", "&append_to_response=credits")
     }
@@ -292,58 +295,59 @@ class HDFilmCehennemiLand : MainAPI() {
 }
 
 // ============================== Veri sınıfları ==============================
+// Alan adları JSON anahtarlarıyla birebir aynı (Jackson import'u gerekmesin diye)
 data class HdfcApiResponse(
-    @JsonProperty("html") val html: String? = null
+    val html: String? = null
 )
 
 data class HdfcSearchResponse(
-    @JsonProperty("results") val results: List<String>? = null
+    val results: List<String>? = null
 )
 
 data class HdfcTmdbSearch(
-    @JsonProperty("results") val results: List<HdfcTmdbItem>? = null
+    val results: List<HdfcTmdbItem>? = null
 )
 
 data class HdfcTmdbItem(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("release_date") val releaseDate: String? = null,
-    @JsonProperty("first_air_date") val firstAirDate: String? = null
+    val id: Int? = null,
+    val release_date: String? = null,
+    val first_air_date: String? = null
 )
 
 data class HdfcTmdbGenre(
-    @JsonProperty("name") val name: String? = null
+    val name: String? = null
 )
 
 data class HdfcTmdbCast(
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("profile_path") val profilePath: String? = null
+    val name: String? = null,
+    val profile_path: String? = null
 )
 
 data class HdfcTmdbCredits(
-    @JsonProperty("cast") val cast: List<HdfcTmdbCast>? = null
+    val cast: List<HdfcTmdbCast>? = null
 )
 
 data class HdfcTmdbDetail(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("poster_path") val posterPath: String? = null,
-    @JsonProperty("backdrop_path") val backdropPath: String? = null,
-    @JsonProperty("runtime") val runtime: Int? = null,
-    @JsonProperty("episode_run_time") val episodeRunTime: List<Int>? = null,
-    @JsonProperty("release_date") val releaseDate: String? = null,
-    @JsonProperty("first_air_date") val firstAirDate: String? = null,
-    @JsonProperty("genres") val genres: List<HdfcTmdbGenre>? = null,
-    @JsonProperty("credits") val credits: HdfcTmdbCredits? = null
+    val id: Int? = null,
+    val overview: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val runtime: Int? = null,
+    val episode_run_time: List<Int>? = null,
+    val release_date: String? = null,
+    val first_air_date: String? = null,
+    val genres: List<HdfcTmdbGenre>? = null,
+    val credits: HdfcTmdbCredits? = null
 )
 
 data class HdfcTmdbEpisode(
-    @JsonProperty("episode_number") val episodeNumber: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("still_path") val stillPath: String? = null,
-    @JsonProperty("air_date") val airDate: String? = null
+    val episode_number: Int? = null,
+    val name: String? = null,
+    val overview: String? = null,
+    val still_path: String? = null,
+    val air_date: String? = null
 )
 
 data class HdfcTmdbSeason(
-    @JsonProperty("episodes") val episodes: List<HdfcTmdbEpisode>? = null
+    val episodes: List<HdfcTmdbEpisode>? = null
 )
