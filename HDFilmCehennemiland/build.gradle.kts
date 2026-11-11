@@ -1,8 +1,13 @@
 // use an integer for version numbers
-version = 1
+version = 10
 
 android {
     namespace = "com.bymesut1"
+}
+
+dependencies {
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    compileOnly("org.jspecify:jspecify:1.0.0")
 }
 
 cloudstream {
