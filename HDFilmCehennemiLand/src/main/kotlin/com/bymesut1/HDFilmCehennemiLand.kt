@@ -285,7 +285,7 @@ class HDFilmCehennemiLand : MainAPI() {
 
     companion object {
         // DiziPod.kt'de kullandığın TMDB API key'in aynısını buraya yapıştır
-        private const val TMDB_API_KEY = "BURAYA_TMDB_API_KEY"
+        private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val TMDB_IMG = "https://image.tmdb.org/t/p"
     }
