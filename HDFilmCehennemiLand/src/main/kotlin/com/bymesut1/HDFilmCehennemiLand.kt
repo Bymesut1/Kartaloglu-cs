@@ -3,8 +3,12 @@ package com.bymesut1
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.mvvm.logError
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -16,13 +20,59 @@ class HDFilmCehennemiLand : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+    override var sequentialMainPage = true
 
-    private val apiHeaders: Map<String, String>
-        get() = mapOf(
-            "Referer" to "$mainUrl/",
-            "Origin" to mainUrl,
-            "X-Requested-With" to "fetch"
-        )
+    // Sırayla denenir, çalışan domain mainUrl olarak hatırlanır
+    private val domains = listOf(
+        "https://www.hdfilmcehennemi.land",
+        "https://www.hdfilmcehennemi.nl"
+    )
+
+    private val interceptor by lazy { HdfcCloudflareInterceptor(CloudflareKiller()) }
+
+    private fun apiHeaders(base: String): Map<String, String> = mapOf(
+        "Referer" to "$base/",
+        "Origin" to base,
+        "X-Requested-With" to "fetch",
+        "Accept" to "application/json, text/javascript, */*; q=0.01"
+    )
+
+    private fun baseOf(url: String): String =
+        url.substringBefore("://") + "://" + url.substringAfter("://").substringBefore("/")
+
+    private fun extractHtml(body: String): String =
+        if (body.trimStart().startsWith("{")) tryParseJson<HdfcApiResponse>(body)?.html.orEmpty() else body
+
+    private fun debugItem(msg: String): SearchResponse =
+        newMovieSearchResponse("DEBUG: ${msg.take(300)}", "$mainUrl/", TvType.Movie)
+
+    // Domainleri sırayla dener; geçerli yanıt veren ilk domaini döndürür
+    private suspend fun callApi(
+        path: String,
+        form: Map<String, String>?,
+        dbg: StringBuilder,
+        valid: (String) -> Boolean
+    ): String? {
+        val order = domains.sortedBy { if (it == mainUrl) 0 else 1 }
+        for (base in order) {
+            try {
+                val res = if (form == null) {
+                    app.get("$base$path", headers = apiHeaders(base), interceptor = interceptor)
+                } else {
+                    app.post("$base$path", headers = apiHeaders(base), data = form, interceptor = interceptor)
+                }
+                val body = res.text
+                if (valid(body)) {
+                    mainUrl = base
+                    return body
+                }
+                dbg.append("${base.substringAfter("//")} → HTTP ${res.code}: ${body.take(80).replace(Regex("\\s+"), " ")}\n")
+            } catch (e: Exception) {
+                dbg.append("${base.substringAfter("//")} → ${e.javaClass.simpleName}: ${e.message?.take(60)}\n")
+            }
+        }
+        return null
+    }
 
     // ============================== Ana Sayfa ==============================
     override val mainPage = mainPageOf(
@@ -31,12 +81,17 @@ class HDFilmCehennemiLand : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val html = app.get(
-            "$mainUrl/load/page/$page/${request.data}/",
-            headers = apiHeaders
-        ).parsedSafe<HdfcApiResponse>()?.html.orEmpty()
+        val dbg = StringBuilder()
+        val body = callApi("/load/page/$page/${request.data}/", null, dbg) {
+            extractHtml(it).contains("poster")
+        }
 
-        val items = Jsoup.parse(html, mainUrl)
+        if (body == null) {
+            val list = if (DEBUG) listOf(debugItem(dbg.toString())) else emptyList()
+            return newHomePageResponse(request.name, list, hasNext = false)
+        }
+
+        val items = Jsoup.parse(extractHtml(body), mainUrl)
             .select("a.poster")
             .mapNotNull { it.toSearchResult() }
 
@@ -59,12 +114,11 @@ class HDFilmCehennemiLand : MainAPI() {
 
     // ================================ Arama ================================
     override suspend fun search(query: String): List<SearchResponse> {
-        val res = app.post(
-            "$mainUrl/search",
-            headers = apiHeaders,
-            data = mapOf("query" to query)
-        ).parsedSafe<HdfcSearchResponse>()
+        val dbg = StringBuilder()
+        val body = callApi("/search", mapOf("query" to query), dbg) { it.contains("results") }
+            ?: return if (DEBUG) listOf(debugItem(dbg.toString())) else emptyList()
 
+        val res = tryParseJson<HdfcSearchResponse>(body)
         return res?.results.orEmpty().mapNotNull {
             Jsoup.parse(it, mainUrl).selectFirst("a[href]")?.toSearchResult()
         }
@@ -82,7 +136,8 @@ class HDFilmCehennemiLand : MainAPI() {
     private val numberRegex = Regex("(\\d+)\\.")
 
     override suspend fun load(url: String): LoadResponse? {
-        val doc = app.get(url, headers = mapOf("Referer" to "$mainUrl/")).document
+        val base = baseOf(url)
+        val doc = app.get(url, headers = mapOf("Referer" to "$base/"), interceptor = interceptor).document
         val isSeries = url.contains("/dizi/")
 
         val siteTitle = doc.selectFirst(".section-title")?.ownText()
@@ -206,8 +261,9 @@ class HDFilmCehennemiLand : MainAPI() {
     ): Boolean {
         var found = false
         val wrapped: (ExtractorLink) -> Unit = { found = true; callback(it) }
+        val base = baseOf(data)
 
-        val doc = app.get(data, headers = mapOf("Referer" to "$mainUrl/")).document
+        val doc = app.get(data, headers = mapOf("Referer" to "$base/"), interceptor = interceptor).document
 
         doc.select("div.alternative-tab div.alternative-links[data-lang]").forEach { langBox ->
             val lang = langBox.attr("data-lang").uppercase()
@@ -215,14 +271,17 @@ class HDFilmCehennemiLand : MainAPI() {
                 val sourceName = "${btn.text().trim()} [$lang]"
                 val videoId = btn.attr("data-video")
                 try {
-                    val raw = app.get("$mainUrl/video/$videoId/", headers = apiHeaders)
-                        .text.replace("\\/", "/")
+                    val raw = app.get(
+                        "$base/video/$videoId/",
+                        headers = apiHeaders(base),
+                        interceptor = interceptor
+                    ).text.replace("\\/", "/")
                     val iframe = Regex("src=\\\\?[\"']([^\"'\\\\]+)").find(raw)
                         ?.groupValues?.get(1) ?: return@forEach
                     val link = fixUrl(iframe)
 
-                    if (!resolvePlayer(link, sourceName, subtitleCallback, wrapped)) {
-                        loadExtractor(link, "$mainUrl/", subtitleCallback, wrapped)
+                    if (!resolvePlayer(link, base, sourceName, subtitleCallback, wrapped)) {
+                        loadExtractor(link, "$base/", subtitleCallback, wrapped)
                     }
                 } catch (e: Exception) {
                     logError(e)
@@ -235,6 +294,7 @@ class HDFilmCehennemiLand : MainAPI() {
     // Close / Rapidrame / trstx (xbet) oynatıcıları için ortak çözücü
     private suspend fun resolvePlayer(
         url: String,
+        base: String,
         sourceName: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
@@ -242,9 +302,9 @@ class HDFilmCehennemiLand : MainAPI() {
         val own = listOf("/rplayer", "rapidrame", "close", "trstx.org", "hdfilmcehennemi")
         if (own.none { url.contains(it, ignoreCase = true) }) return false
 
-        val origin = url.substringBefore("://") + "://" + url.substringAfter("://").substringBefore("/") + "/"
+        val origin = baseOf(url) + "/"
 
-        val text = app.get(url, referer = "$mainUrl/").text.replace("\\/", "/")
+        val text = app.get(url, referer = "$base/").text.replace("\\/", "/")
         val unpacked = if (text.contains("eval(function(p,a,c,k,e")) {
             runCatching { getAndUnpack(text) }.getOrDefault("")
         } else ""
@@ -267,7 +327,7 @@ class HDFilmCehennemiLand : MainAPI() {
         val finalUrl = direct ?: runCatching {
             app.get(
                 url,
-                referer = "$mainUrl/",
+                referer = "$base/",
                 interceptor = WebViewResolver(Regex("\\.(?:m3u8|mp4)"), timeout = 20_000L)
             ).url
         }.getOrNull()?.takeIf { it.contains(".m3u8") || it.contains(".mp4") } ?: return false
@@ -287,6 +347,9 @@ class HDFilmCehennemiLand : MainAPI() {
     }
 
     companion object {
+        // Boş gelirse ekranda DEBUG satırı gösterir; çalışınca false yap
+        private const val DEBUG = true
+
         // DiziPod.kt'de kullandığın TMDB API key'in aynısını buraya yapıştır
         private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
         private const val TMDB_API = "https://api.themoviedb.org/3"
@@ -294,8 +357,25 @@ class HDFilmCehennemiLand : MainAPI() {
     }
 }
 
+// Cloudflare "Just a moment" sayfası gelirse WebView ile aşar
+class HdfcCloudflareInterceptor(private val killer: CloudflareKiller) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        if (response.code == 403 || response.code == 503) {
+            val body = response.peekBody(1024 * 1024).string()
+            if (body.contains("Just a moment", ignoreCase = true) ||
+                body.contains("cloudflare", ignoreCase = true)
+            ) {
+                response.close()
+                return killer.intercept(chain)
+            }
+        }
+        return response
+    }
+}
+
 // ============================== Veri sınıfları ==============================
-// Alan adları JSON anahtarlarıyla birebir aynı (Jackson import'u gerekmesin diye)
 data class HdfcApiResponse(
     val html: String? = null
 )
