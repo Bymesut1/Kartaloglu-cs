@@ -7,10 +7,14 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import com.lagradost.nicehttp.NiceResponse
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicInteger
 import org.jsoup.nodes.Document
 import java.net.URI
 import java.net.URLEncoder
@@ -45,6 +49,33 @@ private val hdBlocked = listOf(
 )
 
 private fun hdLog(msg: String) = Log.d(HD_TAG, msg)
+
+// Anlık DNS ("Unable to resolve host") / timeout hatalarına karşı 3 deneme yapar.
+// Hepsi başarısız olursa null döner, uygulama hata ekranı göstermez.
+private suspend fun hdGet(
+    url: String,
+    referer: String? = null,
+    params: Map<String, String> = emptyMap(),
+    tries: Int = 3
+): NiceResponse? {
+    repeat(tries) { i ->
+        try {
+            return app.get(url, referer = referer, params = params, timeout = 25L)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            hdLog("hdGet hata (${i + 1}/$tries) $url: ${e.javaClass.simpleName} ${e.message}")
+            if (i < tries - 1) delay(800L * (i + 1))
+        }
+    }
+    return null
+}
+
+// Uzun metni logcat'e parça parça yazar (satır ~4000 karakterde kesiliyor)
+private fun hdLogBody(tag: String, body: String, max: Int = 15000) {
+    hdLog("$tag uzunluk=${body.length}")
+    body.take(max).chunked(3000).forEachIndexed { i, c -> hdLog("$tag[$i] $c") }
+}
 
 private fun hdOrigin(url: String): String =
     runCatching { URI(url).let { "${it.scheme}://${it.host}" } }.getOrDefault(HD_SITE)
@@ -233,14 +264,15 @@ class HDFilmCehennemiland : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) request.data else request.data.trimEnd('/') + "/page/$page/"
-        val doc = app.get(url, referer = "$mainUrl/").document
-        val items = parseCards(doc)
+        val doc = hdGet(url, referer = "$mainUrl/")?.document
+        val items = if (doc != null) parseCards(doc) else emptyList()
         hdLog("getMainPage url=$url kart=${items.size}")
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/", params = mapOf("s" to query), referer = "$mainUrl/").document
+        val doc = hdGet("$mainUrl/", referer = "$mainUrl/", params = mapOf("s" to query))?.document
+            ?: return emptyList()
         return parseCards(doc)
     }
 
@@ -335,7 +367,7 @@ class HDFilmCehennemiland : MainAPI() {
     // ---------------------------------------------------------------- Detay
 
     override suspend fun load(url: String): LoadResponse? {
-        val doc: Document = app.get(url, referer = "$mainUrl/").document
+        val doc: Document = hdGet(url, referer = "$mainUrl/")?.document ?: return null
         val isSeries = url.contains("/dizi/")
 
         val h1: org.jsoup.nodes.Element? = doc.selectFirst("h1")
@@ -587,14 +619,29 @@ class HDFilmCehennemiland : MainAPI() {
     }
 
     private suspend fun viaWebView(
-        name: String, url: String, referer: String, callback: (ExtractorLink) -> Unit
+        name: String, url: String, referer: String, callback: (ExtractorLink) -> Unit,
+        timeoutMs: Long = 20_000L
     ): Boolean = try {
         hdLog("WebView deneniyor: $url")
         val resolver = WebViewResolver(
             Regex("""(?i)\.(?:m3u8|mp4|mpd)(?:[?#].*)?$|/manifests/.+\.txt|/(?:master|playlist|index)\.txt"""),
-            timeout = 15_000L
+            // sayfa açılınca oynat tuşuna basar / video.play() dener (otomatik başlamayan oynatıcılar için)
+            script = """
+                (function(){
+                  var t=0, i=setInterval(function(){
+                    try{
+                      var v=document.querySelector('video'); if(v){v.muted=true; v.play();}
+                      ['.jw-icon-display','.vjs-big-play-button','.play-button','.play','#play','.plyr__control--overlay','[class*=play]','button']
+                        .forEach(function(q){var e=document.querySelector(q); if(e) e.click();});
+                    }catch(e){}
+                    if(++t>12) clearInterval(i);
+                  },1000);
+                })();
+            """.trimIndent(),
+            timeout = timeoutMs
         )
         val captured = app.get(url, referer = referer, interceptor = resolver).url
+        hdLog("WebView yakalanan: $captured")
         if (hdMediaRegex.containsMatchIn(captured)) {
             hdEmit(name, captured, "${hdOrigin(captured)}/", callback)
             true
@@ -617,32 +664,48 @@ class HDFilmCehennemiland : MainAPI() {
         val name = sourceLabel(url)
         hdLog("resolveEmbed[$depth] $name -> $url")
 
+        // Gerçekten link üretildi mi sayılır (loadExtractor link üretmese de true dönebiliyor)
+        val emitted = AtomicInteger(0)
+        val cb: (ExtractorLink) -> Unit = { emitted.incrementAndGet(); callback(it) }
+
         if (hdMediaRegex.containsMatchIn(url.lowercase())) {
-            hdEmit(name, url, referer, callback)
+            hdEmit(name, url, referer, cb)
             return true
         }
 
-        val extracted = try {
-            loadExtractor(url, referer, subtitleCallback, callback)
-        } catch (e: Exception) {
-            false
-        }
-        if (extracted) return true
+        runCatching { loadExtractor(url, referer, subtitleCallback, cb) }
+        if (emitted.get() > 0) return true
         if (depth > 2) return false
+        val isSetPlay = url.contains("setplay.", true)
 
         val res = try {
-            app.get(url, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe"))
+            app.get(url, referer = referer, headers = mapOf("Sec-Fetch-Dest" to "iframe"), timeout = 20L)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             dbg("istek hatası ($name): ${e.message}")
-            return false
+            // ağ anlık hata verdiyse yine de WebView ile dene
+            return if (depth == 0) viaWebView(name, url, referer, callback) else false
         }
         val text = hdExpand(res.text)
         hdSubs(text, subtitleCallback)
         val media = hdPickMedia(text)
         hdLog("fetch kod=${res.code} medya=$media")
         if (media != null) {
-            hdEmit(name, media, "${hdOrigin(url)}/", callback)
+            hdEmit(name, media, "${hdOrigin(url)}/", cb)
             return true
+        }
+
+        // Oynatıcı sayfasının içeriğini logcat'e yaz (medya statik bulunamadıysa teşhis için)
+        if (depth == 0 && HD_DEBUG) {
+            hdLogBody("PLAYERSAYFA[$name]", res.text)
+            val ss = res.document.select("script[src]").map { it.attr("src") }
+            hdLog("PLAYERSAYFA[$name] script src: ${ss.joinToString(" | ")}")
+        }
+
+        // SetPlay oynatıcısı: link JS ile yükleniyor, boşuna aday kovalamadan doğrudan WebView ile yakala
+        if (isSetPlay && depth == 0) {
+            return viaWebView(name, url, referer, callback, 25_000L)
         }
 
         val next = LinkedHashSet<String>()
@@ -673,7 +736,7 @@ class HDFilmCehennemiland : MainAPI() {
         hdLog("loadLinks data=$data")
         dbgBuf.clear()
 
-        val doc = app.get(data, referer = "$mainUrl/").document
+        val doc = hdGet(data, referer = "$mainUrl/")?.document ?: return false
 
         // 1) Sitenin kendi yöntemi (admin-ajax get_video_url)
         val viaAjax = try {
