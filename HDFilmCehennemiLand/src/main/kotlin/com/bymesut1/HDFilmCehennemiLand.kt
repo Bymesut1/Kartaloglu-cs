@@ -6,9 +6,9 @@ import com.lagradost.cloudstream3.mvvm.logError
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import okhttp3.Interceptor
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -41,7 +41,13 @@ class HDFilmCehennemiLand : MainAPI() {
         url.substringBefore("://") + "://" + url.substringAfter("://").substringBefore("/")
 
     private fun extractHtml(body: String): String =
-        if (body.trimStart().startsWith("{")) tryParseJson<HdfcApiResponse>(body)?.html.orEmpty() else body
+        if (body.trimStart().startsWith("{")) {
+            try {
+                JSONObject(body).optString("html", "")
+            } catch (e: Exception) {
+                ""
+            }
+        } else body
 
     private fun debugItem(msg: String): SearchResponse =
         newMovieSearchResponse("DEBUG: ${msg.take(300)}", "$mainUrl/", TvType.Movie)
@@ -118,8 +124,14 @@ class HDFilmCehennemiLand : MainAPI() {
         val body = callApi("/search", mapOf("query" to query), dbg) { it.contains("results") }
             ?: return if (DEBUG) listOf(debugItem(dbg.toString())) else emptyList()
 
-        val res = tryParseJson<HdfcSearchResponse>(body)
-        return res?.results.orEmpty().mapNotNull {
+        val results: List<String> = try {
+            val arr = JSONObject(body).optJSONArray("results")
+            if (arr == null) emptyList() else (0 until arr.length()).map { arr.optString(it) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        return results.mapNotNull {
             Jsoup.parse(it, mainUrl).selectFirst("a[href]")?.toSearchResult()
         }
     }
@@ -376,14 +388,6 @@ class HdfcCloudflareInterceptor(private val killer: CloudflareKiller) : Intercep
 }
 
 // ============================== Veri sınıfları ==============================
-data class HdfcApiResponse(
-    val html: String? = null
-)
-
-data class HdfcSearchResponse(
-    val results: List<String>? = null
-)
-
 data class HdfcTmdbSearch(
     val results: List<HdfcTmdbItem>? = null
 )
