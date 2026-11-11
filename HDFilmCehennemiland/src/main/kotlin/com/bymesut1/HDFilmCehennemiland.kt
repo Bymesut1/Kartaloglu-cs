@@ -80,6 +80,36 @@ private fun hdLogBody(tag: String, body: String, max: Int = 15000) {
 private fun hdOrigin(url: String): String =
     runCatching { URI(url).let { "${it.scheme}://${it.host}" } }.getOrDefault(HD_SITE)
 
+
+// WebView'in gerçek isteğinden alınan başlıklar (User-Agent, Cookie, Referer) ile doğrudan M3U8 linki üretir.
+// generateM3u8 kullanılmaz: ek bir istek atıp tek kullanımlık/başlığa bağlı manifesti bozabiliyor.
+private val hdSkipHeaders = setOf(
+    "host", "accept-encoding", "connection", "range", "content-length",
+    "if-none-match", "if-modified-since", "x-requested-with"
+)
+
+private suspend fun hdEmitCaptured(
+    name: String, url: String, reqHeaders: Map<String, String>, callback: (ExtractorLink) -> Unit
+) {
+    val hdrs = LinkedHashMap<String, String>()
+    reqHeaders.forEach { (k, v) -> if (k.lowercase() !in hdSkipHeaders) hdrs[k] = v }
+    if (hdrs.keys.none { it.equals("cookie", true) }) {
+        val ck = runCatching { android.webkit.CookieManager.getInstance().getCookie(url) }.getOrNull()
+        if (!ck.isNullOrBlank()) hdrs["Cookie"] = ck
+    }
+    if (hdrs.keys.none { it.equals("origin", true) }) hdrs["Origin"] = hdOrigin(url)
+    val ref = hdrs.entries.firstOrNull { it.key.equals("referer", true) }?.value ?: "${hdOrigin(url)}/"
+    hdLog("emit başlıklar: ${hdrs.keys.joinToString(",")} referer=$ref")
+    val type = if (url.lowercase().contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+    callback(
+        newExtractorLink(name, name, url, type) {
+            this.referer = ref
+            this.headers = hdrs
+            this.quality = Qualities.Unknown.value
+        }
+    )
+}
+
 // \/ \uXXXX \xXX açar, packed JS çözer, base64 içindeki adresleri ortaya çıkarır
 private fun hdExpand(raw: String): String {
     var t = raw.replace("\\/", "/").replace("&amp;", "&")
@@ -625,6 +655,7 @@ class HDFilmCehennemiland : MainAPI() {
         hdLog("WebView deneniyor: $url")
         val resolver = WebViewResolver(
             Regex("""(?i)\.(?:m3u8|mp4|mpd)(?:[?#].*)?$|/manifests/.+\.txt|/(?:master|playlist|index)\.txt"""),
+            useOkhttp = false,
             // sayfa açılınca oynat tuşuna basar / video.play() dener (otomatik başlamayan oynatıcılar için)
             script = """
                 (function(){
@@ -640,14 +671,20 @@ class HDFilmCehennemiland : MainAPI() {
             """.trimIndent(),
             timeout = timeoutMs
         )
-        val captured = app.get(url, referer = referer, interceptor = resolver).url
-        hdLog("WebView yakalanan: $captured")
-        if (hdMediaRegex.containsMatchIn(captured)) {
-            hdEmit(name, captured, "${hdOrigin(captured)}/", callback)
-            true
-        } else {
+        val req = resolver.resolveUsingWebView(url, referer).first
+        if (req == null) {
             dbg("WebView medya yakalayamadı ($name)")
             false
+        } else {
+            val captured = req.url.toString()
+            hdLog("WebView yakalanan: $captured")
+            if (hdMediaRegex.containsMatchIn(captured)) {
+                hdEmitCaptured(name, captured, req.headers.toMap(), callback)
+                true
+            } else {
+                dbg("WebView medya yakalayamadı ($name)")
+                false
+            }
         }
     } catch (e: Exception) {
         dbg("WebView hata ($name): ${e.message}")
