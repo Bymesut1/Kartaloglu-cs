@@ -40,7 +40,8 @@ private val hdBlocked = listOf(
     "jsdelivr", "bootstrapcdn", "cloudflare", "googleapis", "gstatic", "jquery", "w3.org",
     "schema.org", "fontawesome", "google", "facebook", "twitter", "instagram", "doubleclick",
     "disqus", "youtube", "imdb.com", "themoviedb", "tmdb.org", "gravatar", "hdfilmcehennemi",
-    "devtools", "cdnjs", "unpkg"
+    "devtools", "cdnjs", "unpkg", "://x.com", "twimg", "wp.com", "api.w.org", "wordpress",
+    "googletagmanager", "gtag"
 )
 
 private fun hdLog(msg: String) = Log.d(HD_TAG, msg)
@@ -468,13 +469,51 @@ class HDFilmCehennemiland : MainAPI() {
                     val v = e.attr(a).trim()
                     if (v.startsWith("http") || v.startsWith("//")) {
                         val full = if (v.startsWith("//")) "https:$v" else v
-                        if (!hdAssetRegex.containsMatchIn(full)) out.add(full)
+                        if (!hdAssetRegex.containsMatchIn(full) && hdBlocked.none { full.contains(it, true) } ) out.add(full)
                     }
                 }
             }
         out.addAll(hdCandidates(hdExpand(doc.html()), pageUrl))
         return out.sortedByDescending {
             if (it.contains("fastplay", true) || it.contains("player", true) || it.contains("embed", true)) 1 else 0
+        }
+    }
+
+    // Teşhis: oynatıcıyı yükleyen script'i bulmak için sayfadaki script'leri tarar, logcat'e yazar
+    private suspend fun dumpScripts(doc: Document, pageUrl: String) {
+        val kw = Regex("fimcnt|data-player-name|playerName|player_name|admin-ajax|wp-json|loadingIframe|play-button|get_video|sourceslist")
+        fun scan(label: String, text: String) {
+            val hits = kw.findAll(text).map { it.range.first }.toList()
+            if (hits.isEmpty()) {
+                hdLog("JS[$label] anahtar kelime yok (${text.length} karakter)")
+                return
+            }
+            var last = -100000
+            var n = 0
+            for (h in hits) {
+                if (h - last < 1500) continue
+                last = h
+                if (++n > 6) break
+                val s = text.substring(maxOf(0, h - 600), minOf(text.length, h + 1400))
+                s.chunked(3000).forEachIndexed { i, c -> hdLog("JS[$label@$h/$i] $c") }
+            }
+        }
+
+        val srcs = doc.select("script[src]").map { fixUrl(it.attr("src")) }.distinct()
+        hdLog("SCRIPT SRC (${srcs.size}): ${srcs.joinToString(" | ")}")
+
+        doc.select("script:not([src])").forEachIndexed { i, s -> scan("inline$i", s.data()) }
+
+        srcs.filter { u ->
+            !u.contains("wp-includes", true) && !u.contains("google", true) &&
+                !u.contains("facebook", true) && !u.contains("jquery", true)
+        }.take(12).forEach { u ->
+            try {
+                val t = app.get(u, referer = pageUrl).text
+                scan(u.substringAfterLast('/').take(50), t)
+            } catch (e: Exception) {
+                hdLog("JS[$u] indirilemedi: ${e.message}")
+            }
         }
     }
 
@@ -584,6 +623,15 @@ class HDFilmCehennemiland : MainAPI() {
             }.awaitAll()
         }
         var found = results.any { it }
+
+        // Teşhis: kaynak yoksa oynatıcıyı yükleyen script'leri logcat'e dök
+        if (!found && HD_DEBUG) {
+            try {
+                dumpScripts(doc, data)
+            } catch (e: Exception) {
+                hdLog("dumpScripts hata: ${e.message}")
+            }
+        }
 
         // Son çare: sayfanın kendisini WebView ile aç, ağdan master.txt / m3u8 yakala
         if (!found) found = viaWebView("Player", data, "$mainUrl/", callback)
