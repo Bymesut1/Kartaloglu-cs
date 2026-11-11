@@ -9,19 +9,16 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.StringUtils.encodeUri
 
 class YouTube : MainAPI() {
-    override var mainUrl              = "https://yt.chocolatemoo53.com"
+    override var mainUrl              = "https://eu.yt.chocolatemoo53.com"
     override var name                 = "YouTube"
     override val hasMainPage          = true
     override var lang                 = "tr"
     override val supportedTypes       = setOf(TvType.Others)
 
-    // Invidious örnekleri API'yi zaman zaman kapatabiliyor (inv.nadeko.net gibi),
-    // bu yüzden istekleri sırayla deneyerek çalışan instance'ı buluyoruz.
-    // 2026-11: API'si acik kalan ornekler (f5.si 530, invidious.site 404, nadeko/nerdvpn API kapali).
+    // Tum kaynaklar (API, DASH, HLS canli yayin, MP4, companion/HTML sayfa) tek sunucudan gelir:
+    // eu.yt.chocolatemoo53.com
     private val instances = listOf(
-        "yt.chocolatemoo53.com",
-        "invidious.materialio.us",
-        "yewtu.be",
+        "eu.yt.chocolatemoo53.com",
     )
 
     private fun isJson(body: String) = body.startsWith("[") || body.startsWith("{")
@@ -68,7 +65,7 @@ class YouTube : MainAPI() {
         if (res.code == 200 && t.contains("<MPD") && t.contains("<AdaptationSet") && !t.contains("NaN")) url else null
     } catch (_: Exception) { null }
 
-    // TARAYICININ KULLANDIGI MANIFEST: video sayfasi parcalari yt-comp*.chocolatemoo53.com
+    // TARAYICININ KULLANDIGI MANIFEST: video sayfasi parcalari yt-comp*.chocolatemoo53.com (eu.yt.chocolatemoo53.com uzerinden)
     // uzerinden proxy'leyen "companion" manifest'ini ve her sayfa acilisinda degisen "check=" imzasini
     // kullaniyor:
     //   https://yt-comp3.../companion/api/manifest/dash/id/ID?local=true&unique_res=1&check=...
