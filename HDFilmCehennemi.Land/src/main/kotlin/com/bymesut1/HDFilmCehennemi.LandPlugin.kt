@@ -5,9 +5,9 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class HDFilmCehennemiPlugin : Plugin() {
+class HDFilmCehennemi.LandPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(HDFilmCehennemi())
+        registerMainAPI(HDFilmCehennemi.Land())
         registerExtractorAPI(FastPlay())
     }
 }
