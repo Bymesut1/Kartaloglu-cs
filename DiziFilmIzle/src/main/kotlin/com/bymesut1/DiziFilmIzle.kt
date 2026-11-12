@@ -177,6 +177,73 @@ private data class SiteEpisode(
     val episode: Int?
 )
 
+private data class OversizedMaster(
+    val proxyUrl: String?,
+    val maxHeight: Int,
+    val variants: List<Pair<String, String>>
+)
+
+// ExoPlayer'ın okuyamadığı (BANDWIDTH > Int.MAX) ana m3u8'i düzeltilmiş haliyle
+// 127.0.0.1 üzerinden sunan küçük yerel sunucu. Ses/altyazı grupları korunur.
+private object LocalHlsServer {
+    private val store = LinkedHashMap<String, String>()
+    private var server: java.net.ServerSocket? = null
+
+    @Synchronized
+    private fun ensureStarted(): Int {
+        val current = server
+        if (current != null && !current.isClosed) return current.localPort
+        val created = java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"))
+        server = created
+        Thread {
+            while (!created.isClosed) {
+                val client = try { created.accept() } catch (e: Exception) { break }
+                Thread { handle(client) }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+        return created.localPort
+    }
+
+    private fun handle(client: java.net.Socket) {
+        client.use { socket ->
+            runCatching {
+                val reader = socket.getInputStream().bufferedReader()
+                val first = reader.readLine() ?: return
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isEmpty()) break
+                }
+                val id = first.split(" ").getOrNull(1)
+                    ?.substringBefore('?')?.substringAfterLast('/')?.substringBefore('.')
+                val body = synchronized(store) { store[id] }
+                val out = socket.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    val bytes = body.toByteArray(Charsets.UTF_8)
+                    out.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Access-Control-Allow-Origin: *\r\nContent-Length: ${bytes.size}\r\n" +
+                            "Connection: close\r\n\r\n").toByteArray()
+                    )
+                    out.write(bytes)
+                }
+                out.flush()
+            }
+        }
+    }
+
+    fun publish(content: String): String? = runCatching {
+        val port = ensureStarted()
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+        synchronized(store) {
+            store[id] = content
+            while (store.size > 20) store.remove(store.keys.first())
+        }
+        "http://127.0.0.1:$port/$id.m3u8"
+    }.getOrNull()
+}
+
 // ───────────────────────── Eklenti ─────────────────────────
 
 class DiziFilmIzle : MainAPI() {
@@ -295,7 +362,8 @@ class DiziFilmIzle : MainAPI() {
             val r = results.optJSONObject(i) ?: continue
             var score = 0
             val names = listOfNotNull(r.str("title"), r.str("name"), r.str("original_title"), r.str("original_name"))
-            if (names.any { normalizeName(it) == q }) score += 10
+            if (names.none { normalizeName(it) == q }) continue
+            score += 10
             if (year != null && r.str(dateKey)?.startsWith(year.toString()) == true) score += 5
             if (score > bestScore) {
                 best = r
@@ -315,19 +383,48 @@ class DiziFilmIzle : MainAPI() {
                 if (y != null) params[yearKey] = y.toString()
                 val results = tmdbGet("/search/$type", params)?.optJSONArray("results") ?: continue
                 if (results.length() == 0) continue
-                return pickBest(results, q, year, dateKey)
+                val best = pickBest(results, q, year, dateKey)
+                if (best != null) return best
             }
         }
         return null
     }
 
-    private suspend fun tmdbLookup(title: String, year: Int?, isSeries: Boolean): JSONObject? {
+    private suspend fun tmdbFindByImdb(imdb: String, type: String): Int? {
+        val res = tmdbGet("/find/$imdb", mapOf("external_source" to "imdb_id")) ?: return null
+        val arr = res.optJSONArray(if (type == "tv") "tv_results" else "movie_results") ?: return null
+        return arr.optJSONObject(0)?.optInt("id")?.takeIf { it > 0 }
+    }
+
+    private suspend fun tmdbLookup(
+        title: String,
+        year: Int?,
+        isSeries: Boolean,
+        imdbId: String? = null,
+        imdbTrusted: Boolean = false
+    ): JSONObject? {
         if (!tmdbEnabled) return null
         val type = if (isSeries) "tv" else "movie"
-        val found = tmdbSearch(type, title, year) ?: return null
-        val id = found.optInt("id").takeIf { it > 0 } ?: return null
+        val dateKey = if (isSeries) "first_air_date" else "release_date"
+        var id = 0
+        if (imdbId != null) {
+            id = tmdbFindByImdb(imdbId, type) ?: 0
+        }
+        if (id == 0) {
+            val found = tmdbSearch(type, title, year) ?: return null
+            id = found.optInt("id").takeIf { it > 0 } ?: return null
+        }
         val details = tmdbGet("/$type/$id", mapOf("append_to_response" to "credits,external_ids")) ?: return null
         if (details.optInt("id") == 0) return null
+        // Sayfadan zayıf yolla bulunan IMDb ID'si yanlış filme ait olabilir: ad veya yıl tutmalı.
+        if (imdbId != null && !imdbTrusted) {
+            val q = normalizeName(title)
+            val names = listOfNotNull(details.str("title"), details.str("name"),
+                details.str("original_title"), details.str("original_name"))
+            val nameOk = names.any { normalizeName(it) == q }
+            val yearOk = year != null && details.str(dateKey)?.startsWith(year.toString()) == true
+            if (!nameOk && !yearOk) return null
+        }
         if (details.str("overview") == null) {
             tmdbGet("/$type/$id", emptyMap(), "en-US")?.str("overview")?.let { details.put("overview", it) }
         }
@@ -395,12 +492,18 @@ class DiziFilmIzle : MainAPI() {
             .mapNotNull { it.attr("content").ifBlank { it.text() }.trim().takeIf(String::isNotBlank) }
             .distinct().take(8)
         val year = titleYear
+            ?: Regex(""""(?:datePublished|dateCreated|releaseDate|release_date|year)"\s*:\s*"?(\d{4})""")
+                .find(raw)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it in 1900..2100 }
             ?: Regex("""\b(19|20)\d{2}\b""").find(raw)?.value?.toIntOrNull()
         val siteScore = doc.selectFirst("[itemprop=ratingValue]")?.attr("content")
             ?: Regex(""""(?:imdbPuani|ratingValue|imdb)"\s*:\s*"?([0-9.]+)""").find(raw)?.groupValues?.get(1)
-        val rawImdb = Regex("""tt\d{7,9}""").find(raw)?.value
+        val strongImdb = Regex("""imdb\.com/title/(tt\d{7,9})""").find(raw)?.groupValues?.get(1)
+            ?: Regex(""""imdb_?[iI][dD]"\s*:\s*"(tt\d{7,9})"""").find(raw)?.groupValues?.get(1)
+        val rawImdb = strongImdb ?: Regex("""tt\d{7,9}""").find(raw)?.value
+        val isFilmPage = url.substringBefore('?').contains("/film/")
+        val pageSlug = url.substringBefore('?').trimEnd('/').substringAfterLast('/')
 
-        val siteEpisodes = doc.select("a[href]").mapNotNull { anchor ->
+        val allSiteEpisodes = if (isFilmPage) emptyList() else doc.select("a[href]").mapNotNull { anchor ->
             val href = fixUrlNull(anchor.attr("href")) ?: return@mapNotNull null
             val path = href.substringAfter(mainUrl).substringBefore('?')
             if (!Regex("""(?:bolum|episode)[-_/]?\d+""", RegexOption.IGNORE_CASE).containsMatchIn(path)) return@mapNotNull null
@@ -412,11 +515,14 @@ class DiziFilmIzle : MainAPI() {
                 ?: Regex("""(\d+)[-_]bolum""", RegexOption.IGNORE_CASE).find(path)?.groupValues?.getOrNull(1)?.toIntOrNull()
             SiteEpisode(href, anchor.text().trim().ifBlank { "Bölüm $number" }, season, number)
         }.distinctBy { it.href }.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+        // Yan listelerdeki ("son eklenen bölümler" vb.) başka dizilerin bölümlerini ele
+        val siteEpisodes = allSiteEpisodes.filter { it.href.contains(pageSlug, ignoreCase = true) }
+            .ifEmpty { allSiteEpisodes }
 
         if (siteEpisodes.isNotEmpty()) {
-            val tmdb = tmdbLookup(title, titleYear, true)
+            val tmdb = tmdbLookup(title, year, true, rawImdb, strongImdb != null)
             val tmdbId = tmdb?.optInt("id") ?: 0
-            val imdbId = tmdbImdbId(tmdb) ?: rawImdb
+            val imdbId = tmdbImdbId(tmdb) ?: strongImdb
             val seasonCache = HashMap<Int, Map<Int, JSONObject>>()
             val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
@@ -460,8 +566,8 @@ class DiziFilmIzle : MainAPI() {
             }
         }
 
-        val tmdb = tmdbLookup(title, titleYear, false)
-        val imdbId = tmdbImdbId(tmdb) ?: rawImdb
+        val tmdb = tmdbLookup(title, year, false, rawImdb, strongImdb != null)
+        val imdbId = tmdbImdbId(tmdb) ?: strongImdb
         val tPoster = tmdbImage(tmdb?.str("poster_path"), "w500") ?: poster
         val tBackdrop = tmdbImage(tmdb?.str("backdrop_path"), "w1280") ?: tPoster
         val tGenres = tmdbGenres(tmdb)
@@ -629,18 +735,27 @@ class DiziFilmIzle : MainAPI() {
                 referer.contains("dosyaload")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
             // Ana m3u8 içinde BANDWIDTH Int sınırını aşıyorsa ExoPlayer çöker (NumberFormatException).
-            // Bu durumda alt (variant) listeleri doğrudan veriyoruz.
+            // Düzeltilmiş ana listeyi (ses parçalarıyla birlikte) yerel sunucudan veriyoruz.
             if (type == ExtractorLinkType.M3U8) {
-                val variants = oversizedMasterVariants(stream, referer)
-                if (variants != null) {
-                    for ((vUrl, vLabel) in variants) {
-                        if (!seen.add(vUrl)) continue
-                        val vName = "$label $vLabel".trim()
-                        val vQuality = getQualityFromName(vLabel)
-                        callback.invoke(newExtractorLink(name, vName, vUrl, ExtractorLinkType.M3U8) {
+                val fixed = oversizedMaster(stream, referer)
+                if (fixed != null) {
+                    if (fixed.proxyUrl != null) {
+                        val pName = if (fixed.maxHeight > 0) "$label ${fixed.maxHeight}p" else label
+                        val pQuality = if (fixed.maxHeight > 0) fixed.maxHeight else getQualityFromName(label)
+                        callback.invoke(newExtractorLink(name, pName, fixed.proxyUrl, ExtractorLinkType.M3U8) {
                             this.referer = referer
                             this.headers = browserHeaders
-                            this.quality = vQuality
+                            this.quality = pQuality
+                        })
+                        found = true
+                    }
+                    // Yedek: doğrudan alt listeler (ses ayrı parçaysa sessiz olabilir)
+                    for ((vUrl, vLabel) in fixed.variants) {
+                        if (!seen.add(vUrl)) continue
+                        callback.invoke(newExtractorLink(name, "$label $vLabel (yedek)".trim(), vUrl, ExtractorLinkType.M3U8) {
+                            this.referer = referer
+                            this.headers = browserHeaders
+                            this.quality = 0
                         })
                         found = true
                     }
@@ -711,27 +826,49 @@ class DiziFilmIzle : MainAPI() {
     }
 
     // Ana m3u8'de BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (örn. 2462697000) ExoPlayer
-    // "Source error / NumberFormatException" verir. Böyle bir liste varsa alt listeleri çıkarır.
-    private suspend fun oversizedMasterVariants(master: String, referer: String): List<Pair<String, String>>? {
+    // "Source error / NumberFormatException" verir. Böyle bir liste varsa düzeltilmiş kopyasını üretir.
+    private suspend fun oversizedMaster(master: String, referer: String): OversizedMaster? {
         val body = runCatching {
             app.get(master, headers = browserHeaders, referer = referer).text
         }.getOrNull() ?: return null
         if (!body.contains("#EXT-X-STREAM-INF")) return null
-        val tooBig = Regex("""BANDWIDTH=(\d+)""").findAll(body)
+        val bandwidth = Regex("""BANDWIDTH=(\d+)""")
+        val tooBig = bandwidth.findAll(body)
             .any { (it.groupValues[1].toLongOrNull() ?: 0L) > Int.MAX_VALUE.toLong() }
         if (!tooBig) return null
 
+        val uriAttr = Regex("""URI="([^"]*)"""")
         val lines = body.lines().map { it.trim() }
-        val result = mutableListOf<Pair<String, String>>()
+        val fixedLines = lines.map { line ->
+            when {
+                line.isEmpty() -> line
+                line.startsWith("#") -> {
+                    val clamped = bandwidth.replace(line) { m ->
+                        val v = m.groupValues[1].toLongOrNull() ?: 0L
+                        m.value.substringBefore('=') + "=" + (if (v > Int.MAX_VALUE.toLong()) 2000000000L else v)
+                    }
+                    uriAttr.replace(clamped) { m ->
+                        val abs = absUrl(m.groupValues[1], master) ?: m.groupValues[1]
+                        "URI=\"" + abs + "\""
+                    }
+                }
+                else -> absUrl(line, master) ?: line
+            }
+        }
+
+        val variants = mutableListOf<Pair<String, String>>()
+        var maxHeight = 0
         for (i in lines.indices) {
             val line = lines[i]
             if (!line.startsWith("#EXT-X-STREAM-INF")) continue
             val uriLine = lines.drop(i + 1).firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: continue
-            val abs = runCatching { URI(master).resolve(uriLine).toString() }.getOrNull() ?: continue
-            val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)?.groupValues?.get(1)
-            result.add(abs to (if (height != null) "${height}p" else ""))
+            val abs = absUrl(uriLine, master) ?: continue
+            val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull()
+            if (height != null && height > maxHeight) maxHeight = height
+            variants.add(abs to (if (height != null) "${height}p" else ""))
         }
-        return result.ifEmpty { null }
+        val proxy = LocalHlsServer.publish(fixedLines.joinToString("\n"))
+        return OversizedMaster(proxy, maxHeight, variants)
     }
 
     private fun decryptBePlayer(html: String): String? = runCatching {
