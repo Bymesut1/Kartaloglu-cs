@@ -196,7 +196,6 @@ class DiziFilmIzle : MainAPI() {
         "https://dizifilmizle.to/turkce-dublaj-filmler" to "Türkçe Dublaj",
         "https://dizifilmizle.to/turkce-altyazili-filmler" to "Türkçe Altyazı",
         "https://dizifilmizle.to/ulke/turkiye-hd" to "Yerli Filmler",
-        "https://dizifilmizle.to/seriler" to "Seri Filmler",
         "https://dizifilmizle.to/efsane-diziler" to "Efsane Diziler",
         "https://dizifilmizle.to/" to "Filmler"
     )
