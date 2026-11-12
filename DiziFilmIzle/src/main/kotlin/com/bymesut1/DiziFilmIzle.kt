@@ -19,6 +19,7 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -485,7 +486,7 @@ class DiziFilmIzle : MainAPI() {
     // ───────────────────────── Altyazı ─────────────────────────
 
     // Sayfa / oynatıcı metni içindeki <track>, mutlak ve göreli .vtt/.srt adreslerini toplar.
-    private fun scanSubs(
+    private suspend fun scanSubs(
         rawText: String,
         base: String,
         seen: MutableSet<String>,
@@ -500,14 +501,14 @@ class DiziFilmIzle : MainAPI() {
             val url = absUrl(src, base) ?: continue
             if (!seen.add(url)) continue
             val hint = (htmlAttr(tag, "srclang") ?: "") + " " + (htmlAttr(tag, "label") ?: "") + " " + url
-            callback.invoke(SubtitleFile(subLang(hint), url, subHeaders(base)))
+            callback.invoke(newSubtitleFile(subLang(hint), url) { this.headers = subHeaders(base) })
         }
         for (m in SUBS.findAll(text)) {
             val url = m.value
             if (!seen.add(url)) continue
             val from = maxOf(0, m.range.first - 80)
             val to = minOf(text.length, m.range.last + 80)
-            callback.invoke(SubtitleFile(subLang(text.substring(from, to) + " " + url), url, subHeaders(base)))
+            callback.invoke(newSubtitleFile(subLang(text.substring(from, to) + " " + url), url) { this.headers = subHeaders(base) })
         }
         for (m in REL_SUBS.findAll(text)) {
             val rel = m.groupValues[1]
@@ -516,7 +517,7 @@ class DiziFilmIzle : MainAPI() {
             if (!seen.add(url)) continue
             val from = maxOf(0, m.range.first - 80)
             val to = minOf(text.length, m.range.last + 80)
-            callback.invoke(SubtitleFile(subLang(text.substring(from, to) + " " + url), url, subHeaders(base)))
+            callback.invoke(newSubtitleFile(subLang(text.substring(from, to) + " " + url), url) { this.headers = subHeaders(base) })
         }
     }
 
@@ -540,7 +541,7 @@ class DiziFilmIzle : MainAPI() {
                 r.code == 200 && r.text.take(20).contains("WEBVTT")
             }.getOrDefault(false)
             if (ok && seen.add(url)) {
-                callback.invoke(SubtitleFile(lang, url, subHeaders(embed)))
+                callback.invoke(newSubtitleFile(lang, url) { this.headers = subHeaders(embed) })
             }
         }
     }
@@ -570,7 +571,7 @@ class DiziFilmIzle : MainAPI() {
                     val url = o.str("url") ?: continue
                     if (!seen.add(url)) continue
                     count++
-                    callback.invoke(SubtitleFile("tr", url))
+                    callback.invoke(newSubtitleFile("tr", url))
                 }
             }
         }
@@ -591,7 +592,7 @@ class DiziFilmIzle : MainAPI() {
                 val url = o.str("url") ?: continue
                 if (!seen.add(url)) continue
                 count++
-                callback.invoke(SubtitleFile("tr", url))
+                callback.invoke(newSubtitleFile("tr", url))
             }
         }
     }
