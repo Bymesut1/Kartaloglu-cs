@@ -43,10 +43,18 @@ import javax.crypto.spec.SecretKeySpec
 
 // ───────────────────────── Yardımcılar ─────────────────────────
 
+private const val UA =
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
 private val browserHeaders = mapOf(
-    "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "User-Agent" to UA,
     "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.8"
+)
+
+private fun subHeaders(referer: String): Map<String, String> = mapOf(
+    "User-Agent" to UA,
+    "Referer" to referer
 )
 
 private fun asciiFold(value: String): String = value
@@ -134,14 +142,12 @@ private fun normalizeName(value: String): String =
 
 private fun absUrl(raw: String, base: String): String? {
     val u = raw.trim()
+    if (u.isEmpty()) return null
     return when {
         u.startsWith("http") -> u
         u.startsWith("//") -> "https:$u"
-        u.startsWith("/") -> runCatching {
-            val uri = URI(base)
-            "${uri.scheme}://${uri.host}$u"
-        }.getOrNull()
-        else -> null
+        else -> runCatching { URI(base).resolve(u).toString() }.getOrNull()
+            ?.takeIf { it.startsWith("http") }
     }
 }
 
@@ -152,10 +158,15 @@ private fun htmlAttr(tag: String, name: String): String? =
 private fun subLang(context: String): String {
     val c = asciiFold(context).lowercase()
     return when {
-        Regex("""turk|\btur\b|\btr\b|tr[-_]|[-_/.]tr[-_/.]""").containsMatchIn(c) -> "tr"
-        Regex("""engl|ingiliz|\beng\b|\ben\b""").containsMatchIn(c) -> "en"
+        Regex("""turk|\btur\b|\btr\b|tur_|tr[-_]|[-_/.]tr[-_/.]""").containsMatchIn(c) -> "tr"
+        Regex("""engl|ingiliz|\beng\b|eng_|\ben\b""").containsMatchIn(c) -> "en"
         else -> "tr"
     }
+}
+
+private fun isTurkish(lang: String): Boolean {
+    val l = asciiFold(lang).lowercase()
+    return l == "tr" || l == "tur" || l.startsWith("turk")
 }
 
 private data class SiteEpisode(
@@ -195,7 +206,9 @@ class DiziFilmIzle : MainAPI() {
         private val BE_PLAYER = Regex("""bePlayer\('([^']+)'\s*,\s*'(\{.*?\})'""", RegexOption.DOT_MATCHES_ALL)
         private val MEDIA = Regex("""https?://[^"'\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)?""")
         private val SUBS = Regex("""https?://[^"'\s<>]+?\.(?:vtt|srt)(?:\?[^"'\s<>]*)?""")
+        private val REL_SUBS = Regex("""["']([^"'\s<>]*/[^"'\s<>]*?\.(?:vtt|srt)(?:\?[^"'\s<>]*)?)["']""")
         private val TRACK = Regex("""<track\b[^>]*>""", RegexOption.IGNORE_CASE)
+        private val VIDMIXI_DIR = Regex("""/upload/videos/\d{4}/\d{2}/[0-9a-f]{32}/""")
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -472,6 +485,7 @@ class DiziFilmIzle : MainAPI() {
 
     // ───────────────────────── Altyazı ─────────────────────────
 
+    // Sayfa / oynatıcı metni içindeki <track>, mutlak ve göreli .vtt/.srt adreslerini toplar.
     private fun scanSubs(
         rawText: String,
         base: String,
@@ -487,17 +501,52 @@ class DiziFilmIzle : MainAPI() {
             val url = absUrl(src, base) ?: continue
             if (!seen.add(url)) continue
             val hint = (htmlAttr(tag, "srclang") ?: "") + " " + (htmlAttr(tag, "label") ?: "") + " " + url
-            callback.invoke(SubtitleFile(subLang(hint), url))
+            callback.invoke(SubtitleFile(subLang(hint), url, subHeaders(base)))
         }
         for (m in SUBS.findAll(text)) {
             val url = m.value
             if (!seen.add(url)) continue
             val from = maxOf(0, m.range.first - 80)
             val to = minOf(text.length, m.range.last + 80)
-            callback.invoke(SubtitleFile(subLang(text.substring(from, to)), url))
+            callback.invoke(SubtitleFile(subLang(text.substring(from, to) + " " + url), url, subHeaders(base)))
+        }
+        for (m in REL_SUBS.findAll(text)) {
+            val rel = m.groupValues[1]
+            if (rel.startsWith("http")) continue
+            val url = absUrl(rel, base) ?: continue
+            if (!seen.add(url)) continue
+            val from = maxOf(0, m.range.first - 80)
+            val to = minOf(text.length, m.range.last + 80)
+            callback.invoke(SubtitleFile(subLang(text.substring(from, to) + " " + url), url, subHeaders(base)))
         }
     }
 
+    // Vidmixi: /upload/videos/YYYY/MM/<hash>/altyazi/tur_sub.vtt (+ eng_sub.vtt)
+    private suspend fun vidmixiSubs(
+        embed: String,
+        sources: List<String>,
+        seen: MutableSet<String>,
+        callback: (SubtitleFile) -> Unit
+    ) {
+        val dir = sources.firstNotNullOfOrNull { VIDMIXI_DIR.find(it.replace("\\/", "/"))?.value } ?: return
+        val origin = runCatching {
+            val uri = URI(embed)
+            "${uri.scheme}://${uri.host}"
+        }.getOrNull() ?: return
+        for ((file, lang) in listOf("tur_sub.vtt" to "tr", "eng_sub.vtt" to "en")) {
+            val url = "$origin${dir}altyazi/$file"
+            if (url in seen) continue
+            val ok = runCatching {
+                val r = app.get(url, headers = browserHeaders, referer = embed)
+                r.code == 200 && r.text.take(20).contains("WEBVTT")
+            }.getOrDefault(false)
+            if (ok && seen.add(url)) {
+                callback.invoke(SubtitleFile(lang, url, subHeaders(embed)))
+            }
+        }
+    }
+
+    // Sitede Türkçe altyazı bulunamazsa devreye giren dış kaynaklar (IMDb ID ile).
     private suspend fun externalSubs(
         imdb: String,
         season: Int?,
@@ -507,7 +556,7 @@ class DiziFilmIzle : MainAPI() {
     ) {
         val isSeries = season != null && episode != null
 
-        // 1) OpenSubtitles (Stremio eklentisi)
+        // OpenSubtitles (Stremio eklentisi)
         runCatching {
             val path = if (isSeries) "series/$imdb:$season:$episode" else "movie/$imdb"
             val body = app.get("https://opensubtitles-v3.strem.io/subtitles/$path.json", headers = browserHeaders).text
@@ -527,7 +576,7 @@ class DiziFilmIzle : MainAPI() {
             }
         }
 
-        // 2) Wyzie Subs
+        // Wyzie Subs
         runCatching {
             val params = mutableMapOf("id" to imdb, "language" to "tr")
             if (isSeries) {
@@ -565,8 +614,14 @@ class DiziFilmIzle : MainAPI() {
         val resp = app.get(pageUrl, headers = browserHeaders)
         val text = resp.text.replace("\\\\/", "/").replace("\\/", "/").replace("\\\"", "\"")
         var found = false
+        var siteTurkish = false
         val seen = mutableSetOf<String>()
         val seenSubs = mutableSetOf<String>()
+
+        val subCb: (SubtitleFile) -> Unit = { sub ->
+            if (isTurkish(sub.lang)) siteTurkish = true
+            subtitleCallback.invoke(sub)
+        }
 
         suspend fun emit(stream: String, label: String, referer: String) {
             if (!stream.startsWith("http") || !seen.add(stream)) return
@@ -582,7 +637,7 @@ class DiziFilmIzle : MainAPI() {
         }
 
         // Sayfadaki altyazılar
-        scanSubs(text, pageUrl, seenSubs, subtitleCallback)
+        scanSubs(text, pageUrl, seenSubs, subCb)
 
         val allEmbeds = Regex("""https?://[^"'\s<>]+/embed/[^"'\s<>]+""")
             .findAll(text).map { it.value }.filter { it != pageUrl }.toList()
@@ -593,10 +648,13 @@ class DiziFilmIzle : MainAPI() {
             val player = runCatching {
                 app.get(embed, headers = browserHeaders, referer = pageUrl).text
             }.getOrNull() ?: continue
-            scanSubs(player, embed, seenSubs, subtitleCallback)
-            val clear = decryptBePlayer(player) ?: continue
-            scanSubs(clear, embed, seenSubs, subtitleCallback)
-            val video = runCatching { JSONObject(clear).optString("video_location").trim() }.getOrNull()
+            scanSubs(player, embed, seenSubs, subCb)
+            val clear = decryptBePlayer(player)
+            val video = clear?.let {
+                runCatching { JSONObject(it).optString("video_location").trim() }.getOrNull()
+            }
+            if (clear != null) scanSubs(clear, embed, seenSubs, subCb)
+            vidmixiSubs(embed, listOfNotNull(video, clear, player, text), seenSubs, subCb)
             if (video != null && video.startsWith("http")) emit(video, "Vidmixi", embed)
         }
 
@@ -614,15 +672,17 @@ class DiziFilmIzle : MainAPI() {
             if (inner != null) {
                 val innerFixed = inner.replace("\\/", "/")
                 for (m in MEDIA.findAll(innerFixed)) emit(m.value, "Embed", frame)
-                scanSubs(innerFixed, frame, seenSubs, subtitleCallback)
+                scanSubs(innerFixed, frame, seenSubs, subCb)
             }
-            if (loadExtractor(frame, "$mainUrl/", subtitleCallback, callback)) found = true
+            if (loadExtractor(frame, "$mainUrl/", subCb, callback)) found = true
         }
 
-        // Dış kaynaklardan Türkçe altyazı (IMDb ID ile)
-        val imdb = imdbId ?: Regex("""tt\d{7,9}""").find(text)?.value
-        if (imdb != null) {
-            externalSubs(imdb, subSeason, subEpisode, seenSubs, subtitleCallback)
+        // Sitede Türkçe altyazı yoksa dış kaynaklardan ara (IMDb ID ile)
+        if (!siteTurkish) {
+            val imdb = imdbId ?: Regex("""tt\d{7,9}""").find(text)?.value
+            if (imdb != null) {
+                externalSubs(imdb, subSeason, subEpisode, seenSubs, subtitleCallback)
+            }
         }
 
         if (!found) throw ErrorLoadingException("$name: oynatılabilir akış yok")
