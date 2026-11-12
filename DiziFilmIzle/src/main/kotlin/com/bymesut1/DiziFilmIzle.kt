@@ -143,7 +143,7 @@ private data class SiteEpisode(
 class DiziFilmIzle : MainAPI() {
 
     // TMDB v3 API anahtarını buraya yaz. Boş/varsayılan kalırsa TMDB özelliği kapalı olur.
-    private val tmdbKey = "BURAYA_TMDB_API_KEY"
+    private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbEnabled get() = tmdbKey.isNotBlank() && tmdbKey != "BURAYA_TMDB_API_KEY"
 
