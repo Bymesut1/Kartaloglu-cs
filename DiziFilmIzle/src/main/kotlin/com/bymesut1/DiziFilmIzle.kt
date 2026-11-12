@@ -31,6 +31,7 @@ import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.ByteArrayOutputStream
+import java.net.URI
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Base64
@@ -131,6 +132,32 @@ private fun tmdbImage(path: String?, size: String): String? =
 private fun normalizeName(value: String): String =
     asciiFold(value).lowercase().replace(Regex("""[^a-z0-9]"""), "")
 
+private fun absUrl(raw: String, base: String): String? {
+    val u = raw.trim()
+    return when {
+        u.startsWith("http") -> u
+        u.startsWith("//") -> "https:$u"
+        u.startsWith("/") -> runCatching {
+            val uri = URI(base)
+            "${uri.scheme}://${uri.host}$u"
+        }.getOrNull()
+        else -> null
+    }
+}
+
+private fun htmlAttr(tag: String, name: String): String? =
+    Regex("""\b$name\s*=\s*["']([^"']*)["']""", RegexOption.IGNORE_CASE)
+        .find(tag)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+
+private fun subLang(context: String): String {
+    val c = asciiFold(context).lowercase()
+    return when {
+        Regex("""turk|\btur\b|\btr\b|tr[-_]|[-_/.]tr[-_/.]""").containsMatchIn(c) -> "tr"
+        Regex("""engl|ingiliz|\beng\b|\ben\b""").containsMatchIn(c) -> "en"
+        else -> "tr"
+    }
+}
+
 private data class SiteEpisode(
     val href: String,
     val name: String,
@@ -164,9 +191,11 @@ class DiziFilmIzle : MainAPI() {
     )
 
     companion object {
+        private const val SUBS_MARK = "#imdb="
         private val BE_PLAYER = Regex("""bePlayer\('([^']+)'\s*,\s*'(\{.*?\})'""", RegexOption.DOT_MATCHES_ALL)
-        private val MEDIA = Regex("""https?://[^"'\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)""")
-        private val SUBS = Regex("""https?://[^"'\s<>]+?\.(?:vtt|srt)(?:\?[^"'\s<>]*)""")
+        private val MEDIA = Regex("""https?://[^"'\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)?""")
+        private val SUBS = Regex("""https?://[^"'\s<>]+?\.(?:vtt|srt)(?:\?[^"'\s<>]*)?""")
+        private val TRACK = Regex("""<track\b[^>]*>""", RegexOption.IGNORE_CASE)
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -284,7 +313,7 @@ class DiziFilmIzle : MainAPI() {
         val type = if (isSeries) "tv" else "movie"
         val found = tmdbSearch(type, title, year) ?: return null
         val id = found.optInt("id").takeIf { it > 0 } ?: return null
-        val details = tmdbGet("/$type/$id", mapOf("append_to_response" to "credits")) ?: return null
+        val details = tmdbGet("/$type/$id", mapOf("append_to_response" to "credits,external_ids")) ?: return null
         if (details.optInt("id") == 0) return null
         if (details.str("overview") == null) {
             tmdbGet("/$type/$id", emptyMap(), "en-US")?.str("overview")?.let { details.put("overview", it) }
@@ -330,6 +359,10 @@ class DiziFilmIzle : MainAPI() {
         }.ifEmpty { null }
     }
 
+    private fun tmdbImdbId(tmdb: JSONObject?): String? =
+        (tmdb?.optJSONObject("external_ids")?.str("imdb_id") ?: tmdb?.str("imdb_id"))
+            ?.takeIf { it.startsWith("tt") }
+
     // ───────────────────────── Detay sayfası ─────────────────────────
 
     override suspend fun load(url: String): LoadResponse? {
@@ -352,6 +385,7 @@ class DiziFilmIzle : MainAPI() {
             ?: Regex("""\b(19|20)\d{2}\b""").find(raw)?.value?.toIntOrNull()
         val siteScore = doc.selectFirst("[itemprop=ratingValue]")?.attr("content")
             ?: Regex(""""(?:imdbPuani|ratingValue|imdb)"\s*:\s*"?([0-9.]+)""").find(raw)?.groupValues?.get(1)
+        val rawImdb = Regex("""tt\d{7,9}""").find(raw)?.value
 
         val siteEpisodes = doc.select("a[href]").mapNotNull { anchor ->
             val href = fixUrlNull(anchor.attr("href")) ?: return@mapNotNull null
@@ -369,6 +403,7 @@ class DiziFilmIzle : MainAPI() {
         if (siteEpisodes.isNotEmpty()) {
             val tmdb = tmdbLookup(title, titleYear, true)
             val tmdbId = tmdb?.optInt("id") ?: 0
+            val imdbId = tmdbImdbId(tmdb) ?: rawImdb
             val seasonCache = HashMap<Int, Map<Int, JSONObject>>()
             val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
@@ -380,7 +415,10 @@ class DiziFilmIzle : MainAPI() {
                 } else null
                 val airDate = info?.str("air_date")
                 if (airDate != null && airDate > today) return@mapNotNull null
-                newEpisode(ep.href) {
+                val subsTag = if (imdbId != null && ep.episode != null) {
+                    "$SUBS_MARK$imdbId&s=${ep.season ?: 1}&e=${ep.episode}"
+                } else ""
+                newEpisode(ep.href + subsTag) {
                     this.name = info?.str("name") ?: ep.name
                     this.season = ep.season
                     this.episode = ep.episode
@@ -410,6 +448,7 @@ class DiziFilmIzle : MainAPI() {
         }
 
         val tmdb = tmdbLookup(title, titleYear, false)
+        val imdbId = tmdbImdbId(tmdb) ?: rawImdb
         val tPoster = tmdbImage(tmdb?.str("poster_path"), "w500") ?: poster
         val tBackdrop = tmdbImage(tmdb?.str("backdrop_path"), "w1280") ?: tPoster
         val tGenres = tmdbGenres(tmdb)
@@ -417,8 +456,9 @@ class DiziFilmIzle : MainAPI() {
         val tYear = tmdb?.str("release_date")?.take(4)?.toIntOrNull() ?: year
         val tActors = tmdbActors(tmdb)
         val runtime = tmdb?.optInt("runtime")?.takeIf { it > 0 }
+        val movieData = if (imdbId != null) "$url$SUBS_MARK$imdbId" else url
 
-        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+        return newMovieLoadResponse(title, url, TvType.Movie, movieData) {
             this.posterUrl = tPoster
             this.backgroundPosterUrl = tBackdrop
             this.plot = tmdb?.str("overview") ?: plot
@@ -430,6 +470,84 @@ class DiziFilmIzle : MainAPI() {
         }
     }
 
+    // ───────────────────────── Altyazı ─────────────────────────
+
+    private fun scanSubs(
+        rawText: String,
+        base: String,
+        seen: MutableSet<String>,
+        callback: (SubtitleFile) -> Unit
+    ) {
+        val text = rawText.replace("\\/", "/")
+        for (tagMatch in TRACK.findAll(text)) {
+            val tag = tagMatch.value
+            val src = htmlAttr(tag, "src") ?: continue
+            val kind = htmlAttr(tag, "kind")
+            if (kind != null && !kind.equals("subtitles", true) && !kind.equals("captions", true)) continue
+            val url = absUrl(src, base) ?: continue
+            if (!seen.add(url)) continue
+            val hint = (htmlAttr(tag, "srclang") ?: "") + " " + (htmlAttr(tag, "label") ?: "") + " " + url
+            callback.invoke(SubtitleFile(subLang(hint), url))
+        }
+        for (m in SUBS.findAll(text)) {
+            val url = m.value
+            if (!seen.add(url)) continue
+            val from = maxOf(0, m.range.first - 80)
+            val to = minOf(text.length, m.range.last + 80)
+            callback.invoke(SubtitleFile(subLang(text.substring(from, to)), url))
+        }
+    }
+
+    private suspend fun externalSubs(
+        imdb: String,
+        season: Int?,
+        episode: Int?,
+        seen: MutableSet<String>,
+        callback: (SubtitleFile) -> Unit
+    ) {
+        val isSeries = season != null && episode != null
+
+        // 1) OpenSubtitles (Stremio eklentisi)
+        runCatching {
+            val path = if (isSeries) "series/$imdb:$season:$episode" else "movie/$imdb"
+            val body = app.get("https://opensubtitles-v3.strem.io/subtitles/$path.json", headers = browserHeaders).text
+            val arr = JSONObject(body).optJSONArray("subtitles")
+            var count = 0
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    if (count >= 5) break
+                    val o = arr.optJSONObject(i) ?: continue
+                    val lang = o.optString("lang").lowercase()
+                    if (lang != "tur" && lang != "tr" && lang != "tr-tr") continue
+                    val url = o.str("url") ?: continue
+                    if (!seen.add(url)) continue
+                    count++
+                    callback.invoke(SubtitleFile("tr", url))
+                }
+            }
+        }
+
+        // 2) Wyzie Subs
+        runCatching {
+            val params = mutableMapOf("id" to imdb, "language" to "tr")
+            if (isSeries) {
+                params["season"] = season.toString()
+                params["episode"] = episode.toString()
+            }
+            val body = app.get("https://sub.wyzie.ru/search", params = params, headers = browserHeaders).text
+            val arr = JSONArray(body)
+            var count = 0
+            for (i in 0 until arr.length()) {
+                if (count >= 5) break
+                val o = arr.optJSONObject(i) ?: continue
+                val url = o.str("url") ?: continue
+                if (!seen.add(url)) continue
+                count++
+                callback.invoke(SubtitleFile("tr", url))
+            }
+        }
+    }
+
     // ───────────────────────── Linkler ─────────────────────────
 
     override suspend fun loadLinks(
@@ -438,10 +556,17 @@ class DiziFilmIzle : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val resp = app.get(data, headers = browserHeaders)
+        val pageUrl = data.substringBefore(SUBS_MARK)
+        val meta = data.substringAfter(SUBS_MARK, "")
+        val imdbId = meta.substringBefore('&').takeIf { it.startsWith("tt") }
+        val subSeason = Regex("""(?:^|&)s=(\d+)""").find(meta)?.groupValues?.get(1)?.toIntOrNull()
+        val subEpisode = Regex("""(?:^|&)e=(\d+)""").find(meta)?.groupValues?.get(1)?.toIntOrNull()
+
+        val resp = app.get(pageUrl, headers = browserHeaders)
         val text = resp.text.replace("\\\\/", "/").replace("\\/", "/").replace("\\\"", "\"")
         var found = false
         val seen = mutableSetOf<String>()
+        val seenSubs = mutableSetOf<String>()
 
         suspend fun emit(stream: String, label: String, referer: String) {
             if (!stream.startsWith("http") || !seen.add(stream)) return
@@ -456,36 +581,50 @@ class DiziFilmIzle : MainAPI() {
             found = true
         }
 
+        // Sayfadaki altyazılar
+        scanSubs(text, pageUrl, seenSubs, subtitleCallback)
+
         val allEmbeds = Regex("""https?://[^"'\s<>]+/embed/[^"'\s<>]+""")
-            .findAll(text).map { it.value }.filter { it != data }.toList()
-        val currentEpisode = Regex("""/bolum-(\d+)""").find(data)?.groupValues?.get(1)?.toIntOrNull()
+            .findAll(text).map { it.value }.filter { it != pageUrl }.toList()
+        val currentEpisode = Regex("""/bolum-(\d+)""").find(pageUrl)?.groupValues?.get(1)?.toIntOrNull()
         val embeds = currentEpisode?.let { number -> allEmbeds.getOrNull(number - 1)?.let { setOf(it) } }
             ?: allEmbeds.toSet()
         for (embed in embeds) {
             val player = runCatching {
-                app.get(embed, headers = browserHeaders, referer = data).text
+                app.get(embed, headers = browserHeaders, referer = pageUrl).text
             }.getOrNull() ?: continue
-            decryptBePlayer(player)?.let { emit(it, "Vidmixi", embed) }
+            scanSubs(player, embed, seenSubs, subtitleCallback)
+            val clear = decryptBePlayer(player) ?: continue
+            scanSubs(clear, embed, seenSubs, subtitleCallback)
+            val video = runCatching { JSONObject(clear).optString("video_location").trim() }.getOrNull()
+            if (video != null && video.startsWith("http")) emit(video, "Vidmixi", embed)
         }
 
-        for (m in MEDIA.findAll(text)) emit(m.value, "Direct", data)
+        for (m in MEDIA.findAll(text)) emit(m.value, "Direct", pageUrl)
         val frames = resp.document.select("iframe").mapNotNull {
             val src = it.attr("src").ifBlank { it.attr("data-src") }.ifBlank { it.attr("vdo-src") }
             fixUrlNull(src)
         }.distinct()
         for (frame in frames) {
             if (frame.contains(".mp4") || frame.contains(".m3u8")) {
-                emit(frame, "Embed", data)
+                emit(frame, "Embed", pageUrl)
                 continue
             }
-            val inner = runCatching { app.get(frame, headers = browserHeaders, referer = data).text }.getOrNull()
+            val inner = runCatching { app.get(frame, headers = browserHeaders, referer = pageUrl).text }.getOrNull()
             if (inner != null) {
-                for (m in MEDIA.findAll(inner.replace("\\/", "/"))) emit(m.value, "Embed", frame)
+                val innerFixed = inner.replace("\\/", "/")
+                for (m in MEDIA.findAll(innerFixed)) emit(m.value, "Embed", frame)
+                scanSubs(innerFixed, frame, seenSubs, subtitleCallback)
             }
             if (loadExtractor(frame, "$mainUrl/", subtitleCallback, callback)) found = true
         }
 
-        for (m in SUBS.findAll(text)) subtitleCallback.invoke(SubtitleFile("tr", m.value))
+        // Dış kaynaklardan Türkçe altyazı (IMDb ID ile)
+        val imdb = imdbId ?: Regex("""tt\d{7,9}""").find(text)?.value
+        if (imdb != null) {
+            externalSubs(imdb, subSeason, subEpisode, seenSubs, subtitleCallback)
+        }
+
         if (!found) throw ErrorLoadingException("$name: oynatılabilir akış yok")
         return true
     }
@@ -494,7 +633,6 @@ class DiziFilmIzle : MainAPI() {
         val match = BE_PLAYER.find(html) ?: return@runCatching null
         val params = JSONObject(match.groupValues[2])
         val cipherText = Base64.getDecoder().decode(params.optString("ct"))
-        val clear = evpMd5AesCbcDecrypt(cipherText, match.groupValues[1], params.optString("s"), params.optString("iv"))
-        JSONObject(clear).optString("video_location").trim().takeIf { it.startsWith("http") }
+        evpMd5AesCbcDecrypt(cipherText, match.groupValues[1], params.optString("s"), params.optString("iv"))
     }.getOrNull()
 }
