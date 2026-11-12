@@ -50,6 +50,7 @@ jobs:
           cp DiziSol/build/*.cs3 out/
           cp RecTV/build/*.cs3 out/
           cp DiziYou/build/*.cs3 out/
+          cp DiziFilmIzle/build/*.cs3 out/
           cp SetFilmIzle/build/*.cs3 out/
           cp FilmizleHell/build/*.cs3 out/
           cp WebDramaTurkey2/build/*.cs3 out/
