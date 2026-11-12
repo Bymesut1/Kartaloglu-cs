@@ -627,6 +627,27 @@ class DiziFilmIzle : MainAPI() {
             if (!stream.startsWith("http") || !seen.add(stream)) return
             val type = if (stream.contains(".m3u8") || referer.contains("vidmixi") ||
                 referer.contains("dosyaload")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
+            // Ana m3u8 içinde BANDWIDTH Int sınırını aşıyorsa ExoPlayer çöker (NumberFormatException).
+            // Bu durumda alt (variant) listeleri doğrudan veriyoruz.
+            if (type == ExtractorLinkType.M3U8) {
+                val variants = oversizedMasterVariants(stream, referer)
+                if (variants != null) {
+                    for ((vUrl, vLabel) in variants) {
+                        if (!seen.add(vUrl)) continue
+                        val vName = "$label $vLabel".trim()
+                        val vQuality = getQualityFromName(vLabel)
+                        callback.invoke(newExtractorLink(name, vName, vUrl, ExtractorLinkType.M3U8) {
+                            this.referer = referer
+                            this.headers = browserHeaders
+                            this.quality = vQuality
+                        })
+                        found = true
+                    }
+                    return
+                }
+            }
+
             val quality = getQualityFromName(label)
             callback.invoke(newExtractorLink(name, label, stream, type) {
                 this.referer = referer
@@ -687,6 +708,30 @@ class DiziFilmIzle : MainAPI() {
 
         if (!found) throw ErrorLoadingException("$name: oynatılabilir akış yok")
         return true
+    }
+
+    // Ana m3u8'de BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (örn. 2462697000) ExoPlayer
+    // "Source error / NumberFormatException" verir. Böyle bir liste varsa alt listeleri çıkarır.
+    private suspend fun oversizedMasterVariants(master: String, referer: String): List<Pair<String, String>>? {
+        val body = runCatching {
+            app.get(master, headers = browserHeaders, referer = referer).text
+        }.getOrNull() ?: return null
+        if (!body.contains("#EXT-X-STREAM-INF")) return null
+        val tooBig = Regex("""BANDWIDTH=(\d+)""").findAll(body)
+            .any { (it.groupValues[1].toLongOrNull() ?: 0L) > Int.MAX_VALUE.toLong() }
+        if (!tooBig) return null
+
+        val lines = body.lines().map { it.trim() }
+        val result = mutableListOf<Pair<String, String>>()
+        for (i in lines.indices) {
+            val line = lines[i]
+            if (!line.startsWith("#EXT-X-STREAM-INF")) continue
+            val uriLine = lines.drop(i + 1).firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: continue
+            val abs = runCatching { URI(master).resolve(uriLine).toString() }.getOrNull() ?: continue
+            val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)?.groupValues?.get(1)
+            result.add(abs to (if (height != null) "${height}p" else ""))
+        }
+        return result.ifEmpty { null }
     }
 
     private fun decryptBePlayer(html: String): String? = runCatching {
