@@ -689,19 +689,20 @@ class DiziFilmIzle : MainAPI() {
         callback: (SubtitleFile) -> Unit
     ) {
         val text = rawText.replace("\\/", "/")
+        fun isThumb(u: String) = u.contains("thumb", ignoreCase = true) || u.contains("sprite", ignoreCase = true)
         for (tagMatch in TRACK.findAll(text)) {
             val tag = tagMatch.value
             val src = htmlAttr(tag, "src") ?: continue
             val kind = htmlAttr(tag, "kind")
             if (kind != null && !kind.equals("subtitles", true) && !kind.equals("captions", true)) continue
             val url = absUrl(src, base) ?: continue
-            if (!seen.add(url)) continue
+            if (isThumb(url) || !seen.add(url)) continue
             val hint = (htmlAttr(tag, "srclang") ?: "") + " " + (htmlAttr(tag, "label") ?: "") + " " + url
             callback.invoke(newSubtitleFile(subLang(hint), url) { this.headers = subHeaders(base) })
         }
         for (m in SUBS.findAll(text)) {
             val url = m.value
-            if (!seen.add(url)) continue
+            if (isThumb(url) || !seen.add(url)) continue
             val from = maxOf(0, m.range.first - 80)
             val to = minOf(text.length, m.range.last + 80)
             callback.invoke(newSubtitleFile(subLang(text.substring(from, to) + " " + url), url) { this.headers = subHeaders(base) })
@@ -710,7 +711,7 @@ class DiziFilmIzle : MainAPI() {
             val rel = m.groupValues[1]
             if (rel.startsWith("http")) continue
             val url = absUrl(rel, base) ?: continue
-            if (!seen.add(url)) continue
+            if (isThumb(url) || !seen.add(url)) continue
             val from = maxOf(0, m.range.first - 80)
             val to = minOf(text.length, m.range.last + 80)
             callback.invoke(newSubtitleFile(subLang(text.substring(from, to) + " " + url), url) { this.headers = subHeaders(base) })
@@ -927,17 +928,25 @@ class DiziFilmIzle : MainAPI() {
     // Ana m3u8'i indirip inceler. BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (ExoPlayer çöker) ya da
     // ayrı ses listeleri (EXT-X-MEDIA TYPE=AUDIO URI=...) varsa düzeltilmiş kopyasını yerel sunucudan verir.
     private suspend fun specialMaster(master: String, referer: String): OversizedMaster? {
+        val tag = "DiziFilmIzle"
         val body = runCatching {
             app.get(master, headers = browserHeaders, referer = referer).text
+        }.onFailure {
+            android.util.Log.e(tag, "specialMaster: ana liste indirilemedi: ${it.message} url=$master")
         }.getOrNull() ?: return null
-        if (!body.contains("#EXT-X-STREAM-INF")) return null
         val tooBig = BANDWIDTH_RE.findAll(body)
             .any { (it.groupValues[1].toLongOrNull() ?: 0L) > Int.MAX_VALUE.toLong() }
         val lines = body.lines().map { it.trim() }
-        val hasAudioList = lines.any {
-            it.startsWith("#EXT-X-MEDIA") && it.contains("TYPE=AUDIO") && it.contains("URI=\"")
-        }
-        if (!tooBig && !hasAudioList) return null
+        val hasMediaList = lines.any { it.startsWith("#EXT-X-MEDIA") && it.contains("URI=\"") }
+        val forceProxy = referer.contains("dosyaload")
+        android.util.Log.i(
+            tag,
+            "specialMaster: len=${body.length} streamInf=${body.contains("#EXT-X-STREAM-INF")} " +
+                "tooBig=$tooBig mediaList=$hasMediaList forceProxy=$forceProxy head=" +
+                body.take(900).replace("\n", " | ")
+        )
+        if (!body.contains("#EXT-X-STREAM-INF")) return null
+        if (!tooBig && !hasMediaList && !forceProxy) return null
 
         val fixedLines = ArrayList<String>()
         val variants = mutableListOf<Pair<String, String>>()
