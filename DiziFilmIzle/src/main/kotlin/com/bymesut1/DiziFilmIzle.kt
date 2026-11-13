@@ -181,7 +181,8 @@ private data class OversizedMaster(
     val proxyUrl: String?,
     val maxHeight: Int,
     val variants: List<Pair<String, String>>,
-    val oversized: Boolean
+    val oversized: Boolean,
+    val headers: Map<String, String>
 )
 
 private val BANDWIDTH_RE = Regex("""BANDWIDTH=(\d+)""")
@@ -200,7 +201,12 @@ private fun absolutizePlaylist(text: String, base: String): String =
         }
     }
 
-private data class ProxyEntry(val content: String?, val upstream: String?, val referer: String?)
+private data class ProxyEntry(
+    val content: String?,
+    val upstream: String?,
+    val referer: String?,
+    val headers: Map<String, String> = emptyMap()
+)
 
 // ExoPlayer'ın doğrudan açamadığı (BANDWIDTH > Int.MAX, ayrı ses listesi 404 vb.) ana m3u8'i
 // 127.0.0.1 üzerinden düzeltilmiş halde sunan küçük yerel sunucu. Alt listeleri (video/ses)
@@ -235,6 +241,9 @@ private object LocalHlsServer {
             conn.setRequestProperty("User-Agent", UA)
             conn.setRequestProperty("Accept", "*/*")
             conn.setRequestProperty("Accept-Language", "tr-TR,tr;q=0.9,en;q=0.8")
+            for ((k, v) in entry.headers) {
+                if (!k.equals("Accept-Encoding", true)) conn.setRequestProperty(k, v)
+            }
             val ref = entry.referer
             if (!ref.isNullOrBlank()) {
                 conn.setRequestProperty("Referer", ref)
@@ -304,8 +313,8 @@ private object LocalHlsServer {
 
     fun publish(content: String): String? = register(ProxyEntry(content, null, null))
 
-    fun proxyPlaylist(upstream: String, referer: String): String? =
-        register(ProxyEntry(null, upstream, referer))
+    fun proxyPlaylist(upstream: String, referer: String, headers: Map<String, String> = emptyMap()): String? =
+        register(ProxyEntry(null, upstream, referer, headers))
 }
 
 // ───────────────────────── Eklenti ─────────────────────────
@@ -820,7 +829,7 @@ class DiziFilmIzle : MainAPI() {
             subtitleCallback.invoke(sub)
         }
 
-        suspend fun emit(stream: String, label: String, referer: String) {
+        suspend fun emit(stream: String, label: String, referer: String, extra: Map<String, String> = emptyMap()) {
             if (!stream.startsWith("http") || !seen.add(stream)) return
             val type = if (stream.contains(".m3u8") || referer.contains("vidmixi") ||
                 referer.contains("dosyaload")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -829,15 +838,17 @@ class DiziFilmIzle : MainAPI() {
             // ana listeyi (ses parçalarıyla birlikte) yerel sunucudan veriyoruz.
             var directQuality = getQualityFromName(label)
             var directName = label
+            var linkHeaders = browserHeaders + extra
             if (type == ExtractorLinkType.M3U8) {
-                val fixed = specialMaster(stream, referer)
+                val fixed = specialMaster(stream, referer, browserHeaders + extra)
                 if (fixed != null) {
+                    linkHeaders = fixed.headers
                     if (fixed.proxyUrl != null) {
                         val pName = if (fixed.maxHeight > 0) "$label ${fixed.maxHeight}p" else label
                         val pQuality = if (fixed.maxHeight > 0) fixed.maxHeight else directQuality
                         callback.invoke(newExtractorLink(name, pName, fixed.proxyUrl, ExtractorLinkType.M3U8) {
                             this.referer = referer
-                            this.headers = browserHeaders
+                            this.headers = linkHeaders
                             this.quality = pQuality
                         })
                         found = true
@@ -848,7 +859,7 @@ class DiziFilmIzle : MainAPI() {
                             if (!seen.add(vUrl)) continue
                             callback.invoke(newExtractorLink(name, "$label $vLabel (yedek)".trim(), vUrl, ExtractorLinkType.M3U8) {
                                 this.referer = referer
-                                this.headers = browserHeaders
+                                this.headers = linkHeaders
                                 this.quality = 0
                             })
                             found = true
@@ -866,7 +877,7 @@ class DiziFilmIzle : MainAPI() {
             val quality = directQuality
             callback.invoke(newExtractorLink(name, directName, stream, type) {
                 this.referer = referer
-                this.headers = browserHeaders
+                this.headers = linkHeaders
                 this.quality = quality
             })
             found = true
@@ -881,9 +892,18 @@ class DiziFilmIzle : MainAPI() {
         val embeds = currentEpisode?.let { number -> allEmbeds.getOrNull(number - 1)?.let { setOf(it) } }
             ?: allEmbeds.toSet()
         for (embed in embeds) {
-            val player = runCatching {
-                app.get(embed, headers = browserHeaders, referer = pageUrl).text
+            val playerResp = runCatching {
+                app.get(embed, headers = browserHeaders, referer = pageUrl)
             }.getOrNull() ?: continue
+            val player = playerResp.text
+            val cookieHeader = runCatching {
+                playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            }.getOrDefault("")
+            val embedOrigin = runCatching { URI(embed).let { "${it.scheme}://${it.host}" } }.getOrDefault("")
+            val playerHeaders = buildMap<String, String> {
+                if (cookieHeader.isNotBlank()) put("Cookie", cookieHeader)
+                if (embedOrigin.isNotBlank()) put("Origin", embedOrigin)
+            }
             scanSubs(player, embed, seenSubs, subCb)
             val clear = decryptBePlayer(player)
             val video = clear?.let {
@@ -891,7 +911,12 @@ class DiziFilmIzle : MainAPI() {
             }
             if (clear != null) scanSubs(clear, embed, seenSubs, subCb)
             vidmixiSubs(embed, listOfNotNull(video, clear, player, text), seenSubs, subCb)
-            if (video != null && video.startsWith("http")) emit(video, "Vidmixi", embed)
+            android.util.Log.i(
+                "DiziFilmIzle",
+                "embed=$embed cookies=${cookieHeader.length} video=$video clear=" +
+                    (clear ?: "null").take(1500).replace("\n", " ")
+            )
+            if (video != null && video.startsWith("http")) emit(video, "Vidmixi", embed, playerHeaders)
         }
 
         for (m in MEDIA.findAll(text)) emit(m.value, "Direct", pageUrl)
@@ -927,13 +952,31 @@ class DiziFilmIzle : MainAPI() {
 
     // Ana m3u8'i indirip inceler. BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (ExoPlayer çöker) ya da
     // ayrı ses listeleri (EXT-X-MEDIA TYPE=AUDIO URI=...) varsa düzeltilmiş kopyasını yerel sunucudan verir.
-    private suspend fun specialMaster(master: String, referer: String): OversizedMaster? {
+    private suspend fun specialMaster(master: String, referer: String, baseHeaders: Map<String, String>): OversizedMaster? {
         val tag = "DiziFilmIzle"
-        val body = runCatching {
-            app.get(master, headers = browserHeaders, referer = referer).text
-        }.onFailure {
-            android.util.Log.e(tag, "specialMaster: ana liste indirilemedi: ${it.message} url=$master")
-        }.getOrNull() ?: return null
+        // Farklı başlık kombinasyonlarını dene (çerez / Origin / XHR); ilk geçerli listeyi kullan.
+        val originRoot = runCatching { URI(referer).let { "${it.scheme}://${it.host}/" } }.getOrDefault(referer)
+        val attempts = listOf(
+            baseHeaders to referer,
+            (baseHeaders + mapOf("X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*")) to referer,
+            (baseHeaders - "Cookie") to referer,
+            baseHeaders to originRoot,
+            baseHeaders to "https://dizifilmizle.to/",
+            browserHeaders to referer
+        )
+        var body: String? = null
+        var usedHeaders: Map<String, String> = baseHeaders
+        for ((index, attempt) in attempts.withIndex()) {
+            val (h, ref) = attempt
+            val r = runCatching { app.get(master, headers = h, referer = ref) }.getOrNull()
+            android.util.Log.i(tag, "specialMaster: deneme $index -> HTTP ${r?.code} len=${r?.text?.length}")
+            if (r != null && r.code == 200 && r.text.contains("#EXTM3U")) {
+                body = r.text
+                usedHeaders = h
+                break
+            }
+        }
+        if (body == null) return null
         val tooBig = BANDWIDTH_RE.findAll(body)
             .any { (it.groupValues[1].toLongOrNull() ?: 0L) > Int.MAX_VALUE.toLong() }
         val lines = body.lines().map { it.trim() }
@@ -963,7 +1006,7 @@ class DiziFilmIzle : MainAPI() {
                     val isAudio = l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO")
                     l = URI_ATTR_RE.replace(l) { m ->
                         val abs = absUrl(m.groupValues[1], master) ?: m.groupValues[1]
-                        val target = if (isAudio) LocalHlsServer.proxyPlaylist(abs, referer) ?: abs else abs
+                        val target = if (isAudio) LocalHlsServer.proxyPlaylist(abs, referer, usedHeaders) ?: abs else abs
                         "URI=\"" + target + "\""
                     }
                     if (l.startsWith("#EXT-X-STREAM-INF")) {
@@ -976,12 +1019,12 @@ class DiziFilmIzle : MainAPI() {
                     val abs = absUrl(line, master) ?: line
                     variants.add(abs to (pendingVariantHeight?.let { "${it}p" } ?: ""))
                     pendingVariantHeight = null
-                    fixedLines.add(LocalHlsServer.proxyPlaylist(abs, referer) ?: abs)
+                    fixedLines.add(LocalHlsServer.proxyPlaylist(abs, referer, usedHeaders) ?: abs)
                 }
             }
         }
         val proxy = LocalHlsServer.publish(fixedLines.joinToString("\n"))
-        return OversizedMaster(proxy, maxHeight, variants, tooBig)
+        return OversizedMaster(proxy, maxHeight, variants, tooBig, usedHeaders)
     }
 
     private fun decryptBePlayer(html: String): String? = runCatching {
