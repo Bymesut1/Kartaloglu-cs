@@ -180,13 +180,34 @@ private data class SiteEpisode(
 private data class OversizedMaster(
     val proxyUrl: String?,
     val maxHeight: Int,
-    val variants: List<Pair<String, String>>
+    val variants: List<Pair<String, String>>,
+    val oversized: Boolean
 )
 
-// ExoPlayer'ın okuyamadığı (BANDWIDTH > Int.MAX) ana m3u8'i düzeltilmiş haliyle
-// 127.0.0.1 üzerinden sunan küçük yerel sunucu. Ses/altyazı grupları korunur.
+private val BANDWIDTH_RE = Regex("""BANDWIDTH=(\d+)""")
+private val URI_ATTR_RE = Regex("""URI="([^"]*)"""")
+
+// Oynatma listesindeki göreli adresleri tam adrese çevirir.
+private fun absolutizePlaylist(text: String, base: String): String =
+    text.lines().joinToString("\n") { raw ->
+        val line = raw.trim()
+        when {
+            line.isEmpty() -> line
+            line.startsWith("#") -> URI_ATTR_RE.replace(line) { m ->
+                "URI=\"" + (absUrl(m.groupValues[1], base) ?: m.groupValues[1]) + "\""
+            }
+            else -> absUrl(line, base) ?: line
+        }
+    }
+
+private data class ProxyEntry(val content: String?, val upstream: String?, val referer: String?)
+
+// ExoPlayer'ın doğrudan açamadığı (BANDWIDTH > Int.MAX, ayrı ses listesi 404 vb.) ana m3u8'i
+// 127.0.0.1 üzerinden düzeltilmiş halde sunan küçük yerel sunucu. Alt listeleri (video/ses)
+// de bu sunucu kendi başlıklarıyla (Referer/Origin/User-Agent) çekip tam adreslerle verir.
 private object LocalHlsServer {
-    private val store = LinkedHashMap<String, String>()
+    private const val TAG = "DiziFilmIzleProxy"
+    private val store = LinkedHashMap<String, ProxyEntry>()
     private var server: java.net.ServerSocket? = null
 
     @Synchronized
@@ -204,9 +225,41 @@ private object LocalHlsServer {
         return created.localPort
     }
 
+    private fun fetch(entry: ProxyEntry): String? {
+        val upstream = entry.upstream ?: return null
+        return try {
+            val conn = java.net.URL(upstream).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 15000
+            conn.readTimeout = 25000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", UA)
+            conn.setRequestProperty("Accept", "*/*")
+            conn.setRequestProperty("Accept-Language", "tr-TR,tr;q=0.9,en;q=0.8")
+            val ref = entry.referer
+            if (!ref.isNullOrBlank()) {
+                conn.setRequestProperty("Referer", ref)
+                val u = runCatching { URI(ref) }.getOrNull()
+                if (u?.scheme != null && u.host != null) {
+                    conn.setRequestProperty("Origin", u.scheme + "://" + u.host)
+                }
+            }
+            val code = conn.responseCode
+            if (code != 200) {
+                android.util.Log.e(TAG, "upstream HTTP $code for $upstream")
+                null
+            } else {
+                val text = conn.inputStream.bufferedReader().use { it.readText() }
+                absolutizePlaylist(text, upstream)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "upstream failed for $upstream: ${e.message}")
+            null
+        }
+    }
+
     private fun handle(client: java.net.Socket) {
         client.use { socket ->
-            runCatching {
+            try {
                 val reader = socket.getInputStream().bufferedReader()
                 val first = reader.readLine() ?: return
                 while (true) {
@@ -215,7 +268,8 @@ private object LocalHlsServer {
                 }
                 val id = first.split(" ").getOrNull(1)
                     ?.substringBefore('?')?.substringAfterLast('/')?.substringBefore('.')
-                val body = synchronized(store) { store[id] }
+                val entry = synchronized(store) { store[id] }
+                val body = if (entry == null) null else (entry.content ?: fetch(entry))
                 val out = socket.getOutputStream()
                 if (body == null) {
                     out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
@@ -229,19 +283,29 @@ private object LocalHlsServer {
                     out.write(bytes)
                 }
                 out.flush()
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "handle failed: ${e.message}")
             }
         }
     }
 
-    fun publish(content: String): String? = runCatching {
+    private fun register(entry: ProxyEntry): String? = try {
         val port = ensureStarted()
         val id = java.util.UUID.randomUUID().toString().replace("-", "")
         synchronized(store) {
-            store[id] = content
-            while (store.size > 20) store.remove(store.keys.first())
+            store[id] = entry
+            while (store.size > 60) store.remove(store.keys.first())
         }
         "http://127.0.0.1:$port/$id.m3u8"
-    }.getOrNull()
+    } catch (e: Exception) {
+        android.util.Log.e(TAG, "register failed: ${e.message}")
+        null
+    }
+
+    fun publish(content: String): String? = register(ProxyEntry(content, null, null))
+
+    fun proxyPlaylist(upstream: String, referer: String): String? =
+        register(ProxyEntry(null, upstream, referer))
 }
 
 // ───────────────────────── Eklenti ─────────────────────────
@@ -519,14 +583,40 @@ class DiziFilmIzle : MainAPI() {
         val siteEpisodes = allSiteEpisodes.filter { it.href.contains(pageSlug, ignoreCase = true) }
             .ifEmpty { allSiteEpisodes }
 
-        if (siteEpisodes.isNotEmpty()) {
+        val isDiziUrl = !isFilmPage && url.substringBefore('?').contains("/dizi/")
+        if (!isFilmPage && (siteEpisodes.isNotEmpty() || isDiziUrl)) {
             val tmdb = tmdbLookup(title, year, true, rawImdb, strongImdb != null)
             val tmdbId = tmdb?.optInt("id") ?: 0
             val imdbId = tmdbImdbId(tmdb) ?: strongImdb
             val seasonCache = HashMap<Int, Map<Int, JSONObject>>()
             val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
-            val episodes = siteEpisodes.mapNotNull { ep ->
+            // Sayfada yalnızca ilk sezon görünüyorsa diğer sezon/bölümleri TMDB'den tamamla
+            // (adres kalıbı: /dizi/<slug>/sezon-<s>/bolum-<b>).
+            val merged = LinkedHashMap<String, SiteEpisode>()
+            for (e in siteEpisodes) merged["${e.season ?: 1}-${e.episode ?: e.href}"] = e
+            if (tmdbId > 0 && isDiziUrl) {
+                val seasonArr = tmdb?.optJSONArray("seasons")
+                val seasonNums = (0 until (seasonArr?.length() ?: 0)).mapNotNull { i ->
+                    seasonArr?.optJSONObject(i)?.optInt("season_number")?.takeIf { it > 0 }
+                }.ifEmpty { listOf(1) }
+                for (sNo in seasonNums) {
+                    val map = seasonCache.getOrPut(sNo) { tmdbSeason(tmdbId, sNo) }
+                    for ((eNo, info) in map) {
+                        val key = "$sNo-$eNo"
+                        if (merged.containsKey(key)) continue
+                        merged[key] = SiteEpisode(
+                            "$mainUrl/dizi/$pageSlug/sezon-$sNo/bolum-$eNo",
+                            info.str("name") ?: "Bölüm $eNo",
+                            sNo,
+                            eNo
+                        )
+                    }
+                }
+            }
+            val allEpisodes = merged.values.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
+
+            val episodes = allEpisodes.mapNotNull { ep ->
                 val info = if (tmdbId > 0 && ep.episode != null) {
                     val s = ep.season ?: 1
                     val map = seasonCache.getOrPut(s) { tmdbSeason(tmdbId, s) }
@@ -734,14 +824,16 @@ class DiziFilmIzle : MainAPI() {
             val type = if (stream.contains(".m3u8") || referer.contains("vidmixi") ||
                 referer.contains("dosyaload")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
-            // Ana m3u8 içinde BANDWIDTH Int sınırını aşıyorsa ExoPlayer çöker (NumberFormatException).
-            // Düzeltilmiş ana listeyi (ses parçalarıyla birlikte) yerel sunucudan veriyoruz.
+            // Ana m3u8 doğrudan açılamıyorsa (BANDWIDTH > Int.MAX veya ayrı ses listesi) düzeltilmiş
+            // ana listeyi (ses parçalarıyla birlikte) yerel sunucudan veriyoruz.
+            var directQuality = getQualityFromName(label)
+            var directName = label
             if (type == ExtractorLinkType.M3U8) {
-                val fixed = oversizedMaster(stream, referer)
+                val fixed = specialMaster(stream, referer)
                 if (fixed != null) {
                     if (fixed.proxyUrl != null) {
                         val pName = if (fixed.maxHeight > 0) "$label ${fixed.maxHeight}p" else label
-                        val pQuality = if (fixed.maxHeight > 0) fixed.maxHeight else getQualityFromName(label)
+                        val pQuality = if (fixed.maxHeight > 0) fixed.maxHeight else directQuality
                         callback.invoke(newExtractorLink(name, pName, fixed.proxyUrl, ExtractorLinkType.M3U8) {
                             this.referer = referer
                             this.headers = browserHeaders
@@ -749,22 +841,29 @@ class DiziFilmIzle : MainAPI() {
                         })
                         found = true
                     }
-                    // Yedek: doğrudan alt listeler (ses ayrı parçaysa sessiz olabilir)
-                    for ((vUrl, vLabel) in fixed.variants) {
-                        if (!seen.add(vUrl)) continue
-                        callback.invoke(newExtractorLink(name, "$label $vLabel (yedek)".trim(), vUrl, ExtractorLinkType.M3U8) {
-                            this.referer = referer
-                            this.headers = browserHeaders
-                            this.quality = 0
-                        })
-                        found = true
+                    if (fixed.oversized) {
+                        // Doğrudan ana liste çöker: yedek olarak alt listeleri ver
+                        for ((vUrl, vLabel) in fixed.variants) {
+                            if (!seen.add(vUrl)) continue
+                            callback.invoke(newExtractorLink(name, "$label $vLabel (yedek)".trim(), vUrl, ExtractorLinkType.M3U8) {
+                                this.referer = referer
+                                this.headers = browserHeaders
+                                this.quality = 0
+                            })
+                            found = true
+                        }
+                        return
                     }
-                    return
+                    // Doğrudan ana liste çalışabilir: yedek olarak düşük öncelikle ekle
+                    if (fixed.proxyUrl != null) {
+                        directQuality = 0
+                        directName = "$label (yedek)"
+                    }
                 }
             }
 
-            val quality = getQualityFromName(label)
-            callback.invoke(newExtractorLink(name, label, stream, type) {
+            val quality = directQuality
+            callback.invoke(newExtractorLink(name, directName, stream, type) {
                 this.referer = referer
                 this.headers = browserHeaders
                 this.quality = quality
@@ -825,50 +924,55 @@ class DiziFilmIzle : MainAPI() {
         return true
     }
 
-    // Ana m3u8'de BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (örn. 2462697000) ExoPlayer
-    // "Source error / NumberFormatException" verir. Böyle bir liste varsa düzeltilmiş kopyasını üretir.
-    private suspend fun oversizedMaster(master: String, referer: String): OversizedMaster? {
+    // Ana m3u8'i indirip inceler. BANDWIDTH değeri Int.MAX_VALUE'dan büyükse (ExoPlayer çöker) ya da
+    // ayrı ses listeleri (EXT-X-MEDIA TYPE=AUDIO URI=...) varsa düzeltilmiş kopyasını yerel sunucudan verir.
+    private suspend fun specialMaster(master: String, referer: String): OversizedMaster? {
         val body = runCatching {
             app.get(master, headers = browserHeaders, referer = referer).text
         }.getOrNull() ?: return null
         if (!body.contains("#EXT-X-STREAM-INF")) return null
-        val bandwidth = Regex("""BANDWIDTH=(\d+)""")
-        val tooBig = bandwidth.findAll(body)
+        val tooBig = BANDWIDTH_RE.findAll(body)
             .any { (it.groupValues[1].toLongOrNull() ?: 0L) > Int.MAX_VALUE.toLong() }
-        if (!tooBig) return null
-
-        val uriAttr = Regex("""URI="([^"]*)"""")
         val lines = body.lines().map { it.trim() }
-        val fixedLines = lines.map { line ->
+        val hasAudioList = lines.any {
+            it.startsWith("#EXT-X-MEDIA") && it.contains("TYPE=AUDIO") && it.contains("URI=\"")
+        }
+        if (!tooBig && !hasAudioList) return null
+
+        val fixedLines = ArrayList<String>()
+        val variants = mutableListOf<Pair<String, String>>()
+        var maxHeight = 0
+        var pendingVariantHeight: Int? = null
+        for (line in lines) {
             when {
-                line.isEmpty() -> line
+                line.isEmpty() -> fixedLines.add(line)
                 line.startsWith("#") -> {
-                    val clamped = bandwidth.replace(line) { m ->
+                    var l = BANDWIDTH_RE.replace(line) { m ->
                         val v = m.groupValues[1].toLongOrNull() ?: 0L
                         m.value.substringBefore('=') + "=" + (if (v > Int.MAX_VALUE.toLong()) 2000000000L else v)
                     }
-                    uriAttr.replace(clamped) { m ->
+                    val isAudio = l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO")
+                    l = URI_ATTR_RE.replace(l) { m ->
                         val abs = absUrl(m.groupValues[1], master) ?: m.groupValues[1]
-                        "URI=\"" + abs + "\""
+                        val target = if (isAudio) LocalHlsServer.proxyPlaylist(abs, referer) ?: abs else abs
+                        "URI=\"" + target + "\""
                     }
+                    if (l.startsWith("#EXT-X-STREAM-INF")) {
+                        pendingVariantHeight = Regex("""RESOLUTION=\d+x(\d+)""").find(l)?.groupValues?.get(1)?.toIntOrNull()
+                        if (pendingVariantHeight != null && pendingVariantHeight > maxHeight) maxHeight = pendingVariantHeight
+                    }
+                    fixedLines.add(l)
                 }
-                else -> absUrl(line, master) ?: line
+                else -> {
+                    val abs = absUrl(line, master) ?: line
+                    variants.add(abs to (pendingVariantHeight?.let { "${it}p" } ?: ""))
+                    pendingVariantHeight = null
+                    fixedLines.add(LocalHlsServer.proxyPlaylist(abs, referer) ?: abs)
+                }
             }
         }
-
-        val variants = mutableListOf<Pair<String, String>>()
-        var maxHeight = 0
-        for (i in lines.indices) {
-            val line = lines[i]
-            if (!line.startsWith("#EXT-X-STREAM-INF")) continue
-            val uriLine = lines.drop(i + 1).firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: continue
-            val abs = absUrl(uriLine, master) ?: continue
-            val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull()
-            if (height != null && height > maxHeight) maxHeight = height
-            variants.add(abs to (if (height != null) "${height}p" else ""))
-        }
         val proxy = LocalHlsServer.publish(fixedLines.joinToString("\n"))
-        return OversizedMaster(proxy, maxHeight, variants)
+        return OversizedMaster(proxy, maxHeight, variants, tooBig)
     }
 
     private fun decryptBePlayer(html: String): String? = runCatching {
