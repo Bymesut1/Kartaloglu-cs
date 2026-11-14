@@ -1,4 +1,4 @@
-version = 4
+version = 5
 
 android {
     namespace = "com.bymesut1"
@@ -13,5 +13,5 @@ cloudstream {
 
     tvTypes = listOf("Movie", "TvSeries", "Live")
 
-    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/RecTV/Rec-Tv.png"
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/RecTV/Rec-TV.png"
 }
