@@ -290,7 +290,7 @@ class Filmmodu : MainAPI() {
     // ---------------- TMDB ----------------
 
     // TMDB API anahtarını buraya yaz (themoviedb.org > Ayarlar > API). Boş/yer tutucu kalırsa TMDB atlanır, site bilgileri kullanılır.
-    private val tmdbApiKey = "BURAYA_TMDB_API_KEY"
+    private val tmdbApiKey = "000316508321ce461cf81e7c6815eec7"
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbPoster = "https://image.tmdb.org/t/p/w500"
     private val tmdbBackdrop = "https://image.tmdb.org/t/p/original"
