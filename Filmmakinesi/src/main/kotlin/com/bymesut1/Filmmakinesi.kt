@@ -18,7 +18,7 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 class Filmmakinesi : MainAPI() {
-    override var mainUrl = "https://filmmakinesi.to"
+    override var mainUrl = "https://www.filmmakinesi.to"
     override var name = "Fimmakinesi"
     override var lang = "tr"
     override val hasMainPage = true
