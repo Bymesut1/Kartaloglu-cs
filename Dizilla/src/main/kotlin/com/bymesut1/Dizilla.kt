@@ -11,6 +11,7 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.nodes.Document
 import java.net.InetAddress
+import java.security.MessageDigest
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
@@ -633,6 +634,43 @@ class Dizilla : MainAPI() {
         }
     }
 
+    // Oynatıcının "gate" doğrulaması (proof-of-work): window.NP_GATE fonksiyonunu sayfadan okuyup aynısını çözer.
+    //   _key = fromCharCode(...) ; sha256(_key + n + "." + sayac)[idx] & mask == 0  -> sayac
+    // NP_GATE yoksa oynatıcının varsayılanı: sha256(n + ":" + sayac)[0] >>> (32-bits) == 0
+    private fun solveGate(raw: String, n: String, bits: Int): String? {
+        var key: String? = null
+        var idx = 0
+        var mask = 4095
+        val i = raw.indexOf("NP_GATE")
+        if (i >= 0) {
+            val seg = raw.substring(i, minOf(raw.length, i + 900))
+            Regex("""fromCharCode\(([\d,\s]+)\)""").find(seg)?.let { m ->
+                key = m.groupValues[1].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    .map { it.toInt().toChar() }.joinToString("")
+            }
+            Regex("""\)\[(\d+)\]\s*&\s*(\d+)\s*\)\s*===?\s*0""").find(seg)?.let { m ->
+                idx = m.groupValues[1].toInt()
+                mask = m.groupValues[2].toInt()
+            }
+        }
+        d("gate n=$n bits=$bits key=${key != null} idx=$idx mask=$mask")
+        val md = MessageDigest.getInstance("SHA-256")
+        for (k in 0 until 50_000_000) {
+            val input = if (key != null) key + n + "." + k else "$n:$k"
+            val h = md.digest(input.toByteArray(Charsets.UTF_8))
+            val o = idx * 4
+            if (o + 3 >= h.size) return null
+            val w = ((h[o].toInt() and 0xff) shl 24) or ((h[o + 1].toInt() and 0xff) shl 16) or
+                ((h[o + 2].toInt() and 0xff) shl 8) or (h[o + 3].toInt() and 0xff)
+            val ok = if (key != null) (w and mask) == 0 else (w ushr (32 - bits)) == 0
+            if (ok) {
+                d("gate cozuldu sayac=$k")
+                return k.toString()
+            }
+        }
+        return null
+    }
+
     // Adres gerçekten #EXTM3U döndürüyor mu? Farklı Referer/Origin kombinasyonlarıyla dener; çalışan başlığı döndürür.
     private suspend fun probeList(u: String, f: String, origin: String): Pair<Map<String, String>?, Int> {
         val sets = listOf(
@@ -1133,25 +1171,38 @@ class Dizilla : MainAPI() {
             val np = npConfig(rawIfr)
             if (np != null) {
                 val srcs = np.optJSONArray("sources")
+                var gp: String? = null
+                val gt = np.optJSONObject("gate")
+                if (gt != null && gt.optString("n", "").isNotBlank()) {
+                    gp = try {
+                        solveGate(rawIfr, gt.optString("n"), gt.optInt("b", 12))
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        null
+                    }
+                }
+                fun withGate(u: String): String =
+                    if (gp != null && u.contains(".php?v=") && !u.contains("&p=")) "$u&p=$gp" else u
                 // tanı: NP_CONFIG anahtarları (uzun değerler kısaltılır)
                 d("np ham: " + np.toString().replace(Regex("[A-Za-z0-9_%=-]{60,}"), "<tok>").take(1200))
                 if (srcs != null) {
                     for (i in 0 until srcs.length()) {
                         val so = srcs.optJSONObject(i) ?: continue
-                        val master = so.optString("master", "")
+                        val master = withGate(so.optString("master", ""))
                         val title = so.optString("title", "")
                         val cand = LinkedHashSet<String>()
                         if (master.isNotBlank()) cand.add(fixProto(master))
                         val strs = ArrayList<String>()
                         jsonStrings(so, strs)
                         for (v in strs) {
-                            val u = fixProto(v.replace("\\/", "/").trim())
+                            val u = withGate(fixProto(v.replace("\\/", "/").trim()))
                             if (u.startsWith("/") && u.contains(".php?v=")) cand.add(origin + u)
                             else if (u.startsWith("http") && (u.contains(".php?v=") || u.contains(".m3u8"))) cand.add(u)
                         }
                         // sayfanın / çözülmüş metinlerin her yerindeki *.php?v=<uzun token> adresleri (nl.php vb.)
                         for (t in texts) for (m in phpPlRe.findAll(t)) cand.add(fixProto(m.value))
-                        val list = cand.filter { !plSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) }.take(8)
+                        val list = cand.filter { !plSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) }
+                            .filter { gp == null || !it.contains(".php?v=") || it.contains("&p=") }.take(8)
                         d("np aday liste=${list.size} " + list.joinToString(" | ") { it.substringBefore("?").takeLast(40) })
                         val res = list.amap { u -> u to probeList(u, f, origin) }
                         var okAny = false
@@ -1175,7 +1226,7 @@ class Dizilla : MainAPI() {
                 if (sb != null) {
                     for (i in 0 until sb.length()) {
                         val so = sb.optJSONObject(i) ?: continue
-                        val su = so.optString("url", "")
+                        val su = withGate(so.optString("url", ""))
                         if (su.isBlank()) continue
                         var lb = so.optString("label", "")
                         if (lb.isBlank()) lb = so.optString("lang", "")
