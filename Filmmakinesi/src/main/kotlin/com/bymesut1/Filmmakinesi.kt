@@ -18,7 +18,7 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 class Filmmakinesi : MainAPI() {
-    override var mainUrl = "https://www.filmmakinesi.to"
+    override var mainUrl = "https://filmmakinesi.to"
     override var name = "Fimmakinesi"
     override var lang = "tr"
     override val hasMainPage = true
@@ -34,7 +34,7 @@ class Filmmakinesi : MainAPI() {
     // ---- Kalıcı çerez: eklenti yeniden yüklense / uygulama kapansa da çerez diskte kalır ----
     // Android'de java.io.tmpdir uygulamanın cache klasörüdür; ek izin ya da API gerekmez.
     private val cfFile by lazy {
-        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "filmmakinesi_cf.txt")
+        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "filmmakinesi_cf_desktop.txt")
     }
     private val cfMaxAgeMs = 12L * 60 * 60 * 1000 // bundan eski kayıt kullanılmaz, yeniden çözülür
     @Volatile
@@ -561,7 +561,7 @@ class Filmmakinesi : MainAPI() {
     private fun streamHeaderSets(embedBase: String, streamUrl: String): List<Map<String, String>> {
         fun hs(ref: String?, origin: String?): Map<String, String> {
             val m = LinkedHashMap<String, String>()
-            m["User-Agent"] = androidUA
+            m["User-Agent"] = desktopUA
             if (ref != null) m["Referer"] = ref
             if (origin != null) m["Origin"] = origin
             return m
@@ -635,7 +635,7 @@ class Filmmakinesi : MainAPI() {
         val resp = app.get(
             embed,
             referer = pageUrl,
-            headers = mapOf("User-Agent" to androidUA),
+            headers = mapOf("User-Agent" to desktopUA),
             interceptor = WebViewResolver(wvRegex)
         )
         val u = resp.url
@@ -717,7 +717,7 @@ class Filmmakinesi : MainAPI() {
     private data class Embed(val urls: List<String>, val strict: Set<String>, val base: String)
 
     private fun embedHeaders(ref: String): Map<String, String> = mapOf(
-        "User-Agent" to androidUA,
+        "User-Agent" to desktopUA,
         "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
         "Referer" to ref
