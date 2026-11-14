@@ -12,6 +12,7 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
@@ -898,7 +899,8 @@ class DiziPal : MainAPI() {
             val cfgs = configBlocks(texts)
             Log.d(tag, "yapılandırma bloğu=${cfgs.size}")
             for (cfg in cfgs) {
-                if (emitConfig(cfg, origin, label, subtitleCallback, doneSubs, doneMedia, callback)) ok = true
+                val gp = gateProof(cfg, html)
+                if (emitConfig(cfg, origin, label, subtitleCallback, doneSubs, doneMedia, callback, gp, frameUrl)) ok = true
             }
 
             // 2) metinlerde doğrudan m3u8 / mp4 / nm.php / m.php ara
@@ -1104,7 +1106,8 @@ class DiziPal : MainAPI() {
         label: String,
         origin: String,
         done: MutableSet<String>,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        hdr: Map<String, String>? = null
     ): Boolean {
         if (!done.add(url)) return false
         val nm = if (title.isBlank()) label else "$label - $title"
@@ -1120,9 +1123,9 @@ class DiziPal : MainAPI() {
                 url = url,
                 type = type
             ) {
-                this.referer = "$origin/"
+                this.referer = hdr?.get("Referer") ?: "$origin/"
                 this.quality = Qualities.Unknown.value
-                this.headers = this@DiziPal.headers + mapOf("Referer" to "$origin/", "Origin" to origin)
+                this.headers = hdr ?: (this@DiziPal.headers + mapOf("Referer" to "$origin/", "Origin" to origin))
             }
         )
         return true
@@ -1204,7 +1207,9 @@ class DiziPal : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         doneSubs: MutableSet<String>,
         doneMedia: MutableSet<String>,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        gp: String? = null,
+        frameUrl: String = ""
     ): Boolean {
         val hosts = ArrayList<String>()
         cfg.optJSONArray("hosts")?.let { a ->
@@ -1216,7 +1221,9 @@ class DiziPal : MainAPI() {
         val mediaKeys = setOf("master", "file", "url", "src", "hls", "m3u8", "link", "playlist", "stream", "source", "video")
         var ok = false
         for (item in items) {
-            val v = item.value
+            var v = item.value
+            // oynatıcının "gate" doğrulaması: liste / altyazı adreslerinin sonuna &p=<çözüm> eklenir
+            if (gp != null && v.contains(".php?v=") && !v.contains("&p=")) v = "$v&p=$gp"
             if (imgRe.containsMatchIn(v) && !subFileRe.containsMatchIn(v)) continue
             val isSub = subFileRe.containsMatchIn(v) ||
                 item.path.contains("subtitle", true) || item.path.contains("caption", true) || item.path.contains("track", true)
@@ -1244,9 +1251,85 @@ class DiziPal : MainAPI() {
                 val txt = safeGet(master, "$origin/")
                 if (!txt.trimStart().startsWith("#EXTM3U")) master = master.replace("/m.php", "/master.m3u8")
             }
-            if (emitLink(master, item.title, label, origin, doneMedia, callback)) ok = true
+            var hdr: Map<String, String>? = null
+            if (gp != null && master.contains(".php?v=") && frameUrl.isNotBlank()) {
+                val pr = probeList(master, frameUrl, origin)
+                Log.d(tag, "gate liste doğrulama kod=${pr.second} ok=${pr.first != null} ${master.substringBefore("?").takeLast(30)}")
+                hdr = pr.first
+            }
+            if (emitLink(master, item.title, label, origin, doneMedia, callback, hdr)) ok = true
         }
         return ok
+    }
+
+    // ---- Oynatıcı "gate" doğrulaması (proof-of-work) ----
+    // NP_GATE: sha256(_key + n + "." + sayaç)[idx] & mask == 0  (_key, idx, mask sayfadan okunur)
+    // NP_GATE yoksa varsayılan: sha256(n + ":" + sayaç)[0] >>> (32-bits) == 0
+    private fun gateProof(cfg: JSONObject, html: String): String? {
+        val g = cfg.optJSONObject("gate") ?: return null
+        val n = g.optString("n", "")
+        if (n.isBlank()) return null
+        return try {
+            solveGate(html, n, g.optInt("b", 12))
+        } catch (e: Exception) {
+            rethrow(e)
+            null
+        }
+    }
+
+    private fun solveGate(raw: String, n: String, bits: Int): String? {
+        var key: String? = null
+        var idx = 0
+        var mask = 4095
+        val i = raw.indexOf("NP_GATE")
+        if (i >= 0) {
+            val seg = raw.substring(i, minOf(raw.length, i + 900))
+            Regex("""fromCharCode\(([\d,\s]+)\)""").find(seg)?.let { m ->
+                key = m.groupValues[1].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    .map { it.toInt().toChar() }.joinToString("")
+            }
+            Regex("""\)\[(\d+)\]\s*&\s*(\d+)\s*\)\s*===?\s*0""").find(seg)?.let { m ->
+                idx = m.groupValues[1].toInt()
+                mask = m.groupValues[2].toInt()
+            }
+        }
+        Log.d(tag, "gate n=$n bits=$bits key=${key != null} idx=$idx mask=$mask")
+        val md = MessageDigest.getInstance("SHA-256")
+        for (k in 0 until 50_000_000) {
+            val input = if (key != null) key + n + "." + k else "$n:$k"
+            val h = md.digest(input.toByteArray(Charsets.UTF_8))
+            val o = idx * 4
+            if (o + 3 >= h.size) return null
+            val w = ((h[o].toInt() and 0xff) shl 24) or ((h[o + 1].toInt() and 0xff) shl 16) or
+                ((h[o + 2].toInt() and 0xff) shl 8) or (h[o + 3].toInt() and 0xff)
+            val ok = if (key != null) (w and mask) == 0 else (w ushr (32 - bits)) == 0
+            if (ok) {
+                Log.d(tag, "gate çözüldü sayaç=$k")
+                return k.toString()
+            }
+        }
+        return null
+    }
+
+    // Adres gerçekten #EXTM3U döndürüyor mu? Farklı Referer / Origin kombinasyonlarını dener; çalışan başlığı döndürür.
+    private suspend fun probeList(u: String, frameUrl: String, origin: String): Pair<Map<String, String>?, Int> {
+        val sets = listOf(
+            headers + mapOf("Referer" to frameUrl, "Origin" to origin, "Accept" to "*/*"),
+            headers + mapOf("Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*"),
+            headers + mapOf("Referer" to "$mainUrl/", "Accept" to "*/*"),
+            headers + mapOf("Accept" to "*/*")
+        )
+        var last = 0
+        for (h in sets) {
+            try {
+                val r = app.get(u, headers = h, timeout = 20L)
+                last = r.code
+                if (r.code == 200 && r.text.trimStart().startsWith("#EXTM3U")) return h to last
+            } catch (e: Exception) {
+                rethrow(e)
+            }
+        }
+        return null to last
     }
 
     // Yapılandırma bulunamazsa: sayfa metinlerinde (çözülmüş / paketlenmiş / base64 dahil) m3u8, mp4, nm.php, m.php ara
