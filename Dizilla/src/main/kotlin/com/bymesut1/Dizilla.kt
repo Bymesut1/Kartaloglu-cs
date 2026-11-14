@@ -1127,6 +1127,8 @@ class Dizilla : MainAPI() {
         curFrame = f
         videoOk = true
         curHosts = hostsOf(listOf(rawIfr))
+        var fbMaster: String? = null
+        var fbTitle = ""
         try {
             val np = npConfig(rawIfr)
             if (np != null) {
@@ -1163,10 +1165,9 @@ class Dizilla : MainAPI() {
                             got = true
                         }
                         // hiçbiri doğrulanamadıysa eski davranış: ana listeyi olduğu gibi ver
-                        if (!okAny && master.isNotBlank()) {
-                            val hs = ArrayList<String>()
-                            so.optJSONArray("hosts")?.let { a -> for (k in 0 until a.length()) hs.add(a.optString(k)) }
-                            if (emitHls(master, title, label, origin, f, if (hs.isEmpty()) curHosts else hs, sent, callback)) got = true
+                        if (!okAny && master.isNotBlank() && fbMaster == null) {
+                            fbMaster = master
+                            fbTitle = title
                         }
                     }
                 }
@@ -1190,6 +1191,34 @@ class Dizilla : MainAPI() {
         }
         videoOk = false
         if (got) npDone = true
+
+        // Tanı: doğrulanmış ana liste yoksa iframe sayfasını ve dış script'lerdeki "gate" kodunu logla
+        if (!got && fbMaster != null) {
+            try {
+                val tokRe = Regex("[A-Za-z0-9_%=-]{60,}")
+                dLong("ifrham", rawIfr.replace(tokRe, "<tok>").replace(Regex("\\s+"), " ").take(8400))
+                val srcRe = Regex("""(?i)<script[^>]+src\s*=\s*["']([^"']+)["']""")
+                for (m in srcRe.findAll(rawIfr).take(4)) {
+                    var su = fixProto(m.groupValues[1])
+                    if (su.startsWith("/")) su = origin + su
+                    if (!su.startsWith("http") || badHostRe.containsMatchIn(su)) continue
+                    val js = getAny(su, mapOf("User-Agent" to ua, "Referer" to f, "Accept" to "*/*"))
+                    d("script ${su.takeLast(70)} len=${js.length}")
+                    for (key in listOf("gate", "nl.php", "nm.php", "source2")) {
+                        var idx = js.indexOf(key)
+                        var c = 0
+                        while (idx >= 0 && c < 2) {
+                            d("JS[$key] " + js.substring(maxOf(0, idx - 250), minOf(js.length, idx + 600)).replace(Regex("\\s+"), " "))
+                            idx = js.indexOf(key, idx + 600)
+                            c++
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                d("tani hata ${e.javaClass.simpleName}")
+            }
+        }
 
         // HIZLI YOL: NP_CONFIG yoksa (Kaynak 1 tarzı değilse) CloudStream'in hazır çıkarıcısını hemen çalıştır.
         // Link gelirse yavaş adımlar (ek altyazı uç noktaları, four.pichive denemesi, tahminler, WebView) atlanır.
@@ -1373,21 +1402,37 @@ class Dizilla : MainAPI() {
                     f,
                     referer = "$mainUrl/",
                     interceptor = WebViewResolver(
-                        Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master|/m\.php\?"""),
+                        Regex("""(?i)\.(?:m3u8|mp4)(?:\?|$)|master\.txt|cf-master|/n?[lm]\.php\?v="""),
                         userAgent = ua,
                         useOkhttp = true,
                         timeout = 15_000L
                     ),
                     timeout = 25L
                 )
-                r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)|/m\.php""").containsMatchIn(it) }
+                r.url.takeIf { it != f && Regex("""(?i)\.(?:m3u8|mp4|txt)|/n?[lm]\.php""").containsMatchIn(it) }
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 d("webview hata ${e.javaClass.simpleName}")
                 null
             }
             d("$label webview=${w?.take(90)}")
-            if (w != null && emitMedia(w, "", label, origin, sent, callback)) got = true
+            if (w != null) {
+                if (Regex("""(?i)/n[lm]\.php""").containsMatchIn(w)) {
+                    val pr = probeList(w, f, origin)
+                    d("$label webview dogrulama kod=${pr.second} ok=${pr.first != null}")
+                    if (pr.first != null && sent.add(w)) {
+                        emitLink(w, ExtractorLinkType.M3U8, label, origin, callback, pr.first)
+                        got = true
+                    }
+                }
+                if (!got && emitMedia(w, "", label, origin, sent, callback)) got = true
+            }
+        }
+
+        // doğrulanamayan ana liste: son çare olarak yine de ver
+        if (!got && fbMaster != null && sent.add(fbMaster!!)) {
+            emitLink(fbMaster!!, ExtractorLinkType.M3U8, if (fbTitle.isBlank()) label else "$label $fbTitle", origin, callback)
+            got = true
         }
 
         // Altyazı hâlâ yoksa: ana listeyi (master) açıp EXT-X-MEDIA / .vtt ara (+ tanı logu)
@@ -1519,7 +1564,7 @@ class Dizilla : MainAPI() {
                     first,
                     referer = "$mainUrl/",
                     interceptor = WebViewResolver(
-                        Regex("""(?i)iframe\.php\?v=|\.m3u8|\.mp4|/embed/|master\.txt"""),
+                        Regex("""(?i)iframe\.php\?v=|\.m3u8|\.mp4|/embed/|master\.txt|/n[lm]\.php\?v="""),
                         userAgent = ua,
                         useOkhttp = false,
                         timeout = 25_000L
