@@ -145,7 +145,7 @@ class Filmmakinesi : MainAPI() {
 
     private val pageHeaders
         get() = mapOf(
-            "User-Agent" to androidUA,
+            "User-Agent" to desktopUA,
             "Accept-Language" to "tr-TR,tr;q=0.9",
             "Referer" to "$mainUrl/"
         )
@@ -199,18 +199,18 @@ class Filmmakinesi : MainAPI() {
         return fetchList("$mainUrl/arama/?s=$q")
     }
 
-    // Liste sayfasını önce mobil, olmazsa masaüstü UA ile dener; sonucu loga yazar (sessiz boş liste olmasın)
+    // Liste sayfasını önce masaüstü, olmazsa mobil UA ile dener; sonucu loga yazar (sessiz boş liste olmasın)
     @Volatile
     private var lastInfo = ""
 
     private suspend fun fetchList(url: String): List<SearchResponse> {
-        // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
+        // 0: Cloudflare çözücü ile (masaüstü UA), 1: düz mobil UA ile (yedek)
         for (i in 0..1) {
             val r = try {
                 if (i == 0) {
                     cfGet(url, pageHeaders)
                 } else {
-                    app.get(url, headers = pageHeaders + mapOf("User-Agent" to desktopUA), timeout = 15L)
+                    app.get(url, headers = pageHeaders + mapOf("User-Agent" to androidUA), timeout = 15L)
                 }
             } catch (e: Exception) {
                 lastInfo = "hata ${e.message?.take(40)}"
