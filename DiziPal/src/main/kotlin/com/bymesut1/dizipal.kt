@@ -1278,33 +1278,75 @@ class DiziPal : MainAPI() {
     }
 
     private fun solveGate(raw: String, n: String, bits: Int): String? {
-        var key: String? = null
+        // NP_GATE fonksiyonunu sayfadan okuyup aynısını çözer:
+        //   function(_n,_h){var _k=String.fromCharCode(..);for(..){var _c=..;if((_h(<ifade>)[idx] & mask)===0)return _c}}
+        // <ifade>: "+" ile bağlanmış sabit metin / _n / _k / sayaç parçaları (ayraç sayfadan okunur)
+        var parts: List<String>? = null   // "N" = gate.n, "K" = anahtar, "C" = sayaç, diğerleri sabit metin
+        var key = ""
         var idx = 0
         var mask = 4095
+        var shift = -1
         val i = raw.indexOf("NP_GATE")
+        var seg = ""
         if (i >= 0) {
-            val seg = raw.substring(i, minOf(raw.length, i + 900))
-            Regex("""fromCharCode\(([\d,\s]+)\)""").find(seg)?.let { m ->
-                key = m.groupValues[1].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            seg = raw.substring(i, minOf(raw.length, i + 1400))
+            val fp = Regex("""function\s*\(\s*([\w$]+)\s*,\s*([\w$]+)\s*\)""").find(seg)
+            val nParam = fp?.groupValues?.get(1)
+            val hParam = fp?.groupValues?.get(2)
+            val kv = Regex("""(?:var|let|const)\s+([\w$]+)\s*=\s*String\.fromCharCode\(([\d,\s]+)\)""").find(seg)
+            val keyVar = kv?.groupValues?.get(1)
+            if (kv != null) {
+                key = kv.groupValues[2].split(",").map { it.trim() }.filter { it.isNotEmpty() }
                     .map { it.toInt().toChar() }.joinToString("")
             }
-            Regex("""\)\[(\d+)\]\s*&\s*(\d+)\s*\)\s*===?\s*0""").find(seg)?.let { m ->
-                idx = m.groupValues[1].toInt()
-                mask = m.groupValues[2].toInt()
+            if (hParam != null) {
+                val call = Regex(Regex.escape(hParam) + """\(([^()]*)\)\s*\[(\d+)\]""").find(seg)
+                if (call != null) {
+                    idx = call.groupValues[2].toInt()
+                    val args = call.groupValues[1].split("+").map { it.trim() }
+                    parts = args.map { a ->
+                        when {
+                            a.length >= 2 && (a[0] == '\'' || a[0] == '"') -> "L" + a.substring(1, a.length - 1)
+                            a == nParam -> "N"
+                            a == keyVar -> "K"
+                            else -> "C"
+                        }
+                    }
+                    val rest = seg.substring(call.range.last + 1, minOf(seg.length, call.range.last + 60))
+                    Regex("""^\s*&\s*(0x[0-9a-fA-F]+|\d+)""").find(rest)?.let { m ->
+                        val t = m.groupValues[1]
+                        mask = if (t.startsWith("0x", true)) t.substring(2).toLong(16).toInt() else t.toInt()
+                    }
+                    Regex("""^\s*>>>\s*(\d+)""").find(rest)?.let { m -> shift = m.groupValues[1].toInt() }
+                }
             }
         }
-        Log.d(tag, "gate n=$n bits=$bits key=${key != null} idx=$idx mask=$mask")
+        Log.d(tag, "gate n=$n bits=$bits key=${key.isNotEmpty()} idx=$idx mask=$mask shift=$shift parts=${parts?.joinToString(",") { if (it.startsWith("L")) "'" + it.substring(1) + "'" else it }}")
+        if (parts == null && seg.isNotEmpty()) Log.d(tag, "gate ham: " + seg.replace(Regex("\\s+"), " ").take(700))
         val md = MessageDigest.getInstance("SHA-256")
         for (k in 0 until 50_000_000) {
-            val input = if (key != null) key + n + "." + k else "$n:$k"
+            val input = if (parts != null) {
+                val sb = StringBuilder()
+                for (p in parts) when {
+                    p == "N" -> sb.append(n)
+                    p == "K" -> sb.append(key)
+                    p == "C" -> sb.append(k)
+                    else -> sb.append(p.substring(1))
+                }
+                sb.toString()
+            } else if (key.isNotEmpty()) key + n + "." + k else "$n:$k"
             val h = md.digest(input.toByteArray(Charsets.UTF_8))
             val o = idx * 4
             if (o + 3 >= h.size) return null
             val w = ((h[o].toInt() and 0xff) shl 24) or ((h[o + 1].toInt() and 0xff) shl 16) or
                 ((h[o + 2].toInt() and 0xff) shl 8) or (h[o + 3].toInt() and 0xff)
-            val ok = if (key != null) (w and mask) == 0 else (w ushr (32 - bits)) == 0
+            val ok = when {
+                shift >= 0 -> (w ushr shift) == 0
+                parts != null || key.isNotEmpty() -> (w and mask) == 0
+                else -> (w ushr (32 - bits)) == 0
+            }
             if (ok) {
-                Log.d(tag, "gate çözüldü sayaç=$k")
+                Log.d(tag, "gate cozuldu sayac=$k")
                 return k.toString()
             }
         }
