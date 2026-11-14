@@ -605,15 +605,53 @@ class Dizilla : MainAPI() {
         type: ExtractorLinkType,
         label: String,
         origin: String,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        hdr: Map<String, String>? = null
     ) {
         callback(
             newExtractorLink(name, label, url, type) {
-                this.referer = "$origin/"
+                this.referer = hdr?.get("Referer") ?: "$origin/"
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
+                this.headers = hdr ?: mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
             }
         )
+    }
+
+    // ---- Yeni nesil oynatıcı: ana liste adresi (nm.php / nl.php / ...) doğrulanarak seçilir ----
+    private val phpPlRe = Regex("""(?:https?:)?//[A-Za-z0-9.-]+/[A-Za-z0-9_\-]+\.php\?v=[A-Za-z0-9_%.=-]{60,}""")
+    private val plSkipRe = Regex("""(?i)/(?:iframe|track|nsub|source2|sub|subs|subtitle|subtitles)\.php""")
+
+    private fun jsonStrings(x: Any?, out: MutableList<String>, depth: Int = 0) {
+        if (depth > 6) return
+        when (x) {
+            is JSONObject -> {
+                val ks = x.keys()
+                while (ks.hasNext()) jsonStrings(x.opt(ks.next()), out, depth + 1)
+            }
+            is JSONArray -> for (i in 0 until x.length()) jsonStrings(x.opt(i), out, depth + 1)
+            is String -> out.add(x)
+        }
+    }
+
+    // Adres gerçekten #EXTM3U döndürüyor mu? Farklı Referer/Origin kombinasyonlarıyla dener; çalışan başlığı döndürür.
+    private suspend fun probeList(u: String, f: String, origin: String): Pair<Map<String, String>?, Int> {
+        val sets = listOf(
+            mapOf("User-Agent" to ua, "Referer" to f, "Origin" to origin, "Accept" to "*/*"),
+            mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin, "Accept" to "*/*"),
+            mapOf("User-Agent" to ua, "Referer" to "$mainUrl/", "Accept" to "*/*"),
+            mapOf("User-Agent" to ua, "Accept" to "*/*")
+        )
+        var last = 0
+        for (h in sets) {
+            try {
+                val r = app.get(u, headers = h)
+                last = r.code
+                if (r.code == 200 && r.text.trimStart().startsWith("#EXTM3U")) return h to last
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+            }
+        }
+        return null to last
     }
 
     // Aday adresleri sınıflandırıp yayınlar: .m3u8 -> HLS, .mp4 -> video, diğerleri #EXTM3U ise HLS
@@ -1093,14 +1131,43 @@ class Dizilla : MainAPI() {
             val np = npConfig(rawIfr)
             if (np != null) {
                 val srcs = np.optJSONArray("sources")
+                // tanı: NP_CONFIG anahtarları (uzun değerler kısaltılır)
+                d("np ham: " + np.toString().replace(Regex("[A-Za-z0-9_%=-]{60,}"), "<tok>").take(1200))
                 if (srcs != null) {
                     for (i in 0 until srcs.length()) {
                         val so = srcs.optJSONObject(i) ?: continue
                         val master = so.optString("master", "")
-                        if (master.isBlank()) continue
-                        val hs = ArrayList<String>()
-                        so.optJSONArray("hosts")?.let { a -> for (k in 0 until a.length()) hs.add(a.optString(k)) }
-                        if (emitHls(master, so.optString("title", ""), label, origin, f, if (hs.isEmpty()) curHosts else hs, sent, callback)) got = true
+                        val title = so.optString("title", "")
+                        val cand = LinkedHashSet<String>()
+                        if (master.isNotBlank()) cand.add(fixProto(master))
+                        val strs = ArrayList<String>()
+                        jsonStrings(so, strs)
+                        for (v in strs) {
+                            val u = fixProto(v.replace("\\/", "/").trim())
+                            if (u.startsWith("/") && u.contains(".php?v=")) cand.add(origin + u)
+                            else if (u.startsWith("http") && (u.contains(".php?v=") || u.contains(".m3u8"))) cand.add(u)
+                        }
+                        // sayfanın / çözülmüş metinlerin her yerindeki *.php?v=<uzun token> adresleri (nl.php vb.)
+                        for (t in texts) for (m in phpPlRe.findAll(t)) cand.add(fixProto(m.value))
+                        val list = cand.filter { !plSkipRe.containsMatchIn(it) && !badHostRe.containsMatchIn(it) }.take(8)
+                        d("np aday liste=${list.size} " + list.joinToString(" | ") { it.substringBefore("?").takeLast(40) })
+                        val res = list.amap { u -> u to probeList(u, f, origin) }
+                        var okAny = false
+                        for ((u, pr) in res) {
+                            d("np dogrulama ${u.substringBefore("?").takeLast(30)} kod=${pr.second} ok=${pr.first != null}")
+                            info.append("[${u.substringBefore("?").substringAfterLast("/")}=${pr.second}] ")
+                            val h = pr.first ?: continue
+                            if (!sent.add(u)) continue
+                            emitLink(u, ExtractorLinkType.M3U8, if (title.isBlank()) label else "$label $title", origin, callback, h)
+                            okAny = true
+                            got = true
+                        }
+                        // hiçbiri doğrulanamadıysa eski davranış: ana listeyi olduğu gibi ver
+                        if (!okAny && master.isNotBlank()) {
+                            val hs = ArrayList<String>()
+                            so.optJSONArray("hosts")?.let { a -> for (k in 0 until a.length()) hs.add(a.optString(k)) }
+                            if (emitHls(master, title, label, origin, f, if (hs.isEmpty()) curHosts else hs, sent, callback)) got = true
+                        }
                     }
                 }
                 val sb = np.optJSONArray("subtitles")
