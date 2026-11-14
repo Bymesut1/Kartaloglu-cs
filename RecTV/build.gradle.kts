@@ -13,5 +13,5 @@ cloudstream {
 
     tvTypes = listOf("Movie", "TvSeries", "Live")
 
-    iconUrl = "https://rectvapk.cc/wp-content/uploads/2023/02/Rec-TV.webp"
+    iconUrl = "https://raw.githubusercontent.com/Bymesut1/Kartaloglu-cs/main/RecTv/Rec-Tv.png"
 }
