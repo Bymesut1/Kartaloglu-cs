@@ -151,7 +151,13 @@ class Filmmakinesi : MainAPI() {
     @Volatile
     private var blockedUntil = 0L
     private val minGapMs = 600L
-    private val blockCooldownMs = 3L * 60 * 1000
+    private val blockCooldownMs = 3L * 60 * 1000      // ilk engelde bekleme; her ardışık engelde ikiye katlanır
+    private val blockMaxCooldownMs = 15L * 60 * 1000   // en fazla 15 dk
+    @Volatile
+    private var blockStreak = 0
+    private val blockFile by lazy {
+        java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "filmmakinesi_block.txt")
+    }
     private val listTtlMs = 5L * 60 * 1000
     private val listCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
 
@@ -162,9 +168,40 @@ class Filmmakinesi : MainAPI() {
         return if (left > 0) (left + 999) / 1000 else 0L
     }
 
+    // Engel bilgisi diske yazılır: uygulama/eklenti yeniden başlasa da bekleme süresi korunur
+    // (aksi halde yeniden açılışta ana sayfa hemen yeni istek patlatıp engeli uzatır)
+    private fun blockRestore() {
+        try {
+            if (!blockFile.exists()) return
+            val l = blockFile.readLines()
+            val until = l.getOrNull(0)?.trim()?.toLongOrNull() ?: return
+            blockStreak = l.getOrNull(1)?.trim()?.toIntOrNull() ?: 1
+            blockedUntil = until
+            if (until > System.currentTimeMillis()) log("HIZ SINIRI diskten yüklendi, kalan ${blockedLeftSec()} sn")
+        } catch (e: Throwable) {
+            log("block restore hata ${e.message?.take(60)}")
+        }
+    }
+
+    private fun blockClear() {
+        try {
+            blockStreak = 0
+            if (blockFile.exists()) blockFile.delete()
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun markBlocked() {
-        blockedUntil = System.currentTimeMillis() + blockCooldownMs
-        log("HIZ SINIRI: site erişimi durdurdu, ${blockCooldownMs / 1000} sn istek atılmayacak")
+        val now = System.currentTimeMillis()
+        if (now < blockedUntil) return // aynı engel için art arda gelen yanıtlar sayacı şişirmesin
+        blockStreak = minOf(blockStreak + 1, 6)
+        val dur = minOf(blockCooldownMs * (1L shl (blockStreak - 1)), blockMaxCooldownMs)
+        blockedUntil = now + dur
+        try {
+            blockFile.writeText("$blockedUntil\n$blockStreak")
+        } catch (_: Throwable) {
+        }
+        log("HIZ SINIRI: site erişimi durdurdu, ${dur / 1000} sn istek atılmayacak (ardışık=$blockStreak)")
     }
 
     private fun isRateLimited(r: NiceResponse): Boolean {
@@ -189,6 +226,10 @@ class Filmmakinesi : MainAPI() {
         }
     }
 
+    init {
+        blockRestore()
+    }
+
     private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
         if (!isSiteUrl(url)) return cfGetRaw(url, headers, timeout) // gömülü oynatıcılar vb. sınırlanmaz
         val left = blockedLeftSec()
@@ -199,8 +240,9 @@ class Filmmakinesi : MainAPI() {
             val r = cfGetRaw(url, headers, timeout)
             if (isRateLimited(r)) {
                 markBlocked()
-                throw ErrorLoadingException("Site erişimi geçici durdurdu (çok sayfa açıldı), birkaç dakika sonra tekrar deneyin")
+                throw ErrorLoadingException("Site erişimi geçici durdurdu (çok sayfa açıldı), ~${blockedLeftSec() / 60 + 1} dk sonra tekrar deneyin")
             }
+            if (blockStreak != 0) blockClear() // site yeniden açıldı
             return r
         } finally {
             siteGate.release()
