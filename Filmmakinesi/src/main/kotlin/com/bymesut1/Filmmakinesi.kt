@@ -155,6 +155,11 @@ class Filmmakinesi : MainAPI() {
     private val blockMaxCooldownMs = 15L * 60 * 1000   // en fazla 15 dk
     @Volatile
     private var blockStreak = 0
+    // Cloudflare WebView doğrulaması 60 sn'de çözülemezse (CF hata/engel sayfası) kısa süre siteye hiç dokunma:
+    // her denemede 60 sn takılmasın ve peş peşe WebView açılıp durum kötüleşmesin
+    @Volatile
+    private var cfFailUntil = 0L
+    private val cfFailCooldownMs = 90L * 1000
     private val blockFile by lazy {
         java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", "filmmakinesi_block.txt")
     }
@@ -234,10 +239,27 @@ class Filmmakinesi : MainAPI() {
         if (!isSiteUrl(url)) return cfGetRaw(url, headers, timeout) // gömülü oynatıcılar vb. sınırlanmaz
         val left = blockedLeftSec()
         if (left > 0) throw ErrorLoadingException("Site erişimi geçici durdurdu, yaklaşık $left sn sonra tekrar deneyin")
+        val cfLeft = (cfFailUntil - System.currentTimeMillis() + 999) / 1000
+        if (cfLeft > 0) throw ErrorLoadingException("Cloudflare doğrulaması geçilemedi, yaklaşık $cfLeft sn sonra tekrar deneyin")
         siteGate.acquire()
         try {
             paceWait()
-            val r = cfGetRaw(url, headers, timeout)
+            val r = try {
+                cfGetRaw(url, headers, timeout)
+            } catch (e: ErrorLoadingException) {
+                throw e
+            } catch (e: Exception) {
+                val m = e.message.orEmpty()
+                if (e is java.io.InterruptedIOException || m.contains("timeout", true)) {
+                    cfFailUntil = System.currentTimeMillis() + cfFailCooldownMs
+                    cfKiller = CloudflareKiller() // bayat/başarısız çerezleri bırak
+                    cfWarm = false
+                    cfClear()
+                    log("CF doğrulaması zaman aşımı: ${cfFailCooldownMs / 1000} sn istek atılmayacak ${url.take(70)}")
+                    throw ErrorLoadingException("Cloudflare doğrulaması geçilemedi (60 sn zaman aşımı), ~${cfFailCooldownMs / 1000} sn sonra tekrar deneyin")
+                }
+                throw e
+            }
             if (isRateLimited(r)) {
                 markBlocked()
                 throw ErrorLoadingException("Site erişimi geçici durdurdu (çok sayfa açıldı), ~${blockedLeftSec() / 60 + 1} dk sonra tekrar deneyin")
@@ -320,8 +342,8 @@ class Filmmakinesi : MainAPI() {
         if (cached != null && System.currentTimeMillis() - cached.first < listTtlMs) return cached.second
         // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
         for (i in 0..1) {
-            if (blockedLeftSec() > 0) {
-                lastInfo = "hız sınırı bekleniyor"
+            if (blockedLeftSec() > 0 || cfFailUntil > System.currentTimeMillis()) {
+                lastInfo = "hız sınırı / CF bekleniyor"
                 log("liste atlandı: hız sınırı ${blockedLeftSec()} sn ${url.take(80)}")
                 break
             }
