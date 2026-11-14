@@ -47,6 +47,7 @@ jobs:
           cp Selcukflix/build/*.cs3 out/
           cp DiziLife/build/*.cs3 out/
           cp DiziPal/build/*.cs3 out/
+          cp Dizimag/build/*.cs3 out/
           cp DiziSol/build/*.cs3 out/
           cp RecTV/build/*.cs3 out/
           cp DiziYou/build/*.cs3 out/
