@@ -105,7 +105,7 @@ class Filmmakinesi : MainAPI() {
     // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
     // bu yüzden bir süre sonra hep 403 gelir. 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
-    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+    private suspend fun cfGetRaw(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
         val k = cfKiller
         var r = if (cfWarm) {
             app.get(url, headers = headers, interceptor = k, timeout = timeout)
@@ -117,6 +117,8 @@ class Filmmakinesi : MainAPI() {
                 cfLock.release()
             }
         }
+        // Hız sınırı sayfası Cloudflare doğrulaması değil: çözücüyü sıfırlayıp tekrar istek atma (durumu kötüleştirir)
+        if (isRateLimited(r)) return r
         if (r.code == 403 || r.code == 503) {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
             cfLock.acquire()
@@ -136,6 +138,73 @@ class Filmmakinesi : MainAPI() {
             cfSave()
         }
         return r
+    }
+
+    // ---- Hız sınırı koruması ----
+    // Site kısa sürede çok sayfa açılınca "Biraz yavaşlayalım" sayfası verip IP'yi geçici durduruyor.
+    // Bu yüzden site isteklerini aralıklı (en az minGapMs arayla) ve en fazla 2 eşzamanlı atarız;
+    // durdurulursak blockCooldownMs boyunca siteye hiç istek atmayız (beklemek süreyi uzatmaz, istek atmak uzatır).
+    private val siteGate = Semaphore(2)
+    private val paceLock = Any()
+    @Volatile
+    private var nextSlotAt = 0L
+    @Volatile
+    private var blockedUntil = 0L
+    private val minGapMs = 600L
+    private val blockCooldownMs = 3L * 60 * 1000
+    private val listTtlMs = 5L * 60 * 1000
+    private val listCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+
+    private fun isSiteUrl(u: String) = u.startsWith(mainUrl)
+
+    private fun blockedLeftSec(): Long {
+        val left = blockedUntil - System.currentTimeMillis()
+        return if (left > 0) (left + 999) / 1000 else 0L
+    }
+
+    private fun markBlocked() {
+        blockedUntil = System.currentTimeMillis() + blockCooldownMs
+        log("HIZ SINIRI: site erişimi durdurdu, ${blockCooldownMs / 1000} sn istek atılmayacak")
+    }
+
+    private fun isRateLimited(r: NiceResponse): Boolean {
+        val t = try { r.text } catch (_: Throwable) { return false }
+        return t.length < 8000 && (t.contains("Biraz yavaşlayalım") || t.contains("erişiminiz geçici olarak durduruldu"))
+    }
+
+    // İstekler arasına boşluk koyar (her istek kendi zaman dilimini rezerve eder)
+    private fun paceWait() {
+        val wait: Long
+        synchronized(paceLock) {
+            val now = System.currentTimeMillis()
+            val slot = maxOf(now, nextSlotAt)
+            nextSlotAt = slot + minGapMs
+            wait = slot - now
+        }
+        if (wait > 0) {
+            try {
+                Thread.sleep(wait)
+            } catch (_: InterruptedException) {
+            }
+        }
+    }
+
+    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        if (!isSiteUrl(url)) return cfGetRaw(url, headers, timeout) // gömülü oynatıcılar vb. sınırlanmaz
+        val left = blockedLeftSec()
+        if (left > 0) throw ErrorLoadingException("Site erişimi geçici durdurdu, yaklaşık $left sn sonra tekrar deneyin")
+        siteGate.acquire()
+        try {
+            paceWait()
+            val r = cfGetRaw(url, headers, timeout)
+            if (isRateLimited(r)) {
+                markBlocked()
+                throw ErrorLoadingException("Site erişimi geçici durdurdu (çok sayfa açıldı), birkaç dakika sonra tekrar deneyin")
+            }
+            return r
+        } finally {
+            siteGate.release()
+        }
     }
 
     private val androidUA =
@@ -204,26 +273,47 @@ class Filmmakinesi : MainAPI() {
     private var lastInfo = ""
 
     private suspend fun fetchList(url: String): List<SearchResponse> {
+        // Aynı sayfa kısa süre içinde tekrar istenirse siteye gitmeden önbellekten ver
+        val cached = listCache[url]
+        if (cached != null && System.currentTimeMillis() - cached.first < listTtlMs) return cached.second
         // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
         for (i in 0..1) {
+            if (blockedLeftSec() > 0) {
+                lastInfo = "hız sınırı bekleniyor"
+                log("liste atlandı: hız sınırı ${blockedLeftSec()} sn ${url.take(80)}")
+                break
+            }
             val r = try {
                 if (i == 0) {
                     cfGet(url, pageHeaders)
                 } else {
-                    app.get(url, headers = pageHeaders + mapOf("User-Agent" to desktopUA), timeout = 15L)
+                    siteGate.acquire()
+                    try {
+                        paceWait()
+                        app.get(url, headers = pageHeaders + mapOf("User-Agent" to desktopUA), timeout = 15L)
+                    } finally {
+                        siteGate.release()
+                    }
                 }
             } catch (e: Exception) {
                 lastInfo = "hata ${e.message?.take(40)}"
                 log("liste hata i=$i ${e.message?.take(60)} ${url.take(80)}")
                 null
             } ?: continue
+            if (isRateLimited(r)) {
+                markBlocked()
+                return emptyList()
+            }
             val body = r.text
             val list = try { parseCards(r.document) } catch (e: Exception) { emptyList() }
             val title = Regex("<title>([^<]{0,60})", RegexOption.IGNORE_CASE).find(body)?.groupValues?.get(1)?.trim().orEmpty()
             val srv = r.headers["server"].orEmpty()
             lastInfo = "kod=${r.code} $srv \"$title\""
             log("liste i=$i kod=${r.code} len=${body.length} server=$srv title=$title kart=${list.size} ${url.take(80)}")
-            if (list.isNotEmpty()) return list
+            if (list.isNotEmpty()) {
+                listCache[url] = Pair(System.currentTimeMillis(), list)
+                return list
+            }
         }
         return emptyList()
     }
