@@ -16,5 +16,5 @@ cloudstream {
 
 dependencies {
     // Çalışma anında CloudStream'in içindeki NewPipeExtractor kullanılır
-    compileOnly("com.github.teamnewpipe:NewPipeExtractor:fafd471")
+    compileOnly("com.github.teamnewpipe:NewPipeExtractor:v0.26.5")
 }
