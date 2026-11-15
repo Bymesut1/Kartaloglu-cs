@@ -1,10 +1,12 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -21,6 +23,7 @@ class FilmMakinesiCafe : MainAPI() {
         private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val TMDB_IMG = "https://image.tmdb.org/t/p"
+        private const val TAG = "FMC"
         private const val UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
     }
@@ -50,14 +53,17 @@ class FilmMakinesiCafe : MainAPI() {
 
     private fun parseCards(doc: org.jsoup.nodes.Document): List<SearchResponse> =
         doc.select("a[href*=/film/], a[href*=/dizi/], a[href*=/anime/]")
-            .filter { !it.attr("href").contains("/bolum-") && it.selectFirst("h3") != null }
+            .filter { !it.attr("href").contains("/bolum-") && !it.attr("href").contains("/oyuncu/") }
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val href = fixUrlNull(this.attr("href")) ?: return null
-        val title = this.selectFirst("h3")?.text()?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        val poster = fixUrlNull(this.selectFirst("img")?.attr("src"))
+        val href = fixUrlNull(this.attr("href"))?.substringBefore("?") ?: return null
+        val img = this.selectFirst("img")
+        val title = (this.selectFirst("h3")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: img?.attr("alt")?.cleanTitle()?.takeIf { it.isNotBlank() })
+            ?: return null
+        val poster = fixUrlNull(img?.attr("src"))
         return when {
             href.contains("/film/") -> newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
             href.contains("/anime/") -> newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
@@ -315,9 +321,12 @@ class FilmMakinesiCafe : MainAPI() {
     // ------------------------------------------------------------------
     // VİDEO LİNKLERİ
     // ------------------------------------------------------------------
-    private val streamRegex = Regex("""https?://[^\s"'<>\\]+/api/stream\.php\?[^\s"'<>\\]+""")
-    private val m3u8Regex = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""")
-    private val subRegex = Regex("""https?://[^\s"'<>\\]+/api/sub\.php\?[^\s"'<>\\]+""")
+    private val streamRegex = Regex("""(?:https?:)?//[^\s"'<>\\]+/api/stream\.php\?[^\s"'<>\\]+""")
+    private val m3u8Regex = Regex("""(?:https?:)?//[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""")
+    private val subRegex = Regex("""(?:https?:)?//[^\s"'<>\\]+/api/sub\.php\?[^\s"'<>\\]+""")
+    private val anyUrlRegex = Regex("""(?:https?:)?//[^\s"'<>\\()]+""")
+    private val relApiRegex = Regex("""["'](/?api/[^"'\s]+)["']""")
+    private val staticRegex = Regex("""\.(js|css|png|jpe?g|webp|svg|ico|woff2?|gif|mp4)(\?|$)""", RegexOption.IGNORE_CASE)
 
     private fun normalize(s: String) = s
         .replace("\\/", "/")
@@ -325,39 +334,172 @@ class FilmMakinesiCafe : MainAPI() {
         .replace("\\u0026", "&")
         .replace("&amp;", "&")
 
+    private fun absolute(u: String, base: String): String {
+        val scheme = base.substringBefore("://", "https")
+        val host = base.substringAfter("://").substringBefore("/")
+        return when {
+            u.startsWith("http") -> u
+            u.startsWith("//") -> "$scheme:$u"
+            u.startsWith("/") -> "$scheme://$host$u"
+            else -> "$scheme://$host/$u"
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val headers = mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to UA)
         val seen = HashSet<String>()
+        val visited = HashSet<String>()
+        val seriesUrl = data.substringBefore("/sezon-")
 
-        val page = app.get(data, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA))
-        var found = scan(normalize(page.text), headers, seen, subtitleCallback, callback)
+        val page = app.get(data, referer = seriesUrl, headers = mapOf("User-Agent" to UA))
+        val html = normalize(page.text)
+        debugDump(data, page.code, html)
+
+        var found = crawl(html, data, 0, visited, seen, subtitleCallback, callback)
+        if (!found) found = tryPilavyer(html, visited, seen, subtitleCallback, callback)
 
         page.document.select("track[src]").forEach {
             val src = fixUrlNull(it.attr("src")) ?: return@forEach
             subtitleCallback(SubtitleFile(it.attr("label").ifBlank { "Türkçe" }, src))
         }
 
-        val frames = page.document.select("iframe[src], iframe[data-src]").mapNotNull {
-            fixUrlNull(it.attr("src").ifBlank { it.attr("data-src") })
-        }.filter { it.startsWith("http") }
+        if (!found) {
+            // Bilinen bir extractor'a düşebilecek iframe'ler
+            page.document.select("iframe[src], iframe[data-src]").mapNotNull {
+                fixUrlNull(it.attr("src").ifBlank { it.attr("data-src") })
+            }.filter { it.startsWith("http") }.forEach { f ->
+                runCatching { loadExtractor(f, "$mainUrl/", subtitleCallback, callback) }
+            }
+        }
+        Log.d(TAG, "RESULT found=$found links=${seen.size} visited=${visited.size}")
+        return found
+    }
 
-        for (f in frames) {
-            val body = runCatching { app.get(f, referer = "$mainUrl/", headers = mapOf("User-Agent" to UA)).text }
-                .getOrNull()
-            val got = body?.let { scan(normalize(it), headers, seen, subtitleCallback, callback) } ?: false
-            if (got) {
+    /** Metinde stream/sub ara; bulamazsa içindeki embed/player/api linklerini takip et. */
+    private suspend fun crawl(
+        text: String,
+        base: String,
+        depth: Int,
+        visited: MutableSet<String>,
+        seen: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val headers = mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl, "User-Agent" to UA)
+        var found = scan(text, headers, seen, subtitleCallback, callback)
+        if (found || depth >= 3) return found
+
+        val cands = LinkedHashSet<String>()
+
+        anyUrlRegex.findAll(text).forEach { m ->
+            val u = absolute(m.value.trimEnd(',', ';', '.'), base)
+            val l = u.lowercase()
+            val interesting = l.contains("pilavyer") || l.contains("/embed") || l.contains("/player") ||
+                    l.contains("/api/") || l.contains("iframe") || l.contains("/video")
+            val bad = staticRegex.containsMatchIn(l) || l.contains("themoviedb") || l.contains("google") ||
+                    l.contains("/api/stream.php") || l.contains("/api/sub.php") || l.contains("schema.org") ||
+                    l.contains("w3.org")
+            if (interesting && !bad) cands.add(u)
+        }
+        relApiRegex.findAll(text).forEach { m -> cands.add(absolute(m.groupValues[1], base)) }
+        runCatching {
+            Jsoup.parse(text).select("iframe[src], iframe[data-src], embed[src]").forEach {
+                val s = it.attr("src").ifBlank { it.attr("data-src") }
+                if (s.isNotBlank() && !s.startsWith("about:")) cands.add(absolute(s, base))
+            }
+        }
+
+        for (u in cands.take(8)) {
+            if (!visited.add(u)) continue
+            val res = runCatching {
+                app.get(u, referer = base, headers = mapOf("User-Agent" to UA, "Origin" to mainUrl))
+            }.getOrNull()
+            if (res == null) {
+                Log.d(TAG, "FETCH d=$depth FAIL $u")
+                continue
+            }
+            val body = normalize(res.text)
+            Log.d(TAG, "FETCH d=$depth code=${res.code} len=${body.length} $u")
+            if (crawl(body, u, depth + 1, visited, seen, subtitleCallback, callback)) {
                 found = true
-            } else {
-                loadExtractor(f, "$mainUrl/", subtitleCallback, callback)
-                found = true
+                break
+            } else if (body.length < 3000) {
+                Log.d(TAG, "BODY $u => ${body.replace(Regex("\\s+"), " ").take(1500)}")
             }
         }
         return found
+    }
+
+    /** Sayfada <div data-pv="ID"> + pilavyerplay core.js varsa player'ı elle çözmeyi dener. */
+    private suspend fun tryPilavyer(
+        html: String,
+        visited: MutableSet<String>,
+        seen: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val pv = Regex("""data-pv=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: return false
+        val coreUrl = Regex("""https?://[^"'\s]*pilavyerplay[^"'\s]*core\.js[^"'\s]*""").find(html)?.value
+            ?: "https://pilavyerplay.top/assets/js/core.js"
+        val hdr = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Origin" to mainUrl)
+        Log.d(TAG, "PV id=$pv core=$coreUrl")
+
+        val core = runCatching { app.get(coreUrl, headers = hdr).text }.getOrNull()
+        val cands = LinkedHashSet<String>()
+
+        if (core != null) {
+            Log.d(TAG, "CORE len=${core.length}")
+            // core.js'in tamamını (en fazla ~18 KB) logcat'e yaz
+            core.chunked(3000).take(6).forEachIndexed { i, c ->
+                Log.d(TAG, "CORE[$i] ${c.replace(Regex("\\s+"), " ")}")
+            }
+            val keys = listOf("/embed", "/player", "/api", "/e/", "/v/", "stream", "source", ".php", "pilavyer", "iframe")
+            val lits = Regex("""["'`]([^"'`\s]{3,200})["'`]""").findAll(core)
+                .map { it.groupValues[1] }
+                .filter { l -> keys.any { l.contains(it, ignoreCase = true) } && !staticRegex.containsMatchIn(l) }
+                .distinct().take(40).toList()
+            lits.forEach { Log.d(TAG, "CORE_LIT $it") }
+
+            lits.forEach { l ->
+                if (!(l.startsWith("/") || l.startsWith("http") || l.startsWith("//"))) return@forEach
+                val b = absolute(l, coreUrl)
+                when {
+                    b.endsWith("/") || b.endsWith("=") -> cands.add(b + pv)
+                    b.contains("?") -> cands.add("$b&v=$pv")
+                    else -> {
+                        cands.add("$b/$pv")
+                        cands.add("$b?v=$pv")
+                        cands.add("$b?id=$pv")
+                    }
+                }
+            }
+        }
+
+        // Bilinen/muhtemel kalıplar
+        for (h in listOf("https://pilavyerplay.top", "https://play2.pilavyerplay.top")) {
+            listOf("/embed/$pv", "/e/$pv", "/player/$pv", "/v/$pv", "/embed.php?v=$pv", "/api/source.php?v=$pv")
+                .forEach { cands.add(h + it) }
+        }
+
+        for (u in cands.take(16)) {
+            if (!visited.add(u)) continue
+            val res = runCatching { app.get(u, headers = hdr) }.getOrNull()
+            if (res == null) {
+                Log.d(TAG, "PVTRY FAIL $u")
+                continue
+            }
+            val body = normalize(res.text)
+            Log.d(TAG, "PVTRY code=${res.code} len=${body.length} $u")
+            if (res.code in 200..299 && crawl(body, u, 1, visited, seen, subtitleCallback, callback)) return true
+            if (res.code in 200..299 && body.length in 1..2500) {
+                Log.d(TAG, "PVBODY $u => ${body.replace(Regex("\\s+"), " ").take(1200)}")
+            }
+        }
+        return false
     }
 
     private suspend fun scan(
@@ -368,12 +510,13 @@ class FilmMakinesiCafe : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var any = false
+        fun fix(u: String) = if (u.startsWith("//")) "https:$u" else u
 
-        subRegex.findAll(text).map { it.value }.distinct().forEach { sub ->
+        subRegex.findAll(text).map { fix(it.value) }.distinct().forEach { sub ->
             if (seen.add(sub)) subtitleCallback(SubtitleFile("Türkçe", sub))
         }
 
-        val urls = (streamRegex.findAll(text) + m3u8Regex.findAll(text)).map { it.value }.distinct()
+        val urls = (streamRegex.findAll(text) + m3u8Regex.findAll(text)).map { fix(it.value) }.distinct()
         for (u in urls) {
             if (!seen.add(u)) continue
             val quality = Regex("""stream_v(\d{3,4})""").find(u)?.groupValues?.get(1)?.toIntOrNull()
@@ -382,6 +525,7 @@ class FilmMakinesiCafe : MainAPI() {
                 app.get(u, headers = headers).text.trimStart().startsWith("#EXTM3U")
             }.getOrDefault(false)
 
+            Log.d(TAG, "LINK hls=$isHls q=$quality ${u.take(160)}")
             callback(
                 newExtractorLink(
                     source = name,
@@ -397,5 +541,31 @@ class FilmMakinesiCafe : MainAPI() {
             any = true
         }
         return any
+    }
+
+    /** Link bulunamazsa logcat'te "FMC" etiketiyle sayfanın ilgili kısımlarını gösterir. */
+    private fun debugDump(url: String, code: Int, html: String) {
+        try {
+            Log.d(TAG, "PAGE url=$url code=$code len=${html.length}")
+            val scripts = Jsoup.parse(html).select("script[src]").map { it.attr("src") }
+            Log.d(TAG, "SCRIPTS ${scripts.joinToString(" | ").take(1500)}")
+            val keys = listOf(
+                "pilavyer", "data-pv", "m3u8", "stream.php", "sub.php",
+                "player", "embed", "fetch(", "/api/", "video"
+            )
+            for (k in keys) {
+                var idx = html.indexOf(k, ignoreCase = true)
+                var n = 0
+                while (idx >= 0 && n < 3) {
+                    val s = html.substring(maxOf(0, idx - 120), minOf(html.length, idx + 300))
+                        .replace(Regex("\\s+"), " ")
+                    Log.d(TAG, "[$k] $s")
+                    n++
+                    idx = html.indexOf(k, idx + 400, ignoreCase = true)
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "debugDump error ${e.message}")
+        }
     }
 }
