@@ -139,13 +139,26 @@ class Filmmakinesi : MainAPI() {
     }
 
     // ---- İstek hız sınırı: CloudStream ana sayfadaki tüm kategorileri aynı anda ister; site bunu
-    // "Biraz yavaşlayalım" sayfasıyla keser (tarayıcıda tek tek açıldığı için çalışır).
-    // Bu yüzden istekler sıraya girer, aralarında en az minGapMs bekler, yavaşlama sayfası gelirse bekleyip tekrar dener.
+    // "Biraz yavaşlayalım" (429) sayfasıyla keser ve IP'yi bir süre bekletir. Bu süre dolmadan istek
+    // göndermek engeli uzatır. Bu yüzden: istekler sıraya girer, aralarında minGapMs bekler,
+    // 429 gelince bir bekleme süresi (cooldown) başlar ve liste istekleri o süre boyunca siteye gitmez.
     private val paceLock = Semaphore(1)
     @Volatile
     private var lastReqAt = 0L
-    private val minGapMs = 900L
+    private val minGapMs = 1200L
+    @Volatile
+    private var cooldownUntil = 0L
+    @Volatile
+    private var cooldownStep = 0
     private val slowRe = Regex("yava[sş]layal[ıiİI]m", RegexOption.IGNORE_CASE)
+
+    private fun inCooldown(): Boolean = System.currentTimeMillis() < cooldownUntil
+
+    private fun markSlow() {
+        cooldownStep = minOf(cooldownStep + 1, 4)
+        cooldownUntil = System.currentTimeMillis() + 45_000L * cooldownStep
+        log("YAVAS: bekleme ${45 * cooldownStep} sn başladı")
+    }
 
     private fun isSlowPage(r: NiceResponse): Boolean {
         if (r.code == 429) return true
@@ -154,9 +167,22 @@ class Filmmakinesi : MainAPI() {
         return t.length < 8000 && slowRe.containsMatchIn(t)
     }
 
-    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+    // patient=false (ana sayfa listeleri): bekleme sürecindeyse bekletmez, yavaş sayfa gelirse tekrar denemez.
+    // patient=true (film/dizi açma, kaynak bulma): bekleme süresini (en çok 30 sn) bekleyip bir kez daha dener.
+    private suspend fun cfGet(
+        url: String,
+        headers: Map<String, String>,
+        timeout: Long = 30L,
+        patient: Boolean = true
+    ): NiceResponse {
         var attempt = 0
         while (true) {
+            if (patient) {
+                val w = cooldownUntil - System.currentTimeMillis()
+                if (w > 0) {
+                    try { Thread.sleep(minOf(w, 30_000L)) } catch (_: InterruptedException) { }
+                }
+            }
             paceLock.acquire()
             val r = try {
                 val wait = lastReqAt + minGapMs - System.currentTimeMillis()
@@ -171,12 +197,15 @@ class Filmmakinesi : MainAPI() {
             } finally {
                 paceLock.release()
             }
-            if (isSlowPage(r) && attempt < 3) {
-                attempt++
-                log("YAVAS sayfa: ${attempt}. tekrar bekleniyor ${url.take(70)}")
-                try { Thread.sleep(3500L * attempt) } catch (_: InterruptedException) { }
-                continue
+            if (isSlowPage(r)) {
+                markSlow()
+                if (patient && attempt < 1) {
+                    attempt++
+                    continue
+                }
+                return r
             }
+            if (r.code in 200..299) cooldownStep = 0
             return r
         }
     }
@@ -253,12 +282,17 @@ class Filmmakinesi : MainAPI() {
     private suspend fun fetchList(url: String): List<SearchResponse> {
         val hit = listCache[url]
         if (hit != null && System.currentTimeMillis() - hit.first < listTtlMs) return hit.second
+        // Site "yavaşlayalım" dediyse bekleme süresince istek göndermeyiz (engeli uzatmamak için)
+        if (inCooldown()) {
+            log("liste atlandı (bekleme) ${url.take(70)}")
+            return emptyList()
+        }
 
         // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
         for (i in 0..1) {
             val r = try {
                 if (i == 0) {
-                    cfGet(url, pageHeaders)
+                    cfGet(url, pageHeaders, patient = false)
                 } else {
                     app.get(url, headers = pageHeaders + mapOf("User-Agent" to desktopUA), timeout = 15L)
                 }
