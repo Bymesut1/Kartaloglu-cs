@@ -1,9 +1,10 @@
 package com.bymesut1
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -88,18 +89,16 @@ class FilmMakinesiCafe : MainAPI() {
 
         val tmdb = tmdbDetail(siteTitle, siteYear, isMovie)
 
-        val title = tmdb?.let { it.title ?: it.name } ?: siteTitle
-        val poster = tmdb?.poster_path?.let { "$TMDB_IMG/w780$it" } ?: sitePoster
-        val backdrop = tmdb?.backdrop_path?.let { "$TMDB_IMG/w1280$it" }
-        val plot = tmdb?.overview?.takeIf { it.isNotBlank() } ?: sitePlot
-        val year = (tmdb?.release_date ?: tmdb?.first_air_date)?.take(4)?.toIntOrNull() ?: siteYear
-        val tags = tmdb?.genres?.mapNotNull { it.name }?.takeIf { it.isNotEmpty() } ?: siteTags
-        val actorList = tmdb?.credits?.cast.orEmpty().take(15).mapNotNull { c ->
-            val n = c.name ?: return@mapNotNull null
-            ActorData(Actor(n, c.profile_path?.let { "$TMDB_IMG/w185$it" }), roleString = c.character)
+        val title = tmdb?.title ?: siteTitle
+        val poster = tmdb?.posterPath?.let { "$TMDB_IMG/w780$it" } ?: sitePoster
+        val backdrop = tmdb?.backdropPath?.let { "$TMDB_IMG/w1280$it" }
+        val plot = tmdb?.overview ?: sitePlot
+        val year = tmdb?.date?.take(4)?.toIntOrNull() ?: siteYear
+        val tags = tmdb?.genres?.takeIf { it.isNotEmpty() } ?: siteTags
+        val actorList = tmdb?.cast.orEmpty().map { c ->
+            ActorData(Actor(c.name, c.profile?.let { "$TMDB_IMG/w185$it" }), roleString = c.character)
         }
-        val trailer = tmdb?.videos?.results.orEmpty()
-            .firstOrNull { it.site == "YouTube" && it.type == "Trailer" }?.key
+        val trailer = tmdb?.trailerKey
 
         if (isMovie) {
             return newMovieLoadResponse(title, baseUrl, TvType.Movie, baseUrl) {
@@ -123,37 +122,30 @@ class FilmMakinesiCafe : MainAPI() {
         }.distinctBy { it.third }
 
         if (eps.isEmpty() && tmdb != null) {
-            eps = tmdb.seasons.orEmpty()
-                .filter { (it.season_number ?: 0) > 0 }
-                .flatMap { s ->
-                    (1..(s.episode_count ?: 0)).map { e ->
-                        Triple(s.season_number!!, e, "$baseUrl/sezon-${s.season_number}/bolum-$e")
-                    }
+            eps = tmdb.seasons
+                .filter { it.first > 0 }
+                .flatMap { (sn, count) ->
+                    (1..count).map { e -> Triple(sn, e, "$baseUrl/sezon-$sn/bolum-$e") }
                 }
         }
 
         // Her sezon için TMDB bölüm detaylarını bir kez çek
         val seasonMap = HashMap<Int, Map<Int, TmdbEpisode>>()
-        if (tmdb?.id != null) {
+        if (tmdb != null) {
             eps.map { it.first }.distinct().forEach { s ->
-                val season = tmdbSeason(tmdb.id, s)
-                if (season != null) {
-                    seasonMap[s] = season.episodes.orEmpty()
-                        .filter { it.episode_number != null }
-                        .associateBy { it.episode_number!! }
-                }
+                tmdbSeason(tmdb.id, s)?.let { seasonMap[s] = it }
             }
         }
 
         val episodes = eps.sortedWith(compareBy({ it.first }, { it.second })).map { (s, e, href) ->
             val t = seasonMap[s]?.get(e)
             newEpisode(href) {
-                this.name = t?.name?.takeIf { it.isNotBlank() } ?: "$e. Bölüm"
+                this.name = t?.name ?: "$e. Bölüm"
                 this.season = s
                 this.episode = e
-                this.posterUrl = t?.still_path?.let { "$TMDB_IMG/w780$it" }
-                this.description = t?.overview?.takeIf { it.isNotBlank() }
-                addDate(t?.air_date)
+                this.posterUrl = t?.still?.let { "$TMDB_IMG/w780$it" }
+                this.description = t?.overview
+                addDate(t?.airDate)
             }
         }
 
@@ -171,46 +163,146 @@ class FilmMakinesiCafe : MainAPI() {
     }
 
     // ------------------------------------------------------------------
-    // TMDB
+    // TMDB  (org.json ile, ek kütüphane gerektirmez)
     // ------------------------------------------------------------------
+    private data class TmdbCast(val name: String, val character: String?, val profile: String?)
+
+    private data class TmdbEpisode(
+        val number: Int,
+        val name: String?,
+        val overview: String?,
+        val still: String?,
+        val airDate: String?
+    )
+
+    private data class TmdbDetail(
+        val id: Int,
+        val title: String?,
+        val overview: String?,
+        val posterPath: String?,
+        val backdropPath: String?,
+        val date: String?,
+        val genres: List<String>,
+        val cast: List<TmdbCast>,
+        val trailerKey: String?,
+        val seasons: List<Pair<Int, Int>> // (sezon no, bölüm sayısı)
+    )
+
+    private fun JSONObject.str(key: String): String? =
+        if (isNull(key)) null else optString(key).trim().takeIf { it.isNotBlank() }
+
     private suspend fun tmdbDetail(title: String, year: Int?, isMovie: Boolean): TmdbDetail? {
         if (TMDB_API_KEY.startsWith("BURAYA")) return null
         return try {
             val kind = if (isMovie) "movie" else "tv"
             val q = URLEncoder.encode(title, "UTF-8")
 
-            suspend fun search(withYear: Boolean): List<TmdbItem> {
+            suspend fun search(withYear: Boolean): JSONArray {
                 val y = if (withYear && year != null)
                     (if (isMovie) "&year=$year" else "&first_air_date_year=$year") else ""
-                return app.get("$TMDB_API/search/$kind?api_key=$TMDB_API_KEY&language=tr-TR&query=$q$y")
-                    .parsedSafe<TmdbSearch>()?.results.orEmpty()
+                val txt = app.get("$TMDB_API/search/$kind?api_key=$TMDB_API_KEY&language=tr-TR&query=$q$y").text
+                return JSONObject(txt).optJSONArray("results") ?: JSONArray()
             }
 
             var results = search(true)
-            if (results.isEmpty()) results = search(false)
-            val pick = results.firstOrNull {
-                year != null && (it.release_date ?: it.first_air_date)?.take(4)?.toIntOrNull() == year
-            } ?: results.firstOrNull() ?: return null
-            val id = pick.id ?: return null
+            if (results.length() == 0) results = search(false)
+            if (results.length() == 0) return null
 
-            val detail = app.get(
-                "$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=tr-TR" +
-                        "&append_to_response=credits,videos&include_video_language=tr,en,null"
-            ).parsedSafe<TmdbDetail>() ?: return null
+            var pick = results.getJSONObject(0)
+            if (year != null) {
+                for (i in 0 until results.length()) {
+                    val r = results.getJSONObject(i)
+                    val d = r.str("release_date") ?: r.str("first_air_date")
+                    if (d?.take(4)?.toIntOrNull() == year) {
+                        pick = r
+                        break
+                    }
+                }
+            }
+            val id = pick.optInt("id", -1)
+            if (id < 0) return null
 
-            if (detail.overview.isNullOrBlank()) {
-                val en = app.get("$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=en-US")
-                    .parsedSafe<TmdbDetail>()
-                detail.copy(overview = en?.overview)
-            } else detail
+            val d = JSONObject(
+                app.get(
+                    "$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=tr-TR" +
+                            "&append_to_response=credits,videos&include_video_language=tr,en,null"
+                ).text
+            )
+
+            var overview = d.str("overview")
+            if (overview == null) {
+                overview = JSONObject(
+                    app.get("$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=en-US").text
+                ).str("overview")
+            }
+
+            val genres = mutableListOf<String>()
+            d.optJSONArray("genres")?.let { arr ->
+                for (i in 0 until arr.length()) arr.getJSONObject(i).str("name")?.let { genres.add(it) }
+            }
+
+            val cast = mutableListOf<TmdbCast>()
+            d.optJSONObject("credits")?.optJSONArray("cast")?.let { arr ->
+                for (i in 0 until minOf(arr.length(), 15)) {
+                    val c = arr.getJSONObject(i)
+                    val n = c.str("name") ?: continue
+                    cast.add(TmdbCast(n, c.str("character"), c.str("profile_path")))
+                }
+            }
+
+            var trailer: String? = null
+            d.optJSONObject("videos")?.optJSONArray("results")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val v = arr.getJSONObject(i)
+                    if (v.str("site") == "YouTube" && v.str("type") == "Trailer") {
+                        trailer = v.str("key")
+                        break
+                    }
+                }
+            }
+
+            val seasons = mutableListOf<Pair<Int, Int>>()
+            d.optJSONArray("seasons")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val s = arr.getJSONObject(i)
+                    seasons.add(Pair(s.optInt("season_number", 0), s.optInt("episode_count", 0)))
+                }
+            }
+
+            TmdbDetail(
+                id = id,
+                title = d.str("title") ?: d.str("name"),
+                overview = overview,
+                posterPath = d.str("poster_path"),
+                backdropPath = d.str("backdrop_path"),
+                date = d.str("release_date") ?: d.str("first_air_date"),
+                genres = genres,
+                cast = cast,
+                trailerKey = trailer,
+                seasons = seasons
+            )
         } catch (e: Exception) {
             null
         }
     }
 
-    private suspend fun tmdbSeason(tvId: Int, season: Int): TmdbSeason? = try {
-        app.get("$TMDB_API/tv/$tvId/season/$season?api_key=$TMDB_API_KEY&language=tr-TR")
-            .parsedSafe<TmdbSeason>()
+    private suspend fun tmdbSeason(tvId: Int, season: Int): Map<Int, TmdbEpisode>? = try {
+        val txt = app.get("$TMDB_API/tv/$tvId/season/$season?api_key=$TMDB_API_KEY&language=tr-TR").text
+        val arr = JSONObject(txt).optJSONArray("episodes") ?: JSONArray()
+        val map = HashMap<Int, TmdbEpisode>()
+        for (i in 0 until arr.length()) {
+            val e = arr.getJSONObject(i)
+            val n = e.optInt("episode_number", -1)
+            if (n < 0) continue
+            map[n] = TmdbEpisode(
+                number = n,
+                name = e.str("name"),
+                overview = e.str("overview"),
+                still = e.str("still_path"),
+                airDate = e.str("air_date")
+            )
+        }
+        map
     } catch (e: Exception) {
         null
     }
@@ -306,63 +398,4 @@ class FilmMakinesiCafe : MainAPI() {
         }
         return any
     }
-
-    // ------------------------------------------------------------------
-    // TMDB veri sınıfları
-    // ------------------------------------------------------------------
-    data class TmdbSearch(@JsonProperty("results") val results: List<TmdbItem>? = null)
-
-    data class TmdbItem(
-        @JsonProperty("id") val id: Int? = null,
-        @JsonProperty("release_date") val release_date: String? = null,
-        @JsonProperty("first_air_date") val first_air_date: String? = null
-    )
-
-    data class TmdbDetail(
-        @JsonProperty("id") val id: Int? = null,
-        @JsonProperty("title") val title: String? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("poster_path") val poster_path: String? = null,
-        @JsonProperty("backdrop_path") val backdrop_path: String? = null,
-        @JsonProperty("release_date") val release_date: String? = null,
-        @JsonProperty("first_air_date") val first_air_date: String? = null,
-        @JsonProperty("genres") val genres: List<TmdbGenre>? = null,
-        @JsonProperty("seasons") val seasons: List<TmdbSeasonInfo>? = null,
-        @JsonProperty("credits") val credits: TmdbCredits? = null,
-        @JsonProperty("videos") val videos: TmdbVideos? = null
-    )
-
-    data class TmdbGenre(@JsonProperty("name") val name: String? = null)
-
-    data class TmdbSeasonInfo(
-        @JsonProperty("season_number") val season_number: Int? = null,
-        @JsonProperty("episode_count") val episode_count: Int? = null
-    )
-
-    data class TmdbCredits(@JsonProperty("cast") val cast: List<TmdbCast>? = null)
-
-    data class TmdbCast(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("character") val character: String? = null,
-        @JsonProperty("profile_path") val profile_path: String? = null
-    )
-
-    data class TmdbVideos(@JsonProperty("results") val results: List<TmdbVideo>? = null)
-
-    data class TmdbVideo(
-        @JsonProperty("key") val key: String? = null,
-        @JsonProperty("site") val site: String? = null,
-        @JsonProperty("type") val type: String? = null
-    )
-
-    data class TmdbSeason(@JsonProperty("episodes") val episodes: List<TmdbEpisode>? = null)
-
-    data class TmdbEpisode(
-        @JsonProperty("episode_number") val episode_number: Int? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("still_path") val still_path: String? = null,
-        @JsonProperty("air_date") val air_date: String? = null
-    )
 }
