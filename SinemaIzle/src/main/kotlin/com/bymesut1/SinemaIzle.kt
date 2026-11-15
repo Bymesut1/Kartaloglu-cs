@@ -350,14 +350,16 @@ class SinemaIzle : MainAPI() {
     }
 
     // ------------------------------------------------------------------
-    // LINKLER (vidmixi master m3u8 + Turkce altyazi)
+    // LINKLER
+    // Akis: sayfadaki bx([{i,s}]) -> POST /px (i,s, CSRF, cerez) -> JSON.u
+    //       -> imgsdns/process oynatici -> vidmixi master m3u8 + altyazi
     // ------------------------------------------------------------------
     private val processRegex = Regex("""https?://[^\s"'<>\\]+/process/[A-Za-z0-9+/=_\-%]+""")
     private val m3uRegex = Regex("""https?://[^\s"'<>\\]+(?:/m3u/[A-Za-z0-9+/=_\-]+|\.m3u8[^\s"'<>\\]*)""")
     private val vttRegex = Regex("""https?://[^\s"'<>\\]+?\.vtt""")
-    private val anyUrlRegex = Regex("""https?://[^\s"'<>\\]+""")
-    private val staticRegex = Regex("""\.(jpg|jpeg|png|webp|svg|gif|css|js|woff2?|ttf|ico|json|xml)(\?|$)""", RegexOption.IGNORE_CASE)
-    private val playerKeyRegex = Regex("""process|player|embed|vidmixi|iframe|/play|/e/|/v/|kaynak|source""", RegexOption.IGNORE_CASE)
+    private val bxRegex = Regex(
+        """(?:\\u0022|")i(?:\\u0022|")\s*:\s*(\d+)\s*,\s*(?:\\u0022|")s(?:\\u0022|")\s*:\s*(?:\\u0022|")([^"\\]+)"""
+    )
 
     private fun subLabel(url: String): String {
         val f = url.substringAfterLast('/').substringBefore('.').lowercase()
@@ -393,37 +395,16 @@ class SinemaIzle : MainAPI() {
     ): Boolean {
         val dbg = ArrayList<String>()
         val page = app.get(data, headers = baseHeaders, referer = "$mainUrl/")
-        val html = page.text.replace("\\/", "/").replace("&amp;", "&")
+        val rawHtml = page.text
+        val html = rawHtml.replace("\\/", "/").replace("&amp;", "&")
         dbg.add("sayfa ${page.code} len=${html.length}")
+
+        val csrf = page.document.selectFirst("meta[name=csrf-token]")?.attr("content") ?: ""
+        val cookies = page.cookies
+        dbg.add("csrf=${csrf.take(6)} cerez=${cookies.size}")
 
         val subSeen = HashSet<String>()
         collectSubs(html, subSeen, subtitleCallback)
-
-        // --- aday oynatici linkleri ---
-        val candidates = linkedSetOf<String>()
-        processRegex.findAll(html).forEach { candidates.add(it.value) }
-
-        val attrs = listOf(
-            "src", "data-src", "data-url", "data-embed", "data-player",
-            "data-video", "data-iframe", "data-link", "data-href", "data-source"
-        )
-        for (el in page.document.select("*")) {
-            for (a in attrs) {
-                val v = el.attr(a)
-                if (v.isBlank()) continue
-                val u = fixUrl(v)
-                if (!u.startsWith("http") || staticRegex.containsMatchIn(u)) continue
-                val internal = u.contains("sinemaizle.org")
-                if (internal && el.tagName() != "iframe" && !playerKeyRegex.containsMatchIn(u)) continue
-                candidates.add(u)
-            }
-        }
-        for (m in anyUrlRegex.findAll(html)) {
-            val u = m.value
-            if (staticRegex.containsMatchIn(u)) continue
-            if (u.contains("sinemaizle.org") && !Regex("""player|embed|kaynak|source""").containsMatchIn(u)) continue
-            if (playerKeyRegex.containsMatchIn(u)) candidates.add(u)
-        }
 
         var found = false
 
@@ -449,7 +430,7 @@ class SinemaIzle : MainAPI() {
                 return
             }
             val body = resp.text.replace("\\/", "/").replace("&amp;", "&")
-            dbg.add("${resp.code} len=${body.length} d$depth $u")
+            dbg.add("oynatici ${resp.code} len=${body.length} d$depth $u")
             collectSubs(body, subSeen, subtitleCallback)
 
             if (body.trimStart().startsWith("#EXTM3U")) {
@@ -472,30 +453,60 @@ class SinemaIzle : MainAPI() {
             }
         }
 
-        // sayfanin kendisinde dogrudan m3u8 varsa
-        m3uRegex.find(html)?.value?.let { emit(it, "$mainUrl/") }
+        // 1) sitenin kendi akisi: /px
+        val sources = LinkedHashMap<String, String>() // i -> s
+        for (m in bxRegex.findAll(rawHtml)) {
+            sources[m.groupValues[1]] = m.groupValues[2]
+        }
+        dbg.add("kaynak sayisi ${sources.size}")
 
-        for (c in candidates) {
+        for ((i, s) in sources) {
             if (found) break
-            resolve(c, data, 0)
+            try {
+                val r = app.post(
+                    "$mainUrl/px",
+                    data = mapOf("i" to i, "s" to s),
+                    headers = baseHeaders + mapOf(
+                        "X-CSRF-TOKEN" to csrf,
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept" to "application/json",
+                        "Origin" to mainUrl
+                    ),
+                    referer = data,
+                    cookies = cookies
+                )
+                val body = r.text
+                dbg.add("px ${r.code} ${body.take(90)}")
+                val u = try {
+                    JSONObject(body).str("u")
+                } catch (_: Exception) {
+                    null
+                }
+                if (u != null) resolve(fixUrl(u), "$mainUrl/", 0)
+            } catch (e: Exception) {
+                dbg.add("px HATA ${e.javaClass.simpleName} ${e.message?.take(60)}")
+            }
+        }
+
+        // 2) yedek: sayfada dogrudan process / m3u8 varsa
+        if (!found) {
+            processRegex.findAll(html).forEach { resolve(it.value, "$mainUrl/", 0) }
+        }
+        if (!found) {
+            m3uRegex.find(html)?.value?.let { emit(it, "$mainUrl/") }
         }
 
         if (!found && debug) {
-            // teshis satirlari: kaynak listesinde "DBG ..." olarak gorunur
-            val lines = ArrayList<String>()
-            lines.addAll(dbg.take(6))
-            lines.add("aday sayisi ${candidates.size}")
-            for (kw in listOf("<iframe", "player", "embed", "kaynak", "fetch(", "vidmixi", "data-")) {
-                val i = html.indexOf(kw)
-                if (i >= 0) {
-                    val s = html.substring(maxOf(0, i - 60), minOf(html.length, i + 120))
-                        .replace(Regex("""\s+"""), " ")
-                    lines.add("[$kw] $s")
-                }
-            }
-            for (l in lines.take(12)) {
+            var n = 0
+            for (l in dbg.take(12)) {
+                n++
                 callback(
-                    newExtractorLink(this.name, "DBG " + l.take(160), "https://example.com/", ExtractorLinkType.VIDEO) {
+                    newExtractorLink(
+                        this.name,
+                        "DBG " + l.take(160),
+                        "https://example.com/dbg$n",
+                        ExtractorLinkType.VIDEO
+                    ) {
                         this.referer = mainUrl
                         this.quality = Qualities.Unknown.value
                     }
