@@ -68,7 +68,7 @@ class SinemaIzle : MainAPI() {
             .trim()
     }
 
-    private fun toSearch(title: String, href: String, poster: String?): SearchResponse {
+    private suspend fun toSearch(title: String, href: String, poster: String?): SearchResponse {
         return if (href.contains("/dizi/")) {
             newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster }
         } else {
@@ -76,7 +76,7 @@ class SinemaIzle : MainAPI() {
         }
     }
 
-    private fun parseCards(doc: Document): List<SearchResponse> {
+    private suspend fun parseCards(doc: Document): List<SearchResponse> {
         val seen = HashSet<String>()
         val out = ArrayList<SearchResponse>()
         for (a in doc.select("a[href]")) {
@@ -125,7 +125,7 @@ class SinemaIzle : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    private fun parseSuggest(txt: String): List<SearchResponse> {
+    private suspend fun parseSuggest(txt: String): List<SearchResponse> {
         val out = ArrayList<SearchResponse>()
         val t = txt.trim()
         if (t.startsWith("{")) {
@@ -138,7 +138,7 @@ class SinemaIzle : MainAPI() {
         return out
     }
 
-    private fun collectItems(node: Any?, out: MutableList<SearchResponse>) {
+    private suspend fun collectItems(node: Any?, out: MutableList<SearchResponse>) {
         when (node) {
             is JSONObject -> {
                 val url = node.str("url")
@@ -193,10 +193,7 @@ class SinemaIzle : MainAPI() {
                     ?.optJSONArray("results")?.optJSONObject(0)?.optInt("id", 0) ?: 0
             }
             if (id == 0) return null
-            tmdbJson(
-                "$tmdbApi/$kind/$id?api_key=$tmdbKey&language=tr-TR" +
-                        "&append_to_response=credits,videos&include_video_language=tr,en,null"
-            )
+            tmdbJson("$tmdbApi/$kind/$id?api_key=$tmdbKey&language=tr-TR&append_to_response=credits")
         } catch (_: Exception) {
             null
         }
@@ -241,21 +238,6 @@ class SinemaIzle : MainAPI() {
             }
         }
         if (actors.isNotEmpty()) this.actors = actors
-
-        var trailerKey: String? = null
-        d.optJSONObject("videos")?.optJSONArray("results")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val v = arr.optJSONObject(i) ?: continue
-                if (v.str("site") != "YouTube") continue
-                val k = v.str("key") ?: continue
-                if (v.str("type") == "Trailer") {
-                    trailerKey = k
-                    break
-                }
-                if (trailerKey == null) trailerKey = k
-            }
-        }
-        trailerKey?.let { addTrailer("https://www.youtube.com/watch?v=$it") }
     }
 
     // ------------------------------------------------------------------
@@ -381,7 +363,7 @@ class SinemaIzle : MainAPI() {
         }
     }
 
-    private fun collectSubs(text: String, seen: MutableSet<String>, cb: (SubtitleFile) -> Unit) {
+    private suspend fun collectSubs(text: String, seen: MutableSet<String>, cb: (SubtitleFile) -> Unit) {
         for (m in vttRegex.findAll(text)) {
             val u = m.value
             if (seen.add(u)) cb(newSubtitleFile(subLabel(u), u))
