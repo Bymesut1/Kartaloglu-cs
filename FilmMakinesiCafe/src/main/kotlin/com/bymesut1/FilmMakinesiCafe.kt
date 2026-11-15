@@ -119,22 +119,63 @@ class FilmMakinesiCafe : MainAPI() {
             }
         }
 
-        // --- Bölümler: önce sitedeki linkler, yoksa TMDB sezon listesinden üret ---
+        // --- Bölümler: tüm sezonlar (sitede sezon sekmeleri varsa hepsi çekilir) ---
         val epRegex = Regex("""/sezon-(\d+)/bolum-(\d+)""")
-        var eps: List<Triple<Int, Int, String>> = doc.select("a[href*=/sezon-]").mapNotNull { a ->
-            val href = fixUrlNull(a.attr("href"))?.substringBefore("?") ?: return@mapNotNull null
-            if (href.substringBefore("/sezon-").trimEnd('/') != baseUrl) return@mapNotNull null
-            val m = epRegex.find(href) ?: return@mapNotNull null
-            Triple(m.groupValues[1].toInt(), m.groupValues[2].toInt(), href)
-        }.distinctBy { it.third }
+        fun parseEps(d: org.jsoup.nodes.Document): List<Triple<Int, Int, String>> =
+            d.select("a[href*=/sezon-]").mapNotNull { a ->
+                val href = fixUrlNull(a.attr("href"))?.substringBefore("?")?.trimEnd('/')
+                    ?: return@mapNotNull null
+                if (href.substringBefore("/sezon-").trimEnd('/') != baseUrl) return@mapNotNull null
+                val m = epRegex.find(href) ?: return@mapNotNull null
+                Triple(m.groupValues[1].toInt(), m.groupValues[2].toInt(), href)
+            }
 
-        if (eps.isEmpty() && tmdb != null) {
-            eps = tmdb.seasons
-                .filter { it.first > 0 }
-                .flatMap { (sn, count) ->
-                    (1..count).map { e -> Triple(sn, e, "$baseUrl/sezon-$sn/bolum-$e") }
-                }
+        val epMap = LinkedHashMap<String, Triple<Int, Int, String>>()
+        parseEps(doc).forEach { epMap[it.third] = it }
+
+        // Sitede görünen sezon numaraları: linklerden + "N. Sezon" butonlarından
+        val siteSeasons = sortedSetOf<Int>()
+        siteSeasons.addAll(epMap.values.map { it.first })
+        doc.select("a[href*=/sezon-]").forEach { a ->
+            val href = fixUrlNull(a.attr("href"))?.substringBefore("?")?.trimEnd('/') ?: return@forEach
+            if (href.substringBefore("/sezon-").trimEnd('/') != baseUrl) return@forEach
+            Regex("""/sezon-(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()?.let { siteSeasons.add(it) }
         }
+        val labelRx = Regex("""(?<![\d.])(\d{1,2})\s*\.\s*Sezon""", RegexOption.IGNORE_CASE)
+        doc.select("main button, main a, main option, main [data-season], main [data-sezon]").forEach { el ->
+            val t = el.text().trim()
+            if (t.length <= 15) {
+                labelRx.find(t)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it in 1..60 }?.let { siteSeasons.add(it) }
+            }
+        }
+
+        val tmdbCounts: Map<Int, Int> = tmdb?.seasons.orEmpty().filter { it.first > 0 }.toMap()
+        // Site sezon listesi verdiyse onu, vermediyse TMDB'yi esas al
+        val wantedSeasons = if (siteSeasons.isNotEmpty()) siteSeasons.toSortedSet() else tmdbCounts.keys.toSortedSet()
+
+        for (s in wantedSeasons) {
+            if (epMap.values.any { it.first == s }) continue
+            var got = false
+            for (u in listOf("$baseUrl/sezon-$s", "$baseUrl?sezon=$s", "$baseUrl?season=$s")) {
+                val d = runCatching { app.get(u, headers = mapOf("User-Agent" to UA)).document }.getOrNull()
+                    ?: continue
+                val list = parseEps(d).filter { it.first == s }
+                if (list.isNotEmpty()) {
+                    list.forEach { epMap[it.third] = it }
+                    got = true
+                    break
+                }
+            }
+            if (!got) {
+                val count = tmdbCounts[s] ?: 0
+                (1..count).forEach { e ->
+                    val href = "$baseUrl/sezon-$s/bolum-$e"
+                    epMap[href] = Triple(s, e, href)
+                }
+                Log.d(TAG, "Sezon $s siteden alinamadi, TMDB'den uretildi ($count bolum)")
+            }
+        }
+        val eps: List<Triple<Int, Int, String>> = epMap.values.toList()
 
         // Her sezon için TMDB bölüm detaylarını bir kez çek
         val seasonMap = HashMap<Int, Map<Int, TmdbEpisode>>()
