@@ -616,20 +616,6 @@ class FilmMakinesiCafe : MainAPI() {
                 }
             )
             any = true
-
-            // Ana liste (master) yavaş açılırsa doğrudan 720p kaynağı da seçilebilsin.
-            if (u.contains("/api/stream.php") && !u.contains("&p=") && !u.contains("?p=") && u.contains("&token=")) {
-                val v720 = u.replace("&token=", "&p=stream_v720%2Findex.m3u8&token=")
-                if (seen.add(v720)) {
-                    callback(
-                        newExtractorLink(source = name, name = "$name 720p", url = v720, type = ExtractorLinkType.M3U8) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.P720.value
-                            this.headers = headers
-                        }
-                    )
-                }
-            }
         }
         return any
     }
