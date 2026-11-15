@@ -105,25 +105,19 @@ class Filmmakinesi : MainAPI() {
     // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
     // bu yüzden bir süre sonra hep 403 gelir. 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
-    private suspend fun cfGetRaw(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
-        // cf_clearance çerezi çözümü yapan WebView'in User-Agent'ına bağlıdır. CloudflareKiller bu UA'yı kendisi
-        // ekler; biz de ayrıca farklı bir UA gönderirsek çerez reddedilir (403). Bu yüzden UA'yı çıkarıyoruz.
-        val hdr = headers.filterKeys { !it.equals("User-Agent", ignoreCase = true) }
-        // Oynatıcı alt alan adları (rapid./closeload.) ana siteyle aynı çözücüyü kullanır ama ana sitenin
-        // çerezlerini silmemesi için "sıfırla ve tekrar dene" yalnızca ana site adresleri için yapılır.
-        val isMain = url.startsWith(mainUrl)
+    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
         val k = cfKiller
         var r = if (cfWarm) {
-            app.get(url, headers = hdr, interceptor = k, timeout = timeout)
+            app.get(url, headers = headers, interceptor = k, timeout = timeout)
         } else {
             cfLock.acquire()
             try {
-                app.get(url, headers = hdr, interceptor = cfKiller, timeout = timeout)
+                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
             }
         }
-        if (isMain && (r.code == 403 || r.code == 503)) {
+        if (r.code == 403 || r.code == 503) {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
             cfLock.acquire()
             try {
@@ -132,7 +126,7 @@ class Filmmakinesi : MainAPI() {
                     cfWarm = false
                     cfClear()
                 }
-                r = app.get(url, headers = hdr, interceptor = cfKiller, timeout = timeout)
+                r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
             }
@@ -142,78 +136,6 @@ class Filmmakinesi : MainAPI() {
             cfSave()
         }
         return r
-    }
-
-    // ---- İstek hız sınırı: CloudStream ana sayfadaki tüm kategorileri aynı anda ister; site bunu
-    // "Biraz yavaşlayalım" (429) sayfasıyla keser ve IP'yi bir süre bekletir. Bu süre dolmadan istek
-    // göndermek engeli uzatır. Bu yüzden: istekler sıraya girer, aralarında minGapMs bekler,
-    // 429 gelince bir bekleme süresi (cooldown) başlar ve liste istekleri o süre boyunca siteye gitmez.
-    private val paceLock = Semaphore(1)
-    @Volatile
-    private var lastReqAt = 0L
-    private val minGapMs = 1200L
-    @Volatile
-    private var cooldownUntil = 0L
-    @Volatile
-    private var cooldownStep = 0
-    private val slowRe = Regex("yava[sş]layal[ıiİI]m", RegexOption.IGNORE_CASE)
-
-    private fun inCooldown(): Boolean = System.currentTimeMillis() < cooldownUntil
-
-    private fun markSlow() {
-        cooldownStep = minOf(cooldownStep + 1, 4)
-        cooldownUntil = System.currentTimeMillis() + 45_000L * cooldownStep
-        log("YAVAS: bekleme ${45 * cooldownStep} sn başladı")
-    }
-
-    private fun isSlowPage(r: NiceResponse): Boolean {
-        if (r.code == 429) return true
-        if (r.code !in 200..299) return false
-        val t = r.text
-        return t.length < 8000 && slowRe.containsMatchIn(t)
-    }
-
-    // patient=false (ana sayfa listeleri): bekleme sürecindeyse bekletmez, yavaş sayfa gelirse tekrar denemez.
-    // patient=true (film/dizi açma, kaynak bulma): bekleme süresini (en çok 30 sn) bekleyip bir kez daha dener.
-    private suspend fun cfGet(
-        url: String,
-        headers: Map<String, String>,
-        timeout: Long = 30L,
-        patient: Boolean = true
-    ): NiceResponse {
-        var attempt = 0
-        while (true) {
-            if (patient) {
-                val w = cooldownUntil - System.currentTimeMillis()
-                if (w > 0) {
-                    try { Thread.sleep(minOf(w, 30_000L)) } catch (_: InterruptedException) { }
-                }
-            }
-            paceLock.acquire()
-            val r = try {
-                val wait = lastReqAt + minGapMs - System.currentTimeMillis()
-                if (wait > 0) {
-                    try { Thread.sleep(wait) } catch (_: InterruptedException) { }
-                }
-                try {
-                    cfGetRaw(url, headers, timeout)
-                } finally {
-                    lastReqAt = System.currentTimeMillis()
-                }
-            } finally {
-                paceLock.release()
-            }
-            if (isSlowPage(r)) {
-                markSlow()
-                if (patient && attempt < 1) {
-                    attempt++
-                    continue
-                }
-                return r
-            }
-            if (r.code in 200..299) cooldownStep = 0
-            return r
-        }
     }
 
     private val androidUA =
@@ -281,24 +203,12 @@ class Filmmakinesi : MainAPI() {
     @Volatile
     private var lastInfo = ""
 
-    // Aynı liste kısa süre içinde tekrar istenirse siteye gitmeden önbellekten verir (5 dk)
-    private val listCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
-    private val listTtlMs = 5L * 60 * 1000
-
     private suspend fun fetchList(url: String): List<SearchResponse> {
-        val hit = listCache[url]
-        if (hit != null && System.currentTimeMillis() - hit.first < listTtlMs) return hit.second
-        // Site "yavaşlayalım" dediyse bekleme süresince istek göndermeyiz (engeli uzatmamak için)
-        if (inCooldown()) {
-            log("liste atlandı (bekleme) ${url.take(70)}")
-            return emptyList()
-        }
-
         // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
         for (i in 0..1) {
             val r = try {
                 if (i == 0) {
-                    cfGet(url, pageHeaders, patient = false)
+                    cfGet(url, pageHeaders)
                 } else {
                     app.get(url, headers = pageHeaders + mapOf("User-Agent" to desktopUA), timeout = 15L)
                 }
@@ -313,12 +223,7 @@ class Filmmakinesi : MainAPI() {
             val srv = r.headers["server"].orEmpty()
             lastInfo = "kod=${r.code} $srv \"$title\""
             log("liste i=$i kod=${r.code} len=${body.length} server=$srv title=$title kart=${list.size} ${url.take(80)}")
-            if (list.isNotEmpty()) {
-                listCache[url] = System.currentTimeMillis() to list
-                return list
-            }
-            // Site hâlâ "yavaşlayalım" diyorsa ikinci isteği boşuna gönderme (süreyi daha da uzatır)
-            if (isSlowPage(r)) break
+            if (list.isNotEmpty()) return list
         }
         return emptyList()
     }
@@ -813,13 +718,9 @@ class Filmmakinesi : MainAPI() {
 
     private fun embedHeaders(ref: String): Map<String, String> = mapOf(
         "User-Agent" to androidUA,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-        "Referer" to ref,
-        "Upgrade-Insecure-Requests" to "1",
-        "Sec-Fetch-Dest" to "iframe",
-        "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "same-site"
+        "Referer" to ref
     )
 
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
@@ -831,18 +732,16 @@ class Filmmakinesi : MainAPI() {
                 log("EM hata ${e.message?.take(60)}")
                 null
             }
-            if (r != null && (r.code == 403 || r.code == 404 || r.code == 503)) {
-                log("EM ilk kod=${r.code} server=${r.headers["server"].orEmpty()} gövde=${r.text.take(100).replace("\n", " ")}")
-                // Çözme 60 sn'yi bulabildiği için zaman aşımı uzun tutulur (aksi halde çözüm bitmeden istek düşer)
+            if (r != null && (r.code == 403 || r.code == 503)) {
                 r = try {
-                    cfGet(embedUrl, embedHeaders(rf), 80L)
+                    cfGet(embedUrl, embedHeaders(rf))
                 } catch (e: Exception) {
                     log("EM cf hata ${e.message?.take(60)}")
                     r
                 }
             }
             if (r == null || r.code != 200) {
-                log("EM kod=${r?.code} gövde=${r?.text?.take(100)?.replace("\n", " ")} ${embedUrl.take(70)}")
+                log("EM kod=${r?.code} ${embedUrl.take(70)}")
                 continue
             }
             val html = r.text
