@@ -9,6 +9,10 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URI
 import java.net.URLEncoder
+import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 private fun JSONObject.str(key: String): String? {
     if (!has(key) || isNull(key)) return null
@@ -365,6 +369,45 @@ class SinemaIzle : MainAPI() {
         """(?:\\u0022|")i(?:\\u0022|")\s*:\s*(\d+)\s*,\s*(?:\\u0022|")s(?:\\u0022|")\s*:\s*(?:\\u0022|")([^"\\]+)"""
     )
 
+    // vidmixi (Bepeak) oynaticisi: bePlayer('<parola>', '{"ct":..,"iv":..,"s":..}')
+    // CryptoJS AES (parola + salt -> EVP_BytesToKey/MD5, AES-256-CBC).
+    // Cozulen JSON icinde video_location (m3u8 listesi) ve strSubtitles bulunur.
+    private val bePlayerRegex = Regex(
+        """bePlayer\(\s*['"]([^'"]+)['"]\s*,\s*['"](\{.*?\})['"]\s*\)""",
+        RegexOption.DOT_MATCHES_ALL
+    )
+
+    private fun hexToBytes(h: String): ByteArray =
+        ByteArray(h.length / 2) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    private fun bePlayerDecrypt(pass: String, json: String): JSONObject? {
+        return try {
+            val o = JSONObject(json)
+            val ct = android.util.Base64.decode(o.getString("ct"), android.util.Base64.DEFAULT)
+            val salt = hexToBytes(o.getString("s"))
+            val md = MessageDigest.getInstance("MD5")
+            val passB = pass.toByteArray(Charsets.UTF_8)
+            var acc = ByteArray(0)
+            var dx = ByteArray(0)
+            while (acc.size < 48) {
+                md.reset()
+                md.update(dx)
+                md.update(passB)
+                md.update(salt)
+                dx = md.digest()
+                acc += dx
+            }
+            val key = acc.copyOfRange(0, 32)
+            val iv = o.str("iv")?.let { hexToBytes(it) } ?: acc.copyOfRange(32, 48)
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            JSONObject(String(c.doFinal(ct), Charsets.UTF_8))
+        } catch (e: Exception) {
+            Log.d("SinemaIzle", "bePlayerDecrypt HATA ${e.javaClass.simpleName} ${e.message}")
+            null
+        }
+    }
+
     private fun logBody(tag: String, body: String) {
         try {
             Log.d("SinemaIzle", "=== $tag len=${body.length}")
@@ -446,6 +489,7 @@ class SinemaIzle : MainAPI() {
         }
 
         val visited = HashSet<String>()
+        var fallbackLoc: String? = null
 
         suspend fun resolve(u: String, ref: String, depth: Int): Unit {
             if (found || visited.size >= 14 || !visited.add(u)) return
@@ -460,6 +504,48 @@ class SinemaIzle : MainAPI() {
             logBody("oynatici d$depth $u", body)
             val org = origin(u)
             collectSubs(body, org, subSeen, subtitleCallback)
+
+            // vidmixi / Bepeak: sifreli oynatici verisi
+            val bp = bePlayerRegex.find(body)
+            if (bp != null) {
+                val j = bePlayerDecrypt(bp.groupValues[1], bp.groupValues[2])
+                if (j == null) {
+                    dbg.add("bePlayer cozulemedi")
+                } else {
+                    val subs = j.optJSONArray("strSubtitles")
+                    if (subs != null) {
+                        for (k in 0 until subs.length()) {
+                            val so = subs.optJSONObject(k) ?: continue
+                            val f = so.str("file")?.replace("\\/", "/") ?: continue
+                            val full = if (f.startsWith("http")) f
+                            else org.trimEnd('/') + "/" + f.trimStart('/')
+                            if (subSeen.add(full)) {
+                                subtitleCallback(newSubtitleFile(so.str("label") ?: subLabel(full), full))
+                            }
+                        }
+                    }
+                    val loc = j.str("video_location")?.replace("\\/", "/")
+                    dbg.add("be loc ${loc?.take(50)}")
+                    if (loc != null) {
+                        val full = if (loc.startsWith("http")) loc
+                        else org.trimEnd('/') + "/" + loc.trimStart('/')
+                        val r = try {
+                            app.get(full, headers = baseHeaders, referer = u)
+                        } catch (e: Exception) {
+                            dbg.add("list HATA ${e.javaClass.simpleName}")
+                            null
+                        }
+                        val txt = r?.text ?: ""
+                        dbg.add("list ${r?.code} ${txt.trimStart().take(12)}")
+                        if (txt.trimStart().startsWith("#EXTM3U")) {
+                            emit(full, u)
+                            return
+                        }
+                        logBody("list ${r?.code}", txt.take(1500))
+                        fallbackLoc = full // en sonda yine de oynaticiya ver
+                    }
+                }
+            }
 
             if (body.trimStart().startsWith("#EXTM3U")) {
                 // dogrudan master m3u8 (ses + goruntu birlikte)
@@ -545,6 +631,11 @@ class SinemaIzle : MainAPI() {
         }
         if (!found) {
             m3uRegex.find(html)?.value?.let { emit(it, "$mainUrl/") }
+        }
+
+        val fb = fallbackLoc
+        if (!found && fb != null) {
+            emit(fb, origin(fb))
         }
 
         if (!found && debug) {
