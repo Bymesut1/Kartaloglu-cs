@@ -1,6 +1,5 @@
 package com.bymesut1
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
@@ -9,6 +8,11 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.net.URI
 import java.net.URLEncoder
+
+private fun JSONObject.str(key: String): String? {
+    if (!has(key) || isNull(key)) return null
+    return optString(key).takeIf { it.isNotBlank() }
+}
 
 class SinemaIzle : MainAPI() {
     override var mainUrl = "https://sinemaizle.org"
@@ -137,13 +141,12 @@ class SinemaIzle : MainAPI() {
     private fun collectItems(node: Any?, out: MutableList<SearchResponse>) {
         when (node) {
             is JSONObject -> {
-                val url = node.optString("url")
-                val title = node.optString("title")
-                if (url.isNotBlank() && title.isNotBlank()) {
+                val url = node.str("url")
+                val title = node.str("title")
+                if (url != null && title != null) {
                     val href = fixUrl(url).substringBefore("#").substringBefore("?")
                     if (cardHref.matches(href)) {
-                        val poster = node.optString("poster").ifBlank { null }
-                            ?.replace("/bg/", "/poster/")
+                        val poster = node.str("poster")?.replace("/bg/", "/poster/")
                         out.add(toSearch(cleanTitle(title), href, poster))
                         return
                     }
@@ -158,49 +161,24 @@ class SinemaIzle : MainAPI() {
     }
 
     // ------------------------------------------------------------------
-    // TMDB (sadece icine girince)
+    // TMDB (sadece icine girince)  -- org.json ile
     // ------------------------------------------------------------------
-    data class TmdbHit(@JsonProperty("id") val id: Int? = null)
-    data class TmdbSearch(@JsonProperty("results") val results: List<TmdbHit>? = null)
-    data class TmdbGenre(@JsonProperty("name") val name: String? = null)
-    data class TmdbCast(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("character") val character: String? = null,
-        @JsonProperty("profile_path") val profilePath: String? = null
+    private class EpInfo(
+        val name: String?,
+        val overview: String?,
+        val still: String?,
+        val air: String?
     )
-    data class TmdbCredits(@JsonProperty("cast") val cast: List<TmdbCast>? = null)
-    data class TmdbVideo(
-        @JsonProperty("key") val key: String? = null,
-        @JsonProperty("site") val site: String? = null,
-        @JsonProperty("type") val type: String? = null
-    )
-    data class TmdbVideos(@JsonProperty("results") val results: List<TmdbVideo>? = null)
-    data class TmdbSeasonInfo(@JsonProperty("season_number") val seasonNumber: Int? = null)
-    data class TmdbDetail(
-        @JsonProperty("id") val id: Int? = null,
-        @JsonProperty("title") val title: String? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("poster_path") val posterPath: String? = null,
-        @JsonProperty("backdrop_path") val backdropPath: String? = null,
-        @JsonProperty("release_date") val releaseDate: String? = null,
-        @JsonProperty("first_air_date") val firstAirDate: String? = null,
-        @JsonProperty("runtime") val runtime: Int? = null,
-        @JsonProperty("genres") val genres: List<TmdbGenre>? = null,
-        @JsonProperty("credits") val credits: TmdbCredits? = null,
-        @JsonProperty("videos") val videos: TmdbVideos? = null,
-        @JsonProperty("seasons") val seasons: List<TmdbSeasonInfo>? = null
-    )
-    data class TmdbEp(
-        @JsonProperty("episode_number") val episodeNumber: Int? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("still_path") val stillPath: String? = null,
-        @JsonProperty("air_date") val airDate: String? = null
-    )
-    data class TmdbSeason(@JsonProperty("episodes") val episodes: List<TmdbEp>? = null)
 
-    private suspend fun tmdbDetail(title: String, year: Int?, tv: Boolean): TmdbDetail? {
+    private suspend fun tmdbJson(url: String): JSONObject? {
+        return try {
+            JSONObject(app.get(url).text)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun tmdbDetail(title: String, year: Int?, tv: Boolean): JSONObject? {
         if (tmdbKey.startsWith("BURAYA")) return null
         return try {
             val q = URLEncoder.encode(title, "UTF-8")
@@ -208,52 +186,76 @@ class SinemaIzle : MainAPI() {
             val yearParam = if (year != null) {
                 if (tv) "&first_air_date_year=$year" else "&year=$year"
             } else ""
-            var hit = app.get("$tmdbApi/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q$yearParam")
-                .parsedSafe<TmdbSearch>()?.results?.firstOrNull()
-            if (hit?.id == null && yearParam.isNotEmpty()) {
-                hit = app.get("$tmdbApi/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q")
-                    .parsedSafe<TmdbSearch>()?.results?.firstOrNull()
+            var id = tmdbJson("$tmdbApi/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q$yearParam")
+                ?.optJSONArray("results")?.optJSONObject(0)?.optInt("id", 0) ?: 0
+            if (id == 0 && yearParam.isNotEmpty()) {
+                id = tmdbJson("$tmdbApi/search/$kind?api_key=$tmdbKey&language=tr-TR&query=$q")
+                    ?.optJSONArray("results")?.optJSONObject(0)?.optInt("id", 0) ?: 0
             }
-            val id = hit?.id ?: return null
-            app.get(
+            if (id == 0) return null
+            tmdbJson(
                 "$tmdbApi/$kind/$id?api_key=$tmdbKey&language=tr-TR" +
                         "&append_to_response=credits,videos&include_video_language=tr,en,null"
-            ).parsedSafe<TmdbDetail>()
+            )
         } catch (_: Exception) {
             null
         }
     }
 
-    private suspend fun tmdbSeason(tvId: Int, season: Int): List<TmdbEp> {
-        return try {
-            app.get("$tmdbApi/tv/$tvId/season/$season?api_key=$tmdbKey&language=tr-TR")
-                .parsedSafe<TmdbSeason>()?.episodes ?: emptyList()
+    private suspend fun tmdbSeason(tvId: Int, season: Int): List<Pair<Int, EpInfo>> {
+        val out = ArrayList<Pair<Int, EpInfo>>()
+        try {
+            val arr = tmdbJson("$tmdbApi/tv/$tvId/season/$season?api_key=$tmdbKey&language=tr-TR")
+                ?.optJSONArray("episodes") ?: return out
+            for (i in 0 until arr.length()) {
+                val e = arr.optJSONObject(i) ?: continue
+                val n = e.optInt("episode_number", 0)
+                if (n <= 0) continue
+                out.add(n to EpInfo(e.str("name"), e.str("overview"), e.str("still_path"), e.str("air_date")))
+            }
         } catch (_: Exception) {
-            emptyList()
         }
+        return out
     }
 
-    private fun LoadResponse.applyTmdb(d: TmdbDetail?) {
+    private fun LoadResponse.applyTmdb(d: JSONObject?) {
         if (d == null) return
-        d.posterPath?.let { this.posterUrl = "$tmdbImg/w500$it" }
-        d.backdropPath?.let { this.backgroundPosterUrl = "$tmdbImg/w1280$it" }
-        if (!d.overview.isNullOrBlank()) this.plot = d.overview
-        val y = (d.releaseDate ?: d.firstAirDate)?.take(4)?.toIntOrNull()
-        if (y != null) this.year = y
-        val g = d.genres?.mapNotNull { it.name }
-        if (!g.isNullOrEmpty()) this.tags = g
-        val cast = d.credits?.cast?.filter { !it.name.isNullOrBlank() }?.take(15)
-        if (!cast.isNullOrEmpty()) {
-            this.actors = cast.map {
-                ActorData(
-                    Actor(it.name ?: "", it.profilePath?.let { p -> "$tmdbImg/w185$p" }),
-                    roleString = it.character
-                )
+        d.str("poster_path")?.let { this.posterUrl = "$tmdbImg/w500$it" }
+        d.str("backdrop_path")?.let { this.backgroundPosterUrl = "$tmdbImg/w1280$it" }
+        d.str("overview")?.let { this.plot = it }
+        (d.str("release_date") ?: d.str("first_air_date"))?.take(4)?.toIntOrNull()?.let { this.year = it }
+
+        val genres = ArrayList<String>()
+        d.optJSONArray("genres")?.let { arr ->
+            for (i in 0 until arr.length()) arr.optJSONObject(i)?.str("name")?.let { genres.add(it) }
+        }
+        if (genres.isNotEmpty()) this.tags = genres
+
+        val actors = ArrayList<ActorData>()
+        d.optJSONObject("credits")?.optJSONArray("cast")?.let { arr ->
+            for (i in 0 until minOf(arr.length(), 15)) {
+                val c = arr.optJSONObject(i) ?: continue
+                val n = c.str("name") ?: continue
+                val img = c.str("profile_path")?.let { "$tmdbImg/w185$it" }
+                actors.add(ActorData(Actor(n, img), roleString = c.str("character")))
             }
         }
-        val trailer = d.videos?.results?.firstOrNull { it.site == "YouTube" && it.type == "Trailer" }
-            ?: d.videos?.results?.firstOrNull { it.site == "YouTube" }
-        trailer?.key?.let { addTrailer("https://www.youtube.com/watch?v=$it") }
+        if (actors.isNotEmpty()) this.actors = actors
+
+        var trailerKey: String? = null
+        d.optJSONObject("videos")?.optJSONArray("results")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val v = arr.optJSONObject(i) ?: continue
+                if (v.str("site") != "YouTube") continue
+                val k = v.str("key") ?: continue
+                if (v.str("type") == "Trailer") {
+                    trailerKey = k
+                    break
+                }
+                if (trailerKey == null) trailerKey = k
+            }
+        }
+        trailerKey?.let { addTrailer("https://www.youtube.com/watch?v=$it") }
     }
 
     // ------------------------------------------------------------------
@@ -299,11 +301,11 @@ class SinemaIzle : MainAPI() {
         val tmdb = tmdbDetail(title, year, isSeries)
 
         if (!isSeries) {
-            return newMovieLoadResponse(tmdb?.title ?: title, base, TvType.Movie, base) {
+            return newMovieLoadResponse(tmdb?.str("title") ?: title, base, TvType.Movie, base) {
                 this.posterUrl = sitePoster
                 this.plot = siteDesc
                 this.year = year
-                this.duration = tmdb?.runtime
+                this.duration = tmdb?.optInt("runtime", 0)?.takeIf { it > 0 }
                 applyTmdb(tmdb)
             }
         }
@@ -312,7 +314,13 @@ class SinemaIzle : MainAPI() {
         val found = linkedSetOf<Pair<Int, Int>>()
         collectEpisodes(doc.html(), slug, found)
 
-        val tmdbSeasons = tmdb?.seasons?.mapNotNull { it.seasonNumber }?.filter { it > 0 } ?: emptyList()
+        val tmdbSeasons = ArrayList<Int>()
+        tmdb?.optJSONArray("seasons")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val sn = arr.optJSONObject(i)?.optInt("season_number", 0) ?: 0
+                if (sn > 0) tmdbSeasons.add(sn)
+            }
+        }
 
         // sitede listelenmeyen sezonlari sezon sayfasindan dene
         val have = found.map { it.first }.toSet()
@@ -326,14 +334,11 @@ class SinemaIzle : MainAPI() {
         }
 
         val seasonNums = if (found.isNotEmpty()) found.map { it.first }.toSet() else tmdbSeasons.toSet()
-        val epInfo = HashMap<Pair<Int, Int>, TmdbEp>()
-        val tvId = tmdb?.id
-        if (tvId != null) {
+        val epInfo = HashMap<Pair<Int, Int>, EpInfo>()
+        val tvId = tmdb?.optInt("id", 0) ?: 0
+        if (tvId != 0) {
             for (sn in seasonNums) {
-                for (ep in tmdbSeason(tvId, sn)) {
-                    val en = ep.episodeNumber ?: continue
-                    epInfo[sn to en] = ep
-                }
+                for ((en, info) in tmdbSeason(tvId, sn)) epInfo[sn to en] = info
             }
         }
         // sitede hic bolum bulunamazsa TMDB'den uret
@@ -342,16 +347,16 @@ class SinemaIzle : MainAPI() {
         val episodes = found.sortedWith(compareBy({ it.first }, { it.second })).map { (s, e) ->
             val info = epInfo[s to e]
             newEpisode("$mainUrl/dizi/$slug/sezon-$s/bolum-$e") {
-                this.name = info?.name?.takeIf { it.isNotBlank() } ?: "$e. Bölüm"
+                this.name = info?.name ?: "$e. Bölüm"
                 this.season = s
                 this.episode = e
-                this.description = info?.overview?.takeIf { it.isNotBlank() }
-                this.posterUrl = info?.stillPath?.let { "$tmdbImg/w500$it" }
-                addDate(info?.airDate)
+                this.description = info?.overview
+                this.posterUrl = info?.still?.let { "$tmdbImg/w500$it" }
+                addDate(info?.air)
             }
         }
 
-        return newTvSeriesLoadResponse(tmdb?.name ?: title, base, TvType.TvSeries, episodes) {
+        return newTvSeriesLoadResponse(tmdb?.str("name") ?: title, base, TvType.TvSeries, episodes) {
             this.posterUrl = sitePoster
             this.plot = siteDesc
             this.year = year
