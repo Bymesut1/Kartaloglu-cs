@@ -106,18 +106,24 @@ class Filmmakinesi : MainAPI() {
     // bu yüzden bir süre sonra hep 403 gelir. 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
     private suspend fun cfGetRaw(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        // cf_clearance çerezi çözümü yapan WebView'in User-Agent'ına bağlıdır. CloudflareKiller bu UA'yı kendisi
+        // ekler; biz de ayrıca farklı bir UA gönderirsek çerez reddedilir (403). Bu yüzden UA'yı çıkarıyoruz.
+        val hdr = headers.filterKeys { !it.equals("User-Agent", ignoreCase = true) }
+        // Oynatıcı alt alan adları (rapid./closeload.) ana siteyle aynı çözücüyü kullanır ama ana sitenin
+        // çerezlerini silmemesi için "sıfırla ve tekrar dene" yalnızca ana site adresleri için yapılır.
+        val isMain = url.startsWith(mainUrl)
         val k = cfKiller
         var r = if (cfWarm) {
-            app.get(url, headers = headers, interceptor = k, timeout = timeout)
+            app.get(url, headers = hdr, interceptor = k, timeout = timeout)
         } else {
             cfLock.acquire()
             try {
-                app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+                app.get(url, headers = hdr, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
             }
         }
-        if (r.code == 403 || r.code == 503) {
+        if (isMain && (r.code == 403 || r.code == 503)) {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
             cfLock.acquire()
             try {
@@ -126,7 +132,7 @@ class Filmmakinesi : MainAPI() {
                     cfWarm = false
                     cfClear()
                 }
-                r = app.get(url, headers = headers, interceptor = cfKiller, timeout = timeout)
+                r = app.get(url, headers = hdr, interceptor = cfKiller, timeout = timeout)
             } finally {
                 cfLock.release()
             }
@@ -807,9 +813,13 @@ class Filmmakinesi : MainAPI() {
 
     private fun embedHeaders(ref: String): Map<String, String> = mapOf(
         "User-Agent" to androidUA,
-        "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-        "Referer" to ref
+        "Referer" to ref,
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "iframe",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "same-site"
     )
 
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
@@ -821,16 +831,18 @@ class Filmmakinesi : MainAPI() {
                 log("EM hata ${e.message?.take(60)}")
                 null
             }
-            if (r != null && (r.code == 403 || r.code == 503)) {
+            if (r != null && (r.code == 403 || r.code == 404 || r.code == 503)) {
+                log("EM ilk kod=${r.code} server=${r.headers["server"].orEmpty()} gövde=${r.text.take(100).replace("\n", " ")}")
+                // Çözme 60 sn'yi bulabildiği için zaman aşımı uzun tutulur (aksi halde çözüm bitmeden istek düşer)
                 r = try {
-                    cfGet(embedUrl, embedHeaders(rf))
+                    cfGet(embedUrl, embedHeaders(rf), 80L)
                 } catch (e: Exception) {
                     log("EM cf hata ${e.message?.take(60)}")
                     r
                 }
             }
             if (r == null || r.code != 200) {
-                log("EM kod=${r?.code} ${embedUrl.take(70)}")
+                log("EM kod=${r?.code} gövde=${r?.text?.take(100)?.replace("\n", " ")} ${embedUrl.take(70)}")
                 continue
             }
             val html = r.text
