@@ -20,7 +20,7 @@ class FilmMakinesiCafe : MainAPI() {
 
     companion object {
         // https://www.themoviedb.org/settings/api adresinden aldığın v3 API Key'i yaz
-        private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
+        private const val TMDB_API_KEY = "BURAYA_TMDB_API_KEY"
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val TMDB_IMG = "https://image.tmdb.org/t/p"
         private const val TAG = "FMC"
@@ -327,6 +327,7 @@ class FilmMakinesiCafe : MainAPI() {
     private val anyUrlRegex = Regex("""(?:https?:)?//[^\s"'<>\\()]+""")
     private val relApiRegex = Regex("""["'](/?api/[^"'\s]+)["']""")
     private val staticRegex = Regex("""\.(js|css|png|jpe?g|webp|svg|ico|woff2?|gif|mp4)(\?|$)""", RegexOption.IGNORE_CASE)
+    private val labelRegex = Regex("""["'](?:label|name|lang|language|title)["']\s*:\s*["']([^"']{2,40})["']""", RegexOption.IGNORE_CASE)
 
     private fun normalize(s: String) = s
         .replace("\\/", "/")
@@ -357,10 +358,11 @@ class FilmMakinesiCafe : MainAPI() {
 
         val page = app.get(data, referer = seriesUrl, headers = mapOf("User-Agent" to UA))
         val html = normalize(page.text)
-        debugDump(data, page.code, html)
 
-        var found = crawl(html, data, 0, visited, seen, subtitleCallback, callback)
-        if (!found) found = tryPilavyer(html, visited, seen, subtitleCallback, callback)
+        // 1) Asıl yol: <div data-pv="ID"> + core.js  ->  {origin}/assets/js/s.php?s=ID
+        var found = tryPilavyer(html, visited, seen, subtitleCallback, callback)
+        // 2) Yedek: sayfadaki embed/player/api linklerini tara
+        if (!found) found = crawl(html, data, 0, visited, seen, subtitleCallback, callback)
 
         page.document.select("track[src]").forEach {
             val src = fixUrlNull(it.attr("src")) ?: return@forEach
@@ -368,6 +370,7 @@ class FilmMakinesiCafe : MainAPI() {
         }
 
         if (!found) {
+            debugDump(data, page.code, html)
             // Bilinen bir extractor'a düşebilecek iframe'ler
             page.document.select("iframe[src], iframe[data-src]").mapNotNull {
                 fixUrlNull(it.attr("src").ifBlank { it.attr("data-src") })
@@ -375,8 +378,37 @@ class FilmMakinesiCafe : MainAPI() {
                 runCatching { loadExtractor(f, "$mainUrl/", subtitleCallback, callback) }
             }
         }
-        Log.d(TAG, "RESULT found=$found links=${seen.size} visited=${visited.size}")
+        Log.d(TAG, "RESULT found=$found links=${seen.size} url=$data")
         return found
+    }
+
+    /** Sayfada <div data-pv="ID"> varsa player'ı doğrudan s.php üzerinden çöz. */
+    private suspend fun tryPilavyer(
+        html: String,
+        visited: MutableSet<String>,
+        seen: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val pv = Regex("""data-pv=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: return false
+        val coreUrl = Regex("""https?://[^"'\s]*pilavyerplay[^"'\s]*core\.js[^"'\s]*""").find(html)?.value
+            ?: "https://pilavyerplay.top/assets/js/core.js"
+        val origin = coreUrl.substringBefore("/assets/")
+        val embed = "$origin/assets/js/s.php?s=$pv"
+        val hdr = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Origin" to mainUrl)
+
+        if (!visited.add(embed)) return false
+        val res = runCatching { app.get(embed, headers = hdr) }.getOrNull()
+        if (res == null) {
+            Log.d(TAG, "PV FAIL $embed")
+            return false
+        }
+        val body = normalize(res.text)
+        Log.d(TAG, "PV code=${res.code} len=${body.length} $embed")
+        if (res.code !in 200..299) return false
+        val ok = crawl(body, embed, 1, visited, seen, subtitleCallback, callback)
+        if (!ok) Log.d(TAG, "PVBODY ${body.replace(Regex("\\s+"), " ").take(1500)}")
+        return ok
     }
 
     /** Metinde stream/sub ara; bulamazsa içindeki embed/player/api linklerini takip et. */
@@ -401,15 +433,17 @@ class FilmMakinesiCafe : MainAPI() {
             val interesting = l.contains("pilavyer") || l.contains("/embed") || l.contains("/player") ||
                     l.contains("/api/") || l.contains("iframe") || l.contains("/video")
             val bad = staticRegex.containsMatchIn(l) || l.contains("themoviedb") || l.contains("google") ||
-                    l.contains("/api/stream.php") || l.contains("/api/sub.php") || l.contains("schema.org") ||
-                    l.contains("w3.org")
+                    l.contains("youtube") || l.contains("/api/stream.php") || l.contains("/api/sub.php") ||
+                    l.contains("schema.org") || l.contains("w3.org")
             if (interesting && !bad) cands.add(u)
         }
         relApiRegex.findAll(text).forEach { m -> cands.add(absolute(m.groupValues[1], base)) }
         runCatching {
             Jsoup.parse(text).select("iframe[src], iframe[data-src], embed[src]").forEach {
                 val s = it.attr("src").ifBlank { it.attr("data-src") }
-                if (s.isNotBlank() && !s.startsWith("about:")) cands.add(absolute(s, base))
+                if (s.isNotBlank() && !s.startsWith("about:") && !s.contains("youtube")) {
+                    cands.add(absolute(s, base))
+                }
             }
         }
 
@@ -427,79 +461,9 @@ class FilmMakinesiCafe : MainAPI() {
             if (crawl(body, u, depth + 1, visited, seen, subtitleCallback, callback)) {
                 found = true
                 break
-            } else if (body.length < 3000) {
-                Log.d(TAG, "BODY $u => ${body.replace(Regex("\\s+"), " ").take(1500)}")
             }
         }
         return found
-    }
-
-    /** Sayfada <div data-pv="ID"> + pilavyerplay core.js varsa player'ı elle çözmeyi dener. */
-    private suspend fun tryPilavyer(
-        html: String,
-        visited: MutableSet<String>,
-        seen: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val pv = Regex("""data-pv=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: return false
-        val coreUrl = Regex("""https?://[^"'\s]*pilavyerplay[^"'\s]*core\.js[^"'\s]*""").find(html)?.value
-            ?: "https://pilavyerplay.top/assets/js/core.js"
-        val hdr = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Origin" to mainUrl)
-        Log.d(TAG, "PV id=$pv core=$coreUrl")
-
-        val core = runCatching { app.get(coreUrl, headers = hdr).text }.getOrNull()
-        val cands = LinkedHashSet<String>()
-
-        if (core != null) {
-            Log.d(TAG, "CORE len=${core.length}")
-            // core.js'in tamamını (en fazla ~18 KB) logcat'e yaz
-            core.chunked(3000).take(6).forEachIndexed { i, c ->
-                Log.d(TAG, "CORE[$i] ${c.replace(Regex("\\s+"), " ")}")
-            }
-            val keys = listOf("/embed", "/player", "/api", "/e/", "/v/", "stream", "source", ".php", "pilavyer", "iframe")
-            val lits = Regex("""["'`]([^"'`\s]{3,200})["'`]""").findAll(core)
-                .map { it.groupValues[1] }
-                .filter { l -> keys.any { l.contains(it, ignoreCase = true) } && !staticRegex.containsMatchIn(l) }
-                .distinct().take(40).toList()
-            lits.forEach { Log.d(TAG, "CORE_LIT $it") }
-
-            lits.forEach { l ->
-                if (!(l.startsWith("/") || l.startsWith("http") || l.startsWith("//"))) return@forEach
-                val b = absolute(l, coreUrl)
-                when {
-                    b.endsWith("/") || b.endsWith("=") -> cands.add(b + pv)
-                    b.contains("?") -> cands.add("$b&v=$pv")
-                    else -> {
-                        cands.add("$b/$pv")
-                        cands.add("$b?v=$pv")
-                        cands.add("$b?id=$pv")
-                    }
-                }
-            }
-        }
-
-        // Bilinen/muhtemel kalıplar
-        for (h in listOf("https://pilavyerplay.top", "https://play2.pilavyerplay.top")) {
-            listOf("/embed/$pv", "/e/$pv", "/player/$pv", "/v/$pv", "/embed.php?v=$pv", "/api/source.php?v=$pv")
-                .forEach { cands.add(h + it) }
-        }
-
-        for (u in cands.take(16)) {
-            if (!visited.add(u)) continue
-            val res = runCatching { app.get(u, headers = hdr) }.getOrNull()
-            if (res == null) {
-                Log.d(TAG, "PVTRY FAIL $u")
-                continue
-            }
-            val body = normalize(res.text)
-            Log.d(TAG, "PVTRY code=${res.code} len=${body.length} $u")
-            if (res.code in 200..299 && crawl(body, u, 1, visited, seen, subtitleCallback, callback)) return true
-            if (res.code in 200..299 && body.length in 1..2500) {
-                Log.d(TAG, "PVBODY $u => ${body.replace(Regex("\\s+"), " ").take(1200)}")
-            }
-        }
-        return false
     }
 
     private suspend fun scan(
@@ -512,33 +476,55 @@ class FilmMakinesiCafe : MainAPI() {
         var any = false
         fun fix(u: String) = if (u.startsWith("//")) "https:$u" else u
 
-        subRegex.findAll(text).map { fix(it.value) }.distinct().forEach { sub ->
-            if (seen.add(sub)) subtitleCallback(SubtitleFile("Türkçe", sub))
+        // --- Altyazılar (etiketi linkin yakınından okumayı dene) ---
+        val usedLabels = HashMap<String, Int>()
+        subRegex.findAll(text).distinctBy { it.value }.forEach { m ->
+            val sub = fix(m.value)
+            if (!seen.add(sub)) return@forEach
+            val from = maxOf(0, m.range.first - 160)
+            val to = minOf(text.length, m.range.last + 160)
+            val window = text.substring(from, to)
+            var label = labelRegex.find(window)?.groupValues?.get(1)?.trim()
+            if (label.isNullOrBlank() || label.startsWith("http")) label = "Türkçe"
+            val n = (usedLabels[label] ?: 0) + 1
+            usedLabels[label] = n
+            subtitleCallback(SubtitleFile(if (n > 1) "$label $n" else label, sub))
         }
 
+        // --- Video linkleri ---
         val urls = (streamRegex.findAll(text) + m3u8Regex.findAll(text)).map { fix(it.value) }.distinct()
         for (u in urls) {
             if (!seen.add(u)) continue
+
             val quality = Regex("""stream_v(\d{3,4})""").find(u)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Qualities.Unknown.value
-            val isHls = u.contains("m3u8") || runCatching {
-                app.get(u, headers = headers).text.trimStart().startsWith("#EXTM3U")
-            }.getOrDefault(false)
+            // pilavyerplay stream.php / .m3u8 linkleri HLS'tir. Önceden "HLS mi?" diye
+            // indirip kontrol ediyorduk; sunucu yavaş cevap verince video sanılıyordu (hata 3003).
+            val type = if (u.contains(".mp4", ignoreCase = true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
 
-            Log.d(TAG, "LINK hls=$isHls q=$quality ${u.take(160)}")
+            Log.d(TAG, "LINK type=$type q=$quality ${u.take(140)}")
             callback(
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = u,
-                    type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
+                newExtractorLink(source = name, name = name, url = u, type = type) {
                     this.referer = "$mainUrl/"
                     this.quality = quality
                     this.headers = headers
                 }
             )
             any = true
+
+            // Ana liste (master) yavaş açılırsa doğrudan 720p kaynağı da seçilebilsin.
+            if (u.contains("/api/stream.php") && !u.contains("&p=") && !u.contains("?p=") && u.contains("&token=")) {
+                val v720 = u.replace("&token=", "&p=stream_v720%2Findex.m3u8&token=")
+                if (seen.add(v720)) {
+                    callback(
+                        newExtractorLink(source = name, name = "$name 720p", url = v720, type = ExtractorLinkType.M3U8) {
+                            this.referer = "$mainUrl/"
+                            this.quality = Qualities.P720.value
+                            this.headers = headers
+                        }
+                    )
+                }
+            }
         }
         return any
     }
@@ -546,22 +532,16 @@ class FilmMakinesiCafe : MainAPI() {
     /** Link bulunamazsa logcat'te "FMC" etiketiyle sayfanın ilgili kısımlarını gösterir. */
     private fun debugDump(url: String, code: Int, html: String) {
         try {
-            Log.d(TAG, "PAGE url=$url code=$code len=${html.length}")
+            Log.d(TAG, "NOTFOUND url=$url code=$code len=${html.length}")
+            val playerType = Regex("""data-player-type=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            Log.d(TAG, "player-type=$playerType (none = sitede bu bölüme kaynak eklenmemiş)")
             val scripts = Jsoup.parse(html).select("script[src]").map { it.attr("src") }
-            Log.d(TAG, "SCRIPTS ${scripts.joinToString(" | ").take(1500)}")
-            val keys = listOf(
-                "pilavyer", "data-pv", "m3u8", "stream.php", "sub.php",
-                "player", "embed", "fetch(", "/api/", "video"
-            )
-            for (k in keys) {
-                var idx = html.indexOf(k, ignoreCase = true)
-                var n = 0
-                while (idx >= 0 && n < 3) {
-                    val s = html.substring(maxOf(0, idx - 120), minOf(html.length, idx + 300))
-                        .replace(Regex("\\s+"), " ")
-                    Log.d(TAG, "[$k] $s")
-                    n++
-                    idx = html.indexOf(k, idx + 400, ignoreCase = true)
+            Log.d(TAG, "SCRIPTS ${scripts.joinToString(" | ").take(1200)}")
+            for (k in listOf("pilavyer", "data-pv", "m3u8", "stream.php")) {
+                val idx = html.indexOf(k, ignoreCase = true)
+                if (idx >= 0) {
+                    Log.d(TAG, "[$k] " + html.substring(maxOf(0, idx - 120), minOf(html.length, idx + 300))
+                        .replace(Regex("\\s+"), " "))
                 }
             }
         } catch (e: Exception) {
