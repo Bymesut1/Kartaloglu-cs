@@ -84,14 +84,15 @@ class FilmMakinesiCafe : MainAPI() {
         val siteTitle = (doc.selectFirst("h1")?.text()
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
             ?: return null).cleanTitle()
-        val siteYear = doc.select("a, span, time").asSequence()
+        // Yıl ve türler sadece ana içerikten alınır (üst menüdeki tür listesi karışmasın)
+        val siteYear = doc.select("main a, main span, main time").asSequence()
             .map { it.text().trim() }
             .firstOrNull { Regex("""^(19|20)\d{2}$""").matches(it) }
             ?.toIntOrNull()
         val sitePoster = fixUrlNull(doc.selectFirst("meta[property=og:image]")?.attr("content"))
         val sitePlot = doc.selectFirst("meta[property=og:description]")?.attr("content")
             ?: doc.selectFirst("meta[name=description]")?.attr("content")
-        val siteTags = doc.select("a[href*=/tur/]").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
+        val siteTags = doc.select("main a[href*=/tur/]").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
 
         val tmdb = tmdbDetail(siteTitle, siteYear, isMovie)
 
@@ -146,7 +147,8 @@ class FilmMakinesiCafe : MainAPI() {
         val episodes = eps.sortedWith(compareBy({ it.first }, { it.second })).map { (s, e, href) ->
             val t = seasonMap[s]?.get(e)
             newEpisode(href) {
-                this.name = t?.name ?: "$e. Bölüm"
+                // TMDB yoksa ad boş kalır (CloudStream "1. Bölüm" gibi gösterir, "1. 1. Bölüm" olmaz)
+                this.name = t?.name
                 this.season = s
                 this.episode = e
                 this.posterUrl = t?.still?.let { "$TMDB_IMG/w780$it" }
@@ -197,49 +199,106 @@ class FilmMakinesiCafe : MainAPI() {
     private fun JSONObject.str(key: String): String? =
         if (isNull(key)) null else optString(key).trim().takeIf { it.isNotBlank() }
 
-    private suspend fun tmdbDetail(title: String, year: Int?, isMovie: Boolean): TmdbDetail? {
-        if (TMDB_API_KEY.startsWith("BURAYA")) return null
-        return try {
-            val kind = if (isMovie) "movie" else "tv"
-            val q = URLEncoder.encode(title, "UTF-8")
+    private fun normTitle(s: String): String =
+        s.lowercase().replace(Regex("""[^\p{L}\p{N}]+"""), " ").trim()
 
-            suspend fun search(withYear: Boolean): JSONArray {
-                val y = if (withYear && year != null)
-                    (if (isMovie) "&year=$year" else "&first_air_date_year=$year") else ""
-                val txt = app.get("$TMDB_API/search/$kind?api_key=$TMDB_API_KEY&language=tr-TR&query=$q$y").text
-                return JSONObject(txt).optJSONArray("results") ?: JSONArray()
+    /** TMDB isteği: başarısız olursa bir kez daha dener, hatayı logcat'e yazar. */
+    private suspend fun tmdbGet(url: String): String? {
+        for (attempt in 1..2) {
+            val res = runCatching { app.get(url) }.getOrNull()
+            if (res != null && res.code in 200..299) return res.text
+            Log.d(TAG, "TMDB fail attempt=$attempt code=${res?.code} ${url.substringBefore("api_key=")}")
+        }
+        return null
+    }
+
+    private suspend fun tmdbDetail(title: String, year: Int?, isMovie: Boolean): TmdbDetail? {
+        if (TMDB_API_KEY.startsWith("BURAYA")) {
+            Log.d(TAG, "TMDB: API key girilmemiş")
+            return null
+        }
+        return try {
+            val kinds = if (isMovie) listOf("movie", "tv") else listOf("tv", "movie")
+            val wanted = normTitle(title)
+
+            val variants = LinkedHashSet<String>()
+            variants.add(title)
+            variants.add(wanted)
+            val tokens = wanted.split(" ")
+            if (tokens.size > 1 && tokens.all { t -> t.isNotEmpty() && t.all { it.isDigit() } }) {
+                variants.add(tokens.joinToString("."))
             }
 
-            var results = search(true)
-            if (results.length() == 0) results = search(false)
-            if (results.length() == 0) return null
+            var bestKind = ""
+            var bestId = -1
+            var bestScore = -1
+            var firstKind = ""
+            var firstId = -1
 
-            var pick = results.getJSONObject(0)
-            if (year != null) {
-                for (i in 0 until results.length()) {
-                    val r = results.getJSONObject(i)
-                    val d = r.str("release_date") ?: r.str("first_air_date")
-                    if (d?.take(4)?.toIntOrNull() == year) {
-                        pick = r
-                        break
+            search@ for (kind in kinds) {
+                for (q in variants) {
+                    for (withYear in listOf(true, false)) {
+                        if (withYear && year == null) continue
+                        val ys = if (withYear)
+                            (if (kind == "movie") "&year=$year" else "&first_air_date_year=$year") else ""
+                        val txt = tmdbGet(
+                            "$TMDB_API/search/$kind?api_key=$TMDB_API_KEY&language=tr-TR" +
+                                    "&query=${URLEncoder.encode(q, "UTF-8")}$ys"
+                        ) ?: continue
+                        val arr = JSONObject(txt).optJSONArray("results") ?: continue
+
+                        for (i in 0 until arr.length()) {
+                            val r = arr.getJSONObject(i)
+                            val id = r.optInt("id", -1)
+                            if (id < 0) continue
+                            if (firstId < 0 && kind == kinds[0]) {
+                                firstId = id
+                                firstKind = kind
+                            }
+                            val names = listOf("title", "name", "original_title", "original_name")
+                                .mapNotNull { r.str(it) }.map { normTitle(it) }
+                            val d = r.str("release_date") ?: r.str("first_air_date")
+                            var score = 0
+                            if (names.any { it == wanted }) score += 4
+                            if (year != null && d?.take(4)?.toIntOrNull() == year) score += 2
+                            if (kind == kinds[0]) score += 1
+                            if (score > bestScore) {
+                                bestScore = score
+                                bestId = id
+                                bestKind = kind
+                            }
+                        }
+                        if (bestScore >= 7) break@search
                     }
                 }
+                if (bestScore >= 5) break
             }
-            val id = pick.optInt("id", -1)
-            if (id < 0) return null
+
+            val kind: String
+            val id: Int
+            if (bestScore >= 4) {
+                kind = bestKind
+                id = bestId
+            } else if (firstId >= 0) {
+                kind = firstKind
+                id = firstId
+            } else {
+                Log.d(TAG, "TMDB '$title' year=$year -> sonuç yok")
+                return null
+            }
+            Log.d(TAG, "TMDB '$title' year=$year -> kind=$kind id=$id score=$bestScore")
 
             val d = JSONObject(
-                app.get(
+                tmdbGet(
                     "$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=tr-TR" +
                             "&append_to_response=credits,videos&include_video_language=tr,en,null"
-                ).text
+                ) ?: return null
             )
 
             var overview = d.str("overview")
             if (overview == null) {
-                overview = JSONObject(
-                    app.get("$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=en-US").text
-                ).str("overview")
+                overview = tmdbGet("$TMDB_API/$kind/$id?api_key=$TMDB_API_KEY&language=en-US")
+                    ?.let { JSONObject(it).str("overview") }
             }
 
             val genres = mutableListOf<String>()
@@ -288,28 +347,34 @@ class FilmMakinesiCafe : MainAPI() {
                 seasons = seasons
             )
         } catch (e: Exception) {
+            Log.d(TAG, "TMDB hata: ${e.message}")
             null
         }
     }
 
     private suspend fun tmdbSeason(tvId: Int, season: Int): Map<Int, TmdbEpisode>? = try {
-        val txt = app.get("$TMDB_API/tv/$tvId/season/$season?api_key=$TMDB_API_KEY&language=tr-TR").text
-        val arr = JSONObject(txt).optJSONArray("episodes") ?: JSONArray()
-        val map = HashMap<Int, TmdbEpisode>()
-        for (i in 0 until arr.length()) {
-            val e = arr.getJSONObject(i)
-            val n = e.optInt("episode_number", -1)
-            if (n < 0) continue
-            map[n] = TmdbEpisode(
-                number = n,
-                name = e.str("name"),
-                overview = e.str("overview"),
-                still = e.str("still_path"),
-                airDate = e.str("air_date")
-            )
+        val txt = tmdbGet("$TMDB_API/tv/$tvId/season/$season?api_key=$TMDB_API_KEY&language=tr-TR")
+        if (txt == null) {
+            null
+        } else {
+            val arr = JSONObject(txt).optJSONArray("episodes") ?: JSONArray()
+            val map = HashMap<Int, TmdbEpisode>()
+            for (i in 0 until arr.length()) {
+                val e = arr.getJSONObject(i)
+                val n = e.optInt("episode_number", -1)
+                if (n < 0) continue
+                map[n] = TmdbEpisode(
+                    number = n,
+                    name = e.str("name"),
+                    overview = e.str("overview"),
+                    still = e.str("still_path"),
+                    airDate = e.str("air_date")
+                )
+            }
+            map
         }
-        map
     } catch (e: Exception) {
+        Log.d(TAG, "TMDB sezon hata: ${e.message}")
         null
     }
 
@@ -498,8 +563,7 @@ class FilmMakinesiCafe : MainAPI() {
 
             val quality = Regex("""stream_v(\d{3,4})""").find(u)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Qualities.Unknown.value
-            // pilavyerplay stream.php / .m3u8 linkleri HLS'tir. Önceden "HLS mi?" diye
-            // indirip kontrol ediyorduk; sunucu yavaş cevap verince video sanılıyordu (hata 3003).
+            // pilavyerplay stream.php / .m3u8 linkleri HLS'tir.
             val type = if (u.contains(".mp4", ignoreCase = true)) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
 
             Log.d(TAG, "LINK type=$type q=$quality ${u.take(140)}")
