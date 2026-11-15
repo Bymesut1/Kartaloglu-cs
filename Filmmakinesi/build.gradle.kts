@@ -1,4 +1,4 @@
-version = 35
+version = 38
 
 cloudstream {
     description = "filmmakinesi.to - Film ve Dizi izle"
