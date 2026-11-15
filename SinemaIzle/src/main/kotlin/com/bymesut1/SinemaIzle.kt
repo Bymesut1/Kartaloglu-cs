@@ -26,6 +26,9 @@ class SinemaIzle : MainAPI() {
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImg = "https://image.tmdb.org/t/p"
 
+    // true iken link bulunamazsa kaynak listesine "DBG ..." satirlari ekler
+    private val debug = true
+
     private val ua =
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     private val baseHeaders = mapOf("User-Agent" to ua)
@@ -352,6 +355,9 @@ class SinemaIzle : MainAPI() {
     private val processRegex = Regex("""https?://[^\s"'<>\\]+/process/[A-Za-z0-9+/=_\-%]+""")
     private val m3uRegex = Regex("""https?://[^\s"'<>\\]+(?:/m3u/[A-Za-z0-9+/=_\-]+|\.m3u8[^\s"'<>\\]*)""")
     private val vttRegex = Regex("""https?://[^\s"'<>\\]+?\.vtt""")
+    private val anyUrlRegex = Regex("""https?://[^\s"'<>\\]+""")
+    private val staticRegex = Regex("""\.(jpg|jpeg|png|webp|svg|gif|css|js|woff2?|ttf|ico|json|xml)(\?|$)""", RegexOption.IGNORE_CASE)
+    private val playerKeyRegex = Regex("""process|player|embed|vidmixi|iframe|/play|/e/|/v/|kaynak|source""", RegexOption.IGNORE_CASE)
 
     private fun subLabel(url: String): String {
         val f = url.substringAfterLast('/').substringBefore('.').lowercase()
@@ -385,16 +391,38 @@ class SinemaIzle : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val dbg = ArrayList<String>()
         val page = app.get(data, headers = baseHeaders, referer = "$mainUrl/")
-        val html = page.text.replace("\\/", "/")
+        val html = page.text.replace("\\/", "/").replace("&amp;", "&")
+        dbg.add("sayfa ${page.code} len=${html.length}")
+
         val subSeen = HashSet<String>()
         collectSubs(html, subSeen, subtitleCallback)
 
-        val players = linkedSetOf<String>()
-        processRegex.findAll(html).forEach { players.add(it.value) }
-        for (f in page.document.select("iframe[src], iframe[data-src]")) {
-            val s = fixUrl(f.attr("src").ifBlank { f.attr("data-src") })
-            if (s.startsWith("http") && !s.contains("sinemaizle.org")) players.add(s)
+        // --- aday oynatici linkleri ---
+        val candidates = linkedSetOf<String>()
+        processRegex.findAll(html).forEach { candidates.add(it.value) }
+
+        val attrs = listOf(
+            "src", "data-src", "data-url", "data-embed", "data-player",
+            "data-video", "data-iframe", "data-link", "data-href", "data-source"
+        )
+        for (el in page.document.select("*")) {
+            for (a in attrs) {
+                val v = el.attr(a)
+                if (v.isBlank()) continue
+                val u = fixUrl(v)
+                if (!u.startsWith("http") || staticRegex.containsMatchIn(u)) continue
+                val internal = u.contains("sinemaizle.org")
+                if (internal && el.tagName() != "iframe" && !playerKeyRegex.containsMatchIn(u)) continue
+                candidates.add(u)
+            }
+        }
+        for (m in anyUrlRegex.findAll(html)) {
+            val u = m.value
+            if (staticRegex.containsMatchIn(u)) continue
+            if (u.contains("sinemaizle.org") && !Regex("""player|embed|kaynak|source""").containsMatchIn(u)) continue
+            if (playerKeyRegex.containsMatchIn(u)) candidates.add(u)
         }
 
         var found = false
@@ -410,24 +438,70 @@ class SinemaIzle : MainAPI() {
             found = true
         }
 
-        for (p in players) {
-            try {
-                val resp = app.get(p, headers = baseHeaders, referer = "$mainUrl/")
-                val body = resp.text.replace("\\/", "/")
-                collectSubs(body, subSeen, subtitleCallback)
-                if (body.trimStart().startsWith("#EXTM3U")) {
-                    // process linki dogrudan master m3u8 donuyor (ses + goruntu birlikte)
-                    emit(p, "$mainUrl/")
-                } else {
-                    val m = m3uRegex.find(body)?.value
-                    if (m != null) emit(m, origin(p))
+        val visited = HashSet<String>()
+
+        suspend fun resolve(u: String, ref: String, depth: Int): Unit {
+            if (found || visited.size >= 14 || !visited.add(u)) return
+            val resp = try {
+                app.get(u, headers = baseHeaders, referer = ref)
+            } catch (e: Exception) {
+                dbg.add("HATA ${e.javaClass.simpleName} $u")
+                return
+            }
+            val body = resp.text.replace("\\/", "/").replace("&amp;", "&")
+            dbg.add("${resp.code} len=${body.length} d$depth $u")
+            collectSubs(body, subSeen, subtitleCallback)
+
+            if (body.trimStart().startsWith("#EXTM3U")) {
+                // process linki dogrudan master m3u8 donuyor (ses + goruntu birlikte)
+                emit(u, ref)
+                return
+            }
+            m3uRegex.find(body)?.value?.let {
+                emit(it, origin(u))
+                return
+            }
+            if (depth < 2) {
+                val next = linkedSetOf<String>()
+                processRegex.findAll(body).forEach { next.add(it.value) }
+                for (f in Jsoup.parse(body, u).select("iframe[src], iframe[data-src]")) {
+                    val s = f.absUrl("src").ifBlank { f.absUrl("data-src") }
+                    if (s.startsWith("http")) next.add(s)
                 }
-            } catch (_: Exception) {
+                for (n in next) resolve(n, u, depth + 1)
             }
         }
 
-        if (!found) {
-            m3uRegex.find(html)?.value?.let { emit(it, "$mainUrl/") }
+        // sayfanin kendisinde dogrudan m3u8 varsa
+        m3uRegex.find(html)?.value?.let { emit(it, "$mainUrl/") }
+
+        for (c in candidates) {
+            if (found) break
+            resolve(c, data, 0)
+        }
+
+        if (!found && debug) {
+            // teshis satirlari: kaynak listesinde "DBG ..." olarak gorunur
+            val lines = ArrayList<String>()
+            lines.addAll(dbg.take(6))
+            lines.add("aday sayisi ${candidates.size}")
+            for (kw in listOf("<iframe", "player", "embed", "kaynak", "fetch(", "vidmixi", "data-")) {
+                val i = html.indexOf(kw)
+                if (i >= 0) {
+                    val s = html.substring(maxOf(0, i - 60), minOf(html.length, i + 120))
+                        .replace(Regex("""\s+"""), " ")
+                    lines.add("[$kw] $s")
+                }
+            }
+            for (l in lines.take(12)) {
+                callback(
+                    newExtractorLink(this.name, "DBG " + l.take(160), "https://example.com/", ExtractorLinkType.VIDEO) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+            return true
         }
         return found
     }
