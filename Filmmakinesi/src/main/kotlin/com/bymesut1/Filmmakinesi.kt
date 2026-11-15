@@ -105,7 +105,7 @@ class Filmmakinesi : MainAPI() {
     // CloudflareKiller çerezi bir kez alınca süresi dolsa bile onu kullanmaya devam eder (yeniden çözmez),
     // bu yüzden bir süre sonra hep 403 gelir. 403 alırsak çözücüyü sıfırlayıp bir kez daha deneriz.
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
-    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+    private suspend fun cfGetRaw(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
         val k = cfKiller
         var r = if (cfWarm) {
             app.get(url, headers = headers, interceptor = k, timeout = timeout)
@@ -136,6 +136,49 @@ class Filmmakinesi : MainAPI() {
             cfSave()
         }
         return r
+    }
+
+    // ---- İstek hız sınırı: CloudStream ana sayfadaki tüm kategorileri aynı anda ister; site bunu
+    // "Biraz yavaşlayalım" sayfasıyla keser (tarayıcıda tek tek açıldığı için çalışır).
+    // Bu yüzden istekler sıraya girer, aralarında en az minGapMs bekler, yavaşlama sayfası gelirse bekleyip tekrar dener.
+    private val paceLock = Semaphore(1)
+    @Volatile
+    private var lastReqAt = 0L
+    private val minGapMs = 900L
+    private val slowRe = Regex("yava[sş]layal[ıiİI]m", RegexOption.IGNORE_CASE)
+
+    private fun isSlowPage(r: NiceResponse): Boolean {
+        if (r.code == 429) return true
+        if (r.code !in 200..299) return false
+        val t = r.text
+        return t.length < 8000 && slowRe.containsMatchIn(t)
+    }
+
+    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+        var attempt = 0
+        while (true) {
+            paceLock.acquire()
+            val r = try {
+                val wait = lastReqAt + minGapMs - System.currentTimeMillis()
+                if (wait > 0) {
+                    try { Thread.sleep(wait) } catch (_: InterruptedException) { }
+                }
+                try {
+                    cfGetRaw(url, headers, timeout)
+                } finally {
+                    lastReqAt = System.currentTimeMillis()
+                }
+            } finally {
+                paceLock.release()
+            }
+            if (isSlowPage(r) && attempt < 3) {
+                attempt++
+                log("YAVAS sayfa: ${attempt}. tekrar bekleniyor ${url.take(70)}")
+                try { Thread.sleep(3500L * attempt) } catch (_: InterruptedException) { }
+                continue
+            }
+            return r
+        }
     }
 
     private val androidUA =
@@ -203,7 +246,14 @@ class Filmmakinesi : MainAPI() {
     @Volatile
     private var lastInfo = ""
 
+    // Aynı liste kısa süre içinde tekrar istenirse siteye gitmeden önbellekten verir (5 dk)
+    private val listCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+    private val listTtlMs = 5L * 60 * 1000
+
     private suspend fun fetchList(url: String): List<SearchResponse> {
+        val hit = listCache[url]
+        if (hit != null && System.currentTimeMillis() - hit.first < listTtlMs) return hit.second
+
         // 0: Cloudflare çözücü ile, 1: düz masaüstü UA ile
         for (i in 0..1) {
             val r = try {
@@ -223,7 +273,12 @@ class Filmmakinesi : MainAPI() {
             val srv = r.headers["server"].orEmpty()
             lastInfo = "kod=${r.code} $srv \"$title\""
             log("liste i=$i kod=${r.code} len=${body.length} server=$srv title=$title kart=${list.size} ${url.take(80)}")
-            if (list.isNotEmpty()) return list
+            if (list.isNotEmpty()) {
+                listCache[url] = System.currentTimeMillis() to list
+                return list
+            }
+            // Site hâlâ "yavaşlayalım" diyorsa ikinci isteği boşuna gönderme (süreyi daha da uzatır)
+            if (isSlowPage(r)) break
         }
         return emptyList()
     }
