@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
@@ -352,14 +353,30 @@ class SinemaIzle : MainAPI() {
     // ------------------------------------------------------------------
     // LINKLER
     // Akis: sayfadaki bx([{i,s}]) -> POST /px (i,s, CSRF, cerez) -> JSON.u
-    //       -> imgsdns/process oynatici -> vidmixi master m3u8 + altyazi
+    //       -> vidmixi.com/embed/... -> m3u8 (+ altyazi)
     // ------------------------------------------------------------------
     private val processRegex = Regex("""https?://[^\s"'<>\\]+/process/[A-Za-z0-9+/=_\-%]+""")
     private val m3uRegex = Regex("""https?://[^\s"'<>\\]+(?:/m3u/[A-Za-z0-9+/=_\-]+|\.m3u8[^\s"'<>\\]*)""")
+    private val relM3uRegex = Regex("""["'`](/?m3u/[A-Za-z0-9+/=_\-]+)["'`]""")
+    private val longTokenRegex = Regex("""[A-Za-z0-9+/=_\-]{80,}""")
     private val vttRegex = Regex("""https?://[^\s"'<>\\]+?\.vtt""")
+    private val relVttRegex = Regex("""/upload/videos/[^"'\s<>\\]+?\.vtt""")
     private val bxRegex = Regex(
         """(?:\\u0022|")i(?:\\u0022|")\s*:\s*(\d+)\s*,\s*(?:\\u0022|")s(?:\\u0022|")\s*:\s*(?:\\u0022|")([^"\\]+)"""
     )
+
+    private fun logBody(tag: String, body: String) {
+        try {
+            Log.d("SinemaIzle", "=== $tag len=${body.length}")
+            var i = 0
+            while (i < body.length) {
+                Log.d("SinemaIzle", body.substring(i, minOf(body.length, i + 3000)))
+                i += 3000
+            }
+            Log.d("SinemaIzle", "=== /$tag")
+        } catch (_: Exception) {
+        }
+    }
 
     private fun subLabel(url: String): String {
         val f = url.substringAfterLast('/').substringBefore('.').lowercase()
@@ -371,9 +388,18 @@ class SinemaIzle : MainAPI() {
         }
     }
 
-    private suspend fun collectSubs(text: String, seen: MutableSet<String>, cb: (SubtitleFile) -> Unit) {
+    private suspend fun collectSubs(
+        text: String,
+        base: String,
+        seen: MutableSet<String>,
+        cb: (SubtitleFile) -> Unit
+    ) {
         for (m in vttRegex.findAll(text)) {
             val u = m.value
+            if (seen.add(u)) cb(newSubtitleFile(subLabel(u), u))
+        }
+        for (m in relVttRegex.findAll(text)) {
+            val u = base.trimEnd('/') + m.value
             if (seen.add(u)) cb(newSubtitleFile(subLabel(u), u))
         }
     }
@@ -404,7 +430,7 @@ class SinemaIzle : MainAPI() {
         dbg.add("csrf=${csrf.take(6)} cerez=${cookies.size}")
 
         val subSeen = HashSet<String>()
-        collectSubs(html, subSeen, subtitleCallback)
+        collectSubs(html, mainUrl, subSeen, subtitleCallback)
 
         var found = false
 
@@ -431,17 +457,41 @@ class SinemaIzle : MainAPI() {
             }
             val body = resp.text.replace("\\/", "/").replace("&amp;", "&")
             dbg.add("oynatici ${resp.code} len=${body.length} d$depth $u")
-            collectSubs(body, subSeen, subtitleCallback)
+            logBody("oynatici d$depth $u", body)
+            val org = origin(u)
+            collectSubs(body, org, subSeen, subtitleCallback)
 
             if (body.trimStart().startsWith("#EXTM3U")) {
-                // process linki dogrudan master m3u8 donuyor (ses + goruntu birlikte)
+                // dogrudan master m3u8 (ses + goruntu birlikte)
                 emit(u, ref)
                 return
             }
             m3uRegex.find(body)?.value?.let {
-                emit(it, origin(u))
+                emit(it, org)
                 return
             }
+            relM3uRegex.find(body)?.groupValues?.get(1)?.let {
+                emit(org + it.trimStart('/'), u)
+                return
+            }
+
+            // uzun base64 parcalarini /m3u/ altinda dene
+            val toks = longTokenRegex.findAll(body).map { it.value }.distinct().take(4).toList()
+            for (t in toks) {
+                val cand = org + "m3u/" + t
+                val r = try {
+                    app.get(cand, headers = baseHeaders, referer = u)
+                } catch (_: Exception) {
+                    null
+                }
+                dbg.add("tok ${r?.code} ${t.take(14)}")
+                if (r != null && r.text.trimStart().startsWith("#EXTM3U")) {
+                    collectSubs(r.text, org, subSeen, subtitleCallback)
+                    emit(cand, u)
+                    return
+                }
+            }
+
             if (depth < 2) {
                 val next = linkedSetOf<String>()
                 processRegex.findAll(body).forEach { next.add(it.value) }
@@ -477,6 +527,7 @@ class SinemaIzle : MainAPI() {
                 )
                 val body = r.text
                 dbg.add("px ${r.code} ${body.take(90)}")
+                Log.d("SinemaIzle", "px ${r.code} $body")
                 val u = try {
                     JSONObject(body).str("u")
                 } catch (_: Exception) {
@@ -498,7 +549,7 @@ class SinemaIzle : MainAPI() {
 
         if (!found && debug) {
             var n = 0
-            for (l in dbg.take(12)) {
+            for (l in dbg.take(14)) {
                 n++
                 callback(
                     newExtractorLink(
