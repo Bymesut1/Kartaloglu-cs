@@ -61,6 +61,7 @@ jobs:
           cp ZipFilmizle/build/*.cs3 out/
           cp FilmEkseni/build/*.cs3 out/
           cp Filmmodu/build/*.cs3 out/
+          cp SinemaIzle/build/*.cs3 out/
           cp HDFilmCehennemiland/build/*.cs3 out/
           cp YouTube/build/*.cs3 out/
           cp YouTubeOriginal/build/*.cs3 out/
