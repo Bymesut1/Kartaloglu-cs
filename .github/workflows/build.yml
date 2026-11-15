@@ -63,6 +63,7 @@ jobs:
           cp Filmmodu/build/*.cs3 out/
           cp HDFilmCehennemiland/build/*.cs3 out/
           cp YouTube/build/*.cs3 out/
+          cp YouTubeOriginal/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
           git init -b builds
