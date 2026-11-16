@@ -31,7 +31,6 @@ jobs:
           mkdir out
           cp DiziMom/build/*.cs3 out/
           cp MailRu/build/*.cs3 out/
-          cp Filmmakinesi/build/*.cs3 out/
           cp FilmDozu/build/*.cs3 out/
           cp CizgiMax/build/*.cs3 out/
           cp HDFilmCehennemi/build/*.cs3 out/
@@ -43,10 +42,7 @@ jobs:
           cp FullHDFilmizlesene/build/*.cs3 out/
           cp VkVideo/build/*.cs3 out/
           cp Zdizi/build/*.cs3 out/
-          cp Dizilla/build/*.cs3 out/
-          cp Selcukflix/build/*.cs3 out/
           cp DiziLife/build/*.cs3 out/
-          cp DiziPal/build/*.cs3 out/
           cp Dizimag/build/*.cs3 out/
           cp DiziSol/build/*.cs3 out/
           cp RecTV/build/*.cs3 out/
@@ -64,7 +60,6 @@ jobs:
           cp Filmmodu/build/*.cs3 out/
           cp SinemaIzle/build/*.cs3 out/
           cp HDFilmCehennemiland/build/*.cs3 out/
-          cp YouTube/build/*.cs3 out/
           cp YouTubeOriginal/build/*.cs3 out/
           cp build/plugins.json out/
           cd out
