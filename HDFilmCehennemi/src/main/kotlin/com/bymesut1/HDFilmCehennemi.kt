@@ -868,7 +868,41 @@ class HDFilmCehennemi : MainAPI() {
 
     private val wvStreamRe = Regex("""master\.txt|\.m3u8|\.mp4(\?|$)""")
 
-    private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): EmbedResult? {
+    // Film sayfasını WebView'de açar, (gerekirse) oynatıcı sekmesini seçip oynat'a basar; iframe içinden gelen
+    // master.txt / m3u8 isteğini yakalar. Oynatıcı gerçek iframe bağlamında çalıştığı için doğrudan açmaktan daha güvenilir.
+    private suspend fun wvCapture(pageUrl: String, altId: String?): String? {
+        val page = wwwOf(pageUrl)
+        val idPart = (altId ?: "").filter { it.isLetterOrDigit() }
+        val js = "(function(){var id='" + idPart + "';var n=0;var t=setInterval(function(){n++;try{" +
+            "if(id&&n==2){var b=document.querySelector('button.alternative-link[data-video=\\''+id+'\\']');if(b)b.click();}" +
+            "var f=document.querySelector('.video-container iframe');" +
+            "var p=document.querySelector('.play-that-video');" +
+            "if(n>=3&&p&&!(f&&(f.getAttribute('src')||'').length>0))p.click();" +
+            "}catch(e){}if(n>=20)clearInterval(t);},700);})();"
+        val wwwRoot = "https://www." + siteBase().substringAfter("://").removePrefix("www.").trimEnd('/') + "/"
+        val bad = Regex("""\.(?:vtt|srt|jpe?g|png|webp|gif|css|js)(?:\?|$)""", IC)
+        val wv = app.get(
+            page,
+            referer = wwwRoot,
+            interceptor = WebViewResolver(wvStreamRe, timeout = 30_000L, script = js)
+        )
+        val u = wv.url
+        return if (u != page && wvStreamRe.containsMatchIn(u) && !bad.containsMatchIn(u)) u else null
+    }
+
+    // Uzun metni logcat'e parça parça yaz (yapıyı incelemek için)
+    private fun dumpLog(tag: String, text: String) {
+        val t = text.replace("\r", "").replace("\n", " ").replace(Regex("\\s{2,}"), " ")
+        var i = 0
+        var n = 0
+        while (i < t.length && n < 14) {
+            log("DUMP $tag[$n] " + t.substring(i, minOf(t.length, i + 3000)))
+            i += 3000
+            n++
+        }
+    }
+
+    private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0, altId: String? = null): EmbedResult? {
         val variants = if (depth > 0) listOf(embedUrl) else embedVariants(embedUrl)
         val wwwRoot = "https://www." + siteBase().substringAfter("://").removePrefix("www.").trimEnd('/') + "/"
         var cfTried = false // Cloudflare çözücüyü bu çağrıda en çok bir kez dene (gereksiz bekleme olmasın)
@@ -926,7 +960,10 @@ class HDFilmCehennemi : MainAPI() {
                 keySet.addAll(Decoder.keysFrom(allUrls.toList(), true))
 
                 log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
-                if (allUrls.isEmpty()) log("EM ilk150: " + html.take(150).replace("\n", " "))
+                if (allUrls.isEmpty()) {
+                    log("EM ilk150: " + html.take(150).replace("\n", " "))
+                    if (depth == 0) dumpLog(if (isMobi(v)) "close" else "rapid", html)
+                }
                 if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v, keySet.toList())
 
                 val inner = Jsoup.parse(html).selectFirst("iframe[data-src], iframe[src]")
@@ -949,22 +986,14 @@ class HDFilmCehennemi : MainAPI() {
             }
         }
 
-        // Son çare: oynatıcıyı gerçek tarayıcı gibi (WebView) açıp master.txt / m3u8 isteğini yakala (en çok 25 sn)
+        // Son çare: film sayfasını gerçek tarayıcı gibi (WebView) açıp oynat düğmesine bas, master.txt / m3u8 isteğini yakala
         if (depth == 0) {
             try {
-                val target = variants.firstOrNull() ?: embedUrl
-                val wv = app.get(
-                    target,
-                    referer = wwwRoot,
-                    interceptor = WebViewResolver(wvStreamRe, timeout = 25_000L)
-                )
-                val u = wv.url
-                log("EM WV ${u.take(120)}")
-                if (u != target && wvStreamRe.containsMatchIn(u)) {
-                    return EmbedResult(
-                        listOf(u), emptyList(), setOf(u), target,
-                        Decoder.keysFrom(listOf(u), true)
-                    )
+                val u = wvCapture(pageUrl, altId)
+                log("EM WV ${u?.take(120)}")
+                if (u != null) {
+                    val target = variants.firstOrNull() ?: embedUrl
+                    return EmbedResult(listOf(u), emptyList(), setOf(u), target, Decoder.keysFrom(listOf(u), true))
                 }
             } catch (e: Exception) {
                 log("EM WV hata ${e.javaClass.simpleName}")
@@ -1162,7 +1191,7 @@ class HDFilmCehennemi : MainAPI() {
                     embList.add(embedUrl)
                     log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
 
-                    val res: EmbedResult? = resolveEmbed(embedUrl, pageUrl)
+                    val res: EmbedResult? = resolveEmbed(embedUrl, pageUrl, 0, job.id)
                     if (res == null) {
                         log("P ${job.name} çözülemedi")
                         // Yedek: hazır çıkarıcıları dene (ör. Close)
@@ -1219,16 +1248,9 @@ class HDFilmCehennemi : MainAPI() {
                         // Önce oynatıcıyı tarayıcı gibi (WebView) çalıştırıp gerçek akış isteğini yakala.
                         // Close'un sayfadaki adresi yem olabiliyor; tarayıcıdaki gerçek adres cdnimages üzerinden geliyor.
                         try {
-                            val wvRe = wvStreamRe
-                            val wv = app.get(
-                                res.base,
-                                referer = "https://www." + siteBase().substringAfter("://").removePrefix("www.").trimEnd('/') + "/",
-                                interceptor = WebViewResolver(wvRe, timeout = 25_000L)
-                            )
-                            val wu = wv.url
-                            log("P ${job.name} WV ${wu.take(120)}")
-                            val bad = Regex("""\.(?:vtt|srt|jpe?g|png|webp|gif|css|js)(?:\?|$)""", IC)
-                            if (wu != res.base && wvRe.containsMatchIn(wu) && !bad.containsMatchIn(wu)) {
+                            val wu = wvCapture(pageUrl, job.id)
+                            log("P ${job.name} WV ${wu?.take(120)}")
+                            if (wu != null) {
                                 // Token tek kullanımlık olabilir: ağ doğrulaması yapmadan tarayıcıdaki header'larla ver
                                 okList = listOf(Pair(wu, Verified(false, streamHeaderSets(res.base, wu)[0])))
                             }
