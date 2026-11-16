@@ -952,7 +952,6 @@ class HDFilmCehennemi : MainAPI() {
                     // Çözülen adres varsa yem adresler (JSON-LD contentUrl vb.) öncelik almasın
                     allUrls.addAll(dec)
                     allStrict.addAll(dec)
-                    allUrls.addAll(c.urls)
                 } else {
                     // Close vb.: JSON-LD "contentUrl" doğrudan video adresi olabilir
                     val ld = Regex(""""contentUrl"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
@@ -1807,7 +1806,9 @@ object Decoder {
     }
 
     // Verilen metindeki tüm fn([...]) çağrılarını çözer; çözülen metinleri döndürür
-    fun nsDecodeAll(src: String): List<String> {
+    // returnedOnly=true: yalnizca "return fn([...])" cagrilari (configs.sources icindeki gercek adres);
+    // "var x=fn([...])" olanlar yem (hep ayni / baska bir videonun adresi)
+    fun nsDecodeAll(src: String, returnedOnly: Boolean = false): List<String> {
         if (!src.contains(".join(") || !src.contains("charCodeAt")) return emptyList()
         val defs = HashMap<String, Pair<String, String>>()
         for (m in nsFnRe.findAll(src)) {
@@ -1821,6 +1822,10 @@ object Decoder {
         val out = ArrayList<String>()
         for (m in nsCallRe.findAll(src)) {
             val d = defs[m.groupValues[1]] ?: continue
+            if (returnedOnly) {
+                val pre = src.substring(maxOf(0, m.range.first - 16), m.range.first)
+                if (!Regex("""return\s*$""").containsMatchIn(pre)) continue
+            }
             val parts = nsPartRe.findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
             if (parts.isEmpty()) continue
             // Anahtar / işlem dizisi sırası değişirse diye iki sırayı da dene
@@ -1842,8 +1847,10 @@ object Decoder {
 
     // Çözülen metinlerden akış adresleri (yem adresler karışmaz)
     fun nsUrls(blobs: List<String>): List<String> {
-        val dec = ArrayList<String>()
-        for (b in blobs) dec.addAll(nsDecodeAll(b))
+        // Fonksiyon tanimlari paketlenmis scriptte, gercek cagri ise sayfanin duz metninde: hepsini birlestirip ara
+        val joined = blobs.joinToString("\n")
+        var dec = nsDecodeAll(joined, true)
+        if (dec.isEmpty()) dec = nsDecodeAll(joined, false)
         if (dec.isEmpty()) return emptyList()
         val c = candFrom(dec)
         if (c.urls.isNotEmpty()) return c.urls
@@ -1872,7 +1879,6 @@ object Decoder {
                 next.addAll(b64(u))
                 next.addAll(dcAv(u))
                 next.addAll(b64Strings(u))
-                next.addAll(nsDecodeAll(u))
             }
             queue = next
             round++
