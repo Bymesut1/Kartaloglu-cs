@@ -15,7 +15,6 @@ import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Collections
 import java.util.concurrent.Semaphore
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 
 private data class SiteItem(
@@ -1163,7 +1162,7 @@ class HDFilmCehennemi : MainAPI() {
                     embList.add(embedUrl)
                     log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
 
-                    val res: EmbedResult? = withTimeoutOrNull(60_000L) { resolveEmbed(embedUrl, pageUrl) }
+                    val res: EmbedResult? = resolveEmbed(embedUrl, pageUrl)
                     if (res == null) {
                         log("P ${job.name} çözülemedi")
                         // Yedek: hazır çıkarıcıları dene (ör. Close)
