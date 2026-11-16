@@ -939,8 +939,14 @@ class HDFilmCehennemi : MainAPI() {
 
                 val blobs = Decoder.collectBlobs(html)
                 val c = Decoder.candFrom(blobs)
-                // Sayfadaki şifreli akış adresi (fn(["parça",...]) + anahtar + işlem dizisi); gerçek adres bu
-                val dec = Decoder.nsUrls(blobs)
+                // Sayfa / video kimliği: gerçek akış adresi bu kimliği taşır, yem adresler taşımaz
+                val idHints = listOfNotNull(
+                    Regex("""rapidrame_id=([A-Za-z0-9]+)""").find(v)?.groupValues?.get(1),
+                    Regex("""/(?:rplayer|embed)/([A-Za-z0-9]+)""").find(v)?.groupValues?.get(1)
+                ).distinct()
+                // Sayfadaki şifreli akış adresi (fn(["parça",...]) + anahtar + işlem dizisi)
+                val dec = Decoder.nsUrls(blobs, idHints) { log(it.take(900)) }
+                val decOk = dec.any { u -> idHints.any { h -> u.contains(h, true) } }
                 val subs = ArrayList<SubItem>()
                 val seenS = HashSet<String>()
                 blobs.forEach { b ->
@@ -968,9 +974,9 @@ class HDFilmCehennemi : MainAPI() {
                 keySet.addAll(Decoder.keysFrom(blobs + listOf(v), false))
                 keySet.addAll(Decoder.keysFrom(allUrls.toList(), true))
 
-                log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} dec=${dec.size} iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
-                if (dec.isEmpty() && depth == 0) {
-                    // Şifre çözülemedi: yapıyı incelemek için sayfayı logcat'e yaz
+                log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} dec=${dec.size} decOk=$decOk hints=$idHints iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
+                if ((dec.isEmpty() || !decOk) && depth == 0) {
+                    // Şifre çözülemedi / kimlik eşleşmedi: yapıyı incelemek için sayfayı logcat'e yaz
                     log("EM ilk150: " + html.take(150).replace("\n", " "))
                     dumpLog(if (isMobi(v)) "close" else "rapid", html)
                 }
@@ -1805,63 +1811,70 @@ object Decoder {
         return ok * 100 / t.length >= 95
     }
 
-    // Verilen metindeki tüm fn([...]) çağrılarını çözer; çözülen metinleri döndürür
-    // returnedOnly=true: yalnizca "return fn([...])" cagrilari (configs.sources icindeki gercek adres);
-    // "var x=fn([...])" olanlar yem (hep ayni / baska bir videonun adresi)
-    fun nsDecodeAll(src: String, returnedOnly: Boolean = false): List<String> {
-        if (!src.contains(".join(") || !src.contains("charCodeAt")) return emptyList()
-        val defs = HashMap<String, Pair<String, String>>()
+    // Tüm fn([...]) çağrılarını çözer: (return mu?, çözülen metin).
+    // Aynı isimli birden fazla fonksiyon tanımı olabilir; hepsi denenir.
+    fun nsDecodeDetailed(src: String, dbg: (String) -> Unit = {}): List<Pair<Boolean, String>> {
+        if (!src.contains(".join(") || !src.contains("charCodeAt")) {
+            dbg("NS join/charCodeAt yok")
+            return emptyList()
+        }
+        val defs = LinkedHashMap<String, MutableList<Pair<String, String>>>()
         for (m in nsFnRe.findAll(src)) {
             val st = m.range.last + 1
             val body = src.substring(st, minOf(src.length, st + 1500))
             if (!body.contains(".join(") || !body.contains("charCodeAt")) continue
             val strs = nsStrRe.findAll(body).map { it.groupValues[1] }.take(2).toList()
-            if (strs.size == 2) defs[m.groupValues[1]] = Pair(strs[0], strs[1])
+            if (strs.size == 2) defs.getOrPut(m.groupValues[1]) { ArrayList() }.add(Pair(strs[0], strs[1]))
         }
-        if (defs.isEmpty()) return emptyList()
-        val out = ArrayList<String>()
+        dbg("NS defs=" + defs.map { it.key + ":" + it.value.size })
+        val out = ArrayList<Pair<Boolean, String>>()
         for (m in nsCallRe.findAll(src)) {
-            val d = defs[m.groupValues[1]] ?: continue
-            if (returnedOnly) {
-                val pre = src.substring(maxOf(0, m.range.first - 16), m.range.first)
-                if (!Regex("""return\s*$""").containsMatchIn(pre)) continue
-            }
+            val dl = defs[m.groupValues[1]] ?: continue
+            val pre = src.substring(maxOf(0, m.range.first - 16), m.range.first)
+            val isRet = Regex("""return\s*$""").containsMatchIn(pre)
             val parts = nsPartRe.findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
             if (parts.isEmpty()) continue
-            // Anahtar / işlem dizisi sırası değişirse diye iki sırayı da dene
-            for ((kk, oo) in listOf(d, Pair(d.second, d.first))) {
-                val r = try {
-                    nsRun(parts, kk, oo)
-                } catch (e: Throwable) {
-                    ""
-                }
-                if (mostlyPrintable(r)) {
-                    out.add(r)
-                    break
+            var got: String? = null
+            loop@ for (d in dl) {
+                for ((kk, oo) in listOf(d, Pair(d.second, d.first))) {
+                    val r = try {
+                        nsRun(parts, kk, oo)
+                    } catch (e: Throwable) {
+                        ""
+                    }
+                    if (mostlyPrintable(r)) {
+                        got = r
+                        if (r.contains("http", true)) break@loop
+                    }
                 }
             }
-            if (out.size >= 12) break
+            dbg("NS call ${m.groupValues[1]} ret=$isRet parts=${parts.size} -> ${got?.take(200)}")
+            if (got != null) out.add(Pair(isRet, got))
+            if (out.size >= 20) break
         }
         return out
     }
 
-    // Çözülen metinlerden akış adresleri (yem adresler karışmaz)
-    fun nsUrls(blobs: List<String>): List<String> {
+    // Çözülen metinlerden akış adresleri. hints (sayfa / video kimliği) varsa onu taşıyan adres öne çıkar:
+    // gerçek adres kimliği içerir, yem adresler (rastgele / sabit dosya adı) içermez.
+    fun nsUrls(blobs: List<String>, hints: List<String> = emptyList(), dbg: (String) -> Unit = {}): List<String> {
         // Fonksiyon tanimlari paketlenmis scriptte, gercek cagri ise sayfanin duz metninde: hepsini birlestirip ara
         val joined = blobs.joinToString("\n")
-        var dec = nsDecodeAll(joined, true)
-        if (dec.isEmpty()) dec = nsDecodeAll(joined, false)
+        val dec = nsDecodeDetailed(joined, dbg)
         if (dec.isEmpty()) return emptyList()
-        val c = candFrom(dec)
-        if (c.urls.isNotEmpty()) return c.urls
-        val out = LinkedHashSet<String>()
-        for (t in dec) {
+        val all = ArrayList<Pair<Boolean, String>>() // (return mu, adres)
+        for ((isRet, t) in dec) {
             for (m in urlRe.findAll(cleanBlob(t))) {
                 val u = m.value.trimEnd(',', ';', '.', ']', ')')
-                if (!badRe.containsMatchIn(u) && !junkUrl(u) && !subDirRe.containsMatchIn(u)) out.add(u)
+                if (!badRe.containsMatchIn(u) && !junkUrl(u) && !subDirRe.containsMatchIn(u)) all.add(Pair(isRet, u))
             }
         }
-        return out.toList()
+        val hs = hints.filter { it.length >= 6 }
+        val matched = all.filter { (_, u) -> hs.any { u.contains(it, true) } }.map { it.second }.distinct()
+        if (matched.isNotEmpty()) return matched
+        dbg("NS id eslesmedi hints=$hs urls=${all.map { it.second.take(100) }}")
+        val rets = all.filter { it.first }.map { it.second }.distinct()
+        return if (rets.isNotEmpty()) rets else all.map { it.second }.distinct()
     }
 
     // ---------- Tüm çözülmüş metinleri topla ----------
