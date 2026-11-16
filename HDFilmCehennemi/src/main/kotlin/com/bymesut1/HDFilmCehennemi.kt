@@ -868,9 +868,9 @@ class HDFilmCehennemi : MainAPI() {
 
     private val wvStreamRe = Regex("""master\.txt|\.m3u8|\.mp4(\?|$)""")
 
-    // Film sayfasını WebView'de açar, (gerekirse) oynatıcı sekmesini seçip oynat'a basar; iframe içinden gelen
-    // master.txt / m3u8 isteğini yakalar. Oynatıcı gerçek iframe bağlamında çalıştığı için doğrudan açmaktan daha güvenilir.
-    private suspend fun wvCapture(pageUrl: String, altId: String?): String? {
+    // Film sayfasını WebView'de açar (son çare). Not: oynatıcı çapraz-kaynaklı iframe içinde olduğu için
+    // sayfadaki script iframe'in içindeki oynat düğmesine basamıyor; asıl çözüm Decoder.nsUrls (sayfadaki şifreyi çözer).
+    private suspend fun wvCapture(pageUrl: String, altId: String?, timeoutMs: Long = 15_000L): String? {
         val page = wwwOf(pageUrl)
         val idPart = (altId ?: "").filter { it.isLetterOrDigit() }
         val js = "(function(){var id='" + idPart + "';var n=0;var t=setInterval(function(){n++;try{" +
@@ -884,7 +884,7 @@ class HDFilmCehennemi : MainAPI() {
         val wv = app.get(
             page,
             referer = wwwRoot,
-            interceptor = WebViewResolver(wvStreamRe, timeout = 30_000L, script = js)
+            interceptor = WebViewResolver(wvStreamRe, timeout = timeoutMs, script = js)
         )
         val u = wv.url
         return if (u != page && wvStreamRe.containsMatchIn(u) && !bad.containsMatchIn(u)) u else null
@@ -895,7 +895,7 @@ class HDFilmCehennemi : MainAPI() {
         val t = text.replace("\r", "").replace("\n", " ").replace(Regex("\\s{2,}"), " ")
         var i = 0
         var n = 0
-        while (i < t.length && n < 14) {
+        while (i < t.length && n < 16) {
             log("DUMP $tag[$n] " + t.substring(i, minOf(t.length, i + 3000)))
             i += 3000
             n++
@@ -939,30 +939,41 @@ class HDFilmCehennemi : MainAPI() {
 
                 val blobs = Decoder.collectBlobs(html)
                 val c = Decoder.candFrom(blobs)
+                // Sayfadaki şifreli akış adresi (fn(["parça",...]) + anahtar + işlem dizisi); gerçek adres bu
+                val dec = Decoder.nsUrls(blobs)
                 val subs = ArrayList<SubItem>()
                 val seenS = HashSet<String>()
                 blobs.forEach { b ->
                     Decoder.extractSubs(b, originOf(v)).forEach { s -> if (seenS.add(s.url)) subs.add(s) }
                 }
-                // Close vb.: JSON-LD "contentUrl" doğrudan video adresi olabilir
-                val ld = Regex(""""contentUrl"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
                 val allUrls = LinkedHashSet<String>()
-                val allStrict = LinkedHashSet<String>(c.strict)
-                if (ld != null && ld.startsWith("http", true)) {
-                    allUrls.add(ld)
-                    allStrict.add(ld)
+                val allStrict = LinkedHashSet<String>()
+                if (dec.isNotEmpty()) {
+                    // Çözülen adres varsa yem adresler (JSON-LD contentUrl vb.) öncelik almasın
+                    allUrls.addAll(dec)
+                    allStrict.addAll(dec)
+                    allUrls.addAll(c.urls)
+                } else {
+                    // Close vb.: JSON-LD "contentUrl" doğrudan video adresi olabilir
+                    val ld = Regex(""""contentUrl"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+                    allStrict.addAll(c.strict)
+                    if (ld != null && ld.startsWith("http", true)) {
+                        allUrls.add(ld)
+                        allStrict.add(ld)
+                    }
+                    allUrls.addAll(c.urls)
                 }
-                allUrls.addAll(c.urls)
 
                 // Altyazı anahtarları (/srt/<no>/<kod>_...): sayfa metinlerinden + akış adreslerinden
                 val keySet = LinkedHashSet<Pair<String, String>>()
                 keySet.addAll(Decoder.keysFrom(blobs + listOf(v), false))
                 keySet.addAll(Decoder.keysFrom(allUrls.toList(), true))
 
-                log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
-                if (allUrls.isEmpty()) {
+                log("EM len=${html.length} blob=${blobs.size} url=${allUrls.size} dec=${dec.size} iframe=${Jsoup.parse(html).select("iframe").size} ${v.take(60)}")
+                if (dec.isEmpty() && depth == 0) {
+                    // Şifre çözülemedi: yapıyı incelemek için sayfayı logcat'e yaz
                     log("EM ilk150: " + html.take(150).replace("\n", " "))
-                    if (depth == 0) dumpLog(if (isMobi(v)) "close" else "rapid", html)
+                    dumpLog(if (isMobi(v)) "close" else "rapid", html)
                 }
                 if (allUrls.isNotEmpty()) return EmbedResult(allUrls.toList(), subs, allStrict, v, keySet.toList())
 
@@ -986,10 +997,10 @@ class HDFilmCehennemi : MainAPI() {
             }
         }
 
-        // Son çare: film sayfasını gerçek tarayıcı gibi (WebView) açıp oynat düğmesine bas, master.txt / m3u8 isteğini yakala
+        // Son çare: film sayfasını WebView'de aç (kısa süre; çoğu zaman sonuç vermiyor)
         if (depth == 0) {
             try {
-                val u = wvCapture(pageUrl, altId)
+                val u = wvCapture(pageUrl, altId, 15_000L)
                 log("EM WV ${u?.take(120)}")
                 if (u != null) {
                     val target = variants.firstOrNull() ?: embedUrl
@@ -1230,7 +1241,7 @@ class HDFilmCehennemi : MainAPI() {
 
                     if (!withVideo) return@amap
 
-                    // Akışlar
+                    // Akışlar (çözülen / strict adresler önce)
                     val cands = res.urls
                         .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
                         .take(6)
@@ -1245,22 +1256,7 @@ class HDFilmCehennemi : MainAPI() {
                     log("P ${job.name} aday=${cands.size} dogrulanan=${verified.count { it.second.ok }}")
                     var okList: List<Pair<String, Verified>> = verified.filter { it.second.ok }
                     if (okList.isEmpty()) {
-                        // Önce oynatıcıyı tarayıcı gibi (WebView) çalıştırıp gerçek akış isteğini yakala.
-                        // Close'un sayfadaki adresi yem olabiliyor; tarayıcıdaki gerçek adres cdnimages üzerinden geliyor.
-                        try {
-                            val wu = wvCapture(pageUrl, job.id)
-                            log("P ${job.name} WV ${wu?.take(120)}")
-                            if (wu != null) {
-                                // Token tek kullanımlık olabilir: ağ doğrulaması yapmadan tarayıcıdaki header'larla ver
-                                okList = listOf(Pair(wu, Verified(false, streamHeaderSets(res.base, wu)[0])))
-                            }
-                        } catch (e: Exception) {
-                            log("P ${job.name} WV hata ${e.javaClass.simpleName}")
-                        }
-                    }
-                    if (okList.isEmpty()) {
-                        // Doğrulanamadı: yine de en olası adresi ver (Close gibi oynatıcılar için)
-                        // Close için: strict yoksa bile en olası adresi (master/m3u8 öncelikli) mutlaka ver
+                        // Doğrulanamadı: yine de en olası adresi ver (strict / çözülmüş adres öncelikli)
                         val st = verified.filter { res.strict.contains(it.first) }
                         val pick = if (st.isNotEmpty()) st.take(1) else verified.take(1)
                         okList = pick.map { Pair(it.first, Verified(false, streamHeaderSets(res.base, it.first)[0])) }
@@ -1733,6 +1729,134 @@ object Decoder {
         return out
     }
 
+    // ---------- Yeni şema (Rapid / Close): fn(["parça",...]) + anahtar + işlem dizisi ----------
+    // Sayfadaki paketlenmiş (p.a.c.k.e.r) script şunu içeriyor:
+    //   function f(a){var s=a.join('');var KEY="...";var OPS="...";  ... }  ve  var x=f(["...","...",...]);
+    // Adımlar (her sayfada aynı, yalnızca KEY / OPS değişiyor; "length>4096" gibi koşullar yem):
+    //   1) KEY'den (a,b) hesapla: a=(a*31+c)%251, b=(b^(c+i))&255  -> başlangıç durumu, adım, tohum
+    //   2) OPS'u sondan başa uygula: 'b' = base64 çöz, 'v' = ters çevir, diğer harf = Sezar kaydırma (yalnızca harfler)
+    //   3) Tohumdan (LCG: h=(h*75+74)%65537) karıştırma dizisi üret, elemanları takas et
+    //   4) Akış XOR: x=(x+step)%256; çıktı=c^x; x=(x+c)%256
+    private val nsFnRe = Regex("""function\s+(\w+)\s*\(\s*\w+\s*\)\s*\{""")
+    private val nsStrRe = Regex("""var\s+\w+\s*=\s*"([^"]*)"""")
+    private val nsCallRe = Regex("""(\w+)\(\s*\[((?:\s*"[^"]*"\s*,?)+)\s*\]\s*\)""")
+    private val nsPartRe = Regex(""""([^"]*)"""")
+
+    private fun nsRun(parts: List<String>, key: String, ops: String): String {
+        var s = parts.joinToString("")
+        var a = 0
+        var b = 0
+        for (i in key.indices) {
+            val c = key[i].code
+            a = (a * 31 + c) % 251
+            b = (b xor (c + i)) and 255
+        }
+        val st0 = (a + b) % 256
+        val step = (a % 13) + 3
+        var h = ((a * 256 + b) % 65521) + 1
+
+        for (i in ops.length - 1 downTo 0) {
+            val ch = ops[i]
+            when (ch) {
+                'b' -> s = b64d(s)
+                'v' -> s = s.reversed()
+                else -> {
+                    val r = (26 - ((ch.code - 64) % 26)) % 26
+                    val sb = StringBuilder(s.length)
+                    for (x in s) {
+                        if (x in 'A'..'Z') sb.append((((x.code - 65 + r) % 26) + 65).toChar())
+                        else if (x in 'a'..'z') sb.append((((x.code - 97 + r) % 26) + 97).toChar())
+                        else sb.append(x)
+                    }
+                    s = sb.toString()
+                }
+            }
+        }
+
+        val n = s.length
+        if (n == 0) return ""
+        val k = IntArray(n)
+        for (i in n - 1 downTo 1) {
+            h = (h * 75 + 74) % 65537
+            k[i] = h % (i + 1)
+        }
+        val arr = s.toCharArray()
+        for (i in 1 until n) {
+            val j = k[i]
+            val t = arr[i]
+            arr[i] = arr[j]
+            arr[j] = t
+        }
+
+        var x = st0
+        val out = StringBuilder(n)
+        for (ch in arr) {
+            val c = ch.code
+            x = (x + step) % 256
+            out.append((c xor x).toChar())
+            x = (x + c) % 256
+        }
+        return out.toString()
+    }
+
+    private fun mostlyPrintable(t: String): Boolean {
+        if (t.length < 8) return false
+        var ok = 0
+        for (ch in t) if (ch.code in 32..126 || ch == '\n' || ch == '\r' || ch == '\t') ok++
+        return ok * 100 / t.length >= 95
+    }
+
+    // Verilen metindeki tüm fn([...]) çağrılarını çözer; çözülen metinleri döndürür
+    fun nsDecodeAll(src: String): List<String> {
+        if (!src.contains(".join(") || !src.contains("charCodeAt")) return emptyList()
+        val defs = HashMap<String, Pair<String, String>>()
+        for (m in nsFnRe.findAll(src)) {
+            val st = m.range.last + 1
+            val body = src.substring(st, minOf(src.length, st + 1500))
+            if (!body.contains(".join(") || !body.contains("charCodeAt")) continue
+            val strs = nsStrRe.findAll(body).map { it.groupValues[1] }.take(2).toList()
+            if (strs.size == 2) defs[m.groupValues[1]] = Pair(strs[0], strs[1])
+        }
+        if (defs.isEmpty()) return emptyList()
+        val out = ArrayList<String>()
+        for (m in nsCallRe.findAll(src)) {
+            val d = defs[m.groupValues[1]] ?: continue
+            val parts = nsPartRe.findAll(m.groupValues[2]).map { it.groupValues[1] }.toList()
+            if (parts.isEmpty()) continue
+            // Anahtar / işlem dizisi sırası değişirse diye iki sırayı da dene
+            for ((kk, oo) in listOf(d, Pair(d.second, d.first))) {
+                val r = try {
+                    nsRun(parts, kk, oo)
+                } catch (e: Throwable) {
+                    ""
+                }
+                if (mostlyPrintable(r)) {
+                    out.add(r)
+                    break
+                }
+            }
+            if (out.size >= 12) break
+        }
+        return out
+    }
+
+    // Çözülen metinlerden akış adresleri (yem adresler karışmaz)
+    fun nsUrls(blobs: List<String>): List<String> {
+        val dec = ArrayList<String>()
+        for (b in blobs) dec.addAll(nsDecodeAll(b))
+        if (dec.isEmpty()) return emptyList()
+        val c = candFrom(dec)
+        if (c.urls.isNotEmpty()) return c.urls
+        val out = LinkedHashSet<String>()
+        for (t in dec) {
+            for (m in urlRe.findAll(cleanBlob(t))) {
+                val u = m.value.trimEnd(',', ';', '.', ']', ')')
+                if (!badRe.containsMatchIn(u) && !junkUrl(u) && !subDirRe.containsMatchIn(u)) out.add(u)
+            }
+        }
+        return out.toList()
+    }
+
     // ---------- Tüm çözülmüş metinleri topla ----------
     fun collectBlobs(html: String): List<String> {
         val out = LinkedHashSet<String>()
@@ -1748,6 +1872,7 @@ object Decoder {
                 next.addAll(b64(u))
                 next.addAll(dcAv(u))
                 next.addAll(b64Strings(u))
+                next.addAll(nsDecodeAll(u))
             }
             queue = next
             round++
