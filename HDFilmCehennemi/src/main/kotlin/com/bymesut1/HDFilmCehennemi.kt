@@ -1163,7 +1163,7 @@ class HDFilmCehennemi : MainAPI() {
                     embList.add(embedUrl)
                     log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
 
-                    val res = withTimeoutOrNull(60_000L) { resolveEmbed(embedUrl, pageUrl) }
+                    val res: EmbedResult? = withTimeoutOrNull(60_000L) { resolveEmbed(embedUrl, pageUrl) }
                     if (res == null) {
                         log("P ${job.name} çözülemedi")
                         // Yedek: hazır çıkarıcıları dene (ör. Close)
@@ -1206,7 +1206,7 @@ class HDFilmCehennemi : MainAPI() {
                     val cands = res.urls
                         .sortedWith(compareBy<String>({ if (res.strict.contains(it)) 0 else 1 }, { rank(it) }))
                         .take(6)
-                    val verified = cands.amap { u -> u to verifyUrl(u, streamHeaderSets(res.base, u)) }
+                    val verified: List<Pair<String, Verified>> = cands.amap { u -> Pair(u, verifyUrl(u, streamHeaderSets(res.base, u))) }
 
                     // Akışın içine gömülü (HLS) altyazı kanalları
                     verified.forEach { (mu, mv) ->
@@ -1215,7 +1215,7 @@ class HDFilmCehennemi : MainAPI() {
                         }
                     }
                     log("P ${job.name} aday=${cands.size} dogrulanan=${verified.count { it.second.ok }}")
-                    var okList = verified.filter { it.second.ok }
+                    var okList: List<Pair<String, Verified>> = verified.filter { it.second.ok }
                     if (okList.isEmpty()) {
                         // Önce oynatıcıyı tarayıcı gibi (WebView) çalıştırıp gerçek akış isteğini yakala.
                         // Close'un sayfadaki adresi yem olabiliyor; tarayıcıdaki gerçek adres cdnimages üzerinden geliyor.
@@ -1253,7 +1253,7 @@ class HDFilmCehennemi : MainAPI() {
                     }
                     val lg = if (job.lang == "dual") "DUAL" else if (job.lang.isNotBlank()) "Altyazılı" else "TR"
 
-                    okList.forEachIndexed { i, pair ->
+                    okList.forEachIndexed { i, pair: Pair<String, Verified> ->
                         val u = pair.first
                         val v = pair.second
                         if (!seenUrl.add(u)) return@forEachIndexed
