@@ -15,6 +15,7 @@ import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Collections
 import java.util.concurrent.Semaphore
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 
 private data class SiteItem(
@@ -128,7 +129,7 @@ class HDFilmCehennemi : MainAPI() {
     }
 
     // İlk çözüm sırasında onlarca istek aynı anda WebView açmasın diye ısınana kadar sıraya alınır.
-    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L): NiceResponse {
+    private suspend fun cfGet(url: String, headers: Map<String, String>, timeout: Long = 30L, retry: Boolean = true): NiceResponse {
         val k = cfKiller
         var r = if (cfWarm) {
             app.get(url, headers = headers, interceptor = k, timeout = timeout)
@@ -140,7 +141,7 @@ class HDFilmCehennemi : MainAPI() {
                 cfLock.release()
             }
         }
-        if (r.code == 403 || r.code == 503) {
+        if (retry && (r.code == 403 || r.code == 503)) {
             log("CF 403: çözücü sıfırlanıyor ${url.take(70)}")
             cfLock.acquire()
             try {
@@ -175,6 +176,8 @@ class HDFilmCehennemi : MainAPI() {
     private val maxPlayers = 4              // en fazla kaç oynatıcı (Close, Rapid ...)
     private val subLangs = listOf("tr", "en")   // gömülü altyazı dilleri
     private val uaMobile = "Mozilla/5.0 (Linux; Android 13; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
+    // Tarayıcıda (devtools) görülen gerçek UA: oynatıcı / CDN istekleri bununla gider
+    private val uaEmbed = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
     private val uaDesktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     // /srt/<no>/<kod>_<ad>.vtt/ dosya adı varyantları (Turkish, Turkish2 ...)
@@ -588,7 +591,7 @@ class HDFilmCehennemi : MainAPI() {
         val u = u0.replace("&amp;", "&").replace("\\/", "/")
         return when {
             Regex("^https?://", IC).containsMatchIn(u) ->
-                u.replace(Regex("^https?://(?:www\\.)?hdfilmcehennemi\\.[a-z]+", IC), siteBase())
+                u.replace(Regex("^https?://(?:www\\.)?hdfilmcehennemi\\.(?!mobi)[a-z]+", IC), siteBase())
             u.startsWith("//") -> "https:$u"
             else -> siteBase().trimEnd('/') + (if (u.startsWith("/")) "" else "/") + u
         }
@@ -805,56 +808,98 @@ class HDFilmCehennemi : MainAPI() {
     }
 
     // ---------------- Oynatıcı çözümleme ----------------
-    private fun embedHeaders(ref: String): Map<String, String> = mapOf(
-        "User-Agent" to uaMobile,
+    // Tarayıcıda site www'li adresle açılıyor; Referer olarak da www'li adres gidiyor
+    private fun wwwOf(u: String): String =
+        u.replace(Regex("^(https?://)(?:www\\.)?(hdfilmcehennemi\\.(?!mobi)[a-z]+)", IC), "$1www.$2")
+
+    private fun isMobi(u: String): Boolean = u.contains("hdfilmcehennemi.mobi", true)
+
+    // Düz (altyazı vb.) istekler için
+    private fun plainHeaders(ref: String): Map<String, String> = mapOf(
+        "User-Agent" to uaEmbed,
         "Accept" to "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
         "Referer" to ref
     )
 
-    private fun embedVariants(u: String): List<String> {
-        val out = ArrayList<String>()
-        out.add(u)
-        // Close oynatıcısı tarayıcıda hdfilmcehennemi.mobi üzerinden açılıyor
-        if (u.contains("/video/embed/", true) && u.contains("hdfilmcehennemi.", true) && !u.contains("hdfilmcehennemi.mobi", true)) {
-            out.add(u.replace(Regex("^https?://[^/]+", IC), "https://hdfilmcehennemi.mobi"))
-        }
-        val id = Regex("""[?&]rapidrame_id=([^&#\x22\x27]+)""").find(u)?.groupValues?.get(1)
-        if (id != null) {
-            out.add(siteBase() + "/playerr/" + id)
-            out.add(siteBase() + "/rplayer/" + id)
-        }
-        hosts.forEach { h ->
-            if (u.startsWith(h, true)) return@forEach
-            if (u.contains("hdfilmcehennemi.", true)) out.add(u.replace(Regex("^https?://[^/]+", IC), h))
-        }
-        return out.distinct().take(5)
+    // Oynatıcı sayfası (iframe) için tarayıcı benzeri header'lar
+    private fun embedHeaders(ref: String, target: String = ""): Map<String, String> {
+        val m = LinkedHashMap<String, String>()
+        m["User-Agent"] = uaEmbed
+        m["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        m["Accept-Language"] = "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
+        m["Referer"] = ref
+        m["Upgrade-Insecure-Requests"] = "1"
+        m["Sec-Fetch-Dest"] = "iframe"
+        m["Sec-Fetch-Mode"] = "navigate"
+        val same = target.isNotBlank() && originOf(target).equals(originOf(ref), true)
+        m["Sec-Fetch-Site"] = if (same) "same-origin" else "cross-site"
+        m["Sec-Ch-Ua"] = "\"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\""
+        m["Sec-Ch-Ua-Mobile"] = "?1"
+        m["Sec-Ch-Ua-Platform"] = "\"Android\""
+        return m
     }
 
+    private fun embedVariants(u: String): List<String> {
+        val out = ArrayList<String>()
+        val onSite = Regex("^https?://(?:www\\.)?hdfilmcehennemi\\.(?!mobi)[a-z]+", IC)
+        when {
+            // Close: tarayıcıda hdfilmcehennemi.mobi üzerinden açılıyor
+            u.contains("/video/embed/", true) && u.contains("hdfilmcehennemi.", true) ->
+                out.add(u.replace(Regex("^https?://[^/]+", IC), "https://hdfilmcehennemi.mobi"))
+            // Rapid (/rplayer/<id>/): tarayıcıda www'li adresle açılıyor
+            onSite.containsMatchIn(u) -> {
+                out.add(wwwOf(u))
+                out.add(u.replace(Regex("^(https?://)www\\.", IC), "$1"))
+            }
+            else -> out.add(u)
+        }
+        return out.distinct()
+    }
+
+    // Gerçek Cloudflare doğrulama sayfası mı? (düz 403'te WebView açmanın faydası yok)
+    private fun isCfChallenge(r: NiceResponse?): Boolean {
+        if (r == null || (r.code != 403 && r.code != 503)) return false
+        if (!r.headers["server"].orEmpty().contains("cloudflare", true)) return false
+        if (r.headers["cf-mitigated"].orEmpty().contains("challenge", true)) return true
+        val t = r.text
+        return t.contains("Just a moment", true) || t.contains("cf-chl", true) ||
+            t.contains("challenge-platform", true) || t.contains("Enable JavaScript", true)
+    }
+
+    private val wvStreamRe = Regex("""master\.txt|\.m3u8|\.mp4(\?|$)""")
+
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): EmbedResult? {
-        val refs = listOf(siteBase() + "/", pageUrl).distinct()
         val variants = if (depth > 0) listOf(embedUrl) else embedVariants(embedUrl)
+        val wwwRoot = "https://www." + siteBase().substringAfter("://").removePrefix("www.").trimEnd('/') + "/"
         var cfTried = false // Cloudflare çözücüyü bu çağrıda en çok bir kez dene (gereksiz bekleme olmasın)
 
         for (v in variants) {
+            // Cross-site (.mobi) isteklerde tarayıcı yalnızca kök adresi Referer olarak gönderir
+            val refs = when {
+                depth > 0 -> listOf(pageUrl)
+                isMobi(v) -> listOf(wwwRoot)
+                else -> listOf(wwwOf(pageUrl), wwwRoot).distinct()
+            }
             for (rf in refs) {
                 var r: NiceResponse? = try {
-                    app.get(v, headers = embedHeaders(rf), timeout = 10L)
+                    app.get(v, headers = embedHeaders(rf, v), timeout = 10L)
                 } catch (e: Exception) {
                     log("EM hata ${e.javaClass.simpleName} ${v.take(60)}")
                     null
                 }
-                if (r != null && (r.code == 403 || r.code == 503) && !cfTried &&
-                    r.headers["server"].orEmpty().contains("cloudflare", true)
-                ) {
+                if (isCfChallenge(r) && !cfTried) {
                     cfTried = true
                     r = try {
-                        cfGet(v, embedHeaders(rf), 20L)
+                        cfGet(v, embedHeaders(rf, v), 20L, false)
                     } catch (e: Exception) {
                         r
                     }
                 }
-                log("EM kod=${r?.code} ref=${rf.take(32)} ${v.take(70)}")
+                log("EM kod=${r?.code} ref=${rf.take(40)} ${v.take(70)}")
+                if (r != null && r.code != 200) {
+                    log("EM gövde srv=${r.headers["server"]} mit=${r.headers["cf-mitigated"]} ${r.text.take(80).replace("\n", " ")}")
+                }
                 if (r == null || r.code != 200) continue
                 val html = r.text
                 if (html.isEmpty()) continue
@@ -905,21 +950,27 @@ class HDFilmCehennemi : MainAPI() {
             }
         }
 
-        // Son çare: sayfayı WebView'de açıp m3u8 isteğini yakala
-        try {
-            val wv = app.get(
-                embedUrl,
-                referer = siteBase() + "/",
-                interceptor = WebViewResolver(Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)"""))
-            )
-            val u = wv.url
-            if (Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)""").containsMatchIn(u)) {
-                return EmbedResult(
-                    listOf(u), emptyList(), setOf(u), embedUrl,
-                    Decoder.keysFrom(listOf(u), true)
+        // Son çare: oynatıcıyı gerçek tarayıcı gibi (WebView) açıp master.txt / m3u8 isteğini yakala (en çok 25 sn)
+        if (depth == 0) {
+            try {
+                val target = variants.firstOrNull() ?: embedUrl
+                val wv = app.get(
+                    target,
+                    referer = wwwRoot,
+                    interceptor = WebViewResolver(wvStreamRe, timeout = 25_000L)
                 )
+                val u = wv.url
+                log("EM WV ${u.take(120)}")
+                if (u != target && wvStreamRe.containsMatchIn(u)) {
+                    return EmbedResult(
+                        listOf(u), emptyList(), setOf(u), target,
+                        Decoder.keysFrom(listOf(u), true)
+                    )
+                }
+            } catch (e: Exception) {
+                log("EM WV hata ${e.javaClass.simpleName}")
             }
-        } catch (e: Exception) { }
+        }
         return null
     }
 
@@ -933,7 +984,7 @@ class HDFilmCehennemi : MainAPI() {
         val mobi = "https://hdfilmcehennemi.mobi"
         return when {
             host.contains("cdnimages") -> listOf(mobi, "https://closeload.$site")
-            host.contains("rapidrame") -> listOf(mobi, "https://rapid.$site")
+            host.contains("rapidrame") -> listOf("https://www.$site", "https://www.rapidrame.com", "https://rapidrame.com", mobi, "https://rapid.$site")
             else -> emptyList()
         }
     }
@@ -941,7 +992,7 @@ class HDFilmCehennemi : MainAPI() {
     private fun streamHeaderSets(embedUrl: String, streamUrl: String): List<Map<String, String>> {
         fun hs(ref: String?, origin: String?): Map<String, String> {
             val m = LinkedHashMap<String, String>()
-            m["User-Agent"] = uaMobile
+            m["User-Agent"] = uaEmbed
             if (ref != null) m["Referer"] = ref
             if (origin != null) m["Origin"] = origin
             return m
@@ -1023,7 +1074,7 @@ class HDFilmCehennemi : MainAPI() {
         var chkCode = -1
         for (rf in listOf(pageUrl, siteBase() + "/")) {
             val chk: NiceResponse? = try {
-                app.get(su, headers = embedHeaders(rf), timeout = 6L)
+                app.get(su, headers = plainHeaders(rf), timeout = 6L)
             } catch (e: Exception) {
                 null
             }
@@ -1112,7 +1163,7 @@ class HDFilmCehennemi : MainAPI() {
                     embList.add(embedUrl)
                     log("P ${job.name}/${job.lang} video=$withVideo ${embedUrl.take(80)}")
 
-                    val res = resolveEmbed(embedUrl, pageUrl)
+                    val res = withTimeoutOrNull(60_000L) { resolveEmbed(embedUrl, pageUrl) }
                     if (res == null) {
                         log("P ${job.name} çözülemedi")
                         // Yedek: hazır çıkarıcıları dene (ör. Close)
@@ -1169,11 +1220,11 @@ class HDFilmCehennemi : MainAPI() {
                         // Önce oynatıcıyı tarayıcı gibi (WebView) çalıştırıp gerçek akış isteğini yakala.
                         // Close'un sayfadaki adresi yem olabiliyor; tarayıcıdaki gerçek adres cdnimages üzerinden geliyor.
                         try {
-                            val wvRe = Regex("""\.m3u8|master\.txt|/hls\d?/|\.mp4(\?|$)""")
+                            val wvRe = wvStreamRe
                             val wv = app.get(
                                 res.base,
-                                referer = siteBase() + "/",
-                                interceptor = WebViewResolver(wvRe)
+                                referer = "https://www." + siteBase().substringAfter("://").removePrefix("www.").trimEnd('/') + "/",
+                                interceptor = WebViewResolver(wvRe, timeout = 25_000L)
                             )
                             val wu = wv.url
                             log("P ${job.name} WV ${wu.take(120)}")
@@ -1250,12 +1301,12 @@ class HDFilmCehennemi : MainAPI() {
 
         // 5) Hâlâ Türkçe altyazı yoksa: oynatıcıyı WebView'de aç, .vtt / /srt/ isteğini yakala
         if (!trFound.get()) {
-            for (eu in embList.toList().take(2)) {
+            for (eu in embList.toList().take(1)) {
                 try {
                     val wv = app.get(
                         eu,
                         referer = siteBase() + "/",
-                        interceptor = WebViewResolver(Regex("""\.vtt|/srt/\d|/vtt/\d"""))
+                        interceptor = WebViewResolver(Regex("""\.vtt|/srt/\d|/vtt/\d"""), timeout = 15_000L)
                     )
                     val u = wv.url
                     if (Regex("""\.vtt|/srt/\d|/vtt/\d""", IC).containsMatchIn(u)) {
