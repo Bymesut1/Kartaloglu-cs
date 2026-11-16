@@ -945,8 +945,11 @@ class HDFilmCehennemi : MainAPI() {
                     Regex("""/(?:rplayer|embed)/([A-Za-z0-9]+)""").find(v)?.groupValues?.get(1)
                 ).distinct()
                 // Sayfadaki şifreli akış adresi (fn(["parça",...]) + anahtar + işlem dizisi)
-                val dec = Decoder.nsUrls(blobs, idHints) { log(it.take(900)) }
-                val decOk = dec.any { u -> idHints.any { h -> u.contains(h, true) } }
+                val hostName = v.substringAfter("://").substringBefore("/").substringBefore("?")
+                // Close: sayfa konumu / DOM değerlerine bağlı yeni şema (x4w47)
+                val clUrls = Decoder.closeUrls(html, hostName) { log(it.take(900)) }
+                val dec: List<String> = if (clUrls.isNotEmpty()) clUrls else Decoder.nsUrls(blobs, idHints) { log(it.take(900)) }
+                val decOk = clUrls.isNotEmpty() || dec.any { u -> idHints.any { h -> u.contains(h, true) } }
                 val subs = ArrayList<SubItem>()
                 val seenS = HashSet<String>()
                 blobs.forEach { b ->
@@ -1875,6 +1878,110 @@ object Decoder {
         dbg("NS id eslesmedi hints=$hs urls=${all.map { it.second.take(100) }}")
         val rets = all.filter { it.first }.map { it.second }.distinct()
         return if (rets.isNotEmpty()) rets else all.map { it.second }.distinct()
+    }
+
+    // ---------- Close (yeni şema): var f = function(a){ splice ... getAttribute ... }; f("p*p*p".split("*")) ----------
+    // Anahtar, sayfa adresinin host adı + gizli <i data-xxx="..."> değeri + "DIV" ile karışıyor; çıktıya "?o=255" eklenir.
+    private val clFnRe = Regex("""var\s+(\w+)\s*=\s*function\s*\(\s*\w+\s*\)\s*\{""")
+    private val clCallRe = Regex("""(\w+)\(\s*"([^"]*)"\s*\.split\(\s*"([^"]*)"\s*\)\s*\)""")
+
+    private fun clRun(arr0: List<String>, host: String, attr: String, atobCh: Char, revCh: Char, base: Int): String {
+        val arr = ArrayList(arr0)
+        val f91 = arr.size - 2
+        if (f91 < 1) return ""
+        val oj = f91 % 7
+        val b2 = 8 + (f91 % 5)
+        if (b2 >= arr.size) return ""
+        val ops = arr.removeAt(b2)
+        if (oj >= arr.size) return ""
+        val sp = arr.removeAt(oj) + host + attr + "DIV"
+        var x = arr.joinToString("")
+        var bs = 0
+        var q = 0
+        for (i in sp.indices) {
+            val w = sp[i].code
+            bs = (bs * 37 + w) % 241
+            q = (q + ((w shl 1) xor i)) and 255
+        }
+        val p0 = (bs * 3 + q) % 256
+        val hc = (q % 11) + 5
+        var f16 = ((q * 251 + bs) % 65519) + 1
+        for (i in ops.length - 1 downTo 0) {
+            val ch = ops[i]
+            if (ch == atobCh) {
+                x = b64d(x)
+            } else if (ch == revCh) {
+                x = x.reversed()
+            } else {
+                val r = (26 - ((ch.code - base) % 26)) % 26
+                val sb = StringBuilder(x.length)
+                for (c in x) {
+                    if (c in 'A'..'Z') sb.append((((c.code - 65 + r) % 26) + 65).toChar())
+                    else if (c in 'a'..'z') sb.append((((c.code - 97 + r) % 26) + 97).toChar())
+                    else sb.append(c)
+                }
+                x = sb.toString()
+            }
+        }
+        if (ops.length > 2048) x = x.reversed()
+        val n = x.length
+        if (n == 0) return ""
+        val e = IntArray(n)
+        for (i in n - 1 downTo 1) {
+            f16 = (f16 * 97 + 41) % 65519
+            e[i] = f16 % (i + 1)
+        }
+        val a = x.toCharArray()
+        for (i in 1 until n) {
+            val j = e[i]
+            val t = a[i]
+            a[i] = a[j]
+            a[j] = t
+        }
+        var iin = p0
+        val out = StringBuilder(n)
+        for (ch in a) {
+            val w = ch.code
+            iin = (iin * 5 + hc) % 256
+            out.append((w xor iin).toChar())
+            iin = (iin + w) % 256
+        }
+        return out.toString()
+    }
+
+    fun closeUrls(html: String, host: String, dbg: (String) -> Unit = {}): List<String> {
+        if (!html.contains("splice(") || !html.contains("getAttribute")) return emptyList()
+        class Def(val attrName: String, val atobCh: Char, val revCh: Char, val base: Int)
+        val defs = HashMap<String, Def>()
+        for (m in clFnRe.findAll(html)) {
+            val st = m.range.last + 1
+            val body = html.substring(st, minOf(html.length, st + 6000))
+            if (!body.contains("splice(") || !body.contains("getAttribute") || !body.contains("charCodeAt")) continue
+            val an = Regex("""querySelector\(\s*['"]\[([\w-]+)\]['"]""").find(body)?.groupValues?.get(1) ?: continue
+            val ac = Regex("""===\s*'(.)'\)\s*\{\s*\w+\s*=\s*atob""").find(body)?.groupValues?.get(1)?.firstOrNull() ?: '7'
+            val rc = Regex("""===\s*'(.)'\)\s*\{\s*\w+\s*=\s*\w+\.split\(''\)\.reverse""").find(body)?.groupValues?.get(1)?.firstOrNull() ?: '3'
+            val bs = Regex("""charCodeAt\(0\)\s*-\s*(\d+)\)\s*%\s*26""").find(body)?.groupValues?.get(1)?.toIntOrNull() ?: 96
+            defs[m.groupValues[1]] = Def(an, ac, rc, bs)
+        }
+        dbg("CL defs=" + defs.keys)
+        if (defs.isEmpty()) return emptyList()
+        val out = LinkedHashSet<String>()
+        for (m in clCallRe.findAll(html)) {
+            val d = defs[m.groupValues[1]] ?: continue
+            val attr = Regex("""\b""" + Regex.escape(d.attrName) + """\s*=\s*"([^"]*)"""").find(html)?.groupValues?.get(1) ?: continue
+            val sep = m.groupValues[3].ifEmpty { "*" }
+            val parts = m.groupValues[2].split(sep)
+            val r = try {
+                clRun(parts, host, attr, d.atobCh, d.revCh, d.base)
+            } catch (e: Throwable) {
+                ""
+            }
+            val u = r.trim()
+            dbg("CL call ${m.groupValues[1]} parts=${parts.size} host=$host attr=${attr.take(20)} -> ${u.take(200)}")
+            // Sayfadaki script de adrese tarayıcı özelliklerini gösteren "o" bayrağını ekliyor (tarayıcıda hepsi açık = 255)
+            if (u.startsWith("http", true) && mostlyPrintable(u)) out.add(u + (if (u.contains("?")) "&o=255" else "?o=255"))
+        }
+        return out.toList()
     }
 
     // ---------- Tüm çözülmüş metinleri topla ----------
