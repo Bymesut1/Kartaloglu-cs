@@ -3,8 +3,12 @@ package com.bymesut1
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -123,7 +127,7 @@ class TekFullFilmizle : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- Linkler (Platin / Gold / Silver)
+    // ---------------------------------------------------------------- Linkler (Platin / Gold)
 
     override suspend fun loadLinks(
         data: String,
@@ -132,10 +136,10 @@ class TekFullFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val base = data.trimEnd('/')
+        // Silver (/3) Abyss altyapısı kullandığı için desteklenmiyor.
         val pages = listOf(
             "Platin" to base,
-            "Gold" to "$base/2",
-            "Silver" to "$base/3"
+            "Gold" to "$base/2"
         )
 
         var found = false
@@ -212,39 +216,92 @@ class TekFullFilmizle : MainAPI() {
     ): Boolean {
         return when {
             url.contains("loadvid.com") -> loadvid(label, url, callback)
-            url.contains("myvideoplayer") -> myVideoPlayer(label, url, subtitleCallback, callback)
+            url.contains("myvideoplayer") -> false // Abyss: desteklenmiyor
             else -> generic(label, url, pageUrl, subtitleCallback, callback)
         }
     }
 
-    // ---- Platin: cdn.loadvid.com
+    // ---- Platin: cdn.loadvid.com  (POST /videos/resolve-token -> m3u8 içeriği)
     private suspend fun loadvid(
         label: String,
         url: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val ref = "https://cdn.loadvid.com/"
-        val html = app.get(url, referer = "$mainUrl/").text.replace("\\/", "/")
+        val origin = "https://cdn.loadvid.com"
+        val pageResp = app.get(url, referer = "$mainUrl/")
+        val html = pageResp.text
+        val csrf = pageResp.document.selectFirst("meta[name=csrf-token]")?.attr("content") ?: ""
 
-        // 1) Sayfada doğrudan m3u8 / mp4 varsa
-        findMedia(html)?.let { (link, type) ->
-            addLink(label, link, ref, type, callback)
+        val hash = Regex("""videoHash:\s*'([^']+)'""").find(html)?.groupValues?.get(1)
+            ?: url.substringAfterLast("/")
+        val token = Regex("""videoToken:\s*'([^']*)'""").find(html)?.groupValues?.get(1)
+        val thumb = Regex("""thumbnailUrl:\s*'([^']+)'""").find(html)?.groupValues?.get(1)
+        val baseDir = thumb?.substringBeforeLast("/")?.plus("/")
+
+        // 1) Token çözme (asıl yöntem)
+        if (!token.isNullOrBlank()) {
+            try {
+                val body = JSONObject()
+                    .put("token", token)
+                    .put("hash", hash)
+                    .toString()
+                    .toRequestBody("application/json".toMediaTypeOrNull())
+
+                val resp = app.post(
+                    "$origin/videos/resolve-token",
+                    headers = mapOf(
+                        "X-CSRF-TOKEN" to csrf,
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept" to "application/vnd.apple.mpegurl,*/*",
+                        "Origin" to origin
+                    ),
+                    referer = url,
+                    cookies = pageResp.cookies,
+                    requestBody = body
+                )
+                val text = resp.text
+                if (text.contains("#EXTM3U")) {
+                    val fixed = absolutize(text, baseDir)
+
+                    if (fixed.contains("#EXT-X-STREAM-INF")) {
+                        // Master playlist: varyant linklerini doğrudan ekle
+                        val variants = fixed.lines().map { it.trim() }
+                            .filter { it.startsWith("http") }
+                        if (variants.isNotEmpty()) {
+                            variants.forEach {
+                                addLink(label, it, "$origin/", ExtractorLinkType.M3U8, callback, origin)
+                            }
+                            return true
+                        }
+                    }
+
+                    // Media playlist: içeriği data URI olarak ver
+                    val dataUri = "data:application/vnd.apple.mpegurl;base64," +
+                            Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                    addLink(label, dataUri, "$origin/", ExtractorLinkType.M3U8, callback, origin)
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        // 2) Yedek: sayfada doğrudan m3u8 / mp4 varsa
+        findMedia(html.replace("\\/", "/"))?.let { (link, type) ->
+            addLink(label, link, "$origin/", type, callback, origin)
             return true
         }
 
-        // 2) Thumbnail klasöründen tahmin
-        val thumb = Regex("""thumbnailUrl:\s*'([^']+)'""").find(html)?.groupValues?.get(1)
-        val dir = thumb?.substringBeforeLast("/")
-        if (dir != null) {
+        // 3) Yedek: thumbnail klasöründen tahmin
+        if (baseDir != null) {
             for (n in listOf("master.m3u8", "index.m3u8", "playlist.m3u8", "video.m3u8", "hls.m3u8")) {
-                val cand = "$dir/$n"
+                val cand = "$baseDir$n"
                 val ok = try {
-                    app.get(cand, referer = ref).text.trimStart().startsWith("#EXTM3U")
+                    app.get(cand, referer = "$origin/").text.trimStart().startsWith("#EXTM3U")
                 } catch (_: Exception) {
                     false
                 }
                 if (ok) {
-                    addLink(label, cand, ref, ExtractorLinkType.M3U8, callback)
+                    addLink(label, cand, "$origin/", ExtractorLinkType.M3U8, callback, origin)
                     return true
                 }
             }
@@ -252,42 +309,27 @@ class TekFullFilmizle : MainAPI() {
         return false
     }
 
-    // ---- Silver: myvideoplayer.top -> myvideoplayer.link -> (ok.ru vb.)
-    private suspend fun myVideoPlayer(
-        label: String,
-        url: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val html = app.get(url, referer = "$mainUrl/").text
-
-        var playerUrl: String? = null
-        val b64 = Regex("""atob\("([A-Za-z0-9+/=]+)"\)""").find(html)?.groupValues?.get(1)
-        if (b64 != null) {
-            val decoded = String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8).replace("\\/", "/")
-            playerUrl = Regex("""src=\\?"(https?://[^"\\]+)""").find(decoded)?.groupValues?.get(1)
+    /** m3u8 içindeki göreli adresleri mutlak adrese çevirir. */
+    private fun absolutize(text: String, base: String?): String {
+        if (base == null) return text
+        fun abs(u: String): String {
+            if (u.startsWith("http") || u.startsWith("data:")) return u
+            return try {
+                URI(base).resolve(u).toString()
+            } catch (_: Exception) {
+                u
+            }
         }
-        if (playerUrl == null) {
-            playerUrl = Jsoup.parse(html).selectFirst("iframe[src]")?.attr("src")?.let { normalizeUrl(it) }
+        return text.lines().joinToString("\n") { line ->
+            val l = line.trim()
+            when {
+                l.isEmpty() -> line
+                l.startsWith("#") -> Regex("URI=\"([^\"]+)\"").replace(line) { m ->
+                    "URI=\"" + abs(m.groupValues[1]) + "\""
+                }
+                else -> abs(l)
+            }
         }
-        if (playerUrl == null) return generic(label, url, mainUrl, subtitleCallback, callback)
-
-        val playerHtml = try {
-            app.get(playerUrl, referer = url).text.replace("\\/", "/")
-        } catch (_: Exception) {
-            ""
-        }
-
-        findMedia(playerHtml)?.let { (link, type) ->
-            addLink(label, link, playerUrl, type, callback)
-            return true
-        }
-
-        Regex("""https?://(?:www\.)?ok\.ru/videoembed/\d+""").find(playerHtml)?.value?.let {
-            if (loadExtractor(it, playerUrl, subtitleCallback, callback)) return true
-        }
-
-        return loadExtractor(playerUrl, url, subtitleCallback, callback)
     }
 
     // ---- Gold ve diğerleri: workers.dev m3u8 proxy vb.
@@ -335,7 +377,8 @@ class TekFullFilmizle : MainAPI() {
         url: String,
         referer: String,
         type: ExtractorLinkType,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        origin: String? = null
     ) {
         callback(
             newExtractorLink(
@@ -346,7 +389,9 @@ class TekFullFilmizle : MainAPI() {
             ) {
                 this.referer = referer
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to userAgent)
+                val h = mutableMapOf("User-Agent" to userAgent, "Referer" to referer)
+                if (origin != null) h["Origin"] = origin
+                this.headers = h
             }
         )
     }
