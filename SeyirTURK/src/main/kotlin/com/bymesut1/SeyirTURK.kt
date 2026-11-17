@@ -134,9 +134,9 @@ class SeyirTURKProvider : MainAPI() {
 
     private val json = jacksonObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
-    // textLarge: yanıt 5 MB'ı aşınca .text hata verir (logcat'teki sorun)
+    // okhttpResponse.body.string(): .text 5 MB'ı aşınca hata verir (logcat'teki sorun)
     private suspend inline fun <reified T : Any> get(path: String): T? = try {
-        val body = app.get(base() + path, headers = headers).textLarge
+        val body = app.get(base() + path, headers = headers).okhttpResponse.body?.string() ?: ""
         json.readValue(body, T::class.java)
     } catch (e: Exception) {
         Log.w("SeyirTURK", "get $path: ${e.message}")
@@ -315,7 +315,7 @@ class SeyirTURKProvider : MainAPI() {
 /** TMDB sadece load() (diziye/filme tıklayınca) içinde kullanılır. */
 object Tmdb {
     // >>> KENDİ TMDB API KEY'İNİ BURAYA YAZ (themoviedb.org > Ayarlar > API, "v3 auth") <<<
-    const val API_KEY = "BURAYA_TMDB_API_KEY"
+    const val API_KEY = "000316508321ce461cf81e7c6815eec7"
 
     private const val API = "https://api.themoviedb.org/3"
     const val IMG = "https://image.tmdb.org/t/p/"
@@ -494,7 +494,8 @@ object SeyirExtractor {
 
     private suspend fun page(url: String, referer: String? = null, extra: Map<String, String> = emptyMap()): String? =
         try {
-            app.get(url, headers = mapOf("User-Agent" to UA) + extra, referer = referer ?: (origin(url) + "/")).textLarge
+            app.get(url, headers = mapOf("User-Agent" to UA) + extra, referer = referer ?: (origin(url) + "/"))
+                .okhttpResponse.body?.string()
         } catch (e: Exception) {
             Log.w(TAG, "page $url: ${e.message}")
             null
