@@ -5,7 +5,8 @@ import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import java.net.URLDecoder
 import java.net.URLEncoder
 import org.json.JSONObject
@@ -128,7 +129,7 @@ class SeyirTURKProvider : MainAPI() {
     private fun year(d: String?) = d?.let { Regex("(19|20)\\d{2}").find(it)?.value?.toIntOrNull() }
 
     private suspend inline fun <reified T> get(path: String): T? =
-        tryParseJson<T>(runCatching { app.get(base() + path, headers = headers).text }.getOrNull() ?: return null)
+        runCatching { app.get(base() + path, headers = headers).parsedSafe<T>() }.getOrNull()
 
     // ---------- Liste öğesi ----------
     private fun SeyirMovie.toSearch(): SearchResponse? {
@@ -369,7 +370,7 @@ object Tmdb {
             "$API/search/$kind?api_key=$API_KEY&language=$LANG&query=$q$yearParam",
             "$API/search/$kind?api_key=$API_KEY&language=$LANG&query=$q",
         )) {
-            val r = tryParseJson<Search>(runCatching { app.get(u).text }.getOrNull() ?: continue)
+            val r = runCatching { app.get(u).parsedSafe<Search>() }.getOrNull()
             val id = r?.results?.firstOrNull()?.id
             if (id != null) return id
         }
@@ -382,12 +383,12 @@ object Tmdb {
         val kind = if (tv) "tv" else "movie"
         val u = "$API/$kind/$id?api_key=$API_KEY&language=$LANG" +
             "&append_to_response=credits,videos&include_video_language=tr,en,null"
-        return tryParseJson<Details>(runCatching { app.get(u).text }.getOrNull() ?: return null)
+        return runCatching { app.get(u).parsedSafe<Details>() }.getOrNull()
     }
 
     suspend fun season(tvId: Int, season: Int): Map<Int, Ep> {
         val u = "$API/tv/$tvId/season/$season?api_key=$API_KEY&language=$LANG"
-        val s = tryParseJson<Season>(runCatching { app.get(u).text }.getOrNull() ?: return emptyMap())
+        val s = runCatching { app.get(u).parsedSafe<Season>() }.getOrNull()
         return s?.episodes?.filter { it.episodeNumber != null }?.associateBy { it.episodeNumber!! } ?: emptyMap()
     }
 }
