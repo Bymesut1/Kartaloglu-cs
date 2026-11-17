@@ -10,7 +10,14 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.thread
 import java.net.URLEncoder
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -429,9 +436,18 @@ class TekFullFilmizle : MainAPI() {
                         }
                     }
 
-                    val dataUri = "data:application/vnd.apple.mpegurl;base64," +
-                            Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-                    addLink(label, dataUri, "$origin/", ExtractorLinkType.M3U8, callback, origin)
+                    // Cronet "data:" şemasını desteklemiyor (ERR_UNKNOWN_URL_SCHEME);
+                    // playlist'i 127.0.0.1 üzerinde küçük bir sunucudan gerçek URL olarak veriyoruz.
+                    val localUrl = try {
+                        LocalPlaylistServer.serve(fixed)
+                    } catch (e: Exception) {
+                        log("yerel sunucu başlamadı", e)
+                        null
+                    }
+                    log("playlist url=$localUrl")
+                    val finalUrl = localUrl ?: ("data:application/vnd.apple.mpegurl;base64," +
+                            Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
+                    addLink(label, finalUrl, "$origin/", ExtractorLinkType.M3U8, callback, origin)
                     return true
                 }
             } catch (e: Exception) {
@@ -512,7 +528,24 @@ class TekFullFilmizle : MainAPI() {
             log("generic get hatası: $url", e)
             ""
         }
-        log("generic url=$url head=" + text.take(400).replace("\n", " "))
+        log("generic url=$url len=${text.length}")
+        if (text.trimStart().startsWith("<")) {
+            Jsoup.parse(text).select("script").forEachIndexed { i, sc ->
+                val body = sc.data().ifBlank { sc.attr("src") }.trim()
+                if (body.isNotBlank()) log("generic script[$i]=" + body.take(1800))
+            }
+            // JW Player tarzı: file: "https://..." / "file":"https://..."
+            val unescaped = text.replace("\\/", "/")
+            Regex("""["']?(?:file|src|source|hls|url)["']?\s*[:=]\s*["'](https?://[^"'\s]+)["']""")
+                .findAll(unescaped).map { it.groupValues[1] }
+                .firstOrNull { u -> ignoredHosts.none { u.contains(it) } && !u.endsWith(".js") && !u.endsWith(".css") && !u.contains("jwpcdn") && !u.endsWith(".png") && !u.endsWith(".jpg") }
+                ?.let { u ->
+                    log("generic file=$u")
+                    val t = if (u.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+                    addLink(label, u, ref, t, callback)
+                    return true
+                }
+        }
         if (text.trimStart().startsWith("#EXTM3U")) {
             addLink(label, url, ref, ExtractorLinkType.M3U8, callback)
             return true
@@ -556,5 +589,64 @@ class TekFullFilmizle : MainAPI() {
                 this.headers = h
             }
         )
+    }
+}
+
+/** Media playlist'i http://127.0.0.1:PORT/ID.m3u8 olarak sunan minik sunucu. */
+private object LocalPlaylistServer {
+    private val playlists = ConcurrentHashMap<String, ByteArray>()
+    private var server: ServerSocket? = null
+
+    @Synchronized
+    fun serve(content: String): String {
+        if (playlists.size > 30) playlists.clear()
+        val id = java.util.UUID.randomUUID().toString().replace("-", "")
+        playlists[id] = content.toByteArray(Charsets.UTF_8)
+        val s = ensureStarted()
+        return "http://127.0.0.1:${s.localPort}/$id.m3u8"
+    }
+
+    private fun ensureStarted(): ServerSocket {
+        server?.let { if (!it.isClosed) return it }
+        val s = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        server = s
+        thread(isDaemon = true, name = "TekFullPlaylistServer") {
+            while (!s.isClosed) {
+                try {
+                    val c = s.accept()
+                    thread(isDaemon = true) { handle(c) }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return s
+    }
+
+    private fun handle(c: Socket) {
+        try {
+            c.use { sock ->
+                val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
+                val first = reader.readLine() ?: return
+                while (true) {
+                    val l = reader.readLine()
+                    if (l.isNullOrEmpty()) break
+                }
+                val parts = first.split(" ")
+                val isHead = parts.getOrNull(0) == "HEAD"
+                val id = parts.getOrNull(1)?.trim('/')?.removeSuffix(".m3u8")
+                val body = id?.let { playlists[it] }
+                val out = sock.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    val head = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${body.size}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                    out.write(head.toByteArray())
+                    if (!isHead) out.write(body)
+                }
+                out.flush()
+            }
+        } catch (_: Exception) {
+        }
     }
 }
