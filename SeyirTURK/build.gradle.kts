@@ -1,5 +1,9 @@
 version = 7
 
+dependencies {
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+}
+
 android {
     namespace = "com.bymesut1"
 }
