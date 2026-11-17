@@ -191,23 +191,23 @@ class TekFullFilmizle : MainAPI() {
 
         var found = false
         for ((label, urls) in candidates) {
-            if (label == "Silver") continue // Abyss altyapısı, desteklenmiyor
             for (pageUrl in urls) {
+                reached = false
                 val ok = try {
                     tryPage(label, pageUrl, subtitleCallback, callback)
                 } catch (e: Exception) {
                     log("$label hata: $pageUrl", e)
                     false
                 }
-                if (ok) {
-                    found = true
-                    break
-                }
+                if (ok) found = true
+                if (ok || reached) break // sayfa çözüldüyse diğer tahminlere gerek yok
             }
         }
         log("loadLinks sonuç found=$found")
         return found
     }
+
+    @Volatile private var reached = false
 
     private suspend fun tryPage(
         label: String,
@@ -223,6 +223,7 @@ class TekFullFilmizle : MainAPI() {
         val html = resp.text
         val inner = decryptFromDocument(resp.document, html)
         log("$label decrypted=${inner != null} len=${html.length}: $pageUrl")
+        if (inner != null) reached = true
 
         val sources = extractSources(inner ?: html)
         log("$label kaynaklar=$sources")
@@ -307,9 +308,61 @@ class TekFullFilmizle : MainAPI() {
     ): Boolean {
         return when {
             url.contains("loadvid.com") -> loadvid(label, url, subtitleCallback, callback, pageUrl)
-            url.contains("myvideoplayer") -> false // Abyss: desteklenmiyor
+            url.contains("myvideoplayer") -> myvideo(label, url, pageUrl, subtitleCallback, callback)
             else -> generic(label, url, pageUrl, subtitleCallback, callback)
         }
+    }
+
+
+    // ---- myvideoplayer.top (Platin/Gold/Silver artık hepsi bunu kullanıyor)
+    private suspend fun myvideo(
+        label: String,
+        url: String,
+        pageUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // 1) Cloudstream'in hazır extractor'ları
+        try {
+            if (loadExtractor(url, pageUrl, subtitleCallback, callback)) {
+                log("myvideo: hazır extractor çalıştı")
+                return true
+            }
+        } catch (e: Exception) {
+            log("myvideo loadExtractor hatası", e)
+        }
+
+        val origin = try { "https://" + URI(url).host } catch (_: Exception) { "https://www.myvideoplayer.top" }
+        val resp = app.get(url, referer = "$mainUrl/", headers = baseHeaders)
+        val html = resp.text
+        log("myvideo code=${resp.code} len=${html.length} url=$url")
+
+        // Teşhis: sayfanın script kısımlarını logla (sonraki adımda buna göre extractor yazılır)
+        val doc = Jsoup.parse(html)
+        doc.select("script").forEachIndexed { i, sc ->
+            val body = sc.data().ifBlank { sc.attr("src") }.trim()
+            if (body.isNotBlank()) log("myvideo script[$i]=" + body.take(1500))
+        }
+        log("myvideo head=" + html.take(600))
+
+        // 2) Açık link / packed JS / base64 içinde ara
+        var text = html.replace("\\/", "/")
+        try { getAndUnpack(html).takeIf { it.isNotBlank() }?.let { text += "\n" + it } } catch (_: Exception) {}
+        Regex("""atob\(\s*["']([A-Za-z0-9+/=_-]{20,})["']\s*\)""").findAll(html).forEach { m ->
+            try { text += "\n" + String(b64(m.groupValues[1]), Charsets.UTF_8) } catch (_: Exception) {}
+        }
+        text = text.replace("\\/", "/")
+
+        findMedia(text)?.let { (link, type) ->
+            addLink(label, link, "$origin/", type, callback, origin)
+            return true
+        }
+
+        // 3) İçeride iframe varsa onu da dene
+        for (frame in doc.select("iframe[src]").map { normalizeUrl(it.attr("src")) }) {
+            if (frame != url && generic(label, frame, url, subtitleCallback, callback)) return true
+        }
+        return false
     }
 
     // ---- Platin: cdn.loadvid.com (POST /videos/resolve-token -> m3u8)
