@@ -198,6 +198,7 @@ class TekFullFilmizle : MainAPI() {
 
         var found = false
         for ((label, urls) in candidates) {
+            if (label == "Silver") continue // Abyss oynatıcısı: korumalı, desteklenmiyor
             for (pageUrl in urls) {
                 reached = false
                 val ok = try {
@@ -300,6 +301,13 @@ class TekFullFilmizle : MainAPI() {
         return out.filter { u -> ignoredHosts.none { u.contains(it) } }
     }
 
+    /** Resim, script, stil, takip pikseli gibi video olmayan adresleri eler. */
+    private fun isPlayableCandidate(u: String): Boolean {
+        if (ignoredHosts.any { u.contains(it) }) return false
+        if (listOf("pixel", "analytics", "googlesyndication", "jwpcdn", "jwpsrv", "morphify").any { u.contains(it) }) return false
+        return !Regex("""\.(jpe?g|png|gif|webp|svg|ico|js|css|html?|json|woff2?)(\?|#|$)""", RegexOption.IGNORE_CASE).containsMatchIn(u)
+    }
+
     private fun normalizeUrl(u: String): String = when {
         u.startsWith("//") -> "https:$u"
         u.startsWith("/") -> "$mainUrl$u"
@@ -358,8 +366,13 @@ class TekFullFilmizle : MainAPI() {
         log("myvideo iframe=$frameUrls")
         for (frame in frameUrls) {
             val ok = try {
-                if (frame.contains("loadvid.com")) loadvid(label, frame, subtitleCallback, callback, url)
-                else generic(label, frame, url, subtitleCallback, callback)
+                when {
+                    frame.contains("loadvid.com") -> loadvid(label, frame, subtitleCallback, callback, url)
+                    // Silver: Abyss altyapısı (şifreli), kendi çözümümüz yok; sadece hazır extractor denenir
+                    frame.contains("myvideoplayer.link") || frame.contains("abyss") ->
+                        try { loadExtractor(frame, url, subtitleCallback, callback) } catch (_: Exception) { false }
+                    else -> generic(label, frame, url, subtitleCallback, callback)
+                }
             } catch (e: Exception) {
                 log("myvideo iframe hatası: $frame", e)
                 false
@@ -538,7 +551,7 @@ class TekFullFilmizle : MainAPI() {
             val unescaped = text.replace("\\/", "/")
             Regex("""["']?(?:file|src|source|hls|url)["']?\s*[:=]\s*["'](https?://[^"'\s]+)["']""")
                 .findAll(unescaped).map { it.groupValues[1] }
-                .firstOrNull { u -> ignoredHosts.none { u.contains(it) } && !u.endsWith(".js") && !u.endsWith(".css") && !u.contains("jwpcdn") && !u.endsWith(".png") && !u.endsWith(".jpg") }
+                .firstOrNull { u -> isPlayableCandidate(u) }
                 ?.let { u ->
                     log("generic file=$u")
                     val t = if (u.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
