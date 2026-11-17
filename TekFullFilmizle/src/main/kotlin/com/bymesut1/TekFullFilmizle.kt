@@ -322,16 +322,6 @@ class TekFullFilmizle : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1) Cloudstream'in hazır extractor'ları
-        try {
-            if (loadExtractor(url, pageUrl, subtitleCallback, callback)) {
-                log("myvideo: hazır extractor çalıştı")
-                return true
-            }
-        } catch (e: Exception) {
-            log("myvideo loadExtractor hatası", e)
-        }
-
         val origin = try { "https://" + URI(url).host } catch (_: Exception) { "https://www.myvideoplayer.top" }
         val resp = app.get(url, referer = "$mainUrl/", headers = baseHeaders)
         val html = resp.text
@@ -348,10 +338,27 @@ class TekFullFilmizle : MainAPI() {
         // 2) Açık link / packed JS / base64 içinde ara
         var text = html.replace("\\/", "/")
         try { getAndUnpack(html).takeIf { it.isNotBlank() }?.let { text += "\n" + it } } catch (_: Exception) {}
+        var decodedBlobs = ""
         Regex("""atob\(\s*["']([A-Za-z0-9+/=_-]{20,})["']\s*\)""").findAll(html).forEach { m ->
-            try { text += "\n" + String(b64(m.groupValues[1]), Charsets.UTF_8) } catch (_: Exception) {}
+            try { decodedBlobs += "\n" + String(b64(m.groupValues[1]), Charsets.UTF_8) } catch (_: Exception) {}
         }
-        text = text.replace("\\/", "/")
+        decodedBlobs = decodedBlobs.replace("\\/", "/")
+        text = (text + "\n" + decodedBlobs).replace("\\/", "/")
+
+        // Sayfa aslında bir sarmalayıcı: atob içindeki JS bir iframe oluşturuyor.
+        val frameUrls = Regex("""src=\\*["'](https?://[^"'\\\s]+)""")
+            .findAll(decodedBlobs).map { it.groupValues[1] }.distinct().toList()
+        log("myvideo iframe=$frameUrls")
+        for (frame in frameUrls) {
+            val ok = try {
+                if (frame.contains("loadvid.com")) loadvid(label, frame, subtitleCallback, callback, url)
+                else generic(label, frame, url, subtitleCallback, callback)
+            } catch (e: Exception) {
+                log("myvideo iframe hatası: $frame", e)
+                false
+            }
+            if (ok) return true
+        }
 
         findMedia(text)?.let { (link, type) ->
             addLink(label, link, "$origin/", type, callback, origin)
@@ -362,7 +369,7 @@ class TekFullFilmizle : MainAPI() {
         for (frame in doc.select("iframe[src]").map { normalizeUrl(it.attr("src")) }) {
             if (frame != url && generic(label, frame, url, subtitleCallback, callback)) return true
         }
-        return false
+        return try { loadExtractor(url, pageUrl, subtitleCallback, callback) } catch (_: Exception) { false }
     }
 
     // ---- Platin: cdn.loadvid.com (POST /videos/resolve-token -> m3u8)
@@ -505,6 +512,7 @@ class TekFullFilmizle : MainAPI() {
             log("generic get hatası: $url", e)
             ""
         }
+        log("generic url=$url head=" + text.take(400).replace("\n", " "))
         if (text.trimStart().startsWith("#EXTM3U")) {
             addLink(label, url, ref, ExtractorLinkType.M3U8, callback)
             return true
