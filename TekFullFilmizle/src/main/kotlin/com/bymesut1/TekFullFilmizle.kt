@@ -1,12 +1,14 @@
 package com.bymesut1
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
@@ -22,7 +24,7 @@ class TekFullFilmizle : MainAPI() {
     override var lang = "tr"
     override val hasQuickSearch = false
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie)
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Yeni Eklenenler",
@@ -46,12 +48,19 @@ class TekFullFilmizle : MainAPI() {
     private val fallbackPass = "NaNeACxYoEBKS6WtFPLVvG52CQrmbmJsfdsD5Mh7Pn8TQ5A0db"
     private val userAgent =
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    private val tag = "TekFull"
+
+    private fun log(msg: String, e: Throwable? = null) {
+        if (e != null) Log.e(tag, msg, e) else Log.d(tag, msg)
+    }
+
+    private val baseHeaders get() = mapOf("User-Agent" to userAgent)
 
     // ---------------------------------------------------------------- Ana sayfa
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) request.data else "${request.data.trimEnd('/')}/page/$page"
-        val document = app.get(url).document
+        val document = app.get(url, headers = baseHeaders).document
         val home = document.select("div.moviefilm").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, home)
     }
@@ -69,8 +78,10 @@ class TekFullFilmizle : MainAPI() {
         val rawTitle = a.text().trim().ifBlank { a.attr("title").trim() }
         if (rawTitle.isBlank()) return null
         val href = fixUrlNull(a.attr("href")) ?: return null
-        val poster = fixUrlNull(selectFirst("img")?.attr("src"))
-
+        val img = selectFirst("img")
+        val poster = fixUrlNull(
+            img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src")
+        )
         return newMovieSearchResponse(cleanTitle(rawTitle), href, TvType.Movie) {
             this.posterUrl = poster
         }
@@ -80,14 +91,14 @@ class TekFullFilmizle : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
-        val document = app.get("$mainUrl/search/$q").document
+        val document = app.get("$mainUrl/search/$q", headers = baseHeaders).document
         return document.select("div.moviefilm").mapNotNull { it.toSearchResult() }
     }
 
     // ---------------------------------------------------------------- İçerik sayfası
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
+        val document = app.get(url, headers = baseHeaders).document
 
         val rawTitle = document.selectFirst("meta[property=og:title]")?.attr("content")
             ?: document.selectFirst("div.filmcontent h1")?.ownText()
@@ -130,7 +141,7 @@ class TekFullFilmizle : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- Linkler (Platin / Gold)
+    // ---------------------------------------------------------------- Linkler
 
     override suspend fun loadLinks(
         data: String,
@@ -138,57 +149,132 @@ class TekFullFilmizle : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val base = data.trimEnd('/')
-        // Silver (/3) Abyss altyapısı kullandığı için desteklenmiyor.
-        val pages = listOf(
-            "Platin" to base,
-            "Gold" to "$base/2"
-        )
+        val clean = data.substringBefore("#").substringBefore("?").trimEnd('/')
+        val noHtml = clean.removeSuffix(".html")
+        val slug = noHtml.substringAfterLast("/")
+        log("loadLinks data=$data")
+
+        // label -> aday sayfa adresleri (sırayla denenir)
+        val candidates = linkedMapOf<String, MutableList<String>>()
+        fun add(label: String, url: String) {
+            candidates.getOrPut(label) { mutableListOf() }.let { if (url !in it) it.add(url) }
+        }
+
+        // 1) Ana sayfa (Platin)
+        add("Platin", clean)
+
+        // 2) Sayfadaki gerçek kaynak butonlarını bul (…/2, …/3 vb.)
+        try {
+            val doc = app.get(clean, referer = "$mainUrl/", headers = baseHeaders).document
+            doc.select("a[href]").forEach { a ->
+                val href = fixUrlNull(a.attr("href")) ?: return@forEach
+                if (!href.contains(slug)) return@forEach
+                val n = Regex("/(\\d)(?:\\.html)?/?$").find(href)?.groupValues?.get(1) ?: return@forEach
+                val label = when (n) {
+                    "1" -> "Platin"
+                    "2" -> "Gold"
+                    "3" -> "Silver"
+                    else -> "Kaynak $n"
+                }
+                add(label, href)
+            }
+        } catch (e: Exception) {
+            log("ana sayfa okunamadı: $clean", e)
+        }
+
+        // 3) Bulunamazsa tahmin et (.html olsun / olmasın)
+        add("Gold", "$noHtml/2")
+        add("Gold", "$clean/2")
+        add("Gold", "$noHtml/2.html")
+
+        log("adaylar: $candidates")
 
         var found = false
-        for ((label, pageUrl) in pages) {
-            try {
-                val inner = getDecryptedHtml(pageUrl) ?: continue
-                val srcList = extractSources(inner)
-                for (src in srcList) {
-                    if (handleSource(label, src, pageUrl, subtitleCallback, callback)) found = true
+        for ((label, urls) in candidates) {
+            if (label == "Silver") continue // Abyss altyapısı, desteklenmiyor
+            for (pageUrl in urls) {
+                val ok = try {
+                    tryPage(label, pageUrl, subtitleCallback, callback)
+                } catch (e: Exception) {
+                    log("$label hata: $pageUrl", e)
+                    false
                 }
-            } catch (_: Exception) {
+                if (ok) {
+                    found = true
+                    break
+                }
             }
         }
+        log("loadLinks sonuç found=$found")
         return found
     }
 
-    /** Sayfadaki AES-CBC şifreli #encrypted-content alanını çözer. */
-    private suspend fun getDecryptedHtml(pageUrl: String): String? {
-        val response = app.get(pageUrl, referer = "$mainUrl/")
-        val html = response.text
-        val el = response.document.selectFirst("#encrypted-content") ?: return null
+    private suspend fun tryPage(
+        label: String,
+        pageUrl: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val resp = app.get(pageUrl, referer = "$mainUrl/", headers = baseHeaders)
+        if (resp.code !in 200..299) {
+            log("$label HTTP ${resp.code}: $pageUrl")
+            return false
+        }
+        val html = resp.text
+        val inner = decryptFromDocument(resp.document, html)
+        log("$label decrypted=${inner != null} len=${html.length}: $pageUrl")
+
+        val sources = extractSources(inner ?: html)
+        log("$label kaynaklar=$sources")
+
+        var any = false
+        for (src in sources) {
+            try {
+                if (handleSource(label, src, pageUrl, subtitleCallback, callback)) any = true
+            } catch (e: Exception) {
+                log("$label kaynak hatası: $src", e)
+            }
+        }
+        return any
+    }
+
+    /** #encrypted-content alanını AES-CBC ile çözer. */
+    private fun decryptFromDocument(document: Document, html: String): String? {
+        val el = document.selectFirst("#encrypted-content") ?: return null
         val enc = el.attr("data-enc")
         val iv = el.attr("data-iv")
         if (enc.isBlank() || iv.isBlank()) return null
 
-        val pass = Regex("""pass\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-            ?: fallbackPass
-        return decrypt(enc, iv, pass) ?: if (pass != fallbackPass) decrypt(enc, iv, fallbackPass) else null
+        val pagePass = Regex("""pass\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+        val passes = listOfNotNull(pagePass, fallbackPass).distinct()
+        for (p in passes) {
+            decrypt(enc, iv, p)?.let { if (it.isNotBlank()) return it }
+        }
+        return null
+    }
+
+    private fun b64(s: String): ByteArray = try {
+        Base64.decode(s, Base64.DEFAULT)
+    } catch (_: Exception) {
+        Base64.decode(s, Base64.URL_SAFE)
     }
 
     private fun decrypt(enc: String, iv: String, pass: String): String? {
         return try {
             val key = MessageDigest.getInstance("SHA-256").digest(pass.toByteArray(Charsets.UTF_8))
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                SecretKeySpec(key, "AES"),
-                IvParameterSpec(Base64.decode(iv, Base64.DEFAULT))
-            )
-            String(cipher.doFinal(Base64.decode(enc, Base64.DEFAULT)), Charsets.UTF_8)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(b64(iv)))
+            String(cipher.doFinal(b64(enc)), Charsets.UTF_8)
         } catch (e: Exception) {
             null
         }
     }
 
-    /** Çözülen HTML'den iframe/video/kaynak linklerini toplar. */
+    private val ignoredHosts = listOf(
+        "google", "facebook", "youtube", "doubleclick", "histats", "twitter", "instagram"
+    )
+
+    /** HTML'den iframe/video/kaynak linklerini toplar. */
     private fun extractSources(html: String): List<String> {
         val out = linkedSetOf<String>()
         val doc = Jsoup.parse(html)
@@ -197,11 +283,13 @@ class TekFullFilmizle : MainAPI() {
             if (s.isNotBlank()) out.add(normalizeUrl(s))
         }
         if (out.isEmpty()) {
-            Regex("""https?:(?:\\?/){2}[^\s"'<>\\]+(?:\\/[^\s"'<>\\]*)*""")
+            Regex("""https?://[^\s"'<>\\]+""")
                 .findAll(html.replace("\\/", "/"))
-                .forEach { out.add(it.value) }
+                .map { it.value }
+                .filter { u -> u.contains("m3u8") || u.contains(".mp4") || u.contains("loadvid") || u.contains("embed") || u.contains("player") }
+                .forEach { out.add(it) }
         }
-        return out.toList()
+        return out.filter { u -> ignoredHosts.none { u.contains(it) } }
     }
 
     private fun normalizeUrl(u: String): String = when {
@@ -218,20 +306,22 @@ class TekFullFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         return when {
-            url.contains("loadvid.com") -> loadvid(label, url, callback)
+            url.contains("loadvid.com") -> loadvid(label, url, subtitleCallback, callback, pageUrl)
             url.contains("myvideoplayer") -> false // Abyss: desteklenmiyor
             else -> generic(label, url, pageUrl, subtitleCallback, callback)
         }
     }
 
-    // ---- Platin: cdn.loadvid.com  (POST /videos/resolve-token -> m3u8 içeriği)
+    // ---- Platin: cdn.loadvid.com (POST /videos/resolve-token -> m3u8)
     private suspend fun loadvid(
         label: String,
         url: String,
-        callback: (ExtractorLink) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        pageUrl: String
     ): Boolean {
         val origin = "https://cdn.loadvid.com"
-        val pageResp = app.get(url, referer = "$mainUrl/")
+        val pageResp = app.get(url, referer = "$mainUrl/", headers = baseHeaders)
         val html = pageResp.text
         val csrf = pageResp.document.selectFirst("meta[name=csrf-token]")?.attr("content") ?: ""
 
@@ -240,8 +330,9 @@ class TekFullFilmizle : MainAPI() {
         val token = Regex("""videoToken:\s*'([^']*)'""").find(html)?.groupValues?.get(1)
         val thumb = Regex("""thumbnailUrl:\s*'([^']+)'""").find(html)?.groupValues?.get(1)
         val baseDir = thumb?.substringBeforeLast("/")?.plus("/")
+        log("loadvid hash=$hash tokenLen=${token?.length} baseDir=$baseDir")
 
-        // 1) Token çözme (asıl yöntem)
+        // 1) Token çözme
         if (!token.isNullOrBlank()) {
             try {
                 val body = JSONObject()
@@ -253,6 +344,7 @@ class TekFullFilmizle : MainAPI() {
                 val resp = app.post(
                     "$origin/videos/resolve-token",
                     headers = mapOf(
+                        "User-Agent" to userAgent,
                         "X-CSRF-TOKEN" to csrf,
                         "X-Requested-With" to "XMLHttpRequest",
                         "Accept" to "application/vnd.apple.mpegurl,*/*",
@@ -263,13 +355,12 @@ class TekFullFilmizle : MainAPI() {
                     requestBody = body
                 )
                 val text = resp.text
+                log("resolve-token code=${resp.code} head=${text.take(60)}")
                 if (text.contains("#EXTM3U")) {
                     val fixed = absolutize(text, baseDir)
 
                     if (fixed.contains("#EXT-X-STREAM-INF")) {
-                        // Master playlist: varyant linklerini doğrudan ekle
-                        val variants = fixed.lines().map { it.trim() }
-                            .filter { it.startsWith("http") }
+                        val variants = fixed.lines().map { it.trim() }.filter { it.startsWith("http") }
                         if (variants.isNotEmpty()) {
                             variants.forEach {
                                 addLink(label, it, "$origin/", ExtractorLinkType.M3U8, callback, origin)
@@ -278,17 +369,17 @@ class TekFullFilmizle : MainAPI() {
                         }
                     }
 
-                    // Media playlist: içeriği data URI olarak ver
                     val dataUri = "data:application/vnd.apple.mpegurl;base64," +
                             Base64.encodeToString(fixed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
                     addLink(label, dataUri, "$origin/", ExtractorLinkType.M3U8, callback, origin)
                     return true
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                log("resolve-token hatası", e)
             }
         }
 
-        // 2) Yedek: sayfada doğrudan m3u8 / mp4 varsa
+        // 2) Yedek: sayfada doğrudan m3u8 / mp4
         findMedia(html.replace("\\/", "/"))?.let { (link, type) ->
             addLink(label, link, "$origin/", type, callback, origin)
             return true
@@ -299,7 +390,7 @@ class TekFullFilmizle : MainAPI() {
             for (n in listOf("master.m3u8", "index.m3u8", "playlist.m3u8", "video.m3u8", "hls.m3u8")) {
                 val cand = "$baseDir$n"
                 val ok = try {
-                    app.get(cand, referer = "$origin/").text.trimStart().startsWith("#EXTM3U")
+                    app.get(cand, referer = "$origin/", headers = baseHeaders).text.trimStart().startsWith("#EXTM3U")
                 } catch (_: Exception) {
                     false
                 }
@@ -309,7 +400,9 @@ class TekFullFilmizle : MainAPI() {
                 }
             }
         }
-        return false
+
+        // 4) Son çare: hazır extractor'lar
+        return loadExtractor(url, pageUrl, subtitleCallback, callback)
     }
 
     /** m3u8 içindeki göreli adresleri mutlak adrese çevirir. */
@@ -335,7 +428,7 @@ class TekFullFilmizle : MainAPI() {
         }
     }
 
-    // ---- Gold ve diğerleri: workers.dev m3u8 proxy vb.
+    // ---- Gold ve diğerleri
     private suspend fun generic(
         label: String,
         url: String,
@@ -348,10 +441,15 @@ class TekFullFilmizle : MainAPI() {
             addLink(label, url, ref, ExtractorLinkType.M3U8, callback)
             return true
         }
+        if (url.contains(".mp4")) {
+            addLink(label, url, ref, ExtractorLinkType.VIDEO, callback)
+            return true
+        }
 
         val text = try {
-            app.get(url, referer = ref).text
-        } catch (_: Exception) {
+            app.get(url, referer = ref, headers = baseHeaders).text
+        } catch (e: Exception) {
+            log("generic get hatası: $url", e)
             ""
         }
         if (text.trimStart().startsWith("#EXTM3U")) {
