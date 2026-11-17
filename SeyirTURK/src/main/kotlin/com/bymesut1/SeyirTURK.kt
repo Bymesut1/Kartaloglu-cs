@@ -128,7 +128,7 @@ class SeyirTURKProvider : MainAPI() {
 
     private fun year(d: String?) = d?.let { Regex("(19|20)\\d{2}").find(it)?.value?.toIntOrNull() }
 
-    private suspend inline fun <reified T> get(path: String): T? =
+    private suspend inline fun <reified T : Any> get(path: String): T? =
         runCatching { app.get(base() + path, headers = headers).parsedSafe<T>() }.getOrNull()
 
     // ---------- Liste öğesi ----------
