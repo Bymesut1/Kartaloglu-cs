@@ -112,18 +112,21 @@ class TekFullFilmizle : MainAPI() {
         val year = Regex("(19|20)\\d{2}").find(info("Yapım") ?: "")?.value?.toIntOrNull()
             ?: Regex("\\b(19|20)\\d{2}\\b").find(title)?.value?.toIntOrNull()
 
-        val tags = document.select("div.filmaltiaciklama a[rel=category tag]").map { it.text().trim() }
-        val actors = document.select("div.filmaltiaciklama a[href*=/search/]").map { it.text().trim() }
+        val tagList = document.select("div.filmaltiaciklama a[rel=category tag]").map { it.text().trim() }
+        val actorList = document.select("div.filmaltiaciklama a[href*=/search/]")
+            .map { it.text().trim() }
+            .filter { it.isNotBlank() }
+            .map { ActorData(Actor(it)) }
 
-        val recommendations = document.select("div.moviefilm").mapNotNull { it.toSearchResult() }
+        val recommendationList = document.select("div.moviefilm").mapNotNull { it.toSearchResult() }
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.year = year
             this.plot = plot
-            this.tags = tags
-            this.recommendations = recommendations
-            addActors(actors)
+            this.tags = tagList
+            this.recommendations = recommendationList
+            this.actors = actorList
         }
     }
 
