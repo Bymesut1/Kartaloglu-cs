@@ -3,13 +3,17 @@ package com.bymesut1
 import android.util.Base64
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import java.net.URLDecoder
 import java.net.URLEncoder
+import org.json.JSONArray
 import org.json.JSONObject
+import com.lagradost.cloudstream3.network.WebViewResolver
 import java.net.URI
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -128,8 +132,16 @@ class SeyirTURKProvider : MainAPI() {
 
     private fun year(d: String?) = d?.let { Regex("(19|20)\\d{2}").find(it)?.value?.toIntOrNull() }
 
-    private suspend inline fun <reified T : Any> get(path: String): T? =
-        runCatching { app.get(base() + path, headers = headers).parsedSafe<T>() }.getOrNull()
+    private val json = jacksonObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+
+    // textLarge: yanıt 5 MB'ı aşınca .text hata verir (logcat'teki sorun)
+    private suspend inline fun <reified T : Any> get(path: String): T? = try {
+        val body = app.get(base() + path, headers = headers).textLarge
+        json.readValue(body, T::class.java)
+    } catch (e: Exception) {
+        Log.w("SeyirTURK", "get $path: ${e.message}")
+        null
+    }
 
     // ---------- Liste öğesi ----------
     private fun SeyirMovie.toSearch(): SearchResponse? {
@@ -286,11 +298,14 @@ class SeyirTURKProvider : MainAPI() {
         else "/sey/back/streams.php?id=$id"
 
         val links = get<SeyirStreams>(path)?.links.orEmpty()
+        Log.d("SeyirTURK", "streams: $path -> ${links.size} kaynak")
         var any = false
         for ((i, s) in links.withIndex()) {
             val l = s.link ?: continue
             val label = listOfNotNull(s.mainProvider ?: s.provider, s.name).joinToString(" - ").ifBlank { "Kaynak ${i + 1}" }
-            if (SeyirExtractor.resolve(l, label, mainUrl, headers, subtitleCallback, callback)) any = true
+            val ok = SeyirExtractor.resolve(l, label, mainUrl, headers, subtitleCallback, callback)
+            Log.d("SeyirTURK", "kaynak[$i] $label -> ${if (ok) "OK" else "BULUNAMADI"} | $l")
+            if (ok) any = true
         }
         return any
     }
@@ -300,7 +315,7 @@ class SeyirTURKProvider : MainAPI() {
 /** TMDB sadece load() (diziye/filme tıklayınca) içinde kullanılır. */
 object Tmdb {
     // >>> KENDİ TMDB API KEY'İNİ BURAYA YAZ (themoviedb.org > Ayarlar > API, "v3 auth") <<<
-    const val API_KEY = "000316508321ce461cf81e7c6815eec7"
+    const val API_KEY = "BURAYA_TMDB_API_KEY"
 
     private const val API = "https://api.themoviedb.org/3"
     const val IMG = "https://image.tmdb.org/t/p/"
@@ -393,16 +408,18 @@ object Tmdb {
     }
 }
 
-// ---------- Video kaynağı çözücüler ----------
-/** Video kaynağı çözücüler (cs3 / APK'daki mantığın portu). */
+// ---------- Video kaynağı çözücüler (APK'nın new_parser_unob_safe.js dosyasından taşındı) ----------
 object SeyirExtractor {
     const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    private const val TAG = "SeyirTURK"
 
     private val openPlayerHosts = listOf(
-        "pichive", "selcukflix.com", "roketdizi.life", "hdfilmcehennemi.life",
+        "pichive", "selcukflix.com", "roketdizi", "hdfilmcehennemi.life",
         "dizipub3.life", "diziroll.club", "dizimia.live"
     )
+    private val badFrames = listOf("googletag", "doubleclick", "recaptcha", "facebook.com", "disqus", "/ads/")
 
+    // ---------- yardımcılar ----------
     fun decryptSecureData(data: String): JSONObject? = try {
         val sha = MessageDigest.getInstance("SHA-256").digest("!!22xx!!90!!".toByteArray())
         val key = Base64.encodeToString(sha, Base64.NO_WRAP).substring(0, 32).toByteArray()
@@ -413,13 +430,45 @@ object SeyirExtractor {
         null
     }
 
-    private fun fix(s: String) = s.replace("\\/", "/").replace("\\", "")
+    /** secureData bazen düz base64 JSON, bazen AES şifreli gelir. */
+    private fun secureJson(data: String): JSONObject? {
+        try {
+            val t = String(Base64.decode(data, Base64.DEFAULT))
+            if (t.contains("RelatedResults")) return JSONObject(t)
+        } catch (e: Exception) {
+        }
+        return decryptSecureData(data)
+    }
+
+    private fun fix(s: String) = s.replace("\\/", "/").replace("\\u0026", "&").replace("\\", "")
     private fun origin(u: String) = runCatching {
         val x = URI(u); "${x.scheme}://${x.host}"
     }.getOrDefault(u)
 
+    private fun absUrl(href: String, base: String): String {
+        val h = href.trim()
+        return when {
+            h.startsWith("http") -> h
+            h.startsWith("//") -> "https:$h"
+            h.startsWith("/") -> origin(base) + h
+            else -> origin(base) + "/" + h
+        }
+    }
+
     private fun q(label: String) =
         Regex("(\\d{3,4})").find(label)?.value?.toIntOrNull() ?: Qualities.Unknown.value
+
+    private fun unescapeJs(t: String): String =
+        Regex("\\\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[ntrbf\"'\\\\/])").replace(t) { m ->
+            val g = m.groupValues[1]
+            when {
+                g[0] == 'u' || g[0] == 'x' -> g.substring(1).toInt(16).toChar().toString()
+                g == "n" -> "\n"
+                g == "t" -> "\t"
+                g == "r" -> "\r"
+                else -> g
+            }
+        }
 
     private suspend fun m3u8(
         name: String, url: String, referer: String, quality: Int,
@@ -432,7 +481,26 @@ object SeyirExtractor {
         })
     }
 
-    /** Tek giriş noktası. true = en az bir link bulundu. */
+    private suspend fun direct(url: String, name: String, referer: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val u = fix(url)
+        if (!u.startsWith("http")) return false
+        if (u.contains(".m3u8")) m3u8("$name (Direkt)", u, origin(referer) + "/", Qualities.Unknown.value, cb)
+        else cb(newExtractorLink("SeyirTURK", "$name (Direkt)", u) {
+            this.referer = origin(referer) + "/"
+            this.quality = Qualities.Unknown.value
+        })
+        return true
+    }
+
+    private suspend fun page(url: String, referer: String? = null, extra: Map<String, String> = emptyMap()): String? =
+        try {
+            app.get(url, headers = mapOf("User-Agent" to UA) + extra, referer = referer ?: (origin(url) + "/")).textLarge
+        } catch (e: Exception) {
+            Log.w(TAG, "page $url: ${e.message}")
+            null
+        }
+
+    // ---------- giriş noktası ----------
     suspend fun resolve(
         rawLink: String, label: String, mainUrl: String, headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
@@ -442,28 +510,263 @@ object SeyirExtractor {
         }
         if (!link.startsWith("http")) return false
 
-        if (openPlayerHosts.any { link.contains(it) } && openPlayer(link, label, callback)) return true
+        // 1) siteye özel çözücüler
+        try {
+            if (site(link, label, mainUrl, headers, subtitleCallback, callback)) return true
+        } catch (e: Exception) {
+            Log.w(TAG, "site hata $label: ${e.message}")
+        }
 
-        if (link.contains(".m3u8")) {
-            m3u8("$label (Direkt)", link, origin(link) + "/", Qualities.Unknown.value, callback); return true
-        }
-        if (link.contains(".mp4")) {
-            callback(newExtractorLink("SeyirTURK", "$label (Direkt)", link) {
-                this.referer = origin(link) + "/"
-                this.quality = Qualities.Unknown.value
-            }); return true
-        }
+        // 2) doğrudan / bilinen oynatıcılar
+        if (openPlayerHosts.any { link.contains(it) } && openPlayer(link, label, callback)) return true
+        if (link.contains(".m3u8") || link.contains(".mp4")) return direct(link, label, link, callback)
 
         var ok = false
-        runCatching {
+        try {
             ok = loadExtractor(link, mainUrl, subtitleCallback) { callback(it); ok = true }
+        } catch (e: Exception) {
         }
         if (ok) return true
-        if (webPage(link, label, subtitleCallback, callback)) return true
+        if (webPage(link, label, mainUrl, headers, subtitleCallback, callback)) return true
         return serverParser(link, label, mainUrl, headers, callback)
     }
 
-    /** openPlayer('ID') -> /source2.php?v=ID */
+    private suspend fun site(
+        link: String, label: String, mainUrl: String, headers: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        val k = (link + " " + label).lowercase()
+        return when {
+            "dizilla" in k -> dizilla(link, label, sub, cb)
+            "diziroll" in k -> diziroll(link, label, sub, cb)
+            "dizimia" in k -> dizimia(link, label, sub, cb)
+            "dizibox" in k -> dizibox(link, label, sub, cb)
+            "ddizi" in k -> ddizi(link, label, sub, cb)
+            "webteizle" in k -> webteizle(link, label, mainUrl, headers, sub, cb)
+            "sinemabox" in k -> sinemabox(link, label, cb)
+            "unutulmaz" in k -> unutulmaz(link, label, sub, cb)
+            "hdfilmcehennemi" in k || "boncuk" in k || "syrtrk" in k -> hdfilmcehennemi(link, label, sub, cb)
+            listOf("sinemaizle", "dizirella", "dizipal", "dizitime").any { it in k } -> webview(link, label, cb)
+            listOf("sinefil", "selcukflix", "roketdizi", "yabancidizi", "yabanci-dizi").any { it in k } ->
+                webPage(link, label, mainUrl, headers, sub, cb)
+            else -> false
+        }
+    }
+
+    // ---------- iframe / gömülü oynatıcı ----------
+    private suspend fun embed(
+        raw: String, referer: String, label: String,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit, depth: Int = 0
+    ): Boolean {
+        var u = fix(raw.trim()).replace("&amp;", "&")
+        if (u.startsWith("//")) u = "https:$u"
+        if (!u.startsWith("http") || badFrames.any { u.contains(it) }) return false
+        if (openPlayerHosts.any { u.contains(it) } && openPlayer(u, label, cb)) return true
+        if (u.contains(".m3u8") || u.contains(".mp4")) return direct(u, label, referer, cb)
+        var ok = false
+        try {
+            ok = loadExtractor(u, referer, sub) { cb(it); ok = true }
+        } catch (e: Exception) {
+        }
+        if (ok) return true
+        if (depth >= 2) return false
+        val html = page(u, referer) ?: return false
+        if (harvest(html, u, label, cb)) return true
+        return frames(html, u, label, sub, cb, depth + 1)
+    }
+
+    private suspend fun frames(
+        html: String, base: String, label: String,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit, depth: Int = 0
+    ): Boolean {
+        var ok = false
+        for (m in Regex("<iframe[^>]+(?:data-src|src)=[\"'](.*?)[\"']").findAll(html)) {
+            if (embed(absUrl(m.groupValues[1], base), base, label, sub, cb, depth)) ok = true
+        }
+        return ok
+    }
+
+    /** Sayfadaki doğrudan m3u8 / mp4 linkleri. */
+    private suspend fun harvest(html: String, base: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        var ok = false
+        val t = html.replace("\\/", "/")
+        for (m in Regex("(https?://[^\\s\"'<>\\\\]+?\\.m3u8[^\\s\"'<>\\\\]*)").findAll(t).take(3)) {
+            m3u8("$label (HLS)", m.groupValues[1], origin(base) + "/", Qualities.Unknown.value, cb); ok = true
+        }
+        if (!ok) for (m in Regex("(https?://[^\\s\"'<>\\\\]+?\\.mp4[^\\s\"'<>\\\\]*)").findAll(t).take(2)) {
+            direct(m.groupValues[1], label, base, cb); ok = true
+        }
+        return ok
+    }
+
+    // ---------- siteye özel ----------
+    private suspend fun dizilla(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link)?.replace("\\/", "/") ?: return false
+        val u = Regex("""https://four\.pichive\.online/iframe\.php[^"\\\s]*""").find(html)?.value
+            ?: return harvest(html, link, label, cb) || frames(html, link, label, sub, cb)
+        return embed(u, origin(link) + "/", label, sub, cb)
+    }
+
+    private suspend fun diziroll(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val ep = Regex("focus:outline-none\"\\s*href=\"(.*?)\"\\s*title=\"(.*?)\"\\s*data-navigo")
+            .find(html)?.groupValues?.get(1)
+        val epUrl = if (ep != null) absUrl(ep, link) else link
+        val h2 = page(epUrl, link) ?: return false
+        var ok = false
+        for (m in Regex("class=\"player\".*?iframe.*?src=\"(.*?)\"").findAll(h2)) {
+            if (embed(absUrl(m.groupValues[1], epUrl), epUrl, label, sub, cb)) ok = true
+        }
+        return ok || frames(h2, epUrl, label, sub, cb)
+    }
+
+    private suspend fun dizimia(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val alts = Regex("<a class=\"focus:outline-none\"\\s*href=\"(.*?)\"\\s*title=\"(.*?)\"").findAll(html).toList()
+        if (alts.isEmpty()) return frames(html, link, label, sub, cb)
+        var ok = false
+        for (m in alts.take(6)) {
+            val u = absUrl(m.groupValues[1], link)
+            val h = page(u, link) ?: continue
+            val f = Regex("<iframe.*?src=\"(.*?)\"").find(h)?.groupValues?.get(1) ?: continue
+            if (embed(absUrl(f, u), u, "$label ${m.groupValues[2]}", sub, cb)) ok = true
+        }
+        return ok
+    }
+
+    private suspend fun innerFrame(f: String, ref: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val fu = absUrl(f, ref)
+        if (!fu.contains("haydi.php") && !fu.contains("moly.php")) return embed(fu, ref, label, sub, cb)
+        val h = page(fu, ref) ?: return false
+        var body = h
+        if (fu.contains("moly.php")) {
+            val raw = Regex("unescape\\(\"(.*?)\"\\)").findAll(h).map { it.groupValues[1] }
+                .firstOrNull { !it.contains("display:") }
+            if (raw != null) {
+                val dec = runCatching { String(Base64.decode(URLDecoder.decode(raw, "UTF-8"), Base64.DEFAULT)) }.getOrNull()
+                if (dec != null) body = dec
+            }
+        }
+        val src = Regex("<iframe[^>]*src=[\"'](.*?)[\"']").findAll(body).map { it.groupValues[1] }.firstOrNull()
+            ?: return harvest(body, fu, label, cb)
+        return embed(absUrl(src, fu), fu, label, sub, cb)
+    }
+
+    private suspend fun dizibox(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val block = Regex("woca-linkpages-dd selectBox(.*?)/select", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
+        val urls: List<Pair<String, String>> = if (block != null)
+            Regex("(?:value=[\"']|href=[\"'])(.*?)[\"'].*?>(.*?)<").findAll(block)
+                .map { it.groupValues[1] to it.groupValues[2].trim() }
+                .filter { it.first.startsWith("http") || it.first.startsWith("/") }.toList()
+        else listOf(link to "")
+        var ok = false
+        for ((u0, n) in urls.take(6)) {
+            val u = absUrl(u0, link)
+            val h = page(u, link) ?: continue
+            val f = Regex("frame.*?src=\"(.*?)\".*?webkitallowfullscreen").find(h)?.groupValues?.get(1) ?: continue
+            if (innerFrame(f, u, "$label $n".trim(), sub, cb)) ok = true
+        }
+        return ok || frames(html, link, label, sub, cb)
+    }
+
+    private suspend fun ddizi(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val v = Regex("\"og:video\"\\s*content=\"(.*?)\"").find(html)?.groupValues?.get(1)
+            ?: return harvest(html, link, label, cb) || frames(html, link, label, sub, cb)
+        if (v.contains("youtube")) return embed(v, link, label, sub, cb)
+        val h = page(v, link) ?: return false
+        val f = Regex("file\\s*:\\s*\"(.*?)\"").find(h)?.groupValues?.get(1) ?: return harvest(h, v, label, cb)
+        return direct(f, label, link, cb)
+    }
+
+    private suspend fun webteizle(
+        link: String, label: String, mainUrl: String, headers: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        val cands = listOf(link, link.substringAfter(origin(link)))
+        for (c in cands) {
+            val r = try {
+                app.get("$mainUrl/sey/kodi/proxies/webteizle.php?path=izle&url=" + URLEncoder.encode(c, "UTF-8"), headers = headers).text
+            } catch (e: Exception) {
+                continue
+            }
+            val u = Regex("https?://[^\\s\"'<>]+").find(r)?.value ?: continue
+            if (embed(u, link, label, sub, cb)) return true
+        }
+        return false
+    }
+
+    private suspend fun sinemabox(link: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val names = Regex("<button>(.*?)</button>").findAll(html).map { it.groupValues[1] }.toList()
+        val fr = Regex("iframe data-src=\"([^\"]+)\"").findAll(html).map { it.groupValues[1] }.toList()
+        var ok = false
+        for ((i, f) in fr.withIndex()) {
+            val fu = absUrl(f, link)
+            val h = page(fu, origin(fu)) ?: continue
+            val txt = Regex("var\\s*video\\s*=\\s*(.*?\\});").find(h)?.groupValues?.get(1) ?: continue
+            val v = runCatching { JSONObject(txt) }.getOrNull() ?: continue
+            val u = origin(fu) + "/m3u8/" + v.optString("uid") + "/" + v.optString("md5") +
+                "/master.txt?s=1&id=" + v.optString("id") + "&cache=" + v.optString("status")
+            m3u8("$label ${names.getOrNull(i) ?: ""}".trim(), u, origin(link) + "/", Qualities.Unknown.value, cb)
+            ok = true
+        }
+        return ok
+    }
+
+    private suspend fun unutulmaz(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        var ok = false
+        Regex("<iframe.*?src=(.*?)\\s").find(html)?.groupValues?.get(1)?.replace("\"", "")?.let {
+            if (embed(absUrl(it, link), link, label, sub, cb)) ok = true
+        }
+        for (m in Regex("<li class=\"part\">\\s*<a href=\"(.*?)\"").findAll(html).take(6)) {
+            val h = page(absUrl(m.groupValues[1], link), link) ?: continue
+            val f = Regex("<iframe.*?src=(.*?)\\s").find(h)?.groupValues?.get(1)?.replace("\"", "") ?: continue
+            if (embed(absUrl(f, link), link, label, sub, cb)) ok = true
+        }
+        return ok || frames(html, link, label, sub, cb)
+    }
+
+    private suspend fun hdfilmcehennemi(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val js = Regex("JSON\\.parse\\('(.+?)'\\)").find(html)?.groupValues?.get(1)
+        var ok = false
+        if (js != null) {
+            val root = runCatching { JSONObject(unescapeJs(js)) }.getOrNull()
+            if (root != null) for (k in root.keys()) {
+                val arr = root.optJSONArray(k) ?: continue
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    for (vk in o.keys()) {
+                        val v = o.optString(vk)
+                        if (v.length < 40) continue
+                        val dec = runCatching { String(Base64.decode(v, Base64.DEFAULT)) }.getOrNull() ?: continue
+                        val src = Regex("data-src=\"([^\"]+)\"").find(dec)?.groupValues?.get(1) ?: continue
+                        val u = src.replace("{url}", o.optString("link")).replace("{slug}", o.optString("slug"))
+                        val n = o.optString("name").ifBlank { o.optString("title") }
+                        if (embed(absUrl(u, link), link, "$label $n".trim(), sub, cb)) ok = true
+                    }
+                }
+            }
+        }
+        return ok || harvest(html, link, label, cb) || frames(html, link, label, sub, cb)
+    }
+
+    /** WebView gerektiren siteler: istekleri izleyip m3u8'i yakalar. */
+    private suspend fun webview(link: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val r = try {
+            app.get(link, referer = origin(link) + "/", interceptor = WebViewResolver(Regex("""\.m3u8|master\.txt|\.mp4""")))
+        } catch (e: Exception) {
+            Log.w(TAG, "webview ${e.message}"); return false
+        }
+        val u = r.url
+        return if (u.contains(".m3u8") || u.contains(".txt") || u.contains(".mp4")) direct(u, label, link, cb) else false
+    }
+
+    // ---------- openPlayer: /source2.php?v=ID ----------
     private suspend fun openPlayer(url: String, label: String, callback: (ExtractorLink) -> Unit): Boolean {
         val h = mapOf("User-Agent" to UA, "Referer" to origin(url) + "/")
         val page = runCatching { app.get(url, headers = h).text }.getOrNull() ?: return false
@@ -488,49 +791,78 @@ object SeyirExtractor {
         return found
     }
 
-    /** Next.js sayfası: __NEXT_DATA__ -> secureData -> AES -> kaynak iframe'leri */
+    // ---------- Next.js: sinefil / selcukflix / roketdizi / yabancidizi ----------
+    private fun relatedSources(rel: JSONObject): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        fun add(arr: JSONArray?) {
+            if (arr == null) return
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i)
+                if (o != null) out.add(o)
+            }
+        }
+        for (k in rel.keys()) {
+            if (k.startsWith("get") && k.contains("Source")) add(rel.optJSONObject(k)?.optJSONArray("result"))
+        }
+        val parts = rel.optJSONObject("getMoviePartsById")?.optJSONArray("result")
+        if (parts != null) for (i in 0 until parts.length()) {
+            val id = parts.optJSONObject(i)?.optString("id") ?: continue
+            add(rel.optJSONObject("getMoviePartSourcesById_$id")?.optJSONArray("result"))
+        }
+        return out.distinctBy { it.optString("source_content") }
+    }
+
+    private fun nextFlight(html: String): String {
+        val sb = StringBuilder()
+        for (m in Regex("<script\\b[^>]*>\\s*self\\.__next_f\\.push\\(\\s*(\\[[\\s\\S]*?)\\s*\\)\\s*;?\\s*</script\\s*>").findAll(html)) {
+            try {
+                val a = JSONArray(m.groupValues[1])
+                if (a.optInt(0) == 1 && a.opt(1) is String) sb.append(a.getString(1))
+            } catch (e: Exception) {
+            }
+        }
+        return sb.toString()
+    }
+
     private suspend fun webPage(
-        url: String, label: String,
+        url: String, label: String, mainUrl: String, headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val h = mapOf("User-Agent" to UA, "Referer" to origin(url) + "/")
-        val html = runCatching { app.get(url, headers = h).text }.getOrNull() ?: return false
+        val html = page(url) ?: return false
         var found = false
 
-        val nd = Regex("<script id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-        if (nd != null) runCatching {
-            val secure = JSONObject(nd).getJSONObject("props").getJSONObject("pageProps").optString("secureData")
-            val rel = decryptSecureData(secure)?.optJSONObject("RelatedResults")
-            for (k in listOf("getMovieSources", "getMoviePartSources", "getEpisodeSources")) {
-                val arr = rel?.optJSONObject(k)?.optJSONArray("result") ?: continue
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    val src = Regex("(?:src=[\"']|^)(https?://[^\"'\\s>]+|//[^\"'\\s>]+)")
-                        .find(o.optString("source_content"))?.groupValues?.get(1) ?: continue
-                    val full = if (src.startsWith("//")) "https:$src" else src
-                    val name = "$label - ${o.optString("language_name")} ${o.optString("quality_name")}".trim()
-                    if (full.contains("pichive") && openPlayer(full, name, callback)) { found = true; continue }
-                    runCatching { loadExtractor(full, url, subtitleCallback) { callback(it); found = true } }
+        // secureData -> RelatedResults
+        val secure = Regex("\"secureData\":\"(.*?)\"").find(html)?.groupValues?.get(1)
+            ?: Regex("<script id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>", RegexOption.DOT_MATCHES_ALL).find(html)
+                ?.groupValues?.get(1)?.let { runCatching { JSONObject(it).getJSONObject("props").getJSONObject("pageProps").optString("secureData") }.getOrNull() }
+        if (!secure.isNullOrBlank()) {
+            val rel = secureJson(secure)?.optJSONObject("RelatedResults")
+            if (rel != null) for (o in relatedSources(rel)) {
+                val src = Regex("src=\\\\?[\"'](.*?)\\\\?[\"']").find(o.optString("source_content"))?.groupValues?.get(1) ?: continue
+                val name = "$label - ${o.optString("language_name")} ${o.optString("quality_name")}".trim()
+                if (embed(absUrl(fix(src), url), url, name, subtitleCallback, callback)) found = true
+            }
+            if (found) return true
+        } else {
+            // secureData yoksa sunucu çözücüsü (yabanci.php)
+            val flight = nextFlight(html)
+            val m = Regex("\"enc\"\\s*:\\s*(\\{[^{}]*\\})\\s*,\\s*\"k\"\\s*:\\s*(\"(?:\\\\.|[^\"\\\\])*\")").find(flight)
+            if (m != null) {
+                val v1 = runCatching { JSONArray("[" + m.groupValues[2] + "]").getString(0) }.getOrNull()
+                if (v1 != null) {
+                    val r = runCatching {
+                        app.post(
+                            "$mainUrl/sey/back/v2/parser/yabanci.php", headers = headers,
+                            data = mapOf("v1" to v1, "v2" to m.groupValues[1])
+                        ).text.trim()
+                    }.getOrNull()
+                    Log.d(TAG, "yabanci.php -> $r")
+                    if (r != null && r.startsWith("http") && embed(r, url, label, subtitleCallback, callback)) return true
                 }
             }
         }
-        if (found) return true
-
-        Regex("<iframe[^>]+src=[\"']([^\"']+)[\"']").findAll(html).map { it.groupValues[1] }
-            .filter { !it.contains("googletag") && !it.contains("youtube") }.forEach {
-                val full = if (it.startsWith("//")) "https:$it" else it
-                if (full.startsWith("http")) runCatching {
-                    loadExtractor(full, url, subtitleCallback) { l -> callback(l); found = true }
-                }
-            }
-        if (found) return true
-
-        Regex("(https?://[^\\s\"']+\\.m3u8[^\\s\"']*)").findAll(html).forEach {
-            m3u8("$label (HLS)", fix(it.groupValues[1]), origin(url) + "/", Qualities.Unknown.value, callback)
-            found = true
-        }
-        return found
+        if (frames(html, url, label, subtitleCallback, callback)) return true
+        return harvest(html, url, label, callback)
     }
 
     /** APK'nın kullandığı sunucu tarafı çözücü (yanıt biçimi doğrulanmadı; m3u8/mp4 arar). */
@@ -538,17 +870,10 @@ object SeyirExtractor {
         url: String, label: String, mainUrl: String, headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val enc = java.net.URLEncoder.encode(url, "UTF-8")
+        val enc = URLEncoder.encode(url, "UTF-8")
         val body = runCatching {
-            app.get("$mainUrl/sey/back/v2/parser/parser_test.php?url=$enc", headers = headers).text
+            app.get("$mainUrl/sey/back/v2/parser/parser_test.php?url=$enc&lang=TR", headers = headers).text
         }.getOrNull() ?: return false
-        var found = false
-        Regex("(https?:\\\\?/\\\\?/[^\\s\"'<>]+?\\.(?:m3u8|mp4)[^\\s\"'<>]*)").findAll(body).forEach {
-            val u = fix(it.groupValues[1])
-            if (u.contains(".m3u8")) m3u8("$label (Parser)", u, origin(url) + "/", Qualities.Unknown.value, callback)
-            else callback(newExtractorLink("SeyirTURK", "$label (Parser)", u) { this.referer = origin(url) + "/" })
-            found = true
-        }
-        return found
+        return harvest(body, url, "$label (Parser)", callback)
     }
 }
