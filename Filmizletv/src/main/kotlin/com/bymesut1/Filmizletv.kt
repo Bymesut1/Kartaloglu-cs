@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
@@ -8,7 +9,12 @@ import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Element
+import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
+import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class Filmizletv : MainAPI() {
     override var mainUrl = "https://filmizletv.to"
@@ -262,12 +268,61 @@ class Filmizletv : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------- LİNKLER
+    // ---------------------------------------------------------------- bePlayer ÇÖZÜCÜ
     private fun String.clean() = replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
 
+    private fun hexToBytes(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
+    private fun evpKdf(pass: ByteArray, salt: ByteArray): Pair<ByteArray, ByteArray> {
+        val md = MessageDigest.getInstance("MD5")
+        var d = ByteArray(0)
+        val out = ByteArrayOutputStream()
+        while (out.size() < 48) {
+            md.reset()
+            md.update(d)
+            md.update(pass)
+            md.update(salt)
+            d = md.digest()
+            out.write(d)
+        }
+        val b = out.toByteArray()
+        return b.copyOfRange(0, 32) to b.copyOfRange(32, 48)
+    }
+
+    /** CryptoJS AES: {"ct":base64,"iv":hex,"s":hex} + parola */
+    private fun decryptBe(pass: String, json: String): String? = try {
+        val o = JSONObject(json)
+        val ct = Base64.decode(o.getString("ct"), Base64.DEFAULT)
+        val salt = o.optString("s").takeIf { it.isNotBlank() }?.let { hexToBytes(it) }
+        val key: ByteArray
+        var iv: ByteArray
+        if (salt != null) {
+            val (k, i) = evpKdf(pass.toByteArray(), salt)
+            key = k; iv = i
+        } else {
+            key = MessageDigest.getInstance("SHA-256").digest(pass.toByteArray())
+            iv = ByteArray(16)
+        }
+        o.optString("iv").takeIf { it.isNotBlank() }?.let { iv = hexToBytes(it) }
+        val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        String(c.doFinal(ct), Charsets.UTF_8)
+    } catch (e: Exception) {
+        Log.d(TAG, "bePlayer çözme hatası: ${e.message}")
+        null
+    }
+
     private val vidmixiRegex = Regex("""https?://vidmixi\.com/(?:embed|list|m3u)/[^"'\s\\<>)]+""")
-    private val vttRegex = Regex("""https?://vidmixi\.com/upload/videos/[^"'\s\\<>)]+?\.vtt""")
+    private val vttRegex = Regex("""(?:https?://vidmixi\.com)?/upload/videos/[^"'\s\\<>)]+?\.vtt""")
     private val m3u8Regex = Regex("""https?://[^"'\s\\<>)]+\.m3u8[^"'\s\\<>)]*""")
+    private val keyRegex = Regex("""bePlayer|jwplayer|\"file\"|video_location|\.m3u|sources|atob|eval\(|strSubtitles""", RegexOption.IGNORE_CASE)
+
+    private fun abs(u: String): String = when {
+        u.startsWith("http") -> u
+        u.startsWith("//") -> "https:$u"
+        u.startsWith("/") -> VIDMIXI.trimEnd('/') + u
+        else -> u
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -275,7 +330,7 @@ class Filmizletv : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1) Sayfayı al: bx([{i,s}]) verisi + csrf + çerezler
+        // 1) Sayfa: bx([{i,s}]) + csrf + çerezler
         val page = app.get(data, referer = mainUrl)
         val html = page.text
         val cookies = page.cookies
@@ -284,9 +339,8 @@ class Filmizletv : MainAPI() {
         val raw = Regex("""bx\(JSON\.parse\('(.*?)'\)\)""").find(html)?.groupValues?.get(1)
             ?.replace("\\u0022", "\"")?.replace("\\/", "/")
         val sources = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
-        Log.d(TAG, "bx kaynak sayısı=${sources.length()} csrf=${csrf.isNotBlank()} çerez=${cookies.size}")
 
-        // 2) Her kaynak için /px -> {"u": "https://vidmixi.com/embed/..."}
+        // 2) /px -> embed linki
         val embeds = linkedSetOf<String>()
         for (k in 0 until sources.length()) {
             val o = sources.optJSONObject(k) ?: continue
@@ -303,7 +357,6 @@ class Filmizletv : MainAPI() {
                     cookies = cookies,
                     referer = data
                 ).text
-                Log.d(TAG, "px cevap: ${txt.take(200)}")
                 val u = JSONObject(txt).optString("u")
                 if (u.isNotBlank()) embeds.add(u.clean())
             } catch (e: Exception) {
@@ -312,57 +365,80 @@ class Filmizletv : MainAPI() {
         }
         if (embeds.isEmpty()) return false
 
-        // 3) Embed sayfalarını aç, m3u / list / altyazı çıkar
-        var ok = false
-        var idx = 0
+        // 3) Embed sayfası: açık linkler + bePlayer şifreli veri
+        val links = linkedSetOf<String>()
         val vtts = linkedSetOf<String>()
 
-        for (emb in embeds) {
-            val found = linkedSetOf<String>()
-            val direct = linkedSetOf<String>()
-
-            fun scan(text: String) {
-                val t = text.clean()
-                vidmixiRegex.findAll(t).forEach { found.add(it.value) }
-                m3u8Regex.findAll(t).forEach { found.add(it.value) }
-                vttRegex.findAll(t).forEach { vtts.add(it.value) }
-            }
-
-            if (emb.contains("/m3u/") || emb.contains(".m3u8")) {
-                found.add(emb)
-            } else {
-                val t = try {
-                    app.get(emb, referer = "$mainUrl/", headers = mapOf("Origin" to mainUrl)).text
-                } catch (e: Exception) {
-                    Log.d(TAG, "embed hata: ${e.message}"); ""
-                }
-                Log.d(TAG, "embed $emb -> ${t.take(300)}")
-                if (t.trimStart().startsWith("#EXTM3U")) direct.add(emb) else scan(t)
-
-                for (u in found.filter { it.contains("/list/") }) {
-                    try {
-                        val lt = app.get(u, referer = VIDMIXI).text
-                        if (lt.trimStart().startsWith("#EXTM3U")) direct.add(u) else scan(lt)
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-
-            val links = (found.filter { it.contains("/m3u/") || it.contains(".m3u8") } + direct).distinct()
-            for (link in links) {
-                idx++
-                callback(
-                    newExtractorLink(name, "$name $idx", link, ExtractorLinkType.M3U8) {
-                        this.referer = VIDMIXI
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mapOf("Referer" to VIDMIXI, "Origin" to VIDMIXI.trimEnd('/'))
-                    }
-                )
-                ok = true
+        fun scan(text: String) {
+            val t = text.clean()
+            vidmixiRegex.findAll(t).forEach { links.add(it.value) }
+            m3u8Regex.findAll(t).forEach { links.add(it.value) }
+            vttRegex.findAll(t).forEach { vtts.add(abs(it.value)) }
+            // JSON içinde video_location / file alanları
+            Regex("""\"(?:video_location|file|src|url)\"\s*:\s*\"([^\"]+)\"""").findAll(t).forEach {
+                val v = it.groupValues[1]
+                if (v.contains(".vtt")) vtts.add(abs(v))
+                else if (v.contains("/m3u/") || v.contains("/list/") || v.contains(".m3u8") || v.contains(".mp4")) links.add(abs(v))
             }
         }
 
-        // 4) Hiçbir şey çıkmadıysa kayıtlı extractor'lara bırak
+        for (emb in embeds) {
+            if (emb.contains("/m3u/") || emb.contains(".m3u8")) {
+                links.add(emb); continue
+            }
+            val t = try {
+                app.get(emb, referer = "$mainUrl/", headers = mapOf("Origin" to mainUrl)).text
+            } catch (e: Exception) {
+                Log.d(TAG, "embed hata: ${e.message}"); ""
+            }
+            Log.d(TAG, "embed uzunluk=${t.length}")
+            t.lines().filter { keyRegex.containsMatchIn(it) }.take(12)
+                .forEach { Log.d(TAG, "embed satır: ${it.trim().take(500)}") }
+
+            scan(t)
+
+            // bePlayer('parola', '{"ct":...,"iv":...,"s":...}')
+            val bm = Regex("""bePlayer\(\s*['"]([^'"]+)['"]\s*,\s*(['"]?)(\{.*?\})\2\s*\)""", RegexOption.DOT_MATCHES_ALL).find(t)
+            if (bm != null) {
+                val dec = decryptBe(bm.groupValues[1], bm.groupValues[3].replace("\\\"", "\""))
+                Log.d(TAG, "bePlayer çözüm: ${dec?.take(400)}")
+                if (dec != null) {
+                    scan(dec.trim().removeSurrounding("\"").replace("\\\"", "\""))
+                }
+            } else {
+                Log.d(TAG, "bePlayer bulunamadı")
+            }
+
+            // list sayfaları
+            for (u in links.filter { it.contains("/list/") }.toList()) {
+                try {
+                    val lt = app.get(u, referer = VIDMIXI).text
+                    if (lt.trimStart().startsWith("#EXTM3U")) links.add("M3U::$u") else scan(lt)
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        var ok = false
+        var idx = 0
+        for (u in links) {
+            val isDirectList = u.startsWith("M3U::")
+            val link = u.removePrefix("M3U::")
+            if (link.contains("/embed/")) continue
+            if (link.contains("/list/") && !isDirectList) continue
+            idx++
+            val type = if (link.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+            callback(
+                newExtractorLink(name, "$name $idx", link, type) {
+                    this.referer = VIDMIXI
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("Referer" to VIDMIXI, "Origin" to VIDMIXI.trimEnd('/'))
+                }
+            )
+            ok = true
+        }
+
+        // 4) Hiçbiri çıkmadıysa kayıtlı extractor'lara bırak
         if (!ok) {
             for (emb in embeds) {
                 try {
@@ -381,6 +457,7 @@ class Filmizletv : MainAPI() {
             }
             subtitleCallback(newSubtitleFile(lang, v) { this.headers = mapOf("Referer" to VIDMIXI) })
         }
+        Log.d(TAG, "sonuç: link=${links.size} altyazı=${vtts.size} ok=$ok")
         return ok
     }
 }
