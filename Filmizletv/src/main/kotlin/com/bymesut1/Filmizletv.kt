@@ -6,6 +6,9 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Element
@@ -25,7 +28,7 @@ class Filmizletv : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val TAG = "Filmizletv"
-    private val TMDB_KEY = "000316508321ce461cf81e7c6815eec7"
+    private val TMDB_KEY = "BURAYA_TMDB_API_KEY"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/"
     private val VIDMIXI = "https://vidmixi.com/"
 
@@ -37,6 +40,35 @@ class Filmizletv : MainAPI() {
         "$mainUrl/dil/yerli-filmler" to "Yerli Filmler",
         "$mainUrl/imdb-en-iyiler" to "IMDb Top 250"
     )
+
+    // ---------------------------------------------------------------- OYNATICI DÜZELTMESİ
+    // Vidmixi list dosyasındaki BANDWIDTH değeri Int sınırını aşıyor (ör. 2512450000)
+    // ve ExoPlayer NumberFormatException ile çöküyor. Değerleri 1000'e bölüyoruz.
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
+        if (!extractorLink.url.contains("vidmixi.com")) return null
+        return Interceptor { chain ->
+            val response = chain.proceed(chain.request())
+            val reqUrl = chain.request().url.toString()
+            if (!reqUrl.contains("/list/")) return@Interceptor response
+            try {
+                val body = response.body?.string() ?: return@Interceptor response
+                if (!body.trimStart().startsWith("#EXTM3U")) {
+                    return@Interceptor response.newBuilder()
+                        .body(body.toResponseBody(response.body?.contentType()))
+                        .build()
+                }
+                val fixed = Regex("""(?<=BANDWIDTH=)\d{10,}""").replace(body) {
+                    ((it.value.toLongOrNull() ?: 0L) / 1000L).toString()
+                }
+                response.newBuilder()
+                    .body(fixed.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
+                    .build()
+            } catch (e: Exception) {
+                Log.d(TAG, "interceptor hata: ${e.message}")
+                response
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- ANA SAYFA
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -374,7 +406,6 @@ class Filmizletv : MainAPI() {
             vidmixiRegex.findAll(t).forEach { links.add(it.value) }
             m3u8Regex.findAll(t).forEach { links.add(it.value) }
             vttRegex.findAll(t).forEach { vtts.add(abs(it.value)) }
-            // JSON içinde video_location / file alanları
             Regex("""\"(?:video_location|file|src|url)\"\s*:\s*\"([^\"]+)\"""").findAll(t).forEach {
                 val v = it.groupValues[1]
                 if (v.contains(".vtt")) vtts.add(abs(v))
@@ -392,8 +423,6 @@ class Filmizletv : MainAPI() {
                 Log.d(TAG, "embed hata: ${e.message}"); ""
             }
             Log.d(TAG, "embed uzunluk=${t.length}")
-            t.lines().filter { keyRegex.containsMatchIn(it) }.take(12)
-                .forEach { Log.d(TAG, "embed satır: ${it.trim().take(500)}") }
 
             scan(t)
 
@@ -401,12 +430,14 @@ class Filmizletv : MainAPI() {
             val bm = Regex("""bePlayer\(\s*['"]([^'"]+)['"]\s*,\s*(['"]?)(\{.*?\})\2\s*\)""", RegexOption.DOT_MATCHES_ALL).find(t)
             if (bm != null) {
                 val dec = decryptBe(bm.groupValues[1], bm.groupValues[3].replace("\\\"", "\""))
-                Log.d(TAG, "bePlayer çözüm: ${dec?.take(400)}")
+                Log.d(TAG, "bePlayer çözüm: ${dec?.take(200)}")
                 if (dec != null) {
                     scan(dec.trim().removeSurrounding("\"").replace("\\\"", "\""))
                 }
             } else {
                 Log.d(TAG, "bePlayer bulunamadı")
+                t.lines().filter { keyRegex.containsMatchIn(it) }.take(12)
+                    .forEach { Log.d(TAG, "embed satır: ${it.trim().take(500)}") }
             }
 
             // list sayfaları
