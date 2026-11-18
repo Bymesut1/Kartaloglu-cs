@@ -1,0 +1,361 @@
+package com.bymesut1
+
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.net.URLEncoder
+
+// TMDB API anahtarını buraya yaz (DiziPod.kt vb. dosyalarında kullandığın anahtarın aynısı olur)
+private const val TMDB_API_KEY = "000316508321ce461cf81e7c6815eec7"
+private const val TMDB = "https://api.themoviedb.org/3"
+private const val TMDB_IMG = "https://image.tmdb.org/t/p"
+
+class Dizirella : MainAPI() {
+    override var mainUrl = "https://dizirella.one"
+    override var name = "Dizirella"
+    override val hasMainPage = true
+    override var lang = "tr"
+    override val hasQuickSearch = false
+    override val supportedTypes = setOf(TvType.TvSeries)
+
+    private val epRegex = Regex("-(\\d+)-sezon-(\\d+)-bolum")
+
+    override val mainPage = mainPageOf(
+        "home_eps" to "Son Eklenen Bölümler",
+        "home_series" to "Son Eklenen Diziler",
+        "home_asya" to "Son Eklenen Asya Dizileri",
+        "home_asya_eps" to "Son Asya Bölümleri",
+        "$mainUrl/tum-diziler/" to "Tüm Diziler",
+        "$mainUrl/asya-dizileri/" to "Asya Dizileri",
+        "$mainUrl/tur/komedi/" to "Komedi",
+        "$mainUrl/tur/dram/" to "Dram",
+        "$mainUrl/tur/suc/" to "Suç",
+        "$mainUrl/tur/aksiyon/" to "Aksiyon",
+        "$mainUrl/tur/bilim-kurgu/" to "Bilim Kurgu",
+        "$mainUrl/tur/gerilim/" to "Gerilim",
+        "$mainUrl/tur/gizem/" to "Gizem",
+        "$mainUrl/tur/romantik/" to "Romantik"
+    )
+
+    // ---------------------------------------------------------------- ANA SAYFA
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val data = request.data
+
+        if (data.startsWith("home_")) {
+            if (page > 1) return newHomePageResponse(request.name, emptyList(), false)
+            val doc = app.get(mainUrl).document
+            val secs = doc.select("section.r-sec")
+            val sec = when (data) {
+                "home_eps" -> secs.getOrNull(0)
+                "home_series" -> secs.getOrNull(1)
+                "home_asya" -> secs.getOrNull(2)
+                else -> secs.getOrNull(3)
+            }
+            val items = if (sec != null) parseCards(sec) else emptyList()
+            return newHomePageResponse(request.name, items, false)
+        }
+
+        val url = if (page <= 1) data else data + "page/$page/"
+        val items = try {
+            parseCards(app.get(url).document)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
+    }
+
+    private fun parseCards(root: Element): List<SearchResponse> {
+        val out = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+
+        root.select("a.r-card").forEach { a ->
+            val href = a.attr("href")
+            if (href.isBlank()) return@forEach
+            val url = fixUrl(href)
+            val title = a.selectFirst(".r-cap-t")?.text()?.trim()
+                ?: a.selectFirst("img")?.attr("alt")?.removeSuffix(" izle")?.trim()
+                ?: return@forEach
+            val poster = a.selectFirst("img")?.attr("src")
+            if (seen.add(url)) {
+                out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            }
+        }
+
+        root.select("div.r-epcard").forEach { c ->
+            val a = c.selectFirst("a.r-still") ?: return@forEach
+            val href = a.attr("href")
+            if (href.isBlank()) return@forEach
+            val url = fixUrl(href)
+            val t = c.selectFirst(".r-cap-t")?.text()?.trim() ?: return@forEach
+            val ep = c.selectFirst(".r-cap-ep")?.text()?.trim().orEmpty()
+            val poster = a.selectFirst("img")?.attr("src")
+            if (seen.add(url)) {
+                out.add(newTvSeriesSearchResponse("$t $ep".trim(), url, TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            }
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- ARAMA
+    override suspend fun search(query: String): List<SearchResponse> {
+        val q = URLEncoder.encode(query, "UTF-8")
+        val doc = app.get("$mainUrl/?s=$q").document
+        val cards = parseCards(doc)
+        if (cards.isNotEmpty()) return cards
+
+        val seen = HashSet<String>()
+        val out = ArrayList<SearchResponse>()
+        doc.select("a[href*=/dizi/]").forEach { a ->
+            val url = fixUrl(a.attr("href"))
+            val title = a.selectFirst("img")?.attr("alt")?.removeSuffix(" izle")?.trim()
+                ?: a.text().trim()
+            if (title.isBlank() || !seen.add(url)) return@forEach
+            val poster = a.selectFirst("img")?.attr("src")
+            out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                this.posterUrl = poster
+            })
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- DETAY (TMDB burada devreye girer)
+    override suspend fun load(url: String): LoadResponse? {
+        var seriesUrl = fixUrl(url)
+        var doc = app.get(seriesUrl).document
+        var gridDoc: Document? = null
+
+        // Bölüm linkine tıklanmışsa diziye yönlendir
+        if (!seriesUrl.contains("/dizi/")) {
+            val link = doc.select("nav.r-yol a[href*=/dizi/]").firstOrNull()?.attr("href") ?: return null
+            gridDoc = doc
+            seriesUrl = fixUrl(link)
+            doc = app.get(seriesUrl).document
+        }
+
+        val rawTitle = doc.selectFirst("h1")?.text()
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?: return null
+        val title = cleanTitle(rawTitle)
+        val siteYear = doc.selectFirst("a.r-chip-yil")?.text()?.trim()?.toIntOrNull()
+        val sitePoster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val sitePlot = doc.selectFirst("meta[name=description]")?.attr("content")
+
+        // Bölüm listesi (siteden)
+        if (gridDoc == null) gridDoc = findGridDoc(doc, seriesUrl)
+        val rawEps = ArrayList<Triple<String, Int, Int>>() // url, sezon, bölüm
+        gridDoc?.select("a.r-epk")?.forEach { a ->
+            val href = a.attr("href")
+            val m = epRegex.find(href) ?: return@forEach
+            val s = m.groupValues[1].toIntOrNull() ?: return@forEach
+            val e = m.groupValues[2].toIntOrNull() ?: return@forEach
+            rawEps.add(Triple(fixUrl(href), s, e))
+        }
+
+        // TMDB
+        val tmdbId = try { tmdbSearchId(title, siteYear) } catch (e: Exception) { null }
+        var detail: DzTmdbDetail? = null
+        if (tmdbId != null) {
+            detail = try {
+                var d = app.get("$TMDB/tv/$tmdbId?api_key=$TMDB_API_KEY&language=tr-TR&append_to_response=credits")
+                    .parsedSafe<DzTmdbDetail>()
+                if (d != null && d.overview.isNullOrBlank()) {
+                    val en = app.get("$TMDB/tv/$tmdbId?api_key=$TMDB_API_KEY&language=en-US")
+                        .parsedSafe<DzTmdbDetail>()
+                    d = d.copy(overview = en?.overview)
+                }
+                d
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        val seasonMap = HashMap<Int, Map<Int, DzTmdbEpisode>>()
+        if (tmdbId != null) {
+            for (s in rawEps.map { it.second }.distinct()) {
+                seasonMap[s] = try { fetchSeason(tmdbId, s) } catch (e: Exception) { emptyMap() }
+            }
+        }
+
+        val episodes = rawEps
+            .sortedWith(compareBy({ it.second }, { it.third }))
+            .map { (href, s, e) ->
+                val tm = seasonMap[s]?.get(e)
+                newEpisode(href) {
+                    this.season = s
+                    this.episode = e
+                    this.name = tm?.name?.takeIf { it.isNotBlank() } ?: "$e. Bölüm"
+                    this.posterUrl = tm?.stillPath?.let { "$TMDB_IMG/w780$it" }
+                    this.description = tm?.overview?.takeIf { it.isNotBlank() }
+                    this.addDate(tm?.airDate)
+                }
+            }
+
+        val poster = detail?.posterPath?.let { "$TMDB_IMG/w500$it" } ?: sitePoster
+        val backdrop = detail?.backdropPath?.let { "$TMDB_IMG/w1280$it" }
+        val plot = detail?.overview?.takeIf { it.isNotBlank() } ?: sitePlot
+        val year = detail?.firstAirDate?.take(4)?.toIntOrNull() ?: siteYear
+        val tags = detail?.genres?.mapNotNull { it.name }
+        val actorList = detail?.credits?.cast?.take(15)?.mapNotNull { c ->
+            val n = c.name ?: return@mapNotNull null
+            ActorData(Actor(n, c.profilePath?.let { "$TMDB_IMG/w185$it" }))
+        }
+
+        return newTvSeriesLoadResponse(
+            detail?.name?.takeIf { it.isNotBlank() } ?: title,
+            seriesUrl,
+            TvType.TvSeries,
+            episodes
+        ) {
+            this.posterUrl = poster
+            this.backgroundPosterUrl = backdrop
+            this.plot = plot
+            this.year = year
+            if (!tags.isNullOrEmpty()) this.tags = tags
+            if (!actorList.isNullOrEmpty()) this.actors = actorList
+        }
+    }
+
+    private fun cleanTitle(t: String): String =
+        t.replace(Regex("\\s+-\\s+Dizirella.*$"), "")
+            .replace(Regex("(?i)\\s+izle.*$"), "")
+            .trim()
+
+    private suspend fun findGridDoc(doc: Document, seriesUrl: String): Document? {
+        if (doc.select("a.r-epk").isNotEmpty()) return doc
+        val first = doc.select("a[href]").map { it.attr("href") }
+            .firstOrNull { epRegex.containsMatchIn(it) }
+        if (first != null) {
+            return try { app.get(fixUrl(first)).document } catch (e: Exception) { null }
+        }
+        val slug = seriesUrl.trimEnd('/').substringAfterLast('/')
+        return try { app.get("$mainUrl/$slug-1-sezon-1-bolum/").document } catch (e: Exception) { null }
+    }
+
+    // ---------------------------------------------------------------- TMDB yardımcıları
+    private suspend fun tmdbSearchId(title: String, year: Int?): Int? {
+        if (TMDB_API_KEY.startsWith("BURAYA")) return null
+        val q = URLEncoder.encode(title, "UTF-8")
+        if (year != null) {
+            val r = app.get("$TMDB/search/tv?api_key=$TMDB_API_KEY&language=tr-TR&query=$q&first_air_date_year=$year")
+                .parsedSafe<DzTmdbSearch>()
+            r?.results?.firstOrNull()?.id?.let { return it }
+        }
+        return app.get("$TMDB/search/tv?api_key=$TMDB_API_KEY&language=tr-TR&query=$q")
+            .parsedSafe<DzTmdbSearch>()?.results?.firstOrNull()?.id
+    }
+
+    private suspend fun fetchSeason(id: Int, season: Int): Map<Int, DzTmdbEpisode> {
+        val tr = app.get("$TMDB/tv/$id/season/$season?api_key=$TMDB_API_KEY&language=tr-TR")
+            .parsedSafe<DzTmdbSeason>()?.episodes.orEmpty()
+        val map = LinkedHashMap<Int, DzTmdbEpisode>()
+        tr.forEach { e -> e.episodeNumber?.let { map[it] = e } }
+
+        if (map.values.any { it.overview.isNullOrBlank() }) {
+            val en = app.get("$TMDB/tv/$id/season/$season?api_key=$TMDB_API_KEY&language=en-US")
+                .parsedSafe<DzTmdbSeason>()?.episodes.orEmpty()
+            en.forEach { e ->
+                val n = e.episodeNumber ?: return@forEach
+                val cur = map[n]
+                if (cur == null) {
+                    map[n] = e
+                } else if (cur.overview.isNullOrBlank()) {
+                    map[n] = cur.copy(overview = e.overview, stillPath = cur.stillPath ?: e.stillPath)
+                }
+            }
+        }
+        return map
+    }
+
+    // ---------------------------------------------------------------- LİNKLER
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val doc = app.get(data, referer = mainUrl).document
+        val iframes = doc.select("iframe")
+            .map { it.attr("src").ifBlank { it.attr("data-src") } }
+            .filter { it.isNotBlank() && !it.contains("youtube") }
+            .map { fixUrl(it) }
+            .distinct()
+
+        val absM3u8 = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
+        val relM3u8 = Regex("""["'](/[^"'\s]+\.m3u8[^"']*)["']""")
+
+        var found = false
+        for (src in iframes) {
+            try {
+                val origin = Regex("^(https?://[^/]+)").find(src)?.value ?: src
+                val body = app.get(src, referer = data).text.replace("\\/", "/")
+
+                val urls = LinkedHashSet<String>()
+                absM3u8.findAll(body).forEach { urls.add(it.value) }
+                relM3u8.findAll(body).forEach { urls.add(origin + it.groupValues[1]) }
+
+                if (urls.isNotEmpty()) {
+                    for (u in urls) {
+                        M3u8Helper.generateM3u8(name, u, "$origin/").forEach(callback)
+                        found = true
+                    }
+                } else {
+                    if (loadExtractor(src, data, subtitleCallback, callback)) found = true
+                }
+            } catch (e: Exception) {
+                // sıradaki iframe'e geç
+            }
+        }
+        return found
+    }
+}
+
+// ---------------------------------------------------------------- TMDB veri sınıfları
+data class DzTmdbSearch(
+    @JsonProperty("results") val results: List<DzTmdbItem>? = null
+)
+
+data class DzTmdbItem(
+    @JsonProperty("id") val id: Int? = null,
+    @JsonProperty("name") val name: String? = null
+)
+
+data class DzTmdbGenre(
+    @JsonProperty("name") val name: String? = null
+)
+
+data class DzTmdbCast(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("profile_path") val profilePath: String? = null
+)
+
+data class DzTmdbCredits(
+    @JsonProperty("cast") val cast: List<DzTmdbCast>? = null
+)
+
+data class DzTmdbDetail(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("overview") val overview: String? = null,
+    @JsonProperty("poster_path") val posterPath: String? = null,
+    @JsonProperty("backdrop_path") val backdropPath: String? = null,
+    @JsonProperty("first_air_date") val firstAirDate: String? = null,
+    @JsonProperty("genres") val genres: List<DzTmdbGenre>? = null,
+    @JsonProperty("credits") val credits: DzTmdbCredits? = null
+)
+
+data class DzTmdbEpisode(
+    @JsonProperty("episode_number") val episodeNumber: Int? = null,
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("overview") val overview: String? = null,
+    @JsonProperty("still_path") val stillPath: String? = null,
+    @JsonProperty("air_date") val airDate: String? = null
+)
+
+data class DzTmdbSeason(
+    @JsonProperty("episodes") val episodes: List<DzTmdbEpisode>? = null
+)
