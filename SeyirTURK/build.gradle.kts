@@ -1,4 +1,4 @@
-version = 8
+version = 9
 
 dependencies {
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
