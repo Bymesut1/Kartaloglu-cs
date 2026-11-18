@@ -1,5 +1,6 @@
 package com.bymesut1
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
@@ -17,6 +18,7 @@ class Filmizletv : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    private val TAG = "Filmizletv"
     private val TMDB_KEY = "000316508321ce461cf81e7c6815eec7"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/"
     private val VIDMIXI = "https://vidmixi.com/"
@@ -160,7 +162,7 @@ class Filmizletv : MainAPI() {
         // --- TMDB (sadece içerik sayfasında)
         val tmdbId = tmdbFindId(isSeries, title, orig, year)
         val kind = if (isSeries) "tv" else "movie"
-        val details = tmdbId?.let { tmdbGet("$kind/$it&append_to_response=credits".replace("/$it&", "/$it?")) }
+        val details = tmdbId?.let { tmdbGet("$kind/$it?append_to_response=credits") }
 
         val tPoster = details?.optString("poster_path")?.takeIf { it.isNotBlank() && it != "null" }?.let { TMDB_IMG + "w500" + it }
         val tBack = details?.optString("backdrop_path")?.takeIf { it.isNotBlank() && it != "null" }?.let { TMDB_IMG + "original" + it }
@@ -273,79 +275,101 @@ class Filmizletv : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, referer = mainUrl).text.clean()
-        val found = linkedSetOf<String>()
+        // 1) Sayfayı al: bx([{i,s}]) verisi + csrf + çerezler
+        val page = app.get(data, referer = mainUrl)
+        val html = page.text
+        val cookies = page.cookies
+        val csrf = page.document.selectFirst("meta[name=csrf-token]")?.attr("content") ?: ""
+
+        val raw = Regex("""bx\(JSON\.parse\('(.*?)'\)\)""").find(html)?.groupValues?.get(1)
+            ?.replace("\\u0022", "\"")?.replace("\\/", "/")
+        val sources = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
+        Log.d(TAG, "bx kaynak sayısı=${sources.length()} csrf=${csrf.isNotBlank()} çerez=${cookies.size}")
+
+        // 2) Her kaynak için /px -> {"u": "https://vidmixi.com/embed/..."}
+        val embeds = linkedSetOf<String>()
+        for (k in 0 until sources.length()) {
+            val o = sources.optJSONObject(k) ?: continue
+            try {
+                val txt = app.post(
+                    "$mainUrl/px",
+                    data = mapOf("i" to o.optString("i"), "s" to o.optString("s")),
+                    headers = mapOf(
+                        "X-CSRF-TOKEN" to csrf,
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept" to "application/json",
+                        "Origin" to mainUrl
+                    ),
+                    cookies = cookies,
+                    referer = data
+                ).text
+                Log.d(TAG, "px cevap: ${txt.take(200)}")
+                val u = JSONObject(txt).optString("u")
+                if (u.isNotBlank()) embeds.add(u.clean())
+            } catch (e: Exception) {
+                Log.d(TAG, "px hata: ${e.message}")
+            }
+        }
+        if (embeds.isEmpty()) return false
+
+        // 3) Embed sayfalarını aç, m3u / list / altyazı çıkar
+        var ok = false
+        var idx = 0
         val vtts = linkedSetOf<String>()
 
-        fun scan(text: String) {
-            val t = text.clean()
-            vidmixiRegex.findAll(t).forEach { found.add(it.value) }
-            m3u8Regex.findAll(t).forEach { found.add(it.value) }
-            vttRegex.findAll(t).forEach { vtts.add(it.value) }
-        }
-        scan(html)
+        for (emb in embeds) {
+            val found = linkedSetOf<String>()
+            val direct = linkedSetOf<String>()
 
-        // Sayfada hazır link yoksa bx(...) verisinden oynatıcıyı iste
-        if (found.isEmpty()) {
-            val raw = Regex("""bx\(JSON\.parse\('(.*?)'\)\)""").find(html)?.groupValues?.get(1)
-                ?.replace("\\u0022", "\"")
-            val obj = try { JSONArray(raw).optJSONObject(0) } catch (_: Exception) { null }
-            if (obj != null) {
-                val id = obj.optInt("i")
-                val s = obj.optString("s")
-                val csrf = Regex("""csrf-token" content="([^"]+)""").find(html)?.groupValues?.get(1) ?: ""
-                val hdr = mapOf(
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Accept" to "application/json, text/html",
-                    "X-CSRF-TOKEN" to csrf
-                )
-                val candidates = listOf(
-                    "$mainUrl/player/$id?s=$s",
-                    "$mainUrl/oynatici/$id?s=$s",
-                    "$mainUrl/api/player/$id?s=$s",
-                    "$mainUrl/player?i=$id&s=$s"
-                )
-                for (c in candidates) {
+            fun scan(text: String) {
+                val t = text.clean()
+                vidmixiRegex.findAll(t).forEach { found.add(it.value) }
+                m3u8Regex.findAll(t).forEach { found.add(it.value) }
+                vttRegex.findAll(t).forEach { vtts.add(it.value) }
+            }
+
+            if (emb.contains("/m3u/") || emb.contains(".m3u8")) {
+                found.add(emb)
+            } else {
+                val t = try {
+                    app.get(emb, referer = "$mainUrl/", headers = mapOf("Origin" to mainUrl)).text
+                } catch (e: Exception) {
+                    Log.d(TAG, "embed hata: ${e.message}"); ""
+                }
+                Log.d(TAG, "embed $emb -> ${t.take(300)}")
+                if (t.trimStart().startsWith("#EXTM3U")) direct.add(emb) else scan(t)
+
+                for (u in found.filter { it.contains("/list/") }) {
                     try {
-                        scan(app.get(c, referer = data, headers = hdr).text)
+                        val lt = app.get(u, referer = VIDMIXI).text
+                        if (lt.trimStart().startsWith("#EXTM3U")) direct.add(u) else scan(lt)
                     } catch (_: Exception) {
                     }
-                    if (found.isNotEmpty()) break
                 }
+            }
+
+            val links = (found.filter { it.contains("/m3u/") || it.contains(".m3u8") } + direct).distinct()
+            for (link in links) {
+                idx++
+                callback(
+                    newExtractorLink(name, "$name $idx", link, ExtractorLinkType.M3U8) {
+                        this.referer = VIDMIXI
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("Referer" to VIDMIXI, "Origin" to VIDMIXI.trimEnd('/'))
+                    }
+                )
+                ok = true
             }
         }
 
-        // embed / list sayfalarının içini aç
-        for (u in found.toList()) {
-            if (u.contains("/embed/") || u.contains("/list/")) {
+        // 4) Hiçbir şey çıkmadıysa kayıtlı extractor'lara bırak
+        if (!ok) {
+            for (emb in embeds) {
                 try {
-                    val t = app.get(u, referer = if (u.contains("/embed/")) mainUrl else VIDMIXI).text
-                    if (t.trimStart().startsWith("#EXTM3U")) {
-                        found.add("M3U::$u")
-                    } else {
-                        scan(t)
-                    }
+                    if (loadExtractor(emb, "$mainUrl/", subtitleCallback, callback)) ok = true
                 } catch (_: Exception) {
                 }
             }
-        }
-
-        var ok = false
-        var idx = 0
-        for (u in found) {
-            if (u.contains("/embed/")) continue
-            val isDirectList = u.startsWith("M3U::")
-            val link = u.removePrefix("M3U::")
-            if (link.contains("/list/") && !isDirectList) continue
-            idx++
-            callback(
-                newExtractorLink(name, "$name $idx", link, ExtractorLinkType.M3U8) {
-                    this.referer = VIDMIXI
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("Referer" to VIDMIXI, "Origin" to VIDMIXI.trimEnd('/'))
-                }
-            )
-            ok = true
         }
 
         vtts.forEach { v ->
