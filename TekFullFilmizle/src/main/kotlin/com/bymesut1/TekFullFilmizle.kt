@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -198,7 +199,6 @@ class TekFullFilmizle : MainAPI() {
 
         var found = false
         for ((label, urls) in candidates) {
-            if (label == "Silver") continue // Abyss oynatıcısı: korumalı, desteklenmiyor
             for (pageUrl in urls) {
                 reached = false
                 val ok = try {
@@ -301,13 +301,6 @@ class TekFullFilmizle : MainAPI() {
         return out.filter { u -> ignoredHosts.none { u.contains(it) } }
     }
 
-    /** Resim, script, stil, takip pikseli gibi video olmayan adresleri eler. */
-    private fun isPlayableCandidate(u: String): Boolean {
-        if (ignoredHosts.any { u.contains(it) }) return false
-        if (listOf("pixel", "analytics", "googlesyndication", "jwpcdn", "jwpsrv", "morphify").any { u.contains(it) }) return false
-        return !Regex("""\.(jpe?g|png|gif|webp|svg|ico|js|css|html?|json|woff2?)(\?|#|$)""", RegexOption.IGNORE_CASE).containsMatchIn(u)
-    }
-
     private fun normalizeUrl(u: String): String = when {
         u.startsWith("//") -> "https:$u"
         u.startsWith("/") -> "$mainUrl$u"
@@ -338,6 +331,10 @@ class TekFullFilmizle : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val origin = try { "https://" + URI(url).host } catch (_: Exception) { "https://www.myvideoplayer.top" }
+        // Doğrudan Abyss iç sayfası (myvideoplayer.link) geldiyse
+        if (url.contains("myvideoplayer.link")) {
+            return abyss(label, url, "$mainUrl/", subtitleCallback, callback)
+        }
         val resp = app.get(url, referer = "$mainUrl/", headers = baseHeaders)
         val html = resp.text
         log("myvideo code=${resp.code} len=${html.length} url=$url")
@@ -366,13 +363,9 @@ class TekFullFilmizle : MainAPI() {
         log("myvideo iframe=$frameUrls")
         for (frame in frameUrls) {
             val ok = try {
-                when {
-                    frame.contains("loadvid.com") -> loadvid(label, frame, subtitleCallback, callback, url)
-                    // Silver: Abyss altyapısı (şifreli), kendi çözümümüz yok; sadece hazır extractor denenir
-                    frame.contains("myvideoplayer.link") || frame.contains("abyss") ->
-                        try { loadExtractor(frame, url, subtitleCallback, callback) } catch (_: Exception) { false }
-                    else -> generic(label, frame, url, subtitleCallback, callback)
-                }
+                if (frame.contains("loadvid.com")) loadvid(label, frame, subtitleCallback, callback, url)
+                else if (frame.contains("myvideoplayer.link")) abyss(label, frame, "$origin/", subtitleCallback, callback)
+                else generic(label, frame, url, subtitleCallback, callback)
             } catch (e: Exception) {
                 log("myvideo iframe hatası: $frame", e)
                 false
@@ -390,6 +383,173 @@ class TekFullFilmizle : MainAPI() {
             if (frame != url && generic(label, frame, url, subtitleCallback, callback)) return true
         }
         return try { loadExtractor(url, pageUrl, subtitleCallback, callback) } catch (_: Exception) { false }
+    }
+
+
+    // =====================================================================
+    // Abyss (myvideoplayer.link): iframe HTML'indeki `datas` (base64 JSON)
+    //  -> media alanı AES-CTR (seed = user_id:slug:md5_id)
+    //  -> mp4 kaynakları: https://{domain}/sora/{size}/{token}
+    //     token = b64(b64(AES-CTR("/mp4/{md5_id}/{res_id}/{size}?v={slug}", seed=size)))
+    // =====================================================================
+    private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
+
+    private fun asciiSeed(s: String) = s.toByteArray(Charsets.UTF_8)
+
+    /** JS md5 kütüphanesi sayıyı toString yapıp karakteri sayı olarak okur: "345" -> [3,4,5]. */
+    private fun digitSeed(s: String) = ByteArray(s.length) { i ->
+        val c = s[i]
+        (if (c in '0'..'9') c - '0' else 0).toByte()
+    }
+
+    private fun abyssCrypt(mode: Int, data: ByteArray, seed: ByteArray): ByteArray {
+        val key = hex(MessageDigest.getInstance("MD5").digest(seed)).toByteArray(Charsets.UTF_8) // 32 bayt
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(mode, SecretKeySpec(key, "AES"), IvParameterSpec(key.copyOfRange(0, 16)))
+        return cipher.doFinal(data)
+    }
+
+    private fun abyssToken(path: String, seed: ByteArray): String {
+        val enc = abyssCrypt(Cipher.ENCRYPT_MODE, path.toByteArray(Charsets.UTF_8), seed)
+        val first = Base64.encodeToString(enc, Base64.NO_WRAP).replace("=", "")
+        return Base64.encodeToString(first.toByteArray(Charsets.ISO_8859_1), Base64.NO_WRAP).replace("=", "")
+    }
+
+    private suspend fun abyssReachable(u: String, referer: String): Boolean = try {
+        val r = app.get(
+            u,
+            headers = mapOf("User-Agent" to userAgent, "Referer" to referer, "Range" to "bytes=0-1")
+        )
+        log("abyss test ${r.code}: $u")
+        r.code in 200..299
+    } catch (e: Exception) {
+        log("abyss test hata: $u", e)
+        false
+    }
+
+    private suspend fun abyss(
+        label: String,
+        url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val html = app.get(url, referer = referer, headers = baseHeaders).text
+        val datas = Regex("""datas\s*=\s*["']([A-Za-z0-9+/=_-]{40,})["']""").find(html)?.groupValues?.get(1)
+        if (datas == null) {
+            log("abyss: datas bulunamadı len=${html.length} url=$url")
+            return false
+        }
+        val info = JSONObject(String(b64(datas), Charsets.ISO_8859_1))
+        val userId = info.get("user_id").toString()
+        val slug = info.getString("slug")
+        val md5Id = info.get("md5_id").toString()
+        log("abyss slug=$slug md5_id=$md5Id user_id=$userId")
+
+        val mediaRaw = info.get("media")
+        val media: JSONObject = if (mediaRaw is JSONObject) mediaRaw else {
+            val plain = abyssCrypt(
+                Cipher.DECRYPT_MODE,
+                mediaRaw.toString().toByteArray(Charsets.ISO_8859_1),
+                asciiSeed("$userId:$slug:$md5Id")
+            )
+            JSONObject(String(plain, Charsets.UTF_8))
+        }
+
+        // Altyazılar
+        try {
+            val subs = info.optJSONObject("config")?.optJSONArray("subtitles")
+            if (subs != null) {
+                for (i in 0 until subs.length()) {
+                    val sb = subs.getJSONObject(i)
+                    val lang = java.net.URLDecoder.decode(sb.optString("lang", "Altyazı"), "UTF-8")
+                    subtitleCallback(
+                        SubtitleFile(
+                            lang,
+                            "https://cdn.iamcdn.net/subtitle/$md5Id/${sb.getString("slug")}.${sb.getString("type")}"
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            log("abyss altyazı hatası", e)
+        }
+
+        val mp4 = media.optJSONObject("mp4")
+        if (mp4 == null) {
+            log("abyss: mp4 yok (sadece hls?) keys=${media.keys().asSequence().toList()}")
+            return false
+        }
+        return abyssMp4(label, mp4, md5Id, slug, callback)
+    }
+
+    private suspend fun abyssMp4(
+        label: String,
+        mp4: JSONObject,
+        md5Id: String,
+        slug: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val sources = mp4.optJSONArray("sources") ?: JSONArray()
+        val domains = mp4.optJSONArray("domains") ?: JSONArray()
+        val innerReferer = "https://myvideoplayer.link/"
+        val innerOrigin = "https://myvideoplayer.link"
+
+        // etikete göre grupla (AV1 ve 1440p/2160p atlanır)
+        val groups = linkedMapOf<String, MutableList<JSONObject>>()
+        val all = (0 until sources.length()).map { sources.getJSONObject(it) }
+            .sortedBy { it.optLong("size", 0L) }
+        for (o in all) {
+            if (o.optString("codec") == "av1") continue
+            val q = o.optString("label")
+            if (q == "1440p" || q == "2160p") continue
+            groups.getOrPut(q) { mutableListOf() }.add(o)
+        }
+        log("abyss etiketler=${groups.keys} domains=$domains")
+
+        var any = false
+        for ((q, list) in groups) {
+            val o = list.first()
+            val quality = Regex("\\d+").find(q)?.value?.toIntOrNull() ?: Qualities.Unknown.value
+            val sizeAny = o.opt("size")
+            val sizeStr = sizeAny?.toString()?.takeIf { it.isNotBlank() && it != "0" && it != "null" }
+
+            if (sizeStr == null) {
+                val f = o.optString("file")
+                if (f.isNotBlank()) {
+                    addLink("$label $q", f, innerReferer, ExtractorLinkType.VIDEO, callback, innerOrigin, quality)
+                    any = true
+                }
+                continue
+            }
+
+            val sub = o.optString("sub")
+            var host: String? = null
+            for (i in 0 until domains.length()) {
+                val d = domains.optString(i)
+                if (d.isNotBlank() && d.contains(sub)) { host = d; break }
+            }
+            if (host == null) {
+                log("abyss host yok sub=$sub")
+                continue
+            }
+
+            val path = "/mp4/$md5Id/${o.get("res_id")}/$sizeStr?v=$slug"
+            // JSON'da sayı ise JS tarafı digit-seed kullanır, string ise ASCII. Emin olmak için ikisini de dene.
+            val seeds = if (sizeAny is Number) listOf(digitSeed(sizeStr), asciiSeed(sizeStr))
+            else listOf(asciiSeed(sizeStr), digitSeed(sizeStr))
+            val urls = seeds.map { "https://$host/sora/$sizeStr/${abyssToken(path, it)}" }
+
+            var chosen: String? = null
+            for (u in urls) {
+                if (abyssReachable(u, innerReferer)) { chosen = u; break }
+            }
+            val finalUrl = chosen ?: urls.first()
+            log("abyss $q -> $finalUrl (doğrulandı=${chosen != null})")
+            addLink("$label $q", finalUrl, innerReferer, ExtractorLinkType.VIDEO, callback, innerOrigin, quality)
+            any = true
+        }
+        return any
     }
 
     // ---- Platin: cdn.loadvid.com (POST /videos/resolve-token -> m3u8)
@@ -551,7 +711,7 @@ class TekFullFilmizle : MainAPI() {
             val unescaped = text.replace("\\/", "/")
             Regex("""["']?(?:file|src|source|hls|url)["']?\s*[:=]\s*["'](https?://[^"'\s]+)["']""")
                 .findAll(unescaped).map { it.groupValues[1] }
-                .firstOrNull { u -> isPlayableCandidate(u) }
+                .firstOrNull { u -> ignoredHosts.none { u.contains(it) } && !u.endsWith(".js") && !u.endsWith(".css") && !u.contains("jwpcdn") && !u.endsWith(".png") && !u.endsWith(".jpg") }
                 ?.let { u ->
                     log("generic file=$u")
                     val t = if (u.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
@@ -586,7 +746,8 @@ class TekFullFilmizle : MainAPI() {
         referer: String,
         type: ExtractorLinkType,
         callback: (ExtractorLink) -> Unit,
-        origin: String? = null
+        origin: String? = null,
+        quality: Int = Qualities.Unknown.value
     ) {
         callback(
             newExtractorLink(
@@ -596,7 +757,7 @@ class TekFullFilmizle : MainAPI() {
                 type = type
             ) {
                 this.referer = referer
-                this.quality = Qualities.Unknown.value
+                this.quality = quality
                 val h = mutableMapOf("User-Agent" to userAgent, "Referer" to referer)
                 if (origin != null) h["Origin"] = origin
                 this.headers = h
