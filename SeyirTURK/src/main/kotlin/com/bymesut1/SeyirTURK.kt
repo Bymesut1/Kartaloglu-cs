@@ -144,10 +144,12 @@ class SeyirTURKProvider : MainAPI() {
     }
 
     // ---------- Liste öğesi ----------
-    private fun SeyirMovie.toSearch(): SearchResponse? {
+    private fun SeyirMovie.toSearch(forceTv: Boolean = false): SearchResponse? {
         val i = id ?: return null
         val n = name ?: return null
-        return if (type.equals("TVSeries", true))
+        val t = (type ?: "").lowercase()
+        val isTv = forceTv || t == "tvseries" || t == "tv" || t == "dizi" || t == "series" || t.contains("tvser")
+        return if (isTv)
             newTvSeriesSearchResponse(n, "$mainUrl/series/$i", TvType.TvSeries) { posterUrl = img(image) }
         else
             newMovieSearchResponse(n, "$mainUrl/movie/$i", TvType.Movie) { posterUrl = img(image) }
@@ -179,7 +181,7 @@ class SeyirTURKProvider : MainAPI() {
                     "movie_popular" -> listOf(r?.third, r?.second, r?.first, r?.fourth)
                     else -> listOf(r?.first, r?.firstAlt, r?.second, r?.third)
                 }
-                order.firstOrNull { !it.isNullOrEmpty() }.orEmpty().mapNotNull { it.toSearch() }
+                order.firstOrNull { !it.isNullOrEmpty() }.orEmpty().mapNotNull { it.toSearch(tv) }
             }
         }
         if (out.isNotEmpty()) cache[key] = out
@@ -195,7 +197,7 @@ class SeyirTURKProvider : MainAPI() {
         val q = enc(query)
         val movies = get<SeyirMovies>("/sey/back/search.php?name=$q")?.movies.orEmpty()
         val tv = get<SeyirMovies>("/sey/back/search.php?p_type=TV&name=$q")?.movies.orEmpty()
-        return (movies + tv).mapNotNull { it.toSearch() }.distinctBy { it.url }
+        return (movies.mapNotNull { it.toSearch() } + tv.mapNotNull { it.toSearch(true) }).distinctBy { it.url }
     }
 
     // ---------- Detay sayfası (TMDB burada devreye girer) ----------
@@ -294,8 +296,8 @@ class SeyirTURKProvider : MainAPI() {
         val kind = p.getOrNull(0) ?: return false
         val id = p.getOrNull(1) ?: return false
         val path = if (kind == "series")
-            "/sey/back/streams.php?id=$id&s=${p.getOrNull(2) ?: "1"}&isTv=1&e=${p.getOrNull(3) ?: "1"}"
-        else "/sey/back/streams.php?id=$id"
+            "/sey/back/streams.php?id=$id&s=${p.getOrNull(2) ?: "1"}&isTv=1&e=${p.getOrNull(3) ?: "1"}&includeYK=1"
+        else "/sey/back/streams.php?id=$id&includeYK=1"
 
         val links = get<SeyirStreams>(path)?.links.orEmpty()
         Log.d("SeyirTURK", "streams: $path -> ${links.size} kaynak")
@@ -315,7 +317,7 @@ class SeyirTURKProvider : MainAPI() {
 /** TMDB sadece load() (diziye/filme tıklayınca) içinde kullanılır. */
 object Tmdb {
     // >>> KENDİ TMDB API KEY'İNİ BURAYA YAZ (themoviedb.org > Ayarlar > API, "v3 auth") <<<
-    const val API_KEY = "000316508321ce461cf81e7c6815eec7"
+    const val API_KEY = "BURAYA_TMDB_API_KEY"
 
     private const val API = "https://api.themoviedb.org/3"
     const val IMG = "https://image.tmdb.org/t/p/"
@@ -546,6 +548,11 @@ object SeyirExtractor {
             "webteizle" in k -> webteizle(link, label, mainUrl, headers, sub, cb)
             "sinemabox" in k -> sinemabox(link, label, cb)
             "unutulmaz" in k -> unutulmaz(link, label, sub, cb)
+            "setfilmizle" in k -> setfilmizle(link, label, cb)
+            "fullhdfilmizlesene" in k -> fullhd(link, label, sub, cb)
+            "liderfilm" in k -> liderfilm(link, label, cb)
+            "dizipub" in k -> dizipub(link, label, sub, cb)
+            "diziyou" in k -> diziyou(link, label, cb)
             "hdfilmcehennemi" in k || "boncuk" in k || "syrtrk" in k -> hdfilmcehennemi(link, label, sub, cb)
             listOf("sinemaizle", "dizirella", "dizipal", "dizitime").any { it in k } -> webview(link, label, cb)
             listOf("sinefil", "selcukflix", "roketdizi", "yabancidizi", "yabanci-dizi").any { it in k } ->
@@ -564,6 +571,8 @@ object SeyirExtractor {
         if (!u.startsWith("http") || badFrames.any { u.contains(it) }) return false
         if (openPlayerHosts.any { u.contains(it) } && openPlayer(u, label, cb)) return true
         if (u.contains(".m3u8") || u.contains(".mp4")) return direct(u, label, referer, cb)
+        if (u.contains("videoseyred") && videoseyred(u, label, cb)) return true
+        if (u.contains("rapidvid") && rapidvid(u, label, cb)) return true
         var ok = false
         try {
             ok = loadExtractor(u, referer, sub) { cb(it); ok = true }
@@ -767,6 +776,146 @@ object SeyirExtractor {
         return if (u.contains(".m3u8") || u.contains(".txt") || u.contains(".mp4")) direct(u, label, link, cb) else false
     }
 
+
+    // ---------- Setfilmizle: admin-ajax + XOR ----------
+    private suspend fun setfilmizle(link: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val dub = label.contains("Dublaj", true) && !label.contains("Altyaz", true)
+        val html = page(link) ?: return false
+        val postId = Regex("data[^\"'>]*?-id\\s*=\\s*\"(.*?)\"").find(html)?.groupValues?.get(1) ?: return false
+        val ajax = Regex("\\{\\s*url\\s*:\\s*\"(.*?)\"").find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: (origin(link) + "/wp-admin/admin-ajax.php")
+        val nonce = Regex("nonces\\s*:\\s*\\{\\s*video\\s*:\\s*\"(.*?)\"").find(html)?.groupValues?.get(1) ?: return false
+        val data = HashMap<String, String>()
+        data["action"] = "get_video_url"; data["post_id"] = postId; data["nonce"] = nonce; data["player_name"] = "SetPlay"
+        if (html.contains("tercihimturkce")) data["part_key"] = if (dub) "turkcedublaj" else "turkcealtyazi"
+        val r = try {
+            app.post(ajax, headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest"), referer = link, data = data).text
+        } catch (e: Exception) { return false }
+        val pu = Regex("\"url\":\"(.*?)\"").find(r)?.groupValues?.get(1)?.replace("\\", "") ?: return false
+        val ph = page(pu, link) ?: return false
+        val a = Regex("SPG\\.cerceve\\(\"b2\",\"(.*?)\"").find(ph)?.groupValues?.get(1) ?: return false
+        val b = Regex("SPG\\.cerceve\\(\"b2\",\".*?\".\"(.*?)\"").find(ph)?.groupValues?.get(1) ?: return false
+        val ab = Base64.decode(a, Base64.DEFAULT)
+        val bb = Base64.decode(b, Base64.DEFAULT)
+        val dec = String(ByteArray(ab.size) { (ab[it].toInt() xor bb[it % bb.size].toInt()).toByte() })
+        val host = dec.split("/").getOrNull(2) ?: return false
+        val h2 = page(dec, pu) ?: return false
+        val path = Regex("src\\s*:\\s*\"(.*?)\"").find(h2)?.groupValues?.get(1) ?: return false
+        val u = "https://$host$path"
+        cb(newExtractorLink("SeyirTURK", label, u, ExtractorLinkType.M3U8) {
+            this.referer = "https://$host/"
+            this.quality = Qualities.Unknown.value
+            this.headers = mapOf("User-Agent" to "Cloud", "Referer" to "https://$host/")
+        })
+        return true
+    }
+
+    // ---------- Fullhdfilmizlesene: ROT13 + base64 ----------
+    private fun rot13(s: String): String {
+        val sb = StringBuilder()
+        for (c in s) sb.append(
+            when (c) {
+                in 'a'..'m', in 'A'..'M' -> c + 13
+                in 'n'..'z', in 'N'..'Z' -> c - 13
+                else -> c
+            }
+        )
+        return sb.toString()
+    }
+
+    private fun dec4k(x: String, key: String = "K9L"): String? = try {
+        val a = String(Base64.decode(x.reversed(), Base64.DEFAULT), Charsets.ISO_8859_1)
+        val sb = StringBuilder()
+        for (i in a.indices) sb.append((a[i].code - (key[i % key.length].code % 5 + 1)).toChar())
+        String(Base64.decode(sb.toString(), Base64.DEFAULT))
+    } catch (e: Exception) {
+        null
+    }
+
+    private suspend fun fullhd(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val scx = Regex("var\\s*scx\\s*=\\s*(.*?);").find(html)?.groupValues?.get(1) ?: return false
+        val root = runCatching { JSONObject(scx) }.getOrNull() ?: return false
+        var ok = false
+        for (k in root.keys()) {
+            val t = root.optJSONObject(k)?.optJSONObject("sx")?.opt("t")
+            val raw = when (t) {
+                is JSONArray -> t.optString(0)
+                is JSONObject -> t.optString("tr").ifBlank { t.optString("en") }
+                else -> ""
+            }
+            if (raw.isBlank()) continue
+            val u = runCatching { String(Base64.decode(rot13(raw.replace("\\", "")), Base64.DEFAULT)) }.getOrNull() ?: continue
+            if (!u.startsWith("http")) continue
+            val ph = page(u, link) ?: continue
+            val vid = Regex("var\\s*video\\s*=\\s*(.*?);").find(ph)?.groupValues?.get(1)?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (vid != null) {
+                val m = origin(u) + "/m3u8/" + vid.optString("uid") + "/" + vid.optString("md5") +
+                    "/master.txt?s=1&id=" + vid.optString("id") + "&cache=" + vid.optString("status")
+                m3u8("$label $k".trim(), m, origin(u) + "/", Qualities.Unknown.value, cb); ok = true; continue
+            }
+            val enc = Regex("\"file\":\\s*av\\('(.*?)'\\)").find(ph)?.groupValues?.get(1)
+            val real = if (enc != null) dec4k(enc) else null
+            if (real != null && real.startsWith("http")) { if (direct(real, "$label $k".trim(), u, cb)) ok = true; continue }
+            if (embed(u, link, "$label $k".trim(), sub, cb)) ok = true
+        }
+        return ok
+    }
+
+    private suspend fun rapidvid(u: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val h = page(u) ?: return false
+        val x = Regex("<script>window.*?='(.*?)'").find(h)?.groupValues?.get(1) ?: return false
+        val inner = runCatching { String(Base64.decode(x.reversed(), Base64.DEFAULT), Charsets.ISO_8859_1) }.getOrNull() ?: return false
+        val key = "K9L"
+        val sb = StringBuilder()
+        for (i in inner.indices) sb.append((inner[i].code - (key[i % 3].code % 5 + 1)).toChar())
+        val j = runCatching { JSONObject(String(Base64.decode(sb.toString(), Base64.DEFAULT))) }.getOrNull() ?: return false
+        val v = j.optString("cm")
+        return v.startsWith("http") && direct(v, label, u, cb)
+    }
+
+    private suspend fun videoseyred(u: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val h = page(u, origin(u) + "/") ?: return false
+        val pl = Regex("playlistUrl='(.*?)'").find(h)?.groupValues?.get(1) ?: return false
+        val pj = page(absUrl(pl, u), origin(u) + "/") ?: return false
+        val src = runCatching {
+            JSONArray(pj).getJSONObject(0).getJSONArray("sources").getJSONObject(0).getString("file")
+        }.getOrNull() ?: return false
+        return direct(absUrl(src, u), label, u, cb)
+    }
+
+    private suspend fun liderfilm(link: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link, extra = mapOf("X-Requested-With" to "XMLHttpRequest")) ?: return false
+        val vs = Regex("window\\._vs\\s*=\\s*'(.*?)'").find(html)?.groupValues?.get(1) ?: return false
+        val u = runCatching { JSONArray(String(Base64.decode(vs, Base64.DEFAULT))).getJSONObject(0).optString("url") }.getOrNull()
+        if (u.isNullOrBlank()) return false
+        val ph = page(u, link) ?: return false
+        val file = Regex("sources\\s*:\\s*\\[\\s*\\{\\s*file\\s*:\\s*\"(.*?)\"").find(ph)?.groupValues?.get(1) ?: return false
+        return direct(if (file.startsWith("http")) file else origin(u) + "/" + file.trimStart('/'), label, u, cb)
+    }
+
+    private suspend fun dizipub(link: String, label: String, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val blk = Regex("series-alter-active(.*?) </ul>", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1) ?: html
+        var ok = false
+        for (m in Regex("<(?:span class=|a[^>]*?href=)\"(.*?)\"\\s*title=\"(.*?)\"").findAll(blk).toList().take(6)) {
+            val u = absUrl(m.groupValues[1], link)
+            val h = if (u == link) html else page(u, link) ?: continue
+            val f = Regex("<iframe.*?src=\"(.*?)\".*?allowfullscreen.*?</iframe>").find(h)?.groupValues?.get(1) ?: continue
+            if (embed(absUrl(f, u), u, "$label ${m.groupValues[2]}".trim(), sub, cb)) ok = true
+        }
+        return ok || frames(html, link, label, sub, cb)
+    }
+
+    private suspend fun diziyou(link: String, label: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val html = page(link) ?: return false
+        val f = Regex("<iframe.*?src=\"(.*?)\"").find(html)?.groupValues?.get(1) ?: return false
+        val fu = absUrl(f, link)
+        val h = page(fu, link) ?: return false
+        val src = Regex("<source.*?src=\"(.*?)\"").find(h)?.groupValues?.get(1) ?: return harvest(h, fu, label, cb)
+        return direct(absUrl(src, fu), label, fu, cb)
+    }
+
     // ---------- openPlayer: /source2.php?v=ID ----------
     private suspend fun openPlayer(url: String, label: String, callback: (ExtractorLink) -> Unit): Boolean {
         val h = mapOf("User-Agent" to UA, "Referer" to origin(url) + "/")
@@ -858,7 +1007,7 @@ object SeyirExtractor {
                         ).text.trim()
                     }.getOrNull()
                     Log.d(TAG, "yabanci.php -> $r")
-                    if (r != null && r.startsWith("http") && embed(r, url, label, subtitleCallback, callback)) return true
+                    if (r != null && (r.startsWith("http") || r.startsWith("//")) && embed(r, url, label, subtitleCallback, callback)) return true
                 }
             }
         }
