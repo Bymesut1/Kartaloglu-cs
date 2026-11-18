@@ -28,7 +28,7 @@ class Filmizletv : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val TAG = "Filmizletv"
-    private val TMDB_KEY = "BURAYA_TMDB_API_KEY"
+    private val TMDB_KEY = "000316508321ce461cf81e7c6815eec7"
     private val TMDB_IMG = "https://image.tmdb.org/t/p/"
     private val VIDMIXI = "https://vidmixi.com/"
 
