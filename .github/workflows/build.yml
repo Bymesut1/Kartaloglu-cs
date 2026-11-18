@@ -42,6 +42,7 @@ jobs:
           cp FullHDFilmizlesene/build/*.cs3 out/
           cp VkVideo/build/*.cs3 out/
           cp Zdizi/build/*.cs3 out/
+          cp Dizirella/build/*.cs3 out/
           cp DiziLife/build/*.cs3 out/
           cp Dizimag/build/*.cs3 out/
           cp DiziSol/build/*.cs3 out/
