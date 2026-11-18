@@ -493,7 +493,6 @@ class TekFullFilmizle : MainAPI() {
         val sources = mp4.optJSONArray("sources") ?: JSONArray()
         val domains = mp4.optJSONArray("domains") ?: JSONArray()
         val innerReferer = "https://myvideoplayer.link/"
-        val innerOrigin = "https://myvideoplayer.link"
 
         // etikete göre grupla (AV1 ve 1440p/2160p atlanır)
         val groups = linkedMapOf<String, MutableList<JSONObject>>()
@@ -517,7 +516,7 @@ class TekFullFilmizle : MainAPI() {
             if (sizeStr == null) {
                 val f = o.optString("file")
                 if (f.isNotBlank()) {
-                    addLink("$label $q", f, innerReferer, ExtractorLinkType.VIDEO, callback, innerOrigin, quality)
+                    addLink("$label $q", f, innerReferer, ExtractorLinkType.VIDEO, callback, null, quality)
                     any = true
                 }
                 continue
@@ -546,7 +545,7 @@ class TekFullFilmizle : MainAPI() {
             }
             val finalUrl = chosen ?: urls.first()
             log("abyss $q -> $finalUrl (doğrulandı=${chosen != null})")
-            addLink("$label $q", finalUrl, innerReferer, ExtractorLinkType.VIDEO, callback, innerOrigin, quality)
+            addLink("$label $q", finalUrl, innerReferer, ExtractorLinkType.VIDEO, callback, null, quality)
             any = true
         }
         return any
