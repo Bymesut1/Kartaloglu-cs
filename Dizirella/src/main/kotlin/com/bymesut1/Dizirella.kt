@@ -1,6 +1,5 @@
 package com.bymesut1
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -190,20 +189,20 @@ class Dizirella : MainAPI() {
                     this.season = s
                     this.episode = e
                     this.name = tm?.name?.takeIf { it.isNotBlank() } ?: "$e. Bölüm"
-                    this.posterUrl = tm?.stillPath?.let { "$TMDB_IMG/w780$it" }
+                    this.posterUrl = tm?.still_path?.let { "$TMDB_IMG/w780$it" }
                     this.description = tm?.overview?.takeIf { it.isNotBlank() }
-                    this.addDate(tm?.airDate)
+                    this.addDate(tm?.air_date)
                 }
             }
 
-        val poster = detail?.posterPath?.let { "$TMDB_IMG/w500$it" } ?: sitePoster
-        val backdrop = detail?.backdropPath?.let { "$TMDB_IMG/w1280$it" }
+        val poster = detail?.poster_path?.let { "$TMDB_IMG/w500$it" } ?: sitePoster
+        val backdrop = detail?.backdrop_path?.let { "$TMDB_IMG/w1280$it" }
         val plot = detail?.overview?.takeIf { it.isNotBlank() } ?: sitePlot
-        val year = detail?.firstAirDate?.take(4)?.toIntOrNull() ?: siteYear
+        val year = detail?.first_air_date?.take(4)?.toIntOrNull() ?: siteYear
         val tags = detail?.genres?.mapNotNull { it.name }
         val actorList = detail?.credits?.cast?.take(15)?.mapNotNull { c ->
             val n = c.name ?: return@mapNotNull null
-            ActorData(Actor(n, c.profilePath?.let { "$TMDB_IMG/w185$it" }))
+            ActorData(Actor(n, c.profile_path?.let { "$TMDB_IMG/w185$it" }))
         }
 
         return newTvSeriesLoadResponse(
@@ -254,18 +253,18 @@ class Dizirella : MainAPI() {
         val tr = app.get("$TMDB/tv/$id/season/$season?api_key=$TMDB_API_KEY&language=tr-TR")
             .parsedSafe<DzTmdbSeason>()?.episodes.orEmpty()
         val map = LinkedHashMap<Int, DzTmdbEpisode>()
-        tr.forEach { e -> e.episodeNumber?.let { map[it] = e } }
+        tr.forEach { e -> e.episode_number?.let { map[it] = e } }
 
         if (map.values.any { it.overview.isNullOrBlank() }) {
             val en = app.get("$TMDB/tv/$id/season/$season?api_key=$TMDB_API_KEY&language=en-US")
                 .parsedSafe<DzTmdbSeason>()?.episodes.orEmpty()
             en.forEach { e ->
-                val n = e.episodeNumber ?: return@forEach
+                val n = e.episode_number ?: return@forEach
                 val cur = map[n]
                 if (cur == null) {
                     map[n] = e
                 } else if (cur.overview.isNullOrBlank()) {
-                    map[n] = cur.copy(overview = e.overview, stillPath = cur.stillPath ?: e.stillPath)
+                    map[n] = cur.copy(overview = e.overview, still_path = cur.still_path ?: e.still_path)
                 }
             }
         }
@@ -316,46 +315,47 @@ class Dizirella : MainAPI() {
 }
 
 // ---------------------------------------------------------------- TMDB veri sınıfları
+// Alan adları TMDB JSON'u ile birebir aynı (annotation gerekmesin diye)
 data class DzTmdbSearch(
-    @JsonProperty("results") val results: List<DzTmdbItem>? = null
+    val results: List<DzTmdbItem>? = null
 )
 
 data class DzTmdbItem(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null
+    val id: Int? = null,
+    val name: String? = null
 )
 
 data class DzTmdbGenre(
-    @JsonProperty("name") val name: String? = null
+    val name: String? = null
 )
 
 data class DzTmdbCast(
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("profile_path") val profilePath: String? = null
+    val name: String? = null,
+    val profile_path: String? = null
 )
 
 data class DzTmdbCredits(
-    @JsonProperty("cast") val cast: List<DzTmdbCast>? = null
+    val cast: List<DzTmdbCast>? = null
 )
 
 data class DzTmdbDetail(
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("poster_path") val posterPath: String? = null,
-    @JsonProperty("backdrop_path") val backdropPath: String? = null,
-    @JsonProperty("first_air_date") val firstAirDate: String? = null,
-    @JsonProperty("genres") val genres: List<DzTmdbGenre>? = null,
-    @JsonProperty("credits") val credits: DzTmdbCredits? = null
+    val name: String? = null,
+    val overview: String? = null,
+    val poster_path: String? = null,
+    val backdrop_path: String? = null,
+    val first_air_date: String? = null,
+    val genres: List<DzTmdbGenre>? = null,
+    val credits: DzTmdbCredits? = null
 )
 
 data class DzTmdbEpisode(
-    @JsonProperty("episode_number") val episodeNumber: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("overview") val overview: String? = null,
-    @JsonProperty("still_path") val stillPath: String? = null,
-    @JsonProperty("air_date") val airDate: String? = null
+    val episode_number: Int? = null,
+    val name: String? = null,
+    val overview: String? = null,
+    val still_path: String? = null,
+    val air_date: String? = null
 )
 
 data class DzTmdbSeason(
-    @JsonProperty("episodes") val episodes: List<DzTmdbEpisode>? = null
+    val episodes: List<DzTmdbEpisode>? = null
 )
