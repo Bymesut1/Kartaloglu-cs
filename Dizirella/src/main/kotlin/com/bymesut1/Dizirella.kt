@@ -20,6 +20,7 @@ class Dizirella : MainAPI() {
     override val supportedTypes = setOf(TvType.TvSeries)
 
     private val epRegex = Regex("-(\\d+)-sezon-(\\d+)-bolum")
+    private val epSuffixRegex = Regex("\\s+\\d+\\.\\s*Sezon\\s+\\d+\\.\\s*Bölüm.*$", RegexOption.IGNORE_CASE)
 
     override val mainPage = mainPageOf(
         "home_eps" to "Son Eklenen Bölümler",
@@ -101,23 +102,36 @@ class Dizirella : MainAPI() {
         return out
     }
 
-    // ---------------------------------------------------------------- ARAMA
+    // ---------------------------------------------------------------- ARAMA (bölümleri tek diziye indirir)
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
         val doc = app.get("$mainUrl/?s=$q").document
-        val cards = parseCards(doc)
-        if (cards.isNotEmpty()) return cards
 
+        var raw: List<SearchResponse> = parseCards(doc)
+        if (raw.isEmpty()) {
+            val tmp = ArrayList<SearchResponse>()
+            val seenUrl = HashSet<String>()
+            doc.select("a[href*=/dizi/]").forEach { a ->
+                val url = fixUrl(a.attr("href"))
+                val title = a.selectFirst("img")?.attr("alt")?.removeSuffix(" izle")?.trim()
+                    ?: a.text().trim()
+                if (title.isBlank() || !seenUrl.add(url)) return@forEach
+                val poster = a.selectFirst("img")?.attr("src")
+                tmp.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            }
+            raw = tmp
+        }
+
+        // "Gibi 6. Sezon 13. Bölüm" -> "Gibi" ; aynı diziden tek sonuç
         val seen = HashSet<String>()
         val out = ArrayList<SearchResponse>()
-        doc.select("a[href*=/dizi/]").forEach { a ->
-            val url = fixUrl(a.attr("href"))
-            val title = a.selectFirst("img")?.attr("alt")?.removeSuffix(" izle")?.trim()
-                ?: a.text().trim()
-            if (title.isBlank() || !seen.add(url)) return@forEach
-            val poster = a.selectFirst("img")?.attr("src")
-            out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
-                this.posterUrl = poster
+        for (r in raw) {
+            val cleanName = r.name.replace(epSuffixRegex, "").trim()
+            if (cleanName.isBlank() || !seen.add(cleanName.lowercase())) continue
+            out.add(newTvSeriesSearchResponse(cleanName, r.url, TvType.TvSeries) {
+                this.posterUrl = r.posterUrl
             })
         }
         return out
@@ -287,6 +301,7 @@ class Dizirella : MainAPI() {
 
         val absM3u8 = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
         val relM3u8 = Regex("""["'](/[^"'\s]+\.m3u8[^"']*)["']""")
+        val twimgVariant = Regex("/pl/(avc1|mp4a)/")
 
         var found = false
         for (src in iframes) {
@@ -294,13 +309,21 @@ class Dizirella : MainAPI() {
                 val origin = Regex("^(https?://[^/]+)").find(src)?.value ?: src
                 val body = app.get(src, referer = data).text.replace("\\/", "/")
 
-                val urls = LinkedHashSet<String>()
+                var urls = LinkedHashSet<String>()
                 absM3u8.findAll(body).forEach { urls.add(it.value) }
                 relM3u8.findAll(body).forEach { urls.add(origin + it.groupValues[1]) }
 
+                // Twitter CDN: varsa sadece master linki kullan (varyantlar tek tek listelenmesin)
+                val masters = urls.filter { it.contains("twimg.com") && !twimgVariant.containsMatchIn(it) }
+                if (masters.isNotEmpty()) {
+                    urls = LinkedHashSet(urls.filter { !it.contains("twimg.com") } + masters)
+                }
+
                 if (urls.isNotEmpty()) {
                     for (u in urls) {
-                        M3u8Helper.generateM3u8(name, u, "$origin/").forEach(callback)
+                        // video.twimg.com yabancı referer'a 403 veriyor -> referer boş
+                        val ref = if (u.contains("twimg.com")) "" else "$origin/"
+                        M3u8Helper.generateM3u8(name, u, ref).forEach(callback)
                         found = true
                     }
                 } else {
