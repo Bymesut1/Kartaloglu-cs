@@ -285,7 +285,7 @@ class Dizirella : MainAPI() {
         return map
     }
 
-    // ---------------------------------------------------------------- LİNKLER
+    // ---------------------------------------------------------------- LİNKLER (tek kaynak: Dizirella)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -301,36 +301,44 @@ class Dizirella : MainAPI() {
 
         val absM3u8 = Regex("""https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*""")
         val relM3u8 = Regex("""["'](/[^"'\s]+\.m3u8[^"']*)["']""")
-        val twimgVariant = Regex("/pl/(avc1|mp4a)/")
+        val variantRegex = Regex("/pl/(avc1|mp4a)/")
 
-        var found = false
         for (src in iframes) {
             try {
                 val origin = Regex("^(https?://[^/]+)").find(src)?.value ?: src
                 val body = app.get(src, referer = data).text.replace("\\/", "/")
 
-                var urls = LinkedHashSet<String>()
+                val urls = LinkedHashSet<String>()
                 absM3u8.findAll(body).forEach { urls.add(it.value) }
                 relM3u8.findAll(body).forEach { urls.add(origin + it.groupValues[1]) }
+                if (urls.isEmpty()) continue
 
-                // Twitter CDN: varsa sadece master linki kullan (varyantlar tek tek listelenmesin)
-                val masters = urls.filter { it.contains("twimg.com") && !twimgVariant.containsMatchIn(it) }
-                if (masters.isNotEmpty()) {
-                    urls = LinkedHashSet(urls.filter { !it.contains("twimg.com") } + masters)
-                }
+                // Tek link seç: önce "master", sonra varyant olmayan, yoksa ilk
+                val chosen = urls.firstOrNull { it.contains("master") }
+                    ?: urls.firstOrNull { !variantRegex.containsMatchIn(it) }
+                    ?: urls.first()
 
-                if (urls.isNotEmpty()) {
-                    for (u in urls) {
-                        // video.twimg.com yabancı referer'a 403 veriyor -> referer boş
-                        val ref = if (u.contains("twimg.com")) "" else "$origin/"
-                        M3u8Helper.generateM3u8(name, u, ref).forEach(callback)
-                        found = true
+                // video.twimg.com yabancı referer'a 403 veriyor -> referer boş
+                val ref = if (chosen.contains("twimg.com")) "" else "$origin/"
+
+                callback(
+                    newExtractorLink(name, name, chosen, ExtractorLinkType.M3U8) {
+                        this.referer = ref
+                        this.quality = Qualities.Unknown.value
                     }
-                } else {
-                    if (loadExtractor(src, data, subtitleCallback, callback)) found = true
-                }
+                )
+                return true
             } catch (e: Exception) {
                 // sıradaki iframe'e geç
+            }
+        }
+
+        // m3u8 bulunamadıysa iframe'i extractor'lara bırak
+        var found = false
+        for (src in iframes) {
+            try {
+                if (loadExtractor(src, data, subtitleCallback, callback)) found = true
+            } catch (e: Exception) {
             }
         }
         return found
