@@ -784,16 +784,37 @@ class Filmmodu : MainAPI() {
         var added = 0
 
         // Master list ayrı ses grubu (#EXT-X-MEDIA:TYPE=AUDIO) içeriyorsa, kaliteleri tek tek verirsek ses kaybolur.
-        // Bu durumda master'ı olduğu gibi veriyoruz; ExoPlayer ses parçasını kendisi seçip birleştirir.
-        // BANDWIDTH Int'i aşıyorsa (ExoPlayer çöker) eski yola düşülür.
+        // Master'ı olduğu gibi verirsek ExoPlayer sesi kendisi birleştirir. Ama BANDWIDTH Int'i aşıyorsa (logda
+        // 2514383000) ExoPlayer NumberFormatException ile çöker. Bu durumda master'ı BANDWIDTH düzeltilmiş halde
+        // cihazın içindeki küçük bir yerel sunucudan (127.0.0.1) veriyoruz; alt playlist, ses ve parçalar yine
+        // orijinal adreslerden gelir.
         if (body != null) logChunks("master", usedUrl.takeLast(40) + " " + body)
         val hasAudioGroup = body != null &&
             Regex("""#EXT-X-MEDIA:[^\n]*TYPE=AUDIO""").containsMatchIn(body)
+        var proxied = false
         if (body != null && hasAudioGroup) {
             val bwOk = Regex("""BANDWIDTH=(\d+)""").findAll(body)
                 .all { (it.groupValues[1].toLongOrNull() ?: Long.MAX_VALUE) <= Int.MAX_VALUE }
-            Log.d("FilmmoduDBG", "audio group found, bandwidthOk=$bwOk")
-            if (bwOk) {
+            val masterUrl: String? = if (bwOk) {
+                usedUrl
+            } else {
+                val hasTur = body.contains("LANGUAGE=\"tur\"")
+                val fixed = body.lines().joinToString("\n") { ln ->
+                    var l = ln.replace(Regex("""BANDWIDTH=(\d+)""")) { m ->
+                        "BANDWIDTH=" + minOf(m.groupValues[1].toLongOrNull() ?: 0L, 2_000_000_000L)
+                    }
+                    // Türkçe ses varsayılan olsun (hepsi DEFAULT=NO olduğunda bazı oynatıcılar ses seçmiyor)
+                    if (hasTur && l.startsWith("#EXT-X-MEDIA") && l.contains("TYPE=AUDIO") && l.contains("LANGUAGE=\"tur\"")) {
+                        l = l.replace("DEFAULT=NO", "DEFAULT=YES")
+                    }
+                    l
+                }
+                runCatching { LocalHls.serve(usedUrl.hashCode().toString().replace('-', 'n'), fixed) }
+                    .onFailure { Log.d("FilmmoduDBG", "local server failed: ${it.message}") }
+                    .getOrNull()
+            }
+            Log.d("FilmmoduDBG", "audio group found, bandwidthOk=$bwOk masterUrl=$masterUrl")
+            if (masterUrl != null) {
                 val bestHeight = Regex("""RESOLUTION=\d+x(\d+)""").findAll(body)
                     .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
                 val masterLabel = if (bestHeight != null) "$label ${bestHeight}p" else label
@@ -801,7 +822,7 @@ class Filmmodu : MainAPI() {
                     newExtractorLink(
                         source = masterLabel,
                         name = masterLabel,
-                        url = usedUrl,
+                        url = masterUrl,
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = usedReferer
@@ -810,10 +831,11 @@ class Filmmodu : MainAPI() {
                     }
                 )
                 added++
+                proxied = !bwOk
             }
         }
 
-        if (added == 0 && body != null && body.contains("#EXT-X-STREAM-INF")) {
+        if ((added == 0 || proxied) && body != null && body.contains("#EXT-X-STREAM-INF")) {
             val lines = body.lines().map { it.trim() }
             val seen = HashSet<String>()
             for (i in lines.indices) {
@@ -828,7 +850,7 @@ class Filmmodu : MainAPI() {
 
                 val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)
                     ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                val variantLabel = if (height != null) "$label ${height}p" else label
+                val variantLabel = (if (height != null) "$label ${height}p" else label) + if (proxied) " (sessiz yedek)" else ""
 
                 callback.invoke(
                     newExtractorLink(
@@ -993,5 +1015,56 @@ class Filmmodu : MainAPI() {
             i += 2
         }
         return out
+    }
+}
+
+
+// Cihaz içinde (127.0.0.1) düzeltilmiş master playlist sunan minik HTTP sunucusu.
+private object LocalHls {
+    private val pages = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var port = 0
+
+    @Synchronized
+    fun serve(id: String, body: String): String {
+        pages[id] = body
+        if (port == 0) {
+            val ss = java.net.ServerSocket(0, 50, java.net.InetAddress.getByName("127.0.0.1"))
+            port = ss.localPort
+            Thread {
+                while (true) {
+                    val c = try { ss.accept() } catch (_: Exception) { break }
+                    Thread { handle(c) }.apply { isDaemon = true }.start()
+                }
+            }.apply { isDaemon = true }.start()
+        }
+        return "http://127.0.0.1:$port/$id.m3u8"
+    }
+
+    private fun handle(c: java.net.Socket) {
+        try {
+            c.use { s ->
+                val reader = s.getInputStream().bufferedReader()
+                val reqLine = reader.readLine() ?: return
+                while (true) {
+                    val l = reader.readLine() ?: break
+                    if (l.isEmpty()) break
+                }
+                val id = reqLine.split(" ").getOrNull(1).orEmpty().trim('/').removeSuffix(".m3u8")
+                val body = pages[id]
+                val out = s.getOutputStream()
+                if (body == null) {
+                    out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                } else {
+                    val b = body.toByteArray(Charsets.UTF_8)
+                    out.write(
+                        ("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${b.size}\r\nConnection: close\r\n\r\n").toByteArray()
+                    )
+                    if (!reqLine.startsWith("HEAD")) out.write(b)
+                }
+                out.flush()
+            }
+        } catch (_: Exception) {
+        }
     }
 }
