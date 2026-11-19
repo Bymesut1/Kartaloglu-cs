@@ -12,6 +12,8 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.text.Normalizer
+import kotlin.math.abs
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -41,8 +43,20 @@ class Filmmodu : MainAPI() {
         "$mainUrl/filmizle/yerli-film-izle" to "Yerli Filmler"
     )
 
-    // NOT: Önceki getVideoInterceptor kaldırıldı. Oynatıcı CronetDataSource kullandığı için
-    // OkHttp interceptor hiç çalışmıyordu. BANDWIDTH sorunu artık emitPlaylist() ile çözülüyor.
+    // Aynı adı taşıyan farklı yapımlar yüzünden TMDB'nin yanlış diziyi seçtiği içerikler için elle düzeltme.
+    // anahtar: sitedeki dizi slug'ı. Değer: TMDB'de aranacak ad, yıl ve orijinal dil.
+    private data class TmdbOverride(val query: String, val year: Int?, val lang: String?)
+
+    private val tmdbOverrides = mapOf(
+        // Gizli Bahçe = Kore dizisi "Secret Garden" (2010), 2024 Türk dizisi değil
+        "gizli-bahce" to TmdbOverride("Secret Garden", 2010, "ko")
+    )
+
+    // Bu içeriklerde sadece dosyaload kaynağı kullanılır (vidmixi yedeği atlanır)
+    private val dosyaloadOnlySlugs = setOf("gizli-bahce")
+
+    private fun slugOf(url: String): String =
+        Regex("""/dizi/([^/?#]+)""").find(url)?.groupValues?.getOrNull(1).orEmpty()
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val baseUrl = request.data.trimEnd('/')
@@ -204,16 +218,31 @@ class Filmmodu : MainAPI() {
         val isSeries = cleanUrl.contains("/dizi/")
 
         // TMDB: yalnızca içeriğin detay sayfasında (tıklayınca) çalışır; liste/arama aynen kalır
-        val searchTitle = title
+        var searchTitle = title
             .replace(Regex("""\s*izle.*""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\s*\(\d{4}\)\s*$"""), "")
             .trim()
-        val tmdbId = tmdbFind(isSeries, searchTitle, year)
+        var searchYear = year
+        var langHint: String? = null
+
+        val override = if (isSeries) tmdbOverrides[slugOf(cleanUrl)] else null
+        if (override != null) {
+            searchTitle = override.query
+            searchYear = override.year
+            langHint = override.lang
+        }
+
+        val siteEpCount = if (isSeries) document.select("a.dz-bolum[href]").size else 0
+        val tmdbId = tmdbFind(
+            isSeries, searchTitle, searchYear, description,
+            actors.map { it.name }, siteEpCount, langHint, trustYear = override != null || !isSeries
+        )
         val tmdb = tmdbId?.let { tmdbDetails(isSeries, it) }
+        Log.d("FilmmoduDBG", "load $cleanUrl searchTitle=$searchTitle year=$searchYear lang=$langHint -> tmdbId=$tmdbId")
 
         val finalPoster = tmdb?.poster ?: poster
         val finalPlot = tmdb?.plot ?: description
-        val finalYear = year ?: tmdb?.year
+        val finalYear = if (override != null) (tmdb?.year ?: searchYear) else (year ?: tmdb?.year)
         val finalTags = tmdb?.genres?.takeIf { it.isNotEmpty() } ?: tags
         val finalActors = tmdb?.actors?.takeIf { it.isNotEmpty() } ?: actors
 
@@ -331,11 +360,37 @@ class Filmmodu : MainAPI() {
         }
     }
 
-    private suspend fun tmdbFind(isTv: Boolean, title: String, year: Int?): Int? {
+    private fun norm(s: String): String =
+        Normalizer.normalize(s, Normalizer.Form.NFD)
+            .replace(Regex("""\p{M}+"""), "")
+            .replace('ı', 'i')
+            .lowercase()
+            .trim()
+
+    private fun words(s: String?): Set<String> =
+        if (s.isNullOrBlank()) emptySet()
+        else norm(s).split(Regex("""[^a-z0-9]+""")).filter { it.length > 3 }.toSet()
+
+    // Aynı isimde birden çok yapım olabilir (ör. "Gizli Bahçe": Kore dizisi, Türk dizisi, film).
+    // Adayları sitedeki bilgilere göre puanlıyoruz: yıl, dil, oyuncu eşleşmesi, özet benzerliği, bölüm sayısı.
+    // Her zaman puanlama yapılır (tek aday bile olsa yıl filtresi yanlış yapımı getirmiş olabilir).
+    private suspend fun tmdbFind(
+        isTv: Boolean,
+        title: String,
+        year: Int?,
+        siteDesc: String?,
+        siteActors: List<String>,
+        siteEpCount: Int,
+        langHint: String?,
+        trustYear: Boolean
+    ): Int? {
         if (title.isBlank()) return null
         val kind = if (isTv) "tv" else "movie"
         val yearKey = if (isTv) "first_air_date_year" else "year"
+        // Dizilerde sitedeki yıl güvenilir olmayabilir; yıllı ve yılsız aramaları birlikte topla
         val attempts: List<Int?> = if (year != null) listOf(year, null) else listOf(null)
+
+        val ids = LinkedHashSet<Int>()
         for (y in attempts) {
             val params = mutableListOf(
                 "query" to title,
@@ -344,12 +399,65 @@ class Filmmodu : MainAPI() {
             )
             if (y != null) params.add(yearKey to y.toString())
             val results = tmdbJson("search/$kind", *params.toTypedArray())?.optJSONArray("results") ?: continue
-            if (results.length() > 0) {
-                val id = results.optJSONObject(0)?.optInt("id", 0) ?: 0
-                if (id > 0) return id
+            for (i in 0 until minOf(results.length(), 6)) {
+                val id = results.optJSONObject(i)?.optInt("id", 0) ?: 0
+                if (id > 0) ids.add(id)
             }
         }
-        return null
+        if (ids.isEmpty()) return null
+
+        val siteWords = words(siteDesc)
+        val siteActorSet = siteActors.map { norm(it) }.toSet()
+        var bestId: Int? = null
+        var best = -1000.0
+        var rank = 0
+
+        for (id in ids.take(8)) {
+            val d = tmdbJson("$kind/$id", "language" to "tr-TR", "append_to_response" to "credits") ?: continue
+            var score = -(rank * 0.1)
+            rank++
+
+            val cy = d.str(if (isTv) "first_air_date" else "release_date")?.take(4)?.toIntOrNull()
+            if (year != null && cy != null) {
+                val diff = abs(year - cy)
+                val w = if (trustYear) 1.0 else 0.3
+                if (diff == 0) score += 3.0 * w else if (diff == 1) score += 1.0 * w
+            }
+
+            // Orijinal dil ipucu (ör. Kore dizisi için "ko")
+            if (langHint != null) {
+                if (d.str("original_language") == langHint) score += 12.0 else score -= 6.0
+            }
+
+            val cast = d.optJSONObject("credits")?.optJSONArray("cast")
+            if (cast != null && siteActorSet.isNotEmpty()) {
+                var hit = 0
+                for (i in 0 until minOf(cast.length(), 30)) {
+                    val n = cast.optJSONObject(i)?.str("name")?.let { norm(it) } ?: continue
+                    if (n in siteActorSet) hit++
+                }
+                score += minOf(hit, 5) * 2.0
+            }
+
+            val cw = words(d.str("overview"))
+            if (siteWords.isNotEmpty() && cw.isNotEmpty()) {
+                val inter = siteWords.intersect(cw).size.toDouble()
+                val uni = siteWords.union(cw).size.toDouble()
+                score += inter / uni * 10.0
+            }
+
+            if (isTv && siteEpCount > 0) {
+                val ne = d.optInt("number_of_episodes", 0)
+                if (ne == siteEpCount) score += 5.0 else if (ne > 0 && abs(ne - siteEpCount) <= 2) score += 1.5
+            }
+
+            Log.d("FilmmoduDBG", "tmdb cand $kind/$id '${d.str(if (isTv) "name" else "title")}' year=$cy lang=${d.str("original_language")} score=$score")
+            if (score > best) {
+                best = score
+                bestId = id
+            }
+        }
+        return bestId ?: ids.first()
     }
 
     private suspend fun tmdbDetails(isTv: Boolean, id: Int): TmdbInfo? {
@@ -445,6 +553,8 @@ class Filmmodu : MainAPI() {
         val dataKRaw = document.selectFirst("#f_player[data-k]")?.attr("data-k").orEmpty()
         if (dataKRaw.isBlank()) return false
 
+        val dosyaloadOnly = slugOf(data) in dosyaloadOnlySlugs
+
         val sourcesArr = runCatching { JSONArray(dataKRaw) }.getOrNull() ?: return false
         var foundAny = false
 
@@ -472,6 +582,12 @@ class Filmmodu : MainAPI() {
 
                 val embedUrl = runCatching { JSONObject(pxText).optString("u") }.getOrNull()
                     ?.takeIf { it.isNotBlank() } ?: continue
+
+                if (dosyaloadOnly && !embedUrl.contains("dosyaload", ignoreCase = true)) {
+                    Log.d("FilmmoduDBG", "skip non-dosyaload embed (dosyaload-only): $embedUrl")
+                    continue
+                }
+
                 if (extractEmbedStream(embedUrl, subtitleCallback, callback)) {
                     foundAny = true
                 }
@@ -522,27 +638,30 @@ class Filmmodu : MainAPI() {
                             }
                         }
 
+                        // Teşhis: çözülen JSON'u kısa parçalar halinde logla (uzun satırlar logcat'te kayboluyor)
+                        logChunks("beData", embedUrl + " " + dumpJson(beData))
+                        val mediaRefs = Regex("""[^"'\s\\]*(?:m3u8|\.mp4|/list/|/hls/|playlist)[^"'\s\\]*""")
+                            .findAll(embedHtml).map { it.value }.distinct().take(20).toList()
+                        mediaRefs.forEach { Log.d("FilmmoduDBG", "embedHtml media ref: $it") }
+                        val bpIdx = embedHtml.indexOf("bePlayer")
+                        if (bpIdx >= 0) {
+                            Log.d(
+                                "FilmmoduDBG",
+                                "embedHtml near bePlayer: " +
+                                    embedHtml.substring(maxOf(0, bpIdx - 150), minOf(embedHtml.length, bpIdx + 150)).replace("\n", " ")
+                            )
+                        }
+
                         emitPlaylist(
                             listUrl = videoLoc,
                             label = "$name (Bepeak)",
                             referer = "$hostOrigin/",
                             embedUrl = embedUrl,
                             cookies = embedCookies,
+                            extraCandidates = mediaRefs.filter { it.startsWith("http") && it != videoLoc },
                             callback = callback
                         )
 
-                        // Eski dosyaload.com vb. adresler 404 verebiliyor: aynı list'i vidmixi.com üzerinden de dene
-                        if (!hostOrigin.contains("vidmixi.com") && videoLoc.contains("/list/")) {
-                            val alt = videoLoc.replace(hostOrigin, "https://vidmixi.com")
-                            emitPlaylist(
-                                listUrl = alt,
-                                label = "$name (Bepeak 2)",
-                                referer = "https://vidmixi.com/",
-                                embedUrl = embedUrl,
-                                cookies = embedCookies,
-                                callback = callback
-                            )
-                        }
                         return true
                     }
                 }
@@ -560,53 +679,94 @@ class Filmmodu : MainAPI() {
         return found
     }
 
-    // Vidmixi master list'indeki BANDWIDTH değeri Int sınırını aşıyor (ör. 2514383000) ve hem
-    // CloudStream'in M3u8Helper'ı hem ExoPlayer NumberFormatException ile çöküyor. Oynatıcı Cronet
-    // kullandığı için araya interceptor girmek mümkün değil. Bu yüzden master list'i burada kendimiz
-    // indirip, her kaliteyi (variant) ayrı bir medya playlist linki olarak veriyoruz.
-    // Eski dosyaload.com içerikleri (ör. Gizli Bahçe) list'i referer/cookie olmadan 404 veriyor olabilir:
-    // bu yüzden embed sayfasının cookie'leri ve farklı referer'larla birkaç kez deniyoruz.
-    // Sonuçlar logcat'te "FilmmoduDBG" etiketiyle yazılır.
+    private fun logChunks(tag: String, text: String) {
+        val clean = text.replace("\n", " ")
+        var i = 0
+        var n = 0
+        while (i < clean.length && n < 6) {
+            Log.d("FilmmoduDBG", "$tag[$n] " + clean.substring(i, minOf(clean.length, i + 700)))
+            i += 700
+            n++
+        }
+    }
+
+    // Vidmixi master list'indeki BANDWIDTH değeri Int sınırını aşabiliyor ve hem CloudStream'in M3u8Helper'ı
+    // hem ExoPlayer NumberFormatException ile çöküyor. Master list'i burada kendimiz indirip, her kaliteyi
+    // ayrı medya playlist linki olarak veriyoruz.
+    // Logda görüldüğü gibi dosyaload list'i 404, vidmixi ise 200 ama boş gövde döndürüyor. Bu yüzden
+    // referer / cookie / header kombinasyonlarının yanında dosyaload <-> vidmixi host değişimini de deniyoruz
+    // ve her denemenin durum kodu, uzunluğu ve başlıklarını "FilmmoduDBG" etiketiyle logluyoruz.
     private suspend fun emitPlaylist(
         listUrl: String,
         label: String,
         referer: String,
         embedUrl: String,
         cookies: Map<String, String>,
+        extraCandidates: List<String>,
         callback: (ExtractorLink) -> Unit
     ) {
-        val origin = Regex("""^(https?://[^/]+)""").find(listUrl)?.groupValues?.getOrNull(1).orEmpty()
         val referers = listOf(referer, embedUrl, "$mainUrl/").distinct()
         val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
+        // Aday adresler: orijinal, diğer host'taki aynı yol, embed sayfasında geçen medya adresleri
+        val candidates = LinkedHashSet<String>()
+        candidates.add(listUrl)
+        when {
+            listUrl.contains("://dosyaload.com") -> candidates.add(listUrl.replace("://dosyaload.com", "://vidmixi.com"))
+            listUrl.contains("://vidmixi.com") -> candidates.add(listUrl.replace("://vidmixi.com", "://dosyaload.com"))
+        }
+        candidates.addAll(extraCandidates)
+
         var body: String? = null
+        var usedUrl = listUrl
         var usedReferer = referer
         var usedCookies = false
 
-        loop@ for (ref in referers) {
-            for (withCookies in listOf(true, false)) {
-                if (withCookies && cookies.isEmpty()) continue
-                try {
-                    val r = app.get(
-                        listUrl,
-                        referer = ref,
-                        headers = mapOf("Origin" to origin),
-                        cookies = if (withCookies) cookies else emptyMap()
-                    )
-                    val t = r.text
-                    Log.d(
-                        "FilmmoduDBG",
-                        "list GET $listUrl ref=$ref cookies=$withCookies code=${r.code} head=" +
-                            t.take(200).replace("\n", " ")
-                    )
-                    if (r.code in 200..299 && t.trimStart().startsWith("#EXTM3U")) {
-                        body = t
-                        usedReferer = ref
-                        usedCookies = withCookies
-                        break@loop
+        loop@ for (cand in candidates) {
+            val origin = Regex("""^(https?://[^/]+)""").find(cand)?.groupValues?.getOrNull(1).orEmpty()
+            val headerSets = listOf(
+                mapOf("Origin" to origin, "Accept" to "*/*"),
+                mapOf(
+                    "Origin" to origin,
+                    "Accept" to "*/*",
+                    "X-Requested-With" to "XMLHttpRequest"
+                ),
+                mapOf(
+                    "Accept" to "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+                    "Range" to "bytes=0-"
+                )
+            )
+            for (ref in referers) {
+                for (withCookies in listOf(true, false)) {
+                    if (withCookies && cookies.isEmpty()) continue
+                    for ((hi, hdr) in headerSets.withIndex()) {
+                        try {
+                            val r = app.get(
+                                cand,
+                                referer = ref,
+                                headers = hdr,
+                                cookies = if (withCookies) cookies else emptyMap()
+                            )
+                            val t = r.text
+                            Log.d(
+                                "FilmmoduDBG",
+                                "list GET $cand ref=$ref cookies=$withCookies hdr=$hi code=${r.code} len=${t.length} " +
+                                    "ctype=${r.headers["content-type"]} clen=${r.headers["content-length"]} head=" +
+                                    t.take(200).replace("\n", " ")
+                            )
+                            if (r.code in 200..299 && t.trimStart().startsWith("#EXTM3U")) {
+                                body = t
+                                usedUrl = cand
+                                usedReferer = ref
+                                usedCookies = withCookies
+                                break@loop
+                            }
+                            // 404 yol seviyesinde bir sorun: aynı referer için diğer header setlerini boşuna deneme
+                            if (r.code == 404) break
+                        } catch (e: Exception) {
+                            Log.d("FilmmoduDBG", "list GET failed $cand ref=$ref: ${e.message}")
+                        }
                     }
-                } catch (e: Exception) {
-                    Log.d("FilmmoduDBG", "list GET failed $listUrl ref=$ref: ${e.message}")
                 }
             }
         }
@@ -623,7 +783,7 @@ class Filmmodu : MainAPI() {
                 val uri = (i + 1 until lines.size)
                     .map { lines[it] }
                     .firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
-                val full = resolveHlsUrl(listUrl, uri)
+                val full = resolveHlsUrl(usedUrl, uri)
                 if (!seen.add(full)) continue
 
                 val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)
@@ -650,7 +810,7 @@ class Filmmodu : MainAPI() {
                 newExtractorLink(
                     source = label,
                     name = label,
-                    url = listUrl,
+                    url = usedUrl,
                     type = ExtractorLinkType.M3U8
                 ) {
                     this.referer = usedReferer
@@ -675,6 +835,18 @@ class Filmmodu : MainAPI() {
                 }
             )
         }
+    }
+
+    private fun dumpJson(o: JSONObject?): String {
+        if (o == null) return "null"
+        val sb = StringBuilder("{")
+        val keys = o.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val v = o.opt(k)?.toString().orEmpty().replace("\n", " ")
+            sb.append(k).append("=").append(if (v.length > 220) v.take(220) + "…" else v).append(" | ")
+        }
+        return sb.append("}").toString()
     }
 
     private fun resolveHlsUrl(base: String, uri: String): String {
