@@ -1,6 +1,7 @@
 package com.bymesut1
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
@@ -490,7 +491,9 @@ class Filmmodu : MainAPI() {
         val hostOrigin = Regex("""^(https?://[^/]+)""").find(embedUrl)?.groupValues?.getOrNull(1) ?: "https://vidmixi.com"
 
         try {
-            val embedHtml = app.get(embedUrl, referer = "$mainUrl/").text
+            val embedResp = app.get(embedUrl, referer = "$mainUrl/")
+            val embedHtml = embedResp.text
+            val embedCookies = embedResp.cookies
             val beMatch = Regex(
                 """bePlayer\(\s*['"]([^'"]+)['"]\s*,\s*['"](\{.*?\})['"]\s*\)""",
                 RegexOption.DOT_MATCHES_ALL
@@ -523,6 +526,8 @@ class Filmmodu : MainAPI() {
                             listUrl = videoLoc,
                             label = "$name (Bepeak)",
                             referer = "$hostOrigin/",
+                            embedUrl = embedUrl,
+                            cookies = embedCookies,
                             callback = callback
                         )
 
@@ -533,6 +538,8 @@ class Filmmodu : MainAPI() {
                                 listUrl = alt,
                                 label = "$name (Bepeak 2)",
                                 referer = "https://vidmixi.com/",
+                                embedUrl = embedUrl,
+                                cookies = embedCookies,
                                 callback = callback
                             )
                         }
@@ -556,22 +563,58 @@ class Filmmodu : MainAPI() {
     // Vidmixi master list'indeki BANDWIDTH değeri Int sınırını aşıyor (ör. 2514383000) ve hem
     // CloudStream'in M3u8Helper'ı hem ExoPlayer NumberFormatException ile çöküyor. Oynatıcı Cronet
     // kullandığı için araya interceptor girmek mümkün değil. Bu yüzden master list'i burada kendimiz
-    // indirip, her kaliteyi (variant) ayrı bir medya playlist linki olarak veriyoruz. Medya
-    // playlist'lerde BANDWIDTH olmadığından çökme olmaz. Bir şey parse edilemezse orijinal link verilir.
+    // indirip, her kaliteyi (variant) ayrı bir medya playlist linki olarak veriyoruz.
+    // Eski dosyaload.com içerikleri (ör. Gizli Bahçe) list'i referer/cookie olmadan 404 veriyor olabilir:
+    // bu yüzden embed sayfasının cookie'leri ve farklı referer'larla birkaç kez deniyoruz.
+    // Sonuçlar logcat'te "FilmmoduDBG" etiketiyle yazılır.
     private suspend fun emitPlaylist(
         listUrl: String,
         label: String,
         referer: String,
+        embedUrl: String,
+        cookies: Map<String, String>,
         callback: (ExtractorLink) -> Unit
     ) {
-        val body = try {
-            app.get(listUrl, referer = referer).text
-        } catch (_: Exception) {
-            null
+        val origin = Regex("""^(https?://[^/]+)""").find(listUrl)?.groupValues?.getOrNull(1).orEmpty()
+        val referers = listOf(referer, embedUrl, "$mainUrl/").distinct()
+        val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+        var body: String? = null
+        var usedReferer = referer
+        var usedCookies = false
+
+        loop@ for (ref in referers) {
+            for (withCookies in listOf(true, false)) {
+                if (withCookies && cookies.isEmpty()) continue
+                try {
+                    val r = app.get(
+                        listUrl,
+                        referer = ref,
+                        headers = mapOf("Origin" to origin),
+                        cookies = if (withCookies) cookies else emptyMap()
+                    )
+                    val t = r.text
+                    Log.d(
+                        "FilmmoduDBG",
+                        "list GET $listUrl ref=$ref cookies=$withCookies code=${r.code} head=" +
+                            t.take(200).replace("\n", " ")
+                    )
+                    if (r.code in 200..299 && t.trimStart().startsWith("#EXTM3U")) {
+                        body = t
+                        usedReferer = ref
+                        usedCookies = withCookies
+                        break@loop
+                    }
+                } catch (e: Exception) {
+                    Log.d("FilmmoduDBG", "list GET failed $listUrl ref=$ref: ${e.message}")
+                }
+            }
         }
 
+        val linkHeaders = if (usedCookies && cookieHeader.isNotBlank()) mapOf("Cookie" to cookieHeader) else emptyMap()
+
         var added = 0
-        if (body != null && body.trimStart().startsWith("#EXTM3U") && body.contains("#EXT-X-STREAM-INF")) {
+        if (body != null && body.contains("#EXT-X-STREAM-INF")) {
             val lines = body.lines().map { it.trim() }
             val seen = HashSet<String>()
             for (i in lines.indices) {
@@ -594,15 +637,32 @@ class Filmmodu : MainAPI() {
                         url = full,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = referer
+                        this.referer = usedReferer
+                        this.headers = linkHeaders
                         this.quality = height ?: Qualities.P1080.value
                     }
                 )
                 added++
             }
+        } else if (body != null) {
+            // Zaten medya playlist (BANDWIDTH yok): olduğu gibi ver, ama doğru referer/cookie ile
+            callback.invoke(
+                newExtractorLink(
+                    source = label,
+                    name = label,
+                    url = listUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = usedReferer
+                    this.headers = linkHeaders
+                    this.quality = Qualities.P1080.value
+                }
+            )
+            added++
         }
 
         if (added == 0) {
+            Log.d("FilmmoduDBG", "no playable list found for $listUrl, emitting raw link")
             callback.invoke(
                 newExtractorLink(
                     source = label,
