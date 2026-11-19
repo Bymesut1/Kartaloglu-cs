@@ -5,13 +5,11 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
-import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
 import javax.crypto.Cipher
@@ -42,31 +40,8 @@ class Filmmodu : MainAPI() {
         "$mainUrl/filmizle/yerli-film-izle" to "Yerli Filmler"
     )
 
-    // Vidmixi list dosyasındaki BANDWIDTH değeri Int sınırını aşıyor (ör. 2514383000)
-    // ve ExoPlayer NumberFormatException ile çöküyor. Değerleri 1000'e bölüyoruz.
-    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
-        return Interceptor { chain ->
-            val response = chain.proceed(chain.request())
-            val reqUrl = chain.request().url.toString()
-            if (!reqUrl.contains("/list/")) return@Interceptor response
-            try {
-                val body = response.body?.string() ?: return@Interceptor response
-                if (!body.trimStart().startsWith("#EXTM3U")) {
-                    return@Interceptor response.newBuilder()
-                        .body(body.toResponseBody(response.body?.contentType()))
-                        .build()
-                }
-                val fixed = Regex("""(?<=BANDWIDTH=)\d{10,}""").replace(body) {
-                    ((it.value.toLongOrNull() ?: 0L) / 1000L).toString()
-                }
-                response.newBuilder()
-                    .body(fixed.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
-                    .build()
-            } catch (_: Exception) {
-                response
-            }
-        }
-    }
+    // NOT: Önceki getVideoInterceptor kaldırıldı. Oynatıcı CronetDataSource kullandığı için
+    // OkHttp interceptor hiç çalışmıyordu. BANDWIDTH sorunu artık emitPlaylist() ile çözülüyor.
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val baseUrl = request.data.trimEnd('/')
@@ -544,31 +519,21 @@ class Filmmodu : MainAPI() {
                             }
                         }
 
-                        callback.invoke(
-                            newExtractorLink(
-                                source = "$name (Bepeak)",
-                                name = "$name (Bepeak)",
-                                url = videoLoc,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "$hostOrigin/"
-                                this.quality = Qualities.P1080.value
-                            }
+                        emitPlaylist(
+                            listUrl = videoLoc,
+                            label = "$name (Bepeak)",
+                            referer = "$hostOrigin/",
+                            callback = callback
                         )
 
                         // Eski dosyaload.com vb. adresler 404 verebiliyor: aynı list'i vidmixi.com üzerinden de dene
                         if (!hostOrigin.contains("vidmixi.com") && videoLoc.contains("/list/")) {
                             val alt = videoLoc.replace(hostOrigin, "https://vidmixi.com")
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = "$name (Bepeak 2)",
-                                    name = "$name (Bepeak 2)",
-                                    url = alt,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.referer = "https://vidmixi.com/"
-                                    this.quality = Qualities.P1080.value
-                                }
+                            emitPlaylist(
+                                listUrl = alt,
+                                label = "$name (Bepeak 2)",
+                                referer = "https://vidmixi.com/",
+                                callback = callback
                             )
                         }
                         return true
@@ -586,6 +551,84 @@ class Filmmodu : MainAPI() {
         }
 
         return found
+    }
+
+    // Vidmixi master list'indeki BANDWIDTH değeri Int sınırını aşıyor (ör. 2514383000) ve hem
+    // CloudStream'in M3u8Helper'ı hem ExoPlayer NumberFormatException ile çöküyor. Oynatıcı Cronet
+    // kullandığı için araya interceptor girmek mümkün değil. Bu yüzden master list'i burada kendimiz
+    // indirip, her kaliteyi (variant) ayrı bir medya playlist linki olarak veriyoruz. Medya
+    // playlist'lerde BANDWIDTH olmadığından çökme olmaz. Bir şey parse edilemezse orijinal link verilir.
+    private suspend fun emitPlaylist(
+        listUrl: String,
+        label: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val body = try {
+            app.get(listUrl, referer = referer).text
+        } catch (_: Exception) {
+            null
+        }
+
+        var added = 0
+        if (body != null && body.trimStart().startsWith("#EXTM3U") && body.contains("#EXT-X-STREAM-INF")) {
+            val lines = body.lines().map { it.trim() }
+            val seen = HashSet<String>()
+            for (i in lines.indices) {
+                val line = lines[i]
+                if (!line.startsWith("#EXT-X-STREAM-INF")) continue
+                val uri = (i + 1 until lines.size)
+                    .map { lines[it] }
+                    .firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
+                val full = resolveHlsUrl(listUrl, uri)
+                if (!seen.add(full)) continue
+
+                val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                val variantLabel = if (height != null) "$label ${height}p" else label
+
+                callback.invoke(
+                    newExtractorLink(
+                        source = variantLabel,
+                        name = variantLabel,
+                        url = full,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = referer
+                        this.quality = height ?: Qualities.P1080.value
+                    }
+                )
+                added++
+            }
+        }
+
+        if (added == 0) {
+            callback.invoke(
+                newExtractorLink(
+                    source = label,
+                    name = label,
+                    url = listUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = referer
+                    this.quality = Qualities.P1080.value
+                }
+            )
+        }
+    }
+
+    private fun resolveHlsUrl(base: String, uri: String): String {
+        if (uri.startsWith("http://") || uri.startsWith("https://")) return uri
+        return try {
+            URI(base).resolve(uri).toString()
+        } catch (_: Exception) {
+            val origin = Regex("""^(https?://[^/]+)""").find(base)?.groupValues?.getOrNull(1).orEmpty()
+            when {
+                uri.startsWith("//") -> "https:$uri"
+                uri.startsWith("/") -> "$origin$uri"
+                else -> base.substringBeforeLast('/') + "/" + uri
+            }
+        }
     }
 
     private fun decryptCryptoJsAes(passphrase: String, jsonPayload: String): String? {
