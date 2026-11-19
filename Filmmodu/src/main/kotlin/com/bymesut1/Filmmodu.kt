@@ -771,7 +771,15 @@ class Filmmodu : MainAPI() {
             }
         }
 
-        val linkHeaders = if (usedCookies && cookieHeader.isNotBlank()) mapOf("Cookie" to cookieHeader) else emptyMap()
+        // Liste isteği app.get'in UA'sı + Origin ile geçti; ExoPlayer bunları göndermediği için alt playlist 404 olabilir.
+        // Aynı header'ları oynatıcıya da veriyoruz.
+        val usedOrigin = Regex("""^(https?://[^/]+)""").find(usedUrl)?.groupValues?.getOrNull(1).orEmpty()
+        val linkHeaders = buildMap<String, String> {
+            if (usedCookies && cookieHeader.isNotBlank()) put("Cookie", cookieHeader)
+            if (usedOrigin.isNotBlank()) put("Origin", usedOrigin)
+            put("User-Agent", USER_AGENT)
+            put("Accept", "*/*")
+        }
 
         var added = 0
         if (body != null && body.contains("#EXT-X-STREAM-INF")) {
@@ -785,6 +793,8 @@ class Filmmodu : MainAPI() {
                     .firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
                 val full = resolveHlsUrl(usedUrl, uri)
                 if (!seen.add(full)) continue
+                Log.d("FilmmoduDBG", "variant uri raw=" + uri.take(300))
+                probeVariant(full, usedReferer, linkHeaders, cookies)
 
                 val height = Regex("""RESOLUTION=\d+x(\d+)""").find(line)
                     ?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -834,6 +844,47 @@ class Filmmodu : MainAPI() {
                     this.quality = Qualities.P1080.value
                 }
             )
+        }
+    }
+
+    // Teşhis: alt playlist'i app.get ile farklı header kombinasyonlarıyla dene, sonucu ve ilk parçayı logla
+    private suspend fun probeVariant(
+        url: String,
+        referer: String,
+        linkHeaders: Map<String, String>,
+        cookies: Map<String, String>
+    ) {
+        val noOrigin = linkHeaders - "Origin"
+        val sets = listOf(
+            "full" to Pair(linkHeaders, cookies),
+            "noOrigin" to Pair(noOrigin, cookies),
+            "noCookie" to Pair(linkHeaders - "Cookie", emptyMap<String, String>())
+        )
+        for ((tag, pair) in sets) {
+            try {
+                val r = app.get(url, referer = referer, headers = pair.first - "Cookie", cookies = pair.second)
+                val t = r.text
+                Log.d(
+                    "FilmmoduDBG",
+                    "variant[$tag] $url code=${r.code} len=${t.length} ctype=${r.headers["content-type"]} head=" +
+                        t.take(300).replace("\n", " ")
+                )
+                if (r.code in 200..299 && t.trimStart().startsWith("#EXTM3U")) {
+                    val seg = t.lines().map { it.trim() }.firstOrNull { it.isNotBlank() && !it.startsWith("#") }
+                    if (seg != null) {
+                        val segUrl = resolveHlsUrl(url, seg)
+                        val sr = app.get(
+                            segUrl, referer = referer,
+                            headers = pair.first - "Cookie" + mapOf("Range" to "bytes=0-1"),
+                            cookies = pair.second
+                        )
+                        Log.d("FilmmoduDBG", "segment[$tag] ${segUrl.take(200)} code=${sr.code}")
+                    }
+                    return
+                }
+            } catch (e: Exception) {
+                Log.d("FilmmoduDBG", "variant[$tag] failed: ${e.message}")
+            }
         }
     }
 
