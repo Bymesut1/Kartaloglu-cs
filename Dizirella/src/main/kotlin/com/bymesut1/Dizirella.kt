@@ -285,6 +285,80 @@ class Dizirella : MainAPI() {
         return map
     }
 
+    // ---------------------------------------------------------------- ALTYAZI
+    private fun subLabel(url: String): String {
+        val m = Regex("[_/.\\-](tr|en|de|fr|es|it|ar|ru|pt|ja|ko)[_.\\-]", RegexOption.IGNORE_CASE)
+            .find(url)?.groupValues?.get(1)?.lowercase()
+        return when (m) {
+            "tr" -> "Türkçe"
+            "en" -> "English"
+            "de" -> "Deutsch"
+            "fr" -> "Français"
+            "es" -> "Español"
+            "ar" -> "العربية"
+            "ru" -> "Русский"
+            null -> "Altyazı"
+            else -> m.uppercase()
+        }
+    }
+
+    private fun resolveUrl(u: String, base: String): String {
+        val origin = Regex("^(https?://[^/]+)").find(base)?.value ?: base
+        return when {
+            u.startsWith("http") -> u
+            u.startsWith("//") -> "https:$u"
+            u.startsWith("/") -> origin + u
+            else -> base.substringBeforeLast('/') + "/" + u
+        }
+    }
+
+    // Embed sayfasında ve m3u8 master içinde .vtt/.srt arar
+    private suspend fun findSubtitles(
+        body: String,
+        origin: String,
+        m3u8Url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val subs = LinkedHashSet<String>()
+        val absSub = Regex("""https?://[^"'\s\\<>]+\.(?:vtt|srt)[^"'\s\\<>]*""")
+        val relSub = Regex("""["'](/[^"'\s]+\.(?:vtt|srt)[^"']*)["']""")
+
+        absSub.findAll(body).forEach { subs.add(it.value) }
+        relSub.findAll(body).forEach { subs.add(origin + it.groupValues[1]) }
+
+        // m3u8 master içinden
+        try {
+            val master = app.get(m3u8Url, referer = referer).text
+            Regex("""[^\s"',]+\.(?:vtt|srt)[^\s"',]*""").findAll(master).forEach {
+                subs.add(resolveUrl(it.value, m3u8Url))
+            }
+            master.lines().filter { it.contains("SUBTITLES") }.forEach { line ->
+                val uri = Regex("""URI="([^"]+)"""").find(line)?.groupValues?.get(1) ?: return@forEach
+                val full = resolveUrl(uri, m3u8Url)
+                if (uri.contains(".vtt") || uri.contains(".srt")) {
+                    subs.add(full)
+                } else if (uri.contains(".m3u8")) {
+                    try {
+                        val inner = app.get(full, referer = referer).text
+                        inner.lines().firstOrNull { !it.startsWith("#") && it.contains(".vtt") }
+                            ?.let { subs.add(resolveUrl(it.trim(), full)) }
+                    } catch (e: Exception) {
+                    }
+                }
+            }
+        } catch (e: Exception) {
+        }
+
+        for (s in subs) {
+            subtitleCallback(
+                newSubtitleFile(subLabel(s), s) {
+                    this.headers = mapOf("Referer" to referer)
+                }
+            )
+        }
+    }
+
     // ---------------------------------------------------------------- LİNKLER (tek kaynak: Dizirella)
     override suspend fun loadLinks(
         data: String,
@@ -327,6 +401,12 @@ class Dizirella : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
+
+                // Altyazılar (iki kaynakta da)
+                try {
+                    findSubtitles(body, origin, chosen, "$origin/", subtitleCallback)
+                } catch (e: Exception) {
+                }
                 return true
             } catch (e: Exception) {
                 // sıradaki iframe'e geç
