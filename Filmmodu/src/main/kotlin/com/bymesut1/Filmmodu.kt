@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -38,6 +41,32 @@ class Filmmodu : MainAPI() {
         "$mainUrl/filmizle/komedi-filmleri-hd-izle" to "Komedi Filmleri",
         "$mainUrl/filmizle/yerli-film-izle" to "Yerli Filmler"
     )
+
+    // Vidmixi list dosyasındaki BANDWIDTH değeri Int sınırını aşıyor (ör. 2514383000)
+    // ve ExoPlayer NumberFormatException ile çöküyor. Değerleri 1000'e bölüyoruz.
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
+        return Interceptor { chain ->
+            val response = chain.proceed(chain.request())
+            val reqUrl = chain.request().url.toString()
+            if (!reqUrl.contains("/list/")) return@Interceptor response
+            try {
+                val body = response.body?.string() ?: return@Interceptor response
+                if (!body.trimStart().startsWith("#EXTM3U")) {
+                    return@Interceptor response.newBuilder()
+                        .body(body.toResponseBody(response.body?.contentType()))
+                        .build()
+                }
+                val fixed = Regex("""(?<=BANDWIDTH=)\d{10,}""").replace(body) {
+                    ((it.value.toLongOrNull() ?: 0L) / 1000L).toString()
+                }
+                response.newBuilder()
+                    .body(fixed.toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
+                    .build()
+            } catch (_: Exception) {
+                response
+            }
+        }
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val baseUrl = request.data.trimEnd('/')
@@ -505,6 +534,8 @@ class Filmmodu : MainAPI() {
                             for (i in 0 until subsArr.length()) {
                                 val sub = subsArr.optJSONObject(i) ?: continue
                                 val rawSubFile = sub.optString("file").trim().takeIf { it.isNotBlank() } ?: continue
+                                // thumbs.vtt altyazı değil, oynatıcı önizleme dosyası
+                                if (rawSubFile.contains("thumbs", ignoreCase = true)) continue
                                 val subUrl = if (rawSubFile.startsWith("http")) rawSubFile else "$hostOrigin$rawSubFile"
                                 val label = sub.optString("label").takeIf { it.isNotBlank() }
                                     ?: sub.optString("language").takeIf { it.isNotBlank() }
@@ -524,6 +555,22 @@ class Filmmodu : MainAPI() {
                                 this.quality = Qualities.P1080.value
                             }
                         )
+
+                        // Eski dosyaload.com vb. adresler 404 verebiliyor: aynı list'i vidmixi.com üzerinden de dene
+                        if (!hostOrigin.contains("vidmixi.com") && videoLoc.contains("/list/")) {
+                            val alt = videoLoc.replace(hostOrigin, "https://vidmixi.com")
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = "$name (Bepeak 2)",
+                                    name = "$name (Bepeak 2)",
+                                    url = alt,
+                                    type = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "https://vidmixi.com/"
+                                    this.quality = Qualities.P1080.value
+                                }
+                            )
+                        }
                         return true
                     }
                 }
