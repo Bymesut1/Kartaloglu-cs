@@ -532,9 +532,16 @@ class HDFilmCehennemi : MainAPI() {
     // senkron XHR ile istenen adres çekilir ve yanıt doğrudan alınır.
     private val wvLock = Semaphore(1)
     private val wvCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, SiteResp>>()
+    // WebView bir adreste başarısız olursa kısa süre tekrar denenmez (katalog satırları art arda 25 sn beklemesin)
+    private val wvFailUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
     @Volatile
     private var plainBlockedUntil = 0L
 
+    // Not: WebViewResolver 'script' değerini sayfanın YAPTIĞI HER İSTEKTE çalıştırır.
+    // Eski sürüm ilk çalışan sonucu (Cloudflare doğrulaması bitmeden, 403) alıp WebView'i hemen kapatıyordu.
+    // Şimdi: script yalnızca 2xx gelince "bitti" işareti gönderir; 403 ise WebView açık kalır, doğrulama
+    // çözülünce (sonraki isteklerde) script yeniden dener. Ayrıca /cdn-cgi/trace sayfası doğrulama çalıştırmaz,
+    // bu yüzden çözülmezse gerçek sayfa ("/") üzerinden denenir.
     private suspend fun wvFetch(host: String, path: String, extra: Map<String, String>): SiteResp? {
         val hdr = extra.entries.filter {
             it.key.equals("Accept", true) || it.key.equals("X-Requested-With", true)
@@ -545,21 +552,34 @@ class HDFilmCehennemi : MainAPI() {
             val c = wvCache[key] ?: return null
             return if (System.currentTimeMillis() - c.first < ttl) c.second else null
         }
+        fun failed(): Boolean = System.currentTimeMillis() < (wvFailUntil[host] ?: 0L)
         cached()?.let { return it }
+        if (failed()) return null
 
         val hdrJs = hdr.joinToString("") {
             "x.setRequestHeader(" + JSONObject.quote(it.key) + "," + JSONObject.quote(it.value) + ");"
         }
-        val script = "(function(){var st=0,out='';try{var x=new XMLHttpRequest();x.open('GET'," +
-            JSONObject.quote(path) + ",false);" + hdrJs + "x.send();st=x.status;out=x.responseText;}catch(e){}" +
-            "setTimeout(function(){try{new Image().src='/__hdfc_done__?'+Date.now();}catch(e){}},50);" +
-            "return st+'|'+out;})();"
+        val script = "(function(){try{" +
+            "if(window.__hdfcOk){return window.__hdfcOk;}" +
+            "var now=Date.now();" +
+            "if(window.__hdfcT&&now-window.__hdfcT<1500){return window.__hdfcLast||'0||';}" +
+            "window.__hdfcT=now;" +
+            "var st=0,out='',cfm='';" +
+            "try{var x=new XMLHttpRequest();x.open('GET'," + JSONObject.quote(path) + ",false);" + hdrJs +
+            "x.send();st=x.status;out=x.responseText||'';cfm=x.getResponseHeader('cf-mitigated')||'';}catch(e){}" +
+            "var res=st+'|'+cfm+'|'+out;window.__hdfcLast=res;" +
+            "if(st>=200&&st<300&&out.length>0){window.__hdfcOk=res;" +
+            "setTimeout(function(){try{new Image().src='/__hdfc_done__?'+Date.now();}catch(e){}},50);}" +
+            "return res;}catch(e){return '0||';}})();"
 
         wvLock.acquire()
         try {
             cached()?.let { return it }
-            for (anchor in listOf("/cdn-cgi/trace", "/")) {
-                val got = AtomicReference<String?>(null)
+            if (failed()) return null
+            var lastBad: SiteResp? = null
+            for ((anchor, waitMs) in listOf("/cdn-cgi/trace" to 7_000L, "/" to 25_000L)) {
+                val ok = AtomicReference<String?>(null)
+                val last = AtomicReference<String?>(null)
                 try {
                     app.get(
                         host + anchor,
@@ -568,8 +588,13 @@ class HDFilmCehennemi : MainAPI() {
                             userAgent = null,
                             useOkhttp = false,
                             script = script,
-                            scriptCallback = { v -> got.set(v) },
-                            timeout = 25_000L
+                            scriptCallback = { v ->
+                                if (v != null && v != "null") {
+                                    last.set(v)
+                                    if (v.startsWith("\"2")) ok.set(v)
+                                }
+                            },
+                            timeout = waitMs
                         ),
                         timeout = 40L
                     )
@@ -577,11 +602,11 @@ class HDFilmCehennemi : MainAPI() {
                     log("WV hata ${e.javaClass.simpleName} ${(host + anchor).take(60)}")
                 }
                 var n = 0
-                while (got.get() == null && n < 15) {
+                while (ok.get() == null && last.get() == null && n < 15) {
                     Thread.sleep(100)
                     n++
                 }
-                val raw = got.get() ?: continue
+                val raw = ok.get() ?: last.get() ?: continue
                 val str = try {
                     JSONTokener(raw).nextValue() as? String
                 } catch (e: Exception) {
@@ -591,14 +616,21 @@ class HDFilmCehennemi : MainAPI() {
                 if (i <= 0) continue
                 val code = str.substring(0, i).toIntOrNull() ?: continue
                 if (code == 0) continue
-                val resp = SiteResp(code, str.substring(i + 1))
-                log("WV kod=$code len=${resp.text.length} ${(host + path).take(70)}")
-                if (code in 200..299 && resp.text.isNotEmpty()) {
+                val j = str.indexOf('|', i + 1)
+                val cfm = if (j > i) str.substring(i + 1, j) else ""
+                val body = if (j >= 0) str.substring(j + 1) else str.substring(i + 1)
+                val resp = SiteResp(code, body)
+                log("WV kod=$code len=${body.length} cfm=$cfm anchor=$anchor ${(host + path).take(70)}")
+                if (code in 200..299 && body.isNotEmpty()) {
                     wvCache[key] = Pair(System.currentTimeMillis(), resp)
+                    wvFailUntil.remove(host)
+                    return resp
                 }
-                return resp
+                log("WV gövde: " + body.take(200).replace(Regex("\\s+"), " "))
+                lastBad = resp
             }
-            return null
+            wvFailUntil[host] = System.currentTimeMillis() + 90_000L
+            return lastBad
         } finally {
             wvLock.release()
         }
