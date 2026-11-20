@@ -238,7 +238,7 @@ class Filmmakinesi : MainAPI() {
 
     // ---- Katalog sayfaları için kısa süreli disk önbelleği (uygulama yeniden açılınca anında gelsin) ----
     private val catDir by lazy { java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp") }
-    private val catTtlMs = 15L * 60 * 1000          // taze önbellek
+    private val catTtlMs = 2L * 60 * 60 * 1000           // taze önbellek (2 saat: uygulamayı tekrar açınca anında gelir)
     private val catStaleMs = 24L * 60 * 60 * 1000   // bayat önbellek (site hız sınırı verirse bunu göster)
 
     private fun catFile(key: String): java.io.File =
@@ -276,7 +276,8 @@ class Filmmakinesi : MainAPI() {
         val segs = path.trim('/').split('/').filter { it.isNotEmpty() }
         if (segs.isEmpty()) return null
         val sufRe = Regex("-(?:fm\\w*|\\d+)$", IC)
-        val idx = segs.indexOfFirst { sufRe.containsMatchIn(it) }.let { if (it >= 0) it else segs.lastIndex }
+        val idx = segs.indexOfFirst { sufRe.containsMatchIn(it) }
+        if (idx < 0) return null // sonek yok -> adres zaten sabit, başka kategoriyle karıştırma
         val stem = segs[idx].replace(sufRe, "")
         if (stem.length < 4) return null
         val home = try {
@@ -600,8 +601,8 @@ class Filmmakinesi : MainAPI() {
     private val wvLock = Semaphore(1)
     // Site hız sınırı koyuyor (HTTP 429 "Biraz yavaşlayalım"): HDFilmCehennemi'ndeki gibi 6 paralel WebView burada
     // sınırı hemen aşıyordu. Bu yüzden istekler tek tek, aralarında boşlukla gider; 429 gelirse herkes bekler.
-    private val wvPar = Semaphore(1)
-    private val gapMs = 2_000L
+    private val wvPar = Semaphore(2)
+    private val gapMs = 800L
     @Volatile
     private var nextSlotAt = 0L
     @Volatile
@@ -610,12 +611,17 @@ class Filmmakinesi : MainAPI() {
     private fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntil
     private val rlCooldownMs = 90_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
 
-    private fun waitTurn() {
+    @Synchronized
+    private fun reserveSlot(): Long {
         val now = System.currentTimeMillis()
-        val now2 = System.currentTimeMillis()
-        val slot = maxOf(nextSlotAt, now2)
+        val slot = maxOf(nextSlotAt, now)
         nextSlotAt = slot + gapMs
-        if (slot > now2) Thread.sleep(slot - now2)
+        return slot - now
+    }
+
+    private fun waitTurn() {
+        val w = reserveSlot()
+        if (w > 0) Thread.sleep(w)
     }
     @Volatile
     private var wvLightFails = 0
@@ -673,7 +679,7 @@ class Filmmakinesi : MainAPI() {
             "return res;}catch(e){return '0||';}})();"
 
         // Sırada en çok 40 sn (kullanıcı eyleminde 100 sn) beklenir; olmazsa boş dön (toplam 120 sn zaman aşımı tüm sayfayı öldürüyor)
-        if (!wvPar.tryAcquire(if (patient) 100L else 40L, java.util.concurrent.TimeUnit.SECONDS)) {
+        if (!wvPar.tryAcquire(if (patient) 100L else 45L, java.util.concurrent.TimeUnit.SECONDS)) {
             log("WV sıra zaman aşımı ${path.take(60)}")
             return null
         }
@@ -1078,6 +1084,22 @@ class Filmmakinesi : MainAPI() {
 
             val st = verified.firstOrNull { er.strict.contains(it.first) }
             if (st != null) unverified = Found(st.first, !isMp4(st.first), st.second.headers)
+
+            // Doğrulanamayan aday akış değil de başka bir embed sayfası olabilir: bir adım daha içine gir
+            val pages = verified.filter { !it.second.ok && !isMp4(it.first) && !wvRegex.containsMatchIn(it.first) }
+                .map { it.first }.take(2)
+            for (pg in pages) {
+                val hop = try {
+                    resolveEmbed(pg, er.base, 1)
+                } catch (e: Exception) {
+                    log("EM hop hata $label ${e.message?.take(60)}")
+                    null
+                } ?: continue
+                val hv = hop.urls.take(6).map { u -> u to verifyUrl(u, streamHeaderSets(hop.base, u)) }
+                hv.forEach { log("V2 $label ok=${it.second.ok} deep=${it.second.deep} ${it.first.take(90)}") }
+                val hb = hv.firstOrNull { it.second.deep } ?: hv.firstOrNull { it.second.ok }
+                if (hb != null) return Found(hb.first, !isMp4(hb.first), hb.second.headers)
+            }
         }
 
         val wv = try {
@@ -1142,7 +1164,8 @@ class Filmmakinesi : MainAPI() {
                 log("EM hata ${e.message?.take(60)}")
                 null
             }
-            if (r != null && (r.code == 403 || r.code == 503)) {
+            val cfBody = r != null && r.code != 200 && Regex("challenge-platform|Just a moment|cf-chl|cf\\.errors", IC).containsMatchIn(r.text)
+            if (r != null && (r.code == 403 || r.code == 503 || cfBody)) {
                 r = try {
                     cfGet(embedUrl, embedHeaders(rf))
                 } catch (e: Exception) {
