@@ -589,21 +589,21 @@ class Filmmakinesi : MainAPI() {
     private val wvLock = Semaphore(1)
     // Site hız sınırı koyuyor (HTTP 429 "Biraz yavaşlayalım"): HDFilmCehennemi'ndeki gibi 6 paralel WebView burada
     // sınırı hemen aşıyordu. Bu yüzden istekler tek tek, aralarında boşlukla gider; 429 gelirse herkes bekler.
-    private val wvPar = kotlinx.coroutines.sync.Mutex()
+    private val wvPar = Semaphore(1)
     private val gapMs = 900L
     @Volatile
     private var nextSlotAt = 0L
     @Volatile
     private var rateLimitedUntil = 0L
 
-    private suspend fun waitTurn() {
+    private fun waitTurn() {
         val now = System.currentTimeMillis()
         val rl = rateLimitedUntil - now
-        if (rl > 0) kotlinx.coroutines.delay(rl)
+        if (rl > 0) Thread.sleep(rl)
         val now2 = System.currentTimeMillis()
         val slot = maxOf(nextSlotAt, now2)
         nextSlotAt = slot + gapMs
-        if (slot > now2) kotlinx.coroutines.delay(slot - now2)
+        if (slot > now2) Thread.sleep(slot - now2)
     }
     @Volatile
     private var wvLightFails = 0
@@ -660,7 +660,7 @@ class Filmmakinesi : MainAPI() {
             "setTimeout(function(){try{if(!window.__fmOk){new Image().src='/__fm_done__?'+Date.now();}}catch(e){}},2500);}" +
             "return res;}catch(e){return '0||';}})();"
 
-        wvPar.lock()
+        wvPar.acquire()
         try {
             cached()?.let { return it }
             if (failed()) return null
@@ -766,7 +766,7 @@ class Filmmakinesi : MainAPI() {
             }
             return lastBad
         } finally {
-            wvPar.unlock()
+            wvPar.release()
         }
     }
 
