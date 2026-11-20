@@ -194,47 +194,57 @@ class Filmmakinesi : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // HDFilmCehennemi ile aynı akış: önce disk önbelleği, yoksa siteGet (düz istek -> WebView), o da olmazsa
-        // kategori adresi değişmiş olabilir diye ana sayfadaki menüden gerçek adresi bul
+        // Site HTTP 429 (hız sınırı) veriyor ve Cloudstream tüm satırları aynı anda isteyip toplam 120 sn'de pes ediyor.
+        // Bu yüzden burada ASLA uzun beklenmez: taze önbellek -> ağ (yalnızca sınır yoksa) -> bayat önbellek -> boş liste.
         val path = request.data.trimEnd('/') + "/"
         val p = if (page <= 1) path else "${path}sayfa/$page/"
-        val cachedHtml = diskGet(p)
-        var html = cachedHtml ?: try {
-            siteGet(p)?.text.orEmpty()
-        } catch (e: java.util.concurrent.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            ""
-        }
-        if (html.isBlank()) {
-            val alt = findCatalogPath(path)
-            if (alt != null && alt != path) {
-                log("kategori yolu bulundu: $path -> $alt")
-                val alt2 = alt.trimEnd('/') + "/"
-                val p2 = if (page <= 1) alt2 else "${alt2}sayfa/$page/"
-                html = try {
-                    siteGet(p2)?.text.orEmpty()
-                } catch (e: java.util.concurrent.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    ""
+        var html = diskGet(p).orEmpty()
+        val fresh = html.isNotBlank()
+        if (!fresh && !isRateLimited()) {
+            html = try {
+                siteGet(p, patient = false)?.text.orEmpty()
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ""
+            }
+            if (html.isBlank() && !isRateLimited()) {
+                val alt = findCatalogPath(path)
+                if (alt != null && alt != path) {
+                    log("kategori yolu bulundu: $path -> $alt")
+                    val alt2 = alt.trimEnd('/') + "/"
+                    val p2 = if (page <= 1) alt2 else "${alt2}sayfa/$page/"
+                    html = try {
+                        siteGet(p2, patient = false)?.text.orEmpty()
+                    } catch (e: java.util.concurrent.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        ""
+                    }
                 }
             }
         }
-        val list = try { parseCards(Jsoup.parse(html)) } catch (e: Exception) { emptyList() }
-        if (cachedHtml == null && list.isNotEmpty()) diskPut(p, html)
-        log("anasayfa ${request.name} p=$page html=${html.length} kart=${list.size}")
+        var list = try { parseCards(Jsoup.parse(html)) } catch (e: Exception) { emptyList() }
+        if (!fresh && list.isNotEmpty()) {
+            diskPut(p, html)
+        } else if (list.isEmpty()) {
+            // Ağ başarısız / hız sınırı: bayat önbellek (24 sa'e kadar) varsa onu göster
+            val stale = diskGet(p, catStaleMs).orEmpty()
+            if (stale.isNotBlank()) list = try { parseCards(Jsoup.parse(stale)) } catch (e: Exception) { emptyList() }
+        }
+        log("anasayfa ${request.name} p=$page fresh=$fresh html=${html.length} kart=${list.size} limit=${isRateLimited()}")
         return newHomePageResponse(request.name, list, hasNext = list.isNotEmpty())
     }
 
     // ---- Katalog sayfaları için kısa süreli disk önbelleği (uygulama yeniden açılınca anında gelsin) ----
     private val catDir by lazy { java.io.File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp") }
-    private val catTtlMs = 15L * 60 * 1000
+    private val catTtlMs = 15L * 60 * 1000          // taze önbellek
+    private val catStaleMs = 24L * 60 * 60 * 1000   // bayat önbellek (site hız sınırı verirse bunu göster)
 
     private fun catFile(key: String): java.io.File =
         java.io.File(catDir, "fm_cat_" + key.hashCode().toString().replace('-', 'm') + ".html")
 
-    private fun diskGet(key: String): String? {
+    private fun diskGet(key: String, maxAge: Long = catTtlMs): String? {
         return try {
             val f = catFile(key)
             if (!f.exists()) return null
@@ -242,10 +252,11 @@ class Filmmakinesi : MainAPI() {
             val nl = txt.indexOf('\n')
             if (nl <= 0) return null
             val ts = txt.substring(0, nl).toLongOrNull() ?: return null
-            if (System.currentTimeMillis() - ts > catTtlMs) {
+            if (System.currentTimeMillis() - ts > catStaleMs) {
                 f.delete()
                 return null
             }
+            if (System.currentTimeMillis() - ts > maxAge) return null
             txt.substring(nl + 1).takeIf { it.length > 500 }
         } catch (e: Throwable) {
             null
@@ -269,7 +280,7 @@ class Filmmakinesi : MainAPI() {
         val stem = segs[idx].replace(sufRe, "")
         if (stem.length < 4) return null
         val home = try {
-            siteGet("/")?.text.orEmpty()
+            siteGet("/", patient = false)?.text.orEmpty()
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -298,7 +309,7 @@ class Filmmakinesi : MainAPI() {
 
     private suspend fun fetchList(path: String): List<SearchResponse> {
         val r = try {
-            siteGet(path)
+            siteGet(path, patient = true)
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -477,7 +488,7 @@ class Filmmakinesi : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val resp = siteGet(pathOf(url)) ?: return null
+        val resp = siteGet(pathOf(url), patient = true) ?: return null
         val doc = Jsoup.parse(resp.text)
         val html = resp.text
         val rawTitle = doc.selectFirst("h1")?.text()?.trim()
@@ -590,16 +601,17 @@ class Filmmakinesi : MainAPI() {
     // Site hız sınırı koyuyor (HTTP 429 "Biraz yavaşlayalım"): HDFilmCehennemi'ndeki gibi 6 paralel WebView burada
     // sınırı hemen aşıyordu. Bu yüzden istekler tek tek, aralarında boşlukla gider; 429 gelirse herkes bekler.
     private val wvPar = Semaphore(1)
-    private val gapMs = 900L
+    private val gapMs = 2_000L
     @Volatile
     private var nextSlotAt = 0L
     @Volatile
     private var rateLimitedUntil = 0L
 
+    private fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntil
+    private val rlCooldownMs = 90_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
+
     private fun waitTurn() {
         val now = System.currentTimeMillis()
-        val rl = rateLimitedUntil - now
-        if (rl > 0) Thread.sleep(rl)
         val now2 = System.currentTimeMillis()
         val slot = maxOf(nextSlotAt, now2)
         nextSlotAt = slot + gapMs
@@ -622,7 +634,7 @@ class Filmmakinesi : MainAPI() {
     // Şimdi: script yalnızca 2xx gelince "bitti" işareti gönderir; 403 ise WebView açık kalır, doğrulama
     // çözülünce (sonraki isteklerde) script yeniden dener. Ayrıca /cdn-cgi/trace sayfası doğrulama çalıştırmaz,
     // bu yüzden çözülmezse gerçek sayfa ("/") üzerinden denenir.
-    private suspend fun wvFetch(host: String, path: String, extra: Map<String, String>): SiteResp? {
+    private suspend fun wvFetch(host: String, path: String, extra: Map<String, String>, patient: Boolean = true): SiteResp? {
         val hdr = extra.entries.filter {
             it.key.equals("Accept", true) || it.key.equals("X-Requested-With", true)
         }
@@ -660,10 +672,19 @@ class Filmmakinesi : MainAPI() {
             "setTimeout(function(){try{if(!window.__fmOk){new Image().src='/__fm_done__?'+Date.now();}}catch(e){}},2500);}" +
             "return res;}catch(e){return '0||';}})();"
 
-        wvPar.acquire()
+        // Sırada en çok 40 sn (kullanıcı eyleminde 100 sn) beklenir; olmazsa boş dön (toplam 120 sn zaman aşımı tüm sayfayı öldürüyor)
+        if (!wvPar.tryAcquire(if (patient) 100L else 40L, java.util.concurrent.TimeUnit.SECONDS)) {
+            log("WV sıra zaman aşımı ${path.take(60)}")
+            return null
+        }
         try {
             cached()?.let { return it }
             if (failed()) return null
+            if (isRateLimited()) {
+                if (!patient) return SiteResp(429, "")
+                val w = minOf(rateLimitedUntil - System.currentTimeMillis(), 60_000L)
+                if (w > 0) Thread.sleep(w)
+            }
             waitTurn()
             var lastBad: SiteResp? = null
             var sawError = false
@@ -676,7 +697,7 @@ class Filmmakinesi : MainAPI() {
             // Çalışan yöntem: ana sayfa ("/") yüklenirken XHR. Ağır olduğu için, bir kez çalıştıktan sonra
             // küçük bir 404 sayfası denenir; 2 kez işe yaramazsa bir daha denenmez (eski yönteme dönülür).
             val lightAttempt = wvCleared && !wvLightBad
-            if (lightAttempt) attempts.add(arrayOf("/fm-hafif-sayfa/", null, "", 3_500L))
+            if (lightAttempt) attempts.add(arrayOf("/robots.txt", null, "", 3_500L))
             attempts.add(arrayOf("/", null, "", 18_000L))
             attempts.add(arrayOf("/", null, "XMLHttpRequest", 18_000L))
             for (att in attempts) {
@@ -752,7 +773,8 @@ class Filmmakinesi : MainAPI() {
                 lastBad = resp
                 if (code == 429) {
                     // Hız sınırı: Cloudflare/uygulama engeli DEĞİL. Başka anchor/host denemek sınırı daha da kötüleştirir.
-                    rateLimitedUntil = System.currentTimeMillis() + 7_000L
+                    rateLimitedUntil = System.currentTimeMillis() + rlCooldownMs
+                    log("429: ${rlCooldownMs / 1000} sn siteye istek atılmayacak")
                     return resp
                 }
                 if (code == 404 || code == 410) {
@@ -770,7 +792,7 @@ class Filmmakinesi : MainAPI() {
         }
     }
 
-    private suspend fun siteGet(path: String, extra: Map<String, String> = emptyMap()): SiteResp? {
+    private suspend fun siteGet(path: String, extra: Map<String, String> = emptyMap(), patient: Boolean = true): SiteResp? {
         // 1) Düz istekler (Cloudflare engeli görülürse 10 dk boyunca denenmez, doğrudan WebView)
         if (System.currentTimeMillis() >= plainBlockedUntil) {
             val tries = ArrayList<Pair<String, Boolean>>()
@@ -792,8 +814,8 @@ class Filmmakinesi : MainAPI() {
                 }
                 val sr = r?.let { SiteResp(it.code, it.text) }
                 if (r != null && r.code == 429) {
-                    rateLimitedUntil = System.currentTimeMillis() + 7_000L
-                    break
+                    rateLimitedUntil = System.currentTimeMillis() + rlCooldownMs
+                    return sr
                 }
                 if (!denied(sr)) {
                     good = Pair(host, desk)
@@ -815,30 +837,23 @@ class Filmmakinesi : MainAPI() {
             }
         }
 
-        // 2) WebView ile (çerez beklemeden, sayfa içinden XHR). 429 gelirse bekleyip aynı adresi yeniden dener.
+        // 2) WebView ile (çerez beklemeden, sayfa içinden XHR). 429 gelirse YENİDEN DENENMEZ (yasak uzuyor).
         val cands = listOf(good?.first ?: hosts[0], hosts[1], hosts[0]).distinct()
-        for (round in 0..3) {
-            var limited = false
-            for (host in cands) {
-                val r = try {
-                    wvFetch(host, path, extra)
-                } catch (e: java.util.concurrent.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    log("WV istisna ${e.javaClass.simpleName}")
-                    null
-                }
-                if (!denied(r)) {
-                    good = Pair(host, false)
-                    return r
-                }
-                if (r != null && r.code == 429) {
-                    limited = true
-                    log("429 hız sınırı, bekleniyor round=$round ${path.take(60)}")
-                    break
-                }
+        for (host in cands) {
+            val r = try {
+                wvFetch(host, path, extra, patient)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log("WV istisna ${e.javaClass.simpleName}")
+                null
             }
-            if (!limited) break
+            if (!denied(r)) {
+                good = Pair(host, false)
+                return r
+            }
+            if (r != null && r.code == 429) return r
+            if (r == null && !patient) return null
         }
         return null
     }
@@ -863,7 +878,7 @@ class Filmmakinesi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = try {
-            siteGet(pathOf(data))
+            siteGet(pathOf(data), patient = true)
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
