@@ -1112,7 +1112,7 @@ class Filmmakinesi : MainAPI() {
     // veriyor; OkHttp de 404 alıyor. Tarayıcıda ise embed, film sayfasının İÇİNDE iframe olarak yüklendiği için çalışıyor
     // (Sec-Fetch-Dest: iframe + Referer: film sayfası). Burada aynısı yapılır: film sayfası WebView'de açılır, içine
     // embed adresi iframe olarak eklenir ve iframe'in yaptığı .m3u8/.mp4 istekleri yakalanır.
-    private suspend fun webViewFrameFind(embed: String, pageUrl: String, base: String, label: String): Found? {
+    private suspend fun webViewFrameFind(embed: String, pageUrl: String, base: String, label: String, waitMs: Long = 35_000L): Found? {
         val script = "(function(){try{" +
             "if(window.__fmI){return '';}" +
             "if(!document.body||document.title.toLowerCase().indexOf('moment')>=0){return '';}" +
@@ -1132,12 +1132,12 @@ class Filmmakinesi : MainAPI() {
                 useOkhttp = false,
                 script = script,
                 scriptCallback = { },
-                timeout = 35_000L
+                timeout = waitMs
             ),
-            timeout = 45L
+            timeout = (waitMs / 1000L) + 10L
         )
         val u = resp.url
-        log("WVF $label ${u.take(100)}")
+        log("WVF $label ${u.take(120)}")
         if (u == pageUrl || u == embed || badExt.containsMatchIn(u) || !wvRegex.containsMatchIn(u)) return null
         val v = verifyUrl(u, streamHeaderSets(base, u))
         return Found(u, !isMp4(u), v.headers)
@@ -1236,8 +1236,9 @@ class Filmmakinesi : MainAPI() {
             }
         }
 
+        val isRapid = originOf(embed).contains("rapid", true)
         val wvf = try {
-            webViewFrameFind(embed, pageUrl, base, label)
+            webViewFrameFind(embed, pageUrl, base, label, if (isRapid) 24_000L else 35_000L)
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1246,6 +1247,8 @@ class Filmmakinesi : MainAPI() {
         }
         if (wvf != null) return wvf
 
+        // Rapid'de embed'i WebView'de doğrudan açmak anında Cloudflare hata sayfası veriyor; boşuna 25 sn beklenmesin
+        if (isRapid) return unverified
         val wv = try {
             webViewFind(embed, pageUrl, base, label)
         } catch (e: java.util.concurrent.CancellationException) {
@@ -1454,6 +1457,14 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
             if (r == null || r.code != 200) {
                 val r2 = fetchEmbed(embedUrl, hB, "B", false)
                 if (r2 != null && (r2.code == 200 || r == null)) r = r2
+            }
+            // Log analizi (04:51): Rapid embed'i hem sade hem tarayıcı başlıklarıyla 403 (Cloudflare hata sayfası, cf.errors.css) veriyor.
+            // CloudflareKiller "çözdü" görünüp yine 403 alıyor, WebView doğrudan açınca da hata sayfası geliyor ve 30 sn boşa gidiyor
+            // (Job was cancelled). Rapid için bu yollar atlanır; akış, film sayfasına iframe olarak gömülen embed'in
+            // rapidrame .m3u8 isteği yakalanarak (webViewFrameFind) alınır.
+            if (rapidHost && (r == null || r.code != 200)) {
+                log("EM Rapid düz istek yok: kod=${r?.code} ref=${rf.take(40)} gövde=" + (r?.text?.take(160)?.replace(Regex("\\s+"), " ") ?: ""))
+                continue
             }
             if (r == null || r.code != 200) {
                 val r3 = fetchEmbed(embedUrl, hB, "CF", true)
