@@ -1237,6 +1237,23 @@ class Filmmakinesi : MainAPI() {
         }
 
         val isRapid = originOf(embed).contains("rapid", true)
+        if (isRapid) {
+            val fu = try {
+                frameStreamWv(embed, pageUrl)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                log("FW hata ${e.javaClass.simpleName} ${e.message?.take(60)}")
+                null
+            }
+            if (fu != null) {
+                val fv = verifyUrl(fu, streamHeaderSets(base, fu))
+                log("V FW $label ok=${fv.ok} deep=${fv.deep} ${fu.take(90)}")
+                return Found(fu, !isMp4(fu), fv.headers)
+            }
+            // Rapid'de eski iframe yolu ayni basliktan dolayi duser; ek 24 sn beklenmesin
+            return unverified
+        }
         val wvf = try {
             webViewFrameFind(embed, pageUrl, base, label, if (isRapid) 24_000L else 35_000L)
         } catch (e: java.util.concurrent.CancellationException) {
@@ -1444,6 +1461,100 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
         return null
     }
 
+    // Android WebView her istege (alt cerceveler dahil) X-Requested-With: <paket> ekler; Chrome'da bu baslik yok.
+    // Rapid embed'i bu basligi gorunce Cloudflare engel sayfasi veriyor. Baslik, androidx.webkit varsa kapatilir.
+    private fun stripRequestedWith(w: android.webkit.WebView) {
+        try {
+            val cls = Class.forName("androidx.webkit.WebSettingsCompat")
+            val m = cls.getMethod("setRequestedWithHeaderOriginAllowList", android.webkit.WebSettings::class.java, java.util.Set::class.java)
+            m.invoke(null, w.settings, HashSet<String>())
+            log("XRW kapatildi")
+        } catch (e: Throwable) {
+            log("XRW kapatilamadi ${e.javaClass.simpleName} ${e.message?.take(60)}")
+        }
+    }
+
+    // Film sayfasini kendi WebView'imizde (X-Requested-With'siz) acar, embed'i iframe olarak gomer ve
+    // iframe'in yaptigi .m3u8 istegini yakalar.
+    private fun frameStreamWv(embed: String, pageUrl: String, waitMs: Long = 25_000L): String? {
+        val ctx = appContext()
+        if (ctx == null) {
+            log("FW: context yok")
+            return null
+        }
+        val hit = AtomicReference<String?>(null)
+        val holder = AtomicReference<android.webkit.WebView?>(null)
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val inject = "(function(){try{" +
+            "if(window.__fmI){return '';}" +
+            "if(!document.body||document.title.toLowerCase().indexOf('moment')>=0){return '';}" +
+            "window.__fmI=1;" +
+            "var f=document.createElement('iframe');" +
+            "f.src=" + JSONObject.quote(embed) + ";" +
+            "f.setAttribute('allow','autoplay; fullscreen; encrypted-media');" +
+            "f.style.cssText='position:fixed;left:0;top:0;width:100%;height:100%;border:0;z-index:99999;background:#000';" +
+            "document.body.appendChild(f);" +
+            "}catch(e){}return '';})();"
+        handler.post {
+            try {
+                val w = android.webkit.WebView(ctx)
+                holder.set(w)
+                w.settings.javaScriptEnabled = true
+                w.settings.domStorageEnabled = true
+                w.settings.mediaPlaybackRequiresUserGesture = false
+                w.settings.userAgentString = uaSiteMobile
+                stripRequestedWith(w)
+                try {
+                    android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookie(w, true)
+                } catch (_: Throwable) {
+                }
+                w.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: android.webkit.WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString().orEmpty()
+                        if (u.startsWith("http") && wvRegex.containsMatchIn(u) && !badExt.containsMatchIn(u)) {
+                            hit.compareAndSet(null, u)
+                        }
+                        return null
+                    }
+
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        try {
+                            view?.evaluateJavascript(inject, null)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+                w.loadUrl(pageUrl, mapOf("X-Requested-With" to ""))
+            } catch (e: Throwable) {
+                log("FW WebView hata ${e.javaClass.simpleName} ${e.message?.take(60)}")
+            }
+        }
+        val end = System.currentTimeMillis() + waitMs
+        while (System.currentTimeMillis() < end && hit.get() == null) {
+            Thread.sleep(500)
+            handler.post {
+                try {
+                    holder.get()?.evaluateJavascript(inject, null)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        handler.post {
+            try {
+                holder.get()?.stopLoading()
+                holder.get()?.destroy()
+            } catch (_: Throwable) {
+            }
+        }
+        val h = hit.get()
+        log("FW sonuc: " + (h?.take(140) ?: "yok"))
+        return h
+    }
+
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
         val refs = listOf(pageUrl, "$mainUrl/").distinct()
         var wvTried = false // WebView yedeği çağrı başına yalnızca bir kez (her referer için 25 sn beklenmesin)
@@ -1471,38 +1582,7 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
                     .replace(Regex("<[^>]+>"), " ")
                     .replace(Regex("\\s+"), " ").trim()
                 log("EM Rapid CF: kod=${r?.code} hata=$ecode ref=${rf.take(40)} metin=" + plain.take(600))
-                // Başlık matrisi: hangi istek biçimi geçiyor görmek için (masaüstü UA, Referer'sız)
-                val variants = listOf(
-                    "C" to mapOf(
-                        "User-Agent" to desktopUA,
-                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-                        "Referer" to "$mainUrl/",
-                        "Sec-Fetch-Dest" to "iframe",
-                        "Sec-Fetch-Mode" to "navigate",
-                        "Sec-Fetch-Site" to "cross-site"
-                    ),
-                    "D" to mapOf("User-Agent" to uaSiteMobile)
-                )
-                for ((vt, vh) in variants) {
-                    val rv = fetchEmbed(embedUrl, vh, vt, false)
-                    if (rv != null && rv.code == 200 && rv.text.isNotBlank()) {
-                        log("EM Rapid $vt başlıklarıyla 200")
-                        r = rv
-                        break
-                    }
-                }
-                // Deneme: embed'i rapidrame'nin kendi alan adından iste (site alt alanındaki Cloudflare kuralını atlayabilir)
-                for (alt in (if (r != null && r.code == 200) emptyList() else listOf("https://rapidrame.com", "https://www.rapidrame.com"))) {
-                    val au = embedUrl.replaceFirst(Regex("^https?://[^/]+"), alt)
-                    val ra = fetchEmbed(au, embedHeaders(rf), "ALT", false)
-                    log("EM Rapid alt ${au.take(60)} kod=${ra?.code}")
-                    if (ra != null && ra.code == 200 && ra.text.isNotBlank()) {
-                        r = ra
-                        break
-                    }
-                }
-                if (r == null || r.code != 200) continue
+                continue
             }
             if (r == null || r.code != 200) {
                 val r3 = fetchEmbed(embedUrl, hB, "CF", true)
