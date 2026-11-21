@@ -1152,7 +1152,7 @@ class Filmmakinesi : MainAPI() {
         }
         var n = 0
         while (got.get() == null && n < 10) {
-            kotlinx.coroutines.delay(100)
+            Thread.sleep(100)
             n++
         }
         val h = got.get()
