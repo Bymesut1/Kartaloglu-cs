@@ -1316,7 +1316,7 @@ class Filmmakinesi : MainAPI() {
         "Sec-Fetch-Site" to "cross-site"
     )
 
-    private suspend fun fetchEmbed(url: String, headers: Map<String, String>, tag: String): NiceResponse? {
+    private suspend fun fetchEmbed(url: String, headers: Map<String, String>, tag: String, allowCf: Boolean = true): NiceResponse? {
         var r = try {
             app.get(url, headers = headers, timeout = 10L)
         } catch (e: java.util.concurrent.CancellationException) {
@@ -1326,7 +1326,7 @@ class Filmmakinesi : MainAPI() {
             null
         }
         val cfBody = r != null && r.code != 200 && Regex("challenge-platform|Just a moment|cf-chl|cf\\.errors", IC).containsMatchIn(r.text)
-        if (r != null && (r.code == 403 || r.code == 503 || cfBody)) {
+        if (allowCf && r != null && (r.code == 403 || r.code == 503 || cfBody)) {
             r = try {
                 cfGet(url, headers)
             } catch (e: java.util.concurrent.CancellationException) {
@@ -1342,14 +1342,122 @@ class Filmmakinesi : MainAPI() {
         return r
     }
 
+    // ---------- Gerçek WebView'de oynatıcı betiğini çalıştır ----------
+    private fun appContext(): android.content.Context? = try {
+        Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? android.content.Context
+    } catch (e: Throwable) {
+        null
+    }
+
+    // jwplayer / Hls / video.src çağrılarını yakalayan sahte nesneler (harici betikler engellendiği için gerekli)
+    private val jsStub = """<script>(function(){var o2;
+function mk(){var b=function(){return o2};return new Proxy(b,{get:function(t,k){
+if(k==='setup'){return function(c){try{window.__cfg=JSON.stringify(c)}catch(e){window.__cfg='ERR'}return o2}}
+if(typeof k==='symbol'||k==='then'){return undefined}
+return function(){return o2}},apply:function(){return o2}})}
+o2=mk();
+window.jwplayer=function(){return o2};
+window['$']=window.jQuery=function(){return o2};
+window.Hls=function(){this.loadSource=function(u){window.__u=u};this.attachMedia=function(){};this.on=function(){};this.startLoad=function(){};this.destroy=function(){}};
+window.Hls.isSupported=function(){return true};window.Hls.Events={};
+try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){window.__u=v},get:function(){return ''}});}catch(e){}
+})();</script>"""
+
+    private fun jsStream(html: String, baseUrl: String, waitMs: Long = 9_000L): String? {
+        val ctx = appContext()
+        if (ctx == null) {
+            log("JS: context yok")
+            return null
+        }
+        val res = AtomicReference<String?>(null)
+        val hit = AtomicReference<String?>(null)
+        val holder = AtomicReference<android.webkit.WebView?>(null)
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val hm = Regex("<head[^>]*>", IC).find(html)
+        val page = if (hm != null) html.substring(0, hm.range.last + 1) + jsStub + html.substring(hm.range.last + 1) else jsStub + html
+        handler.post {
+            try {
+                val w = android.webkit.WebView(ctx)
+                holder.set(w)
+                w.settings.javaScriptEnabled = true
+                w.settings.domStorageEnabled = true
+                w.settings.userAgentString = uaSiteMobile
+                w.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: android.webkit.WebView?,
+                        request: android.webkit.WebResourceRequest?
+                    ): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString().orEmpty()
+                        if (u.startsWith("http") && wvRegex.containsMatchIn(u) && !badExt.containsMatchIn(u)) hit.set(u)
+                        // Ağa hiçbir şey gönderme (Cloudflare'e takılmasın); yalnızca satır içi betikler çalışsın
+                        return android.webkit.WebResourceResponse("text/plain", "utf-8", java.io.ByteArrayInputStream(ByteArray(0)))
+                    }
+                }
+                w.loadDataWithBaseURL(baseUrl, page, "text/html", "utf-8", null)
+            } catch (e: Throwable) {
+                log("JS WebView hata ${e.javaClass.simpleName} ${e.message?.take(60)}")
+            }
+        }
+        val end = System.currentTimeMillis() + waitMs
+        while (System.currentTimeMillis() < end && res.get() == null && hit.get() == null) {
+            Thread.sleep(400)
+            handler.post {
+                try {
+                    holder.get()?.evaluateJavascript("(function(){return window.__cfg||window.__u||''})()") { v ->
+                        if (v != null && v != "null" && v != "\"\"") res.set(v)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            Thread.sleep(150)
+        }
+        handler.post {
+            try {
+                holder.get()?.stopLoading()
+                holder.get()?.destroy()
+            } catch (_: Throwable) {
+            }
+        }
+        val raw = res.get()
+        if (raw != null) {
+            var str = ""
+            try {
+                str = (JSONTokener(raw).nextValue() as? String).orEmpty()
+            } catch (e: Exception) {
+            }
+            log("JS sonuç: " + str.take(260))
+            val f = Regex("\"file\"\\s*:\\s*\"(https?:[^\"]+)\"").findAll(str)
+                .map { it.groupValues[1].replace("\\/", "/") }
+                .firstOrNull { !badExt.containsMatchIn(it) }
+            if (f != null) return f
+            if (str.startsWith("http") && !badExt.containsMatchIn(str)) return str
+        }
+        val h = hit.get()
+        if (h != null) {
+            log("JS ağ isteği yakalandı: " + h.take(110))
+            return h
+        }
+        log("JS: sonuç yok")
+        return null
+    }
+
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
         val refs = listOf(pageUrl, "$mainUrl/").distinct()
         var wvTried = false // WebView yedeği çağrı başına yalnızca bir kez (her referer için 25 sn beklenmesin)
         for (rf in refs) {
-            var r = fetchEmbed(embedUrl, browserEmbedHeaders(rf), "tarayici")
+            // Log analizi: Rapid sayfası eski (sade) başlıklarla düz istekte 200 veriyor, tarayıcı başlıklarıyla Cloudflare 403 + 25 sn çözücü bekleme;
+            // Close sayfası tersine tarayıcı (iframe) başlıklarıyla 200 veriyor, sade başlıklarla 404. Bu yüzden sıra siteye göre seçilir.
+            val rapidHost = originOf(embedUrl).contains("rapid", true)
+            val hA = if (rapidHost) embedHeaders(rf) else browserEmbedHeaders(rf)
+            val hB = if (rapidHost) browserEmbedHeaders(rf) else embedHeaders(rf)
+            var r = fetchEmbed(embedUrl, hA, "A", false)
             if (r == null || r.code != 200) {
-                val r2 = fetchEmbed(embedUrl, embedHeaders(rf), "eski")
+                val r2 = fetchEmbed(embedUrl, hB, "B", false)
                 if (r2 != null && (r2.code == 200 || r == null)) r = r2
+            }
+            if (r == null || r.code != 200) {
+                val r3 = fetchEmbed(embedUrl, hB, "CF", true)
+                if (r3 != null) r = r3
             }
 
             var html: String
@@ -1377,6 +1485,22 @@ class Filmmakinesi : MainAPI() {
                 log("EM WV ile alındı len=${html.length} ${embedUrl.take(60)}")
             }
 
+            // Log analizi: Rapid sayfasındaki asıl adres her yüklemede değişen (rastgele isimli, tuzlu, karıştırmalı) bir JS ile
+            // çözülüyor; Close sayfasındaki sabit görünen master.txt ise sahte (404). Bu betikleri gerçek bir WebView'de çalıştırıp
+            // jwplayer.setup'a verilen ayarı yakalıyoruz.
+            val js = try {
+                jsStream(html, finalUrl)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                log("JS hata ${e.javaClass.simpleName} ${e.message?.take(60)}")
+                null
+            }
+            if (js != null) {
+                log("EM JS ile bulundu ${js.take(110)}")
+                return Embed(listOf(js), setOf(js), finalUrl)
+            }
+
             // Yeni çözücü: p.a.c.k.e.r, atob, dc_xxx([...]), av("..."), iç içe base64
             val blobs = FmDecoder.collectBlobs(html)
             val c = FmDecoder.candFrom(blobs)
@@ -1397,7 +1521,7 @@ class Filmmakinesi : MainAPI() {
                 }
             }
             log("EM len=${html.length} blob=${blobs.size} url=${urls.size} strict=${strict.size} final=${finalUrl.take(60)}")
-            if (strict.isEmpty()) {
+            run {
                 val ix = html.indexOf("closeload", ignoreCase = true)
                 if (ix >= 0) log("EM ipucu: " + html.substring(maxOf(0, ix - 160), minOf(html.length, ix + 200)).replace(Regex("\\s+"), " "))
                 Regex("<iframe[^>]*>", IC).find(html)?.let { log("EM iframe: " + it.value.take(200)) }
@@ -1407,6 +1531,7 @@ class Filmmakinesi : MainAPI() {
                     for (sc in Jsoup.parse(html).select("script:not([src])")) {
                         val d = sc.data()
                         if (d.length < 200) continue
+                        if (d.contains("olc()") || d.contains("devtoolsDetector") || d.startsWith("Date.now||") || d.contains("__CF\$cv\$params")) continue
                         k++
                         if (k > 6) break
                         log("EM script#$k len=${d.length}")
