@@ -163,73 +163,19 @@ class Filmmakinesi : MainAPI() {
 
     override val mainPage = mainPageOf(
         "/filmler-1/" to "Son Filmler",
-        "/yabanci-dizi-izle-1/" to "Diziler",
-        "/ulke/turkiye-fm4/" to "Yerli Filmler",
-        "/film-izle/olmeden-izlenmesi-gerekenler-fm1/" to "Ölmeden İzle",
-        "/seri-filmler-izle-1/" to "Seri Filmler",
-        "/kanal/netflix-fm1/" to "Netflix",
-        "/kanal/disney-fmgj6b/" to "Disney",
-        "/kanal/amazon/" to "PrimeVideo",
-        "/ulke/guney-kore-fm2/" to "Kore Filmleri",
-        "/tur/aksiyon-fmy54y/film/" to "Aksiyon",
-        "/tur/aile-fm2/film/" to "Aile",
-        "/tur/animasyon-fm2/film/" to "Animasyon",
-        "/tur/belgesel/film/" to "Belgesel",
-        "/tur/biyografi/film/" to "Biyografi",
-        "/tur/bilim-kurgu-fmy58w/film/" to "Bilim Kurgu",
-        "/tur/dram-fm1/film/" to "Dram",
-        "/tur/fantastik-fm1/film/" to "Fantastik",
-        "/tur/gerilim-fm1/film/" to "Gerilim",
-        "/tur/gizem/film/" to "Gizem",
-        "/tur/komedi-fm1/film/" to "Komedi",
-        "/tur/korku-fm2/film/" to "Korku",
-        "/tur/macera-fm1/film/" to "Macera",
-        "/tur/muzik/film/" to "Müzik",
-        "/tur/polisiye/film/" to "Polisiye",
-        "/tur/romantik-fm1/film/" to "Romantik",
-        "/tur/savas-fm1/film/" to "Savaş",
-        "/tur/spor/film/" to "Spor",
-        "/tur/tarih-fm1/film/" to "Tarih",
-        "/tur/western-fm1/film/" to "Western"
+        "/yabanci-dizi-izle-1/" to "Diziler"
     )
-
-    // ---- Ana sayfa satırları sırayla (aralıklı) yüklenir ----
-    // Log analizi (06:21): Cloudstream 29 satırı AYNI ANDA istiyordu; dakikalık bütçe (14) ilk satırlarda bitiyor,
-    // geri kalanlar ("bütçe doldu, ağ atlanıyor") hiç yüklenmeden BOŞ dönüyordu (Diziler, PrimeVideo, Kore, Aksiyon, ...).
-    // Artık satırlar atlanmıyor: her biri sıraya girer ve homeGapMs aralıkla (≈27 istek/dk, ban sınırının altında) yüklenir.
-    // 29 satır ≈ 65 sn'de biter (Cloudstream'in 120 sn sınırı içinde). Yüklenenler diske de yazılır, sonraki açılış anında gelir.
-    private val homeGapMs = 2_200L
-    private val homeMaxWaitMs = 100_000L
-    @Volatile
-    private var homeNextAt = 0L
-
-    @Synchronized
-    private fun reserveHome(): Long {
-        val now = System.currentTimeMillis()
-        val slot = maxOf(homeNextAt, now)
-        if (slot - now > homeMaxWaitMs) return -1L
-        homeNextAt = slot + homeGapMs
-        return slot - now
-    }
-
-    // true: sıra geldi, istek atılabilir; false: çok uzun beklenecekti ya da hız sınırı var
-    private suspend fun awaitHomeSlot(): Boolean {
-        val w = reserveHome()
-        if (w < 0) return false
-        if (w > 0) Thread.sleep(w) // kotlinx.coroutines bu modülde yok; dosyanın geri kalanı da Thread.sleep kullanıyor
-        return !isRateLimited()
-    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // Site HTTP 429 (hız sınırı) veriyor ve Cloudstream tüm satırları aynı anda isteyip toplam 120 sn'de pes ediyor.
-        // Taze önbellek -> sıralı ağ isteği (yalnızca sınır yoksa) -> bayat önbellek -> boş liste.
+        // Bu yüzden burada ASLA uzun beklenmez: taze önbellek -> ağ (yalnızca sınır yoksa) -> bayat önbellek -> boş liste.
         val path = request.data.trimEnd('/') + "/"
         val p = if (page <= 1) path else "${path}sayfa/$page/"
         var html = diskGet(p).orEmpty()
         val fresh = html.isNotBlank()
         if (!fresh && !isRateLimited()) {
             html = try {
-                if (awaitHomeSlot()) siteGet(p, patient = false)?.text.orEmpty() else ""
+                siteGet(p, patient = false)?.text.orEmpty()
             } catch (e: java.util.concurrent.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -242,7 +188,7 @@ class Filmmakinesi : MainAPI() {
                     val alt2 = alt.trimEnd('/') + "/"
                     val p2 = if (page <= 1) alt2 else "${alt2}sayfa/$page/"
                     html = try {
-                        if (awaitHomeSlot()) siteGet(p2, patient = false)?.text.orEmpty() else ""
+                        siteGet(p2, patient = false)?.text.orEmpty()
                     } catch (e: java.util.concurrent.CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -308,7 +254,7 @@ class Filmmakinesi : MainAPI() {
         val stem = segs[idx].replace(sufRe, "")
         if (stem.length < 4) return null
         val home = try {
-            if (awaitHomeSlot()) siteGet("/", patient = false)?.text.orEmpty() else ""
+            siteGet("/", patient = false)?.text.orEmpty()
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -654,10 +600,8 @@ class Filmmakinesi : MainAPI() {
     }
     @Synchronized
     private fun noteNet() { netTimes.addLast(System.currentTimeMillis()) }
-    // Ana sayfa satırları artık awaitHomeSlot() ile aralıklı gittiği için bu bütçeler yalnızca acil durum emniyeti:
-    // eskiden 14'tü ve 29 satırın yarısı "bütçe doldu" diye boş kalıyordu.
-    private val homeBudget = 40   // ana sayfa satırları dakikada en çok bu kadar sayfa çeker
-    private val allBudget = 50    // kullanıcı eylemleri dahil üst sınır
+    private val homeBudget = 14   // ana sayfa satırları dakikada en çok bu kadar sayfa çeker
+    private val allBudget = 22    // kullanıcı eylemleri dahil üst sınır
 
     private fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntil
     private val rlCooldownMs = 5 * 60_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
@@ -1141,7 +1085,7 @@ class Filmmakinesi : MainAPI() {
     // veriyor; OkHttp de 404 alıyor. Tarayıcıda ise embed, film sayfasının İÇİNDE iframe olarak yüklendiği için çalışıyor
     // (Sec-Fetch-Dest: iframe + Referer: film sayfası). Burada aynısı yapılır: film sayfası WebView'de açılır, içine
     // embed adresi iframe olarak eklenir ve iframe'in yaptığı .m3u8/.mp4 istekleri yakalanır.
-    private suspend fun webViewFrameFind(embed: String, pageUrl: String, base: String, label: String, waitMs: Long = 35_000L): Found? {
+    private suspend fun webViewFrameFind(embed: String, pageUrl: String, base: String, label: String): Found? {
         val script = "(function(){try{" +
             "if(window.__fmI){return '';}" +
             "if(!document.body||document.title.toLowerCase().indexOf('moment')>=0){return '';}" +
@@ -1161,12 +1105,12 @@ class Filmmakinesi : MainAPI() {
                 useOkhttp = false,
                 script = script,
                 scriptCallback = { },
-                timeout = waitMs
+                timeout = 35_000L
             ),
-            timeout = (waitMs / 1000L) + 10L
+            timeout = 45L
         )
         val u = resp.url
-        log("WVF $label ${u.take(120)}")
+        log("WVF $label ${u.take(100)}")
         if (u == pageUrl || u == embed || badExt.containsMatchIn(u) || !wvRegex.containsMatchIn(u)) return null
         val v = verifyUrl(u, streamHeaderSets(base, u))
         return Found(u, !isMp4(u), v.headers)
@@ -1265,9 +1209,8 @@ class Filmmakinesi : MainAPI() {
             }
         }
 
-        val isRapid = originOf(embed).contains("rapid", true)
         val wvf = try {
-            webViewFrameFind(embed, pageUrl, base, label, if (isRapid) 24_000L else 35_000L)
+            webViewFrameFind(embed, pageUrl, base, label)
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1276,8 +1219,6 @@ class Filmmakinesi : MainAPI() {
         }
         if (wvf != null) return wvf
 
-        // Rapid'de embed'i WebView'de doğrudan açmak anında Cloudflare hata sayfası veriyor; boşuna 25 sn beklenmesin
-        if (isRapid) return unverified
         val wv = try {
             webViewFind(embed, pageUrl, base, label)
         } catch (e: java.util.concurrent.CancellationException) {
@@ -1486,52 +1427,6 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
             if (r == null || r.code != 200) {
                 val r2 = fetchEmbed(embedUrl, hB, "B", false)
                 if (r2 != null && (r2.code == 200 || r == null)) r = r2
-            }
-            // Log analizi (04:51): Rapid embed'i hem sade hem tarayıcı başlıklarıyla 403 (Cloudflare hata sayfası, cf.errors.css) veriyor.
-            // CloudflareKiller "çözdü" görünüp yine 403 alıyor, WebView doğrudan açınca da hata sayfası geliyor ve 30 sn boşa gidiyor
-            // (Job was cancelled). Rapid için bu yollar atlanır; akış, film sayfasına iframe olarak gömülen embed'in
-            // rapidrame .m3u8 isteği yakalanarak (webViewFrameFind) alınır.
-            if (rapidHost && (r == null || r.code != 200)) {
-                // Log analizi (05:16): iframe içinde bile cf.errors.css geliyor => Cloudflare bu bağlantıyı (IP/VPN) engelliyor.
-                val body = r?.text.orEmpty()
-                val ecode = Regex("Error\\s+(\\d{3,4})|error code:?\\s*(\\d{3,4})", IC).find(body)?.value
-                val plain = body
-                    .replace(Regex("<(script|style)[^>]*>.*?</\\1>", setOf(IC, RegexOption.DOT_MATCHES_ALL)), " ")
-                    .replace(Regex("<[^>]+>"), " ")
-                    .replace(Regex("\\s+"), " ").trim()
-                log("EM Rapid CF: kod=${r?.code} hata=$ecode ref=${rf.take(40)} metin=" + plain.take(600))
-                // Başlık matrisi: hangi istek biçimi geçiyor görmek için (masaüstü UA, Referer'sız)
-                val variants = listOf(
-                    "C" to mapOf(
-                        "User-Agent" to desktopUA,
-                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-                        "Referer" to "$mainUrl/",
-                        "Sec-Fetch-Dest" to "iframe",
-                        "Sec-Fetch-Mode" to "navigate",
-                        "Sec-Fetch-Site" to "cross-site"
-                    ),
-                    "D" to mapOf("User-Agent" to uaSiteMobile)
-                )
-                for ((vt, vh) in variants) {
-                    val rv = fetchEmbed(embedUrl, vh, vt, false)
-                    if (rv != null && rv.code == 200 && rv.text.isNotBlank()) {
-                        log("EM Rapid $vt başlıklarıyla 200")
-                        r = rv
-                        break
-                    }
-                }
-                // Deneme: embed'i rapidrame'nin kendi alan adından iste (site alt alanındaki Cloudflare kuralını atlayabilir)
-                for (alt in (if (r != null && r.code == 200) emptyList() else listOf("https://rapidrame.com", "https://www.rapidrame.com"))) {
-                    val au = embedUrl.replaceFirst(Regex("^https?://[^/]+"), alt)
-                    val ra = fetchEmbed(au, embedHeaders(rf), "ALT", false)
-                    log("EM Rapid alt ${au.take(60)} kod=${ra?.code}")
-                    if (ra != null && ra.code == 200 && ra.text.isNotBlank()) {
-                        r = ra
-                        break
-                    }
-                }
-                if (r == null || r.code != 200) continue
             }
             if (r == null || r.code != 200) {
                 val r3 = fetchEmbed(embedUrl, hB, "CF", true)
