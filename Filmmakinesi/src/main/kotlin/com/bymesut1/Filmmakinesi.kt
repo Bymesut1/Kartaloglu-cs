@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.Jsoup
@@ -193,16 +194,43 @@ class Filmmakinesi : MainAPI() {
         "/tur/western-fm1/film/" to "Western"
     )
 
+    // ---- Ana sayfa satırları sırayla (aralıklı) yüklenir ----
+    // Log analizi (06:21): Cloudstream 29 satırı AYNI ANDA istiyordu; dakikalık bütçe (14) ilk satırlarda bitiyor,
+    // geri kalanlar ("bütçe doldu, ağ atlanıyor") hiç yüklenmeden BOŞ dönüyordu (Diziler, PrimeVideo, Kore, Aksiyon, ...).
+    // Artık satırlar atlanmıyor: her biri sıraya girer ve homeGapMs aralıkla (≈27 istek/dk, ban sınırının altında) yüklenir.
+    // 29 satır ≈ 65 sn'de biter (Cloudstream'in 120 sn sınırı içinde). Yüklenenler diske de yazılır, sonraki açılış anında gelir.
+    private val homeGapMs = 2_200L
+    private val homeMaxWaitMs = 100_000L
+    @Volatile
+    private var homeNextAt = 0L
+
+    @Synchronized
+    private fun reserveHome(): Long {
+        val now = System.currentTimeMillis()
+        val slot = maxOf(homeNextAt, now)
+        if (slot - now > homeMaxWaitMs) return -1L
+        homeNextAt = slot + homeGapMs
+        return slot - now
+    }
+
+    // true: sıra geldi, istek atılabilir; false: çok uzun beklenecekti ya da hız sınırı var
+    private suspend fun awaitHomeSlot(): Boolean {
+        val w = reserveHome()
+        if (w < 0) return false
+        if (w > 0) delay(w)
+        return !isRateLimited()
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // Site HTTP 429 (hız sınırı) veriyor ve Cloudstream tüm satırları aynı anda isteyip toplam 120 sn'de pes ediyor.
-        // Bu yüzden burada ASLA uzun beklenmez: taze önbellek -> ağ (yalnızca sınır yoksa) -> bayat önbellek -> boş liste.
+        // Taze önbellek -> sıralı ağ isteği (yalnızca sınır yoksa) -> bayat önbellek -> boş liste.
         val path = request.data.trimEnd('/') + "/"
         val p = if (page <= 1) path else "${path}sayfa/$page/"
         var html = diskGet(p).orEmpty()
         val fresh = html.isNotBlank()
         if (!fresh && !isRateLimited()) {
             html = try {
-                siteGet(p, patient = false)?.text.orEmpty()
+                if (awaitHomeSlot()) siteGet(p, patient = false)?.text.orEmpty() else ""
             } catch (e: java.util.concurrent.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -215,7 +243,7 @@ class Filmmakinesi : MainAPI() {
                     val alt2 = alt.trimEnd('/') + "/"
                     val p2 = if (page <= 1) alt2 else "${alt2}sayfa/$page/"
                     html = try {
-                        siteGet(p2, patient = false)?.text.orEmpty()
+                        if (awaitHomeSlot()) siteGet(p2, patient = false)?.text.orEmpty() else ""
                     } catch (e: java.util.concurrent.CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -281,7 +309,7 @@ class Filmmakinesi : MainAPI() {
         val stem = segs[idx].replace(sufRe, "")
         if (stem.length < 4) return null
         val home = try {
-            siteGet("/", patient = false)?.text.orEmpty()
+            if (awaitHomeSlot()) siteGet("/", patient = false)?.text.orEmpty() else ""
         } catch (e: java.util.concurrent.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -627,8 +655,10 @@ class Filmmakinesi : MainAPI() {
     }
     @Synchronized
     private fun noteNet() { netTimes.addLast(System.currentTimeMillis()) }
-    private val homeBudget = 14   // ana sayfa satırları dakikada en çok bu kadar sayfa çeker
-    private val allBudget = 22    // kullanıcı eylemleri dahil üst sınır
+    // Ana sayfa satırları artık awaitHomeSlot() ile aralıklı gittiği için bu bütçeler yalnızca acil durum emniyeti:
+    // eskiden 14'tü ve 29 satırın yarısı "bütçe doldu" diye boş kalıyordu.
+    private val homeBudget = 40   // ana sayfa satırları dakikada en çok bu kadar sayfa çeker
+    private val allBudget = 50    // kullanıcı eylemleri dahil üst sınır
 
     private fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntil
     private val rlCooldownMs = 5 * 60_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
