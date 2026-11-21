@@ -1301,28 +1301,55 @@ class Filmmakinesi : MainAPI() {
         "Referer" to ref
     )
 
+    // Gerçek mobil Chrome'un iframe içinde embed isterken gönderdiği başlıklar (Sec-Fetch-Dest: iframe, cross-site)
+    private fun browserEmbedHeaders(ref: String): Map<String, String> = mapOf(
+        "User-Agent" to uaSiteMobile,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
+        "Referer" to ref,
+        "sec-ch-ua" to "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
+        "sec-ch-ua-mobile" to "?1",
+        "sec-ch-ua-platform" to "\"Android\"",
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "iframe",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "cross-site"
+    )
+
+    private suspend fun fetchEmbed(url: String, headers: Map<String, String>, tag: String): NiceResponse? {
+        var r = try {
+            app.get(url, headers = headers, timeout = 10L)
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("EM hata $tag ${e.message?.take(60)}")
+            null
+        }
+        val cfBody = r != null && r.code != 200 && Regex("challenge-platform|Just a moment|cf-chl|cf\\.errors", IC).containsMatchIn(r.text)
+        if (r != null && (r.code == 403 || r.code == 503 || cfBody)) {
+            r = try {
+                cfGet(url, headers)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log("EM cf hata $tag ${e.message?.take(60)}")
+                r
+            }
+        }
+        if (r != null && r.code != 200) {
+            log("EM $tag kod=${r.code} len=${r.text.length} server=${r.headers["server"]} ray=${r.headers["cf-ray"]} mit=${r.headers["cf-mitigated"]} ${url.take(60)}")
+        }
+        return r
+    }
+
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
         val refs = listOf(pageUrl, "$mainUrl/").distinct()
         var wvTried = false // WebView yedeği çağrı başına yalnızca bir kez (her referer için 25 sn beklenmesin)
         for (rf in refs) {
-            var r = try {
-                app.get(embedUrl, headers = embedHeaders(rf), timeout = 10L)
-            } catch (e: java.util.concurrent.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                log("EM hata ${e.message?.take(60)}")
-                null
-            }
-            val cfBody = r != null && r.code != 200 && Regex("challenge-platform|Just a moment|cf-chl|cf\\.errors", IC).containsMatchIn(r.text)
-            if (r != null && (r.code == 403 || r.code == 503 || cfBody)) {
-                r = try {
-                    cfGet(embedUrl, embedHeaders(rf))
-                } catch (e: java.util.concurrent.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    log("EM cf hata ${e.message?.take(60)}")
-                    r
-                }
+            var r = fetchEmbed(embedUrl, browserEmbedHeaders(rf), "tarayici")
+            if (r == null || r.code != 200) {
+                val r2 = fetchEmbed(embedUrl, embedHeaders(rf), "eski")
+                if (r2 != null && (r2.code == 200 || r == null)) r = r2
             }
 
             var html: String
@@ -1375,6 +1402,22 @@ class Filmmakinesi : MainAPI() {
                 if (ix >= 0) log("EM ipucu: " + html.substring(maxOf(0, ix - 160), minOf(html.length, ix + 200)).replace(Regex("\\s+"), " "))
                 Regex("<iframe[^>]*>", IC).find(html)?.let { log("EM iframe: " + it.value.take(200)) }
                 log("EM başlık: " + (Jsoup.parse(html).title().take(80)))
+                try {
+                    var k = 0
+                    for (sc in Jsoup.parse(html).select("script:not([src])")) {
+                        val d = sc.data()
+                        if (d.length < 200) continue
+                        k++
+                        if (k > 6) break
+                        log("EM script#$k len=${d.length}")
+                        var o = 0
+                        while (o < d.length && o < 7000) {
+                            log("EM s$k[$o]: " + d.substring(o, minOf(d.length, o + 1800)).replace(Regex("\\s+"), " "))
+                            o += 1800
+                        }
+                    }
+                } catch (_: Exception) {
+                }
             }
             if (urls.isNotEmpty()) return Embed(urls.toList(), strict, finalUrl)
 
@@ -1810,7 +1853,7 @@ private object FmDecoder {
     private val streamRe = Regex("""\.m3u8|\.mp4|sublist|/hls\d?/|/(?:master|playlist|index)[^/"']*\.txt""", IC)
     private val badRe = Regex("""\.(?:vtt|srt|jpe?g|png|gif|webp|css|js|svg|ico|woff2?)(?:\?|#|/?\z)""", IC)
     private val junkRe = Regex(
-        """cloudflareinsights|cloudflare\.com|googletagmanager|google-analytics|googlesyndication|gstatic|googleapis|doubleclick|facebook\.|twitter\.|jquery|cdnjs|jsdelivr|unpkg|bootstrapcdn|histats|yandex|adsterra|popads|beacon\.min\.js|/cdn-cgi/""",
+        """cloudflareinsights|cloudflare\.com|googletagmanager|google-analytics|googlesyndication|gstatic|googleapis|doubleclick|facebook\.|twitter\.|jquery|cdnjs|jsdelivr|unpkg|bootstrapcdn|histats|yandex|adsterra|popads|beacon\.min\.js|/cdn-cgi/|/ah/?(?:[?#]|$)""",
         IC
     )
     private val keyedRe = Regex(
