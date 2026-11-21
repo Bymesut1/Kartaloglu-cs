@@ -1078,18 +1078,86 @@ class Filmmakinesi : MainAPI() {
         return firstOk ?: Verified(false, false, sets[0])
     }
 
+    // Oynatıcıyı WebView'de gerçekten başlatmayı dener (autoplay engelli olduğundan tıklama gerekebilir)
+    private val playScript =
+        "(function(){try{" +
+            "var v=document.querySelector('video');" +
+            "if(v){v.muted=true;var p=v.play();if(p&&p.catch){p.catch(function(){});}}" +
+            "var b=document.querySelector('.jw-icon-display,.jw-display-icon-container,.vjs-big-play-button,.plyr__control--overlayed,.play-button,.play,#play,[class*=play]');" +
+            "if(b&&b.click){b.click();}" +
+            "}catch(e){}return '';})();"
+
     private suspend fun webViewFind(embed: String, pageUrl: String, base: String, label: String): Found? {
+        // Log analizi: WebView embed sayfasını Android'in X-Requested-With: <paket> başlığıyla açınca Cloudflare
+        // hata sayfası (cf.errors.css) dönüyor ve 60 sn boşuna bekleniyordu. Başlık boş değerle ezilir (ana sitede de böyle çözüldü).
         val resp = app.get(
             embed,
             referer = pageUrl,
-            headers = mapOf("User-Agent" to androidUA),
-            interceptor = WebViewResolver(wvRegex)
+            headers = mapOf("X-Requested-With" to ""),
+            interceptor = WebViewResolver(
+                wvRegex,
+                script = playScript,
+                scriptCallback = { },
+                timeout = 25_000L
+            )
         )
         val u = resp.url
         log("WV $label ${u.take(100)}")
         if (u == embed || badExt.containsMatchIn(u) || !wvRegex.containsMatchIn(u)) return null
         val v = verifyUrl(u, streamHeaderSets(base, u))
         return Found(u, !isMp4(u), v.headers)
+    }
+
+    // Düz istek 404/403 alınca embed sayfasının HTML'ini WebView'den (çizilmiş haliyle) alır.
+    // X-Requested-With ezilir; Cloudflare doğrulaması varsa sayfa gerçekten açılana kadar beklenir.
+    private val wvHtmlScript =
+        "(function(){try{" +
+            "var d=document;if(!d.documentElement){return '';}" +
+            "var h=d.documentElement.outerHTML||'';" +
+            "var t=d.title||'';" +
+            "if(h.length>2500&&h.indexOf('<script')>=0&&h.indexOf('cf-chl')<0&&h.indexOf('challenge-platform')<0&&!/just a moment|access denied|attention required|404|not found/i.test(t)){" +
+            "if(!window.__fmH){window.__fmH=1;setTimeout(function(){try{new Image().src='/__fm_done__?'+Date.now();}catch(e){}},1800);}" +
+            "return h;}" +
+            "return '';}catch(e){return '';}})();"
+
+    private suspend fun wvHtml(url: String, referer: String): String? {
+        val got = AtomicReference<String?>(null)
+        try {
+            app.get(
+                url,
+                referer = referer,
+                headers = mapOf("X-Requested-With" to ""),
+                interceptor = WebViewResolver(
+                    Regex("__fm_done__"),
+                    useOkhttp = false,
+                    script = wvHtmlScript,
+                    scriptCallback = { v ->
+                        if (v != null && v != "null" && v.length > 10) {
+                            val s = try {
+                                JSONTokener(v).nextValue() as? String
+                            } catch (e: Exception) {
+                                null
+                            }
+                            if (!s.isNullOrBlank()) got.set(s)
+                        }
+                    },
+                    timeout = 25_000L
+                ),
+                timeout = 40L
+            )
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("WVH hata ${e.javaClass.simpleName} ${url.take(60)}")
+        }
+        var n = 0
+        while (got.get() == null && n < 10) {
+            kotlinx.coroutines.delay(100)
+            n++
+        }
+        val h = got.get()
+        log("WVH len=${h?.length ?: 0} ${url.take(70)}")
+        return h
     }
 
     private suspend fun findStream(embed: String, pageUrl: String, label: String): Found? {
@@ -1135,6 +1203,8 @@ class Filmmakinesi : MainAPI() {
 
         val wv = try {
             webViewFind(embed, pageUrl, base, label)
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
         } catch (e: Exception) {
             log("WV hata $label ${e.message?.take(60)}")
             null
@@ -1188,9 +1258,12 @@ class Filmmakinesi : MainAPI() {
 
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
         val refs = listOf(pageUrl, "$mainUrl/").distinct()
+        var wvTried = false // WebView yedeği çağrı başına yalnızca bir kez (her referer için 25 sn beklenmesin)
         for (rf in refs) {
             var r = try {
                 app.get(embedUrl, headers = embedHeaders(rf), timeout = 10L)
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 log("EM hata ${e.message?.take(60)}")
                 null
@@ -1199,18 +1272,37 @@ class Filmmakinesi : MainAPI() {
             if (r != null && (r.code == 403 || r.code == 503 || cfBody)) {
                 r = try {
                     cfGet(embedUrl, embedHeaders(rf))
+                } catch (e: java.util.concurrent.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     log("EM cf hata ${e.message?.take(60)}")
                     r
                 }
             }
-            if (r == null || r.code != 200) {
+
+            var html: String
+            var finalUrl: String
+            if (r != null && r.code == 200 && r.text.isNotBlank()) {
+                html = r.text
+                finalUrl = r.url.ifBlank { embedUrl }
+            } else {
                 log("EM kod=${r?.code} ${embedUrl.take(70)}")
-                continue
+                // Düz istek (OkHttp) Cloudflare/uygulama filtresine takılıyor: sayfayı WebView'den (X-Requested-With ezilmiş) al
+                if (wvTried) continue
+                wvTried = true
+                val w = try {
+                    wvHtml(embedUrl, rf)
+                } catch (e: java.util.concurrent.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    log("EM wv hata ${e.message?.take(60)}")
+                    null
+                }
+                if (w.isNullOrBlank()) continue
+                html = w
+                finalUrl = embedUrl
+                log("EM WV ile alındı len=${html.length} ${embedUrl.take(60)}")
             }
-            val html = r.text
-            if (html.isBlank()) continue
-            val finalUrl = r.url.ifBlank { embedUrl }
 
             // Yeni çözücü: p.a.c.k.e.r, atob, dc_xxx([...]), av("..."), iç içe base64
             val blobs = FmDecoder.collectBlobs(html)
