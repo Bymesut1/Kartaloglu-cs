@@ -1463,8 +1463,46 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
             // (Job was cancelled). Rapid için bu yollar atlanır; akış, film sayfasına iframe olarak gömülen embed'in
             // rapidrame .m3u8 isteği yakalanarak (webViewFrameFind) alınır.
             if (rapidHost && (r == null || r.code != 200)) {
-                log("EM Rapid düz istek yok: kod=${r?.code} ref=${rf.take(40)} gövde=" + (r?.text?.take(160)?.replace(Regex("\\s+"), " ") ?: ""))
-                continue
+                // Log analizi (05:16): iframe içinde bile cf.errors.css geliyor => Cloudflare bu bağlantıyı (IP/VPN) engelliyor.
+                val body = r?.text.orEmpty()
+                val ecode = Regex("Error\\s+(\\d{3,4})|error code:?\\s*(\\d{3,4})", IC).find(body)?.value
+                val plain = body
+                    .replace(Regex("<(script|style)[^>]*>.*?</\\1>", setOf(IC, RegexOption.DOT_MATCHES_ALL)), " ")
+                    .replace(Regex("<[^>]+>"), " ")
+                    .replace(Regex("\\s+"), " ").trim()
+                log("EM Rapid CF: kod=${r?.code} hata=$ecode ref=${rf.take(40)} metin=" + plain.take(600))
+                // Başlık matrisi: hangi istek biçimi geçiyor görmek için (masaüstü UA, Referer'sız)
+                val variants = listOf(
+                    "C" to mapOf(
+                        "User-Agent" to desktopUA,
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
+                        "Referer" to "$mainUrl/",
+                        "Sec-Fetch-Dest" to "iframe",
+                        "Sec-Fetch-Mode" to "navigate",
+                        "Sec-Fetch-Site" to "cross-site"
+                    ),
+                    "D" to mapOf("User-Agent" to uaSiteMobile)
+                )
+                for ((vt, vh) in variants) {
+                    val rv = fetchEmbed(embedUrl, vh, vt, false)
+                    if (rv != null && rv.code == 200 && rv.text.isNotBlank()) {
+                        log("EM Rapid $vt başlıklarıyla 200")
+                        r = rv
+                        break
+                    }
+                }
+                // Deneme: embed'i rapidrame'nin kendi alan adından iste (site alt alanındaki Cloudflare kuralını atlayabilir)
+                for (alt in (if (r != null && r.code == 200) emptyList() else listOf("https://rapidrame.com", "https://www.rapidrame.com"))) {
+                    val au = embedUrl.replaceFirst(Regex("^https?://[^/]+"), alt)
+                    val ra = fetchEmbed(au, embedHeaders(rf), "ALT", false)
+                    log("EM Rapid alt ${au.take(60)} kod=${ra?.code}")
+                    if (ra != null && ra.code == 200 && ra.text.isNotBlank()) {
+                        r = ra
+                        break
+                    }
+                }
+                if (r == null || r.code != 200) continue
             }
             if (r == null || r.code != 200) {
                 val r3 = fetchEmbed(embedUrl, hB, "CF", true)
