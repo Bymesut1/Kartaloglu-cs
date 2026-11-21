@@ -1108,6 +1108,41 @@ class Filmmakinesi : MainAPI() {
         return Found(u, !isMp4(u), v.headers)
     }
 
+    // Log analizi: embed adreslerini (closeload / rapid) WebView'de DOĞRUDAN açınca Cloudflare anında hata sayfası (cf.errors.css)
+    // veriyor; OkHttp de 404 alıyor. Tarayıcıda ise embed, film sayfasının İÇİNDE iframe olarak yüklendiği için çalışıyor
+    // (Sec-Fetch-Dest: iframe + Referer: film sayfası). Burada aynısı yapılır: film sayfası WebView'de açılır, içine
+    // embed adresi iframe olarak eklenir ve iframe'in yaptığı .m3u8/.mp4 istekleri yakalanır.
+    private suspend fun webViewFrameFind(embed: String, pageUrl: String, base: String, label: String): Found? {
+        val script = "(function(){try{" +
+            "if(window.__fmI){return '';}" +
+            "if(!document.body||document.title.toLowerCase().indexOf('moment')>=0){return '';}" +
+            "window.__fmI=1;" +
+            "var f=document.createElement('iframe');" +
+            "f.src=" + JSONObject.quote(embed) + ";" +
+            "f.setAttribute('allow','autoplay; fullscreen; encrypted-media');" +
+            "f.setAttribute('allowfullscreen','true');" +
+            "f.style.cssText='position:fixed;left:0;top:0;width:100%;height:100%;border:0;z-index:99999;background:#000';" +
+            "document.body.appendChild(f);" +
+            "}catch(e){}return '';})();"
+        val resp = app.get(
+            pageUrl,
+            headers = mapOf("X-Requested-With" to ""),
+            interceptor = WebViewResolver(
+                wvRegex,
+                useOkhttp = false,
+                script = script,
+                scriptCallback = { },
+                timeout = 35_000L
+            ),
+            timeout = 45L
+        )
+        val u = resp.url
+        log("WVF $label ${u.take(100)}")
+        if (u == pageUrl || u == embed || badExt.containsMatchIn(u) || !wvRegex.containsMatchIn(u)) return null
+        val v = verifyUrl(u, streamHeaderSets(base, u))
+        return Found(u, !isMp4(u), v.headers)
+    }
+
     // Düz istek 404/403 alınca embed sayfasının HTML'ini WebView'den (çizilmiş haliyle) alır.
     // X-Requested-With ezilir; Cloudflare doğrulaması varsa sayfa gerçekten açılana kadar beklenir.
     private val wvHtmlScript =
@@ -1201,6 +1236,16 @@ class Filmmakinesi : MainAPI() {
             }
         }
 
+        val wvf = try {
+            webViewFrameFind(embed, pageUrl, base, label)
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("WVF hata $label ${e.message?.take(60)}")
+            null
+        }
+        if (wvf != null) return wvf
+
         val wv = try {
             webViewFind(embed, pageUrl, base, label)
         } catch (e: java.util.concurrent.CancellationException) {
@@ -1287,6 +1332,7 @@ class Filmmakinesi : MainAPI() {
                 finalUrl = r.url.ifBlank { embedUrl }
             } else {
                 log("EM kod=${r?.code} ${embedUrl.take(70)}")
+                if (r != null) log("EM gövde: " + r.text.take(220).replace(Regex("\\s+"), " "))
                 // Düz istek (OkHttp) Cloudflare/uygulama filtresine takılıyor: sayfayı WebView'den (X-Requested-With ezilmiş) al
                 if (wvTried) continue
                 wvTried = true
@@ -1324,6 +1370,12 @@ class Filmmakinesi : MainAPI() {
                 }
             }
             log("EM len=${html.length} blob=${blobs.size} url=${urls.size} strict=${strict.size} final=${finalUrl.take(60)}")
+            if (strict.isEmpty()) {
+                val ix = html.indexOf("closeload", ignoreCase = true)
+                if (ix >= 0) log("EM ipucu: " + html.substring(maxOf(0, ix - 160), minOf(html.length, ix + 200)).replace(Regex("\\s+"), " "))
+                Regex("<iframe[^>]*>", IC).find(html)?.let { log("EM iframe: " + it.value.take(200)) }
+                log("EM başlık: " + (Jsoup.parse(html).title().take(80)))
+            }
             if (urls.isNotEmpty()) return Embed(urls.toList(), strict, finalUrl)
 
             val inner = Jsoup.parse(html).selectFirst("iframe[data-src], iframe[src]")
