@@ -602,14 +602,36 @@ class Filmmakinesi : MainAPI() {
     // Site hız sınırı koyuyor (HTTP 429 "Biraz yavaşlayalım"): HDFilmCehennemi'ndeki gibi 6 paralel WebView burada
     // sınırı hemen aşıyordu. Bu yüzden istekler tek tek, aralarında boşlukla gider; 429 gelirse herkes bekler.
     private val wvPar = Semaphore(2)
-    private val gapMs = 800L
+    private val gapMs = 1_000L
     @Volatile
     private var nextSlotAt = 0L
     @Volatile
-    private var rateLimitedUntil = 0L
+    private var rateLimitedUntil = loadRl()
+
+    // Site IP'yi "birkaç dakika" engelliyor (tarayıcıda da aynı uyarı çıkıyor). Bekleme süresi uygulama kapanınca kaybolmasın diye diske yazılır.
+    private fun rlFile() = java.io.File(catDir, "fm_rl.txt")
+    private fun loadRl(): Long = try { rlFile().readText().trim().toLong() } catch (e: Throwable) { 0L }
+    private fun markRateLimited() {
+        rateLimitedUntil = System.currentTimeMillis() + rlCooldownMs
+        try { rlFile().writeText(rateLimitedUntil.toString()) } catch (e: Throwable) { }
+        log("429: ${rlCooldownMs / 1000} sn siteye istek atılmayacak")
+    }
+
+    // Son 60 sn'deki ağ sayfa istekleri: sınıra hiç ulaşmadan durmak için (ban 24 sayfa/25 sn'de geldi, 31/dk güvenliydi)
+    private val netTimes = java.util.ArrayDeque<Long>()
+    @Synchronized
+    private fun netCount(): Int {
+        val lim = System.currentTimeMillis() - 60_000L
+        while (netTimes.isNotEmpty() && netTimes.peekFirst() < lim) netTimes.pollFirst()
+        return netTimes.size
+    }
+    @Synchronized
+    private fun noteNet() { netTimes.addLast(System.currentTimeMillis()) }
+    private val homeBudget = 14   // ana sayfa satırları dakikada en çok bu kadar sayfa çeker
+    private val allBudget = 22    // kullanıcı eylemleri dahil üst sınır
 
     private fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntil
-    private val rlCooldownMs = 90_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
+    private val rlCooldownMs = 5 * 60_000L // 429 sonrası bu süre siteye HİÇ istek atılmaz (yeniden denemek yasağı uzatıyordu)
 
     @Synchronized
     private fun reserveSlot(): Long {
@@ -688,10 +710,20 @@ class Filmmakinesi : MainAPI() {
             if (failed()) return null
             if (isRateLimited()) {
                 if (!patient) return SiteResp(429, "")
-                val w = minOf(rateLimitedUntil - System.currentTimeMillis(), 60_000L)
-                if (w > 0) Thread.sleep(w)
+                val w = rateLimitedUntil - System.currentTimeMillis()
+                // Ban uzun sürecekse boşuna bekleyip yasağı yenileme: hemen vazgeç
+                if (w > 60_000L) return SiteResp(429, "")
+                if (w > 0) Thread.sleep(w + 1_000L)
+            }
+            if (!patient && netCount() >= homeBudget) {
+                log("bütçe doldu (${netCount()}/dk), ağ atlanıyor ${path.take(50)}")
+                return SiteResp(429, "")
+            }
+            if (patient && netCount() >= allBudget) {
+                Thread.sleep(15_000L)
             }
             waitTurn()
+            noteNet()
             var lastBad: SiteResp? = null
             var sawError = false
             // Log analizi: site, X-Requested-With başlığı olan (WebView/uygulama) istekleri "Uygulama desteklenmiyor" (403)
@@ -779,8 +811,7 @@ class Filmmakinesi : MainAPI() {
                 lastBad = resp
                 if (code == 429) {
                     // Hız sınırı: Cloudflare/uygulama engeli DEĞİL. Başka anchor/host denemek sınırı daha da kötüleştirir.
-                    rateLimitedUntil = System.currentTimeMillis() + rlCooldownMs
-                    log("429: ${rlCooldownMs / 1000} sn siteye istek atılmayacak")
+                    markRateLimited()
                     return resp
                 }
                 if (code == 404 || code == 410) {
@@ -820,7 +851,7 @@ class Filmmakinesi : MainAPI() {
                 }
                 val sr = r?.let { SiteResp(it.code, it.text) }
                 if (r != null && r.code == 429) {
-                    rateLimitedUntil = System.currentTimeMillis() + rlCooldownMs
+                    markRateLimited()
                     return sr
                 }
                 if (!denied(sr)) {
