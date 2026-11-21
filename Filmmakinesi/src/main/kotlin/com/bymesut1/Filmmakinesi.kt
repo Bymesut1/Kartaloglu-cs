@@ -1506,7 +1506,7 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
                 stripRequestedWith(w)
                 try {
                     android.webkit.CookieManager.getInstance().setAcceptCookie(true)
-                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookie(w, true)
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
                 } catch (_: Throwable) {
                 }
                 w.webViewClient = object : android.webkit.WebViewClient() {
