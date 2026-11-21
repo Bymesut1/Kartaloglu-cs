@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.nicehttp.NiceResponse
-import kotlinx.coroutines.delay
 import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.Jsoup
@@ -217,7 +216,7 @@ class Filmmakinesi : MainAPI() {
     private suspend fun awaitHomeSlot(): Boolean {
         val w = reserveHome()
         if (w < 0) return false
-        if (w > 0) delay(w)
+        if (w > 0) Thread.sleep(w) // kotlinx.coroutines bu modülde yok; dosyanın geri kalanı da Thread.sleep kullanıyor
         return !isRateLimited()
     }
 
