@@ -29,8 +29,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
@@ -211,9 +209,7 @@ class Zdizi : MainAPI() {
     private suspend fun webFetch(url: String): Page? {
         val c = htmlCache[url]
         if (c != null && System.currentTimeMillis() - c.first < 120_000L) return Page(200, c.second, emptyMap())
-        val html = wvSem.withPermit {
-            withContext(Dispatchers.IO) { webHtmlBlocking(url, 25_000L) }
-        }
+        val html: String? = wvSem.withPermit { webHtmlBlocking(url, 25_000L) }
         if (html == null) {
             dbg = "webview html alinamadi ($dbg)"
             return null
