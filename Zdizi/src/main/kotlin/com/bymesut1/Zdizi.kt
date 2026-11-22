@@ -107,6 +107,27 @@ class Zdizi : MainAPI() {
 
     private val tmdbCache = ConcurrentHashMap<String, Any>()
     private val posterCache = ConcurrentHashMap<String, String>()
+    private val titleCache = ConcurrentHashMap<String, String>()
+
+    // 0 = bilinmiyor, 1 = tarayıcı benzeri başlıklarla OkHttp çalışıyor, -1 = çalışmıyor
+    @Volatile
+    private var altState = 0
+
+    // Gerçek WebView'ın gönderdiği türden başlıklar (Sec-Fetch-*, WebView User-Agent)
+    private fun altHeaders(ref: String?, extra: Map<String, String>): Map<String, String> {
+        val h = LinkedHashMap<String, String>(hdr(ref, extra))
+        try {
+            val c = appCtx()
+            if (c != null) h["User-Agent"] = android.webkit.WebSettings.getDefaultUserAgent(c).replace("; wv", "")
+        } catch (e: Throwable) {
+        }
+        h["Sec-Fetch-Dest"] = "document"
+        h["Sec-Fetch-Mode"] = "navigate"
+        h["Sec-Fetch-Site"] = "same-origin"
+        h["Sec-Fetch-User"] = "?1"
+        h["Upgrade-Insecure-Requests"] = "1"
+        return h
+    }
 
     @Volatile
     private var siteCookie = ""
@@ -155,13 +176,9 @@ class Zdizi : MainAPI() {
                         val u = request.url.toString()
                         val low = u.lowercase()
                         val path = low.substringBefore("?").substringBefore("#")
-                        val own = low.contains("zdizi.com")
-                        val cfChallenge = low.contains("cloudflare") && !low.contains("cloudflareinsights")
                         var block = false
-                        if (!own && !cfChallenge) block = true
-                        if (low.contains("cloudflareinsights") || low.contains("/cdn-cgi/rum")) block = true
-                        if (Regex("\\.(jpe?g|png|gif|webp|svg|ico|css|woff2?|ttf|otf|mp4|webm|m3u8)$").containsMatchIn(path)) block = true
-                        if (own && path.endsWith(".js") && (path.contains("/wp-content/") || path.contains("/wp-includes/"))) block = true
+                        if (Regex("youtube|ytimg|googletagmanager|google-analytics|doubleclick|googlesyndication|apis\\.google|cloudflareinsights").containsMatchIn(low)) block = true
+                        if (Regex("\\.(jpe?g|png|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm)$").containsMatchIn(path)) block = true
                         return if (block) WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0))) else null
                     }
                 }
@@ -180,6 +197,7 @@ class Zdizi : MainAPI() {
 
         val js = "(function(){try{return JSON.stringify({t:document.title,r:document.readyState," +
             "h:document.documentElement.outerHTML});}catch(e){return '';}})()"
+        val lastLog = java.util.concurrent.atomic.AtomicLong(0)
         val end = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < end && res.get() == null) {
             try {
@@ -191,7 +209,13 @@ class Zdizi : MainAPI() {
                 try {
                     holder[0]?.evaluateJavascript(js) { r ->
                         try {
-                            if (r.isNullOrBlank() || r == "null") return@evaluateJavascript
+                            val nowT = System.currentTimeMillis()
+                            val doLog = nowT - lastLog.get() > 2000
+                            if (doLog) lastLog.set(nowT)
+                            if (r.isNullOrBlank() || r == "null") {
+                                if (doLog) d("wv bos sonuc")
+                                return@evaluateJavascript
+                            }
                             val txt = (org.json.JSONTokener(r).nextValue() as? String) ?: return@evaluateJavascript
                             if (txt.isBlank()) return@evaluateJavascript
                             val o = JSONObject(txt)
@@ -200,6 +224,7 @@ class Zdizi : MainAPI() {
                             val h = o.optString("h")
                             val chall = title.contains("Just a moment", true) || title.contains("Attention Required", true) ||
                                 title.contains("Bir dakika", true) || h.contains("cf-browser-verification", true)
+                            if (doLog) d("wv rs=$rs len=${h.length} chall=$chall t=${title.take(40)}")
                             if (chall || h.length < 3000) return@evaluateJavascript
                             val prev = lastLen.getAndSet(h.length)
                             if (rs == "complete" || (rs == "interactive" && prev == h.length)) res.set(h)
@@ -225,13 +250,13 @@ class Zdizi : MainAPI() {
         return res.get()
     }
 
-    private suspend fun webFetch(url: String): Page? {
+    private suspend fun webFetch(url: String, timeoutMs: Long = 25_000L): Page? {
         val c = htmlCache[url]
         if (c != null && System.currentTimeMillis() - c.first < 600_000L) return Page(200, c.second, emptyMap())
         val html: String? = try {
             wvSem.acquire()
             try {
-                webHtmlBlocking(url, 25_000L)
+                webHtmlBlocking(url, timeoutMs)
             } finally {
                 wvSem.release()
             }
@@ -246,35 +271,55 @@ class Zdizi : MainAPI() {
         return Page(200, html, emptyMap())
     }
 
-    // cf = true: site adresi için 403/503 gelirse sayfa WebView ile okunur.
-    // OkHttp çerezle de 503 alıyorsa (okMode = -2) bir daha denenmez, doğrudan WebView kullanılır.
+    // cf = true: site adresi için 403/503 gelirse önce tarayıcı benzeri başlıklarla, olmazsa WebView ile okunur.
+    // wvTimeout: WebView'ın en fazla bekleyeceği süre.
     private suspend fun fetch(
         url: String,
         ref: String?,
         cf: Boolean,
         extra: Map<String, String> = emptyMap(),
-        cookies: Map<String, String> = emptyMap()
+        cookies: Map<String, String> = emptyMap(),
+        wvTimeout: Long = 25_000L
     ): Page? {
         val isSite = url.startsWith(mainUrl, true)
         val t0 = System.currentTimeMillis()
         if (isSite && cf) {
             val cached = htmlCache[url]
             if (cached != null && System.currentTimeMillis() - cached.first < 600_000L) return Page(200, cached.second, emptyMap())
-            if (okMode == -2) return webFetch(url)
+            if (okMode == -2 && altState == -1) return webFetch(url, wvTimeout)
         }
         return try {
             val withCk = isSite && siteCookie.isNotBlank()
             val ck = if (withCk) cookieMap(siteCookie) + cookies else cookies
-            val r = app.get(url, headers = hdr(ref, extra), cookies = ck)
+            val useAlt = isSite && cf && altState == 1
+            val r = app.get(url, headers = if (useAlt) altHeaders(ref, extra) else hdr(ref, extra), cookies = ck)
             if (isSite && cf) {
                 if (r.code == 403 || r.code == 503) {
+                    // 1) tarayıcı benzeri başlıklarla bir kez daha dene
+                    if (altState == 0) {
+                        val r2 = try {
+                            app.get(url, headers = altHeaders(ref, extra), cookies = ck)
+                        } catch (e: Exception) {
+                            if (e is java.util.concurrent.CancellationException) throw e
+                            null
+                        }
+                        if (r2 != null && r2.code != 403 && r2.code != 503) {
+                            altState = 1
+                            okMode = 1
+                            d("alt basliklar calisiyor code=${r2.code} ${System.currentTimeMillis() - t0}ms")
+                            return Page(r2.code, r2.text, r2.cookies)
+                        }
+                        altState = -1
+                        d("alt basliklar da ${r2?.code} verdi")
+                    }
+                    // 2) WebView
                     okMode = if (withCk) -2 else -1
                     d("okhttp ${r.code} withCookie=$withCk -> webview ${url.takeLast(40)}")
-                    val w = webFetch(url)
+                    val w = webFetch(url, wvTimeout)
                     d("webview ${System.currentTimeMillis() - t0}ms ok=${w != null}")
                     if (w != null) return w
                 } else {
-                    if (okMode != 1) d("okhttp calisiyor code=${r.code}")
+                    if (okMode != 1) d("okhttp calisiyor code=${r.code} ${System.currentTimeMillis() - t0}ms ${url.takeLast(30)}")
                     okMode = 1
                 }
             }
@@ -282,7 +327,7 @@ class Zdizi : MainAPI() {
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             dbg = "hata: ${e.message}"
-            if (isSite && cf) return webFetch(url)
+            if (isSite && cf) return webFetch(url, wvTimeout)
             null
         }
     }
@@ -435,6 +480,7 @@ class Zdizi : MainAPI() {
         for ((url, t) in titles) {
             val title = if (t.isNotBlank()) t else slugTitle(pathOf(url))
             if (title.isBlank()) continue
+            titleCache[url] = title
             val poster = posters[url]
             out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { this.posterUrl = poster })
         }
@@ -513,34 +559,30 @@ class Zdizi : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (page > 1) return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
-        val p = fetch(mainUrl + request.data, "$mainUrl/", true)
+        val t0 = System.currentTimeMillis()
+        val p = fetch(mainUrl + request.data, "$mainUrl/", true, wvTimeout = 12_000L)
+        val t1 = System.currentTimeMillis()
         val items = if (p != null && p.code == 200) cards(Jsoup.parse(p.text, mainUrl)) else emptyList()
         fillPosters(items)
+        d("anasayfa ${request.name}: sayfa ${t1 - t0}ms posterler ${System.currentTimeMillis() - t1}ms ${items.size} kart")
         return newHomePageResponse(request.name, items, false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = URLEncoder.encode(query, "UTF-8")
-        // 1) WordPress arama sayfası
-        val p = fetch("$mainUrl/?s=$q", "$mainUrl/", true)
-        if (p != null && p.code == 200) {
-            val r = cards(Jsoup.parse(p.text, mainUrl))
-            if (r.isNotEmpty()) {
-                fillPosters(r)
-                return r
-            }
-        }
-        // 2) Yedek: WordPress REST araması
-        val j = fetch(
-            "$mainUrl/wp-json/wp/v2/search?search=$q&per_page=20&_fields=title,url",
-            "$mainUrl/",
-            true,
-            extra = mapOf("Accept" to "application/json")
-        )
+        val t0 = System.currentTimeMillis()
+        // 1) WordPress REST araması: yalnızca OkHttp, WebView yok (hızlı)
         val out = ArrayList<SearchResponse>()
-        if (j != null && j.code == 200) {
-            try {
-                val arr = JSONArray(if (j.text.trimStart().startsWith("[")) j.text else Jsoup.parse(j.text).text())
+        try {
+            val ck = if (siteCookie.isNotBlank()) cookieMap(siteCookie) else emptyMap()
+            val r = app.get(
+                "$mainUrl/wp-json/wp/v2/search?search=$q&per_page=20&_fields=title,url",
+                headers = hdr("$mainUrl/", mapOf("Accept" to "application/json")),
+                cookies = ck,
+                timeout = 10L
+            )
+            if (r.code == 200) {
+                val arr = JSONArray(r.text)
                 val seen = HashSet<String>()
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
@@ -556,12 +598,28 @@ class Zdizi : MainAPI() {
                     var title = cleanTitle(stripMeta(Jsoup.parse(o.optString("title", "")).text()))
                     if (!looksTitle(title)) title = slugTitle(path)
                     if (title.isBlank()) continue
+                    titleCache[url] = title
                     out.add(newTvSeriesSearchResponse(title, url, TvType.TvSeries) { })
                 }
-            } catch (e: Exception) {
+            } else {
+                d("rest arama ${r.code}")
             }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
         }
-        fillPosters(out)
+        if (out.isNotEmpty()) {
+            fillPosters(out)
+            d("arama rest ${System.currentTimeMillis() - t0}ms ${out.size}")
+            return out
+        }
+        // 2) WordPress arama sayfası (gerekirse kısa süreli WebView)
+        val p = fetch("$mainUrl/?s=$q", "$mainUrl/", true, wvTimeout = 10_000L)
+        if (p != null && p.code == 200) {
+            val r = cards(Jsoup.parse(p.text, mainUrl))
+            fillPosters(r)
+            d("arama html ${System.currentTimeMillis() - t0}ms ${r.size}")
+            return r
+        }
         return out
     }
 
@@ -583,7 +641,9 @@ class Zdizi : MainAPI() {
         val poster: String?,
         val backdrop: String?,
         val overview: String?,
-        val eps: Map<String, TEp>
+        val eps: Map<String, TEp>,
+        val genres: List<String>,
+        val year: Int?
     )
 
     private suspend fun tmdbJson(url: String): JSONObject? = try {
@@ -622,6 +682,12 @@ class Zdizi : MainAPI() {
             if (sn > 0) allSeasons.add(sn)
         }
         val seasonList = allSeasons.filter { it > 0 }.distinct().sorted()
+        val genreList = ArrayList<String>()
+        detail?.optJSONArray("genres")?.let { ga ->
+            for (i in 0 until ga.length()) ga.optJSONObject(i)?.optString("name")?.takeIf { it.isNotBlank() }?.let { genreList.add(it) }
+        }
+        val tmYear = (detail?.optString("first_air_date").orEmpty().ifBlank { sh.optString("first_air_date") })
+            .take(4).toIntOrNull()
 
         val map = java.util.concurrent.ConcurrentHashMap<String, TEp>()
         seasonList.amap { sn ->
@@ -662,7 +728,9 @@ class Zdizi : MainAPI() {
             pp?.let { "$tmdbImg/w780$it" },
             bp?.let { "$tmdbImg/w1280$it" },
             sh.optString("overview").takeIf { it.isNotBlank() },
-            map
+            map,
+            genreList,
+            tmYear
         )
         tmdbCache[ckey] = res
         return res
@@ -769,14 +837,97 @@ class Zdizi : MainAPI() {
     // ------------------------------------------------------------------
     // Detay sayfası
     // ------------------------------------------------------------------
+    // TMDB'deki yayınlanmış (tarihi geçmiş) bölümleri sitenin bölüm adresiyle ekler
+    private fun addTmdbEps(tm: TShow, base: String, seen: HashSet<String>, eps: ArrayList<Episode>) {
+        if (eps.isNotEmpty() &&
+            eps.count { tm.eps.containsKey("${it.season}_${it.episode}") }.toDouble() / eps.size < 0.6
+        ) return
+        val df3 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val now = System.currentTimeMillis()
+        val keys = ArrayList<Triple<Int, Int, String>>()
+        for (k in tm.eps.keys) {
+            val sn = k.substringBefore("_").toIntOrNull() ?: continue
+            val n = k.substringAfter("_").toIntOrNull() ?: continue
+            if (sn > 0) keys.add(Triple(sn, n, k))
+        }
+        keys.sortWith(compareBy({ it.first }, { it.second }))
+        for ((sn, n, k) in keys) {
+            val air = tm.eps[k]?.air ?: continue
+            val ms: Long? = try {
+                df3.parse(air)?.time
+            } catch (e: Exception) {
+                null
+            }
+            if (ms == null || ms > now) continue
+            val u = "$mainUrl/$base-$sn-sezon-$n-bolum-izle"
+            if (!seen.add(u)) continue
+            eps.add(newEpisode(u) {
+                this.season = sn
+                this.episode = n
+            })
+        }
+    }
+
+    private suspend fun tmdbOnlyLoad(pageUrl: String, slug: String, title: String, tm: TShow): LoadResponse? {
+        val seen = HashSet<String>()
+        val eps = ArrayList<Episode>()
+        addTmdbEps(tm, slug, seen, eps)
+        val df2 = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        for (ep in eps) {
+            val t = tm.eps["${ep.season}_${ep.episode}"] ?: continue
+            if (!isGenericName(t.name)) ep.name = t.name
+            if (t.overview.isNotBlank()) ep.description = t.overview
+            if (t.still != null) ep.posterUrl = t.still
+            if (t.runtime != null) ep.runTime = t.runtime
+            if (t.air != null) {
+                try {
+                    df2.parse(t.air)?.time?.let { ep.date = it }
+                } catch (ex: Exception) {
+                }
+            }
+        }
+        return newTvSeriesLoadResponse(title, pageUrl, TvType.TvSeries, eps) {
+            this.posterUrl = tm.poster
+            this.backgroundPosterUrl = tm.backdrop
+            this.plot = tm.overview
+            this.tags = tm.genres
+            this.year = tm.year
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         var path = pathOf(url)
         if (kindOf(path) == 3) path = epToSeries(path)
         val kind = kindOf(path)
         if (kind != 1) return null
         val pageUrl = mainUrl + path
-        val p = fetch(pageUrl, "$mainUrl/", true) ?: return null
-        if (p.code != 200) return null
+        val slug0 = path.substringAfterLast("/").removeSuffix("-izle")
+        val guess = titleCache[pageUrl] ?: slugTitle(path)
+        val tL = System.currentTimeMillis()
+
+        // Dizi sayfası (kısa süre) ve TMDB aynı anda istenir
+        var pH: Page? = null
+        var tm0H: TShow? = null
+        listOf(0, 1).amap { i ->
+            if (i == 0) {
+                pH = fetch(pageUrl, "$mainUrl/", true, wvTimeout = 6_000L)
+            } else {
+                tm0H = try {
+                    tmdbShow(guess, null, emptyList())
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    null
+                }
+            }
+            i
+        }
+        val p = pH
+        d("load ${System.currentTimeMillis() - tL}ms site=${p?.code} tmdb=${tm0H != null} $slug0")
+        if (p == null || p.code != 200) {
+            // Site sayfası gelmediyse: bölüm listesi TMDB'den (yayınlanmış bölümler)
+            val t = tm0H ?: return null
+            return tmdbOnlyLoad(pageUrl, slug0, guess, t)
+        }
         val doc = Jsoup.parse(p.text, mainUrl)
 
         val slug = path.substringAfterLast("/").removeSuffix("-izle")
@@ -837,9 +988,9 @@ class Zdizi : MainAPI() {
         var tmH: TShow? = null
         listOf(0, 1).amap { i ->
             if (i == 0) {
-                srH = fetch(seedUrl, pageUrl, true)
+                srH = fetch(seedUrl, pageUrl, true, wvTimeout = 6_000L)
             } else {
-                tmH = try {
+                tmH = tm0H ?: try {
                     tmdbShow(title, year, emptyList())
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
@@ -956,6 +1107,9 @@ class Zdizi : MainAPI() {
             }
         }
 
+        // Site engelliyse ve tam liste alınamadıysa: TMDB'deki yayınlanmış bölümlerle tamamla
+        if (!siteComplete && blocked && tm != null) addTmdbEps(tm, epSlug ?: slugNorm, seen, eps)
+
         eps.sortWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
         // TMDB eşleşmesi tutarlı mı? (site bölümlerinin en az %60'ı TMDB'de varsa). Tutarsızsa TMDB hiç kullanılmaz.
@@ -1007,7 +1161,7 @@ class Zdizi : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val pageUrl = abs(data)
-        val p = fetch(pageUrl, "$mainUrl/", true)
+        val p = fetch(pageUrl, "$mainUrl/", true, wvTimeout = 15_000L)
         if (p == null || p.code != 200) {
             if (debug) {
                 debugLink(callback, "sayfa alinamadi: code=${p?.code} $dbg")
