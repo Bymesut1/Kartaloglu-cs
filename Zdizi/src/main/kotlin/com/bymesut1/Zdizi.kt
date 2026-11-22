@@ -224,13 +224,13 @@ class Zdizi : MainAPI() {
             .replace("\\/", "/")
             .replace("&amp;", "&")
 
-    // Sayfadaki dizi kartları (yan menü, üst menü ve alt bilgi alanı hariç). Filmler alınmaz.
+    // Sayfadaki dizi kartları (üst menü ve alt bilgi hariç). Filmler alınmaz.
+    // NOT: sitede iç içe iki id="content" var; ilki sadece arama kutusunu içerdiği için bütün sayfa taranır.
     private fun cards(doc: Document): List<SearchResponse> {
         val titles = LinkedHashMap<String, String>()
         val posters = HashMap<String, String>()
-        val scope = doc.selectFirst("#content") ?: doc
-        for (a in scope.select("a[href]")) {
-            if (a.parents().any { it.tagName() == "aside" || it.tagName() == "footer" || it.tagName() == "header" }) continue
+        for (a in doc.select("a[href]")) {
+            if (a.parents().any { it.tagName() == "footer" || it.tagName() == "header" }) continue
             val raw = a.attr("href").trim()
             if (raw.isBlank() || raw.startsWith("#") || raw.startsWith("javascript", true)) continue
             if (raw.startsWith("http", true) && !raw.contains("zdizi.com", true)) continue
@@ -242,17 +242,23 @@ class Zdizi : MainAPI() {
             val url = mainUrl + path
             if (!titles.containsKey(url)) titles[url] = ""
 
-            // Başlık: sitedeki asıl isim (puan / yıl metinleri isim sayılmaz). Bölüm bağlantılarından alınmaz.
-            if (!isEp && titles[url].isNullOrBlank()) {
-                val cand = listOf(
-                    a.attr("title"),
-                    a.selectFirst("h1,h2,h3,h4,h5,.title,.name")?.text().orEmpty(),
-                    a.selectFirst("img")?.attr("alt").orEmpty(),
-                    a.text()
-                ).map { cleanTitle(stripMeta(it)) }.firstOrNull { looksTitle(it) }
+            // Başlık: sitedeki asıl isim (puan / yıl metinleri isim sayılmaz)
+            if (titles[url].isNullOrBlank()) {
+                val cand = if (!isEp) {
+                    listOf(
+                        a.attr("title"),
+                        a.selectFirst("h1,h2,h3,h4,h5,.title,.name")?.text().orEmpty(),
+                        a.selectFirst("img")?.attr("alt").orEmpty(),
+                        a.text()
+                    )
+                } else {
+                    // Bölüm kartı: dizi adı kart içindeki başlıktadır (ör. <h2>FROM</h2>)
+                    listOf(a.selectFirst("h1,h2,h3,h4,h5,h6")?.text().orEmpty())
+                }.map { cleanTitle(stripMeta(it)) }.firstOrNull { looksTitle(it) }
                 if (cand != null) titles[url] = cand
             }
-            if (!posters.containsKey(url)) {
+            // Poster: bölüm kartlarındaki küçük bölüm görseli kullanılmaz (eksikleri TMDB tamamlar)
+            if (!isEp && !posters.containsKey(url)) {
                 val poster = imgUrl(a.selectFirst("img") ?: a.parent()?.selectFirst("img"))
                     ?: bgImage(a) ?: bgImage(a.parent())
                 if (poster != null) posters[url] = poster
