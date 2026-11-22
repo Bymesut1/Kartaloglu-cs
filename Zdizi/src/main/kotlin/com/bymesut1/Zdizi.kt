@@ -29,6 +29,10 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 class Zdizi : MainAPI() {
     override var mainUrl = "https://zdizi.com"
@@ -57,9 +61,6 @@ class Zdizi : MainAPI() {
     private val tmdbKey = "000316508321ce461cf81e7c6815eec7"
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImg = "https://image.tmdb.org/t/p"
-
-    @Volatile
-    private var cfKiller: CloudflareKiller? = null
 
     override val mainPage = mainPageOf(
         "/" to "Ana Sayfa",
@@ -99,7 +100,129 @@ class Zdizi : MainAPI() {
         return h
     }
 
-    // cf = true: site adresi için Cloudflare 403/503 gelirse CloudflareKiller ile yeniden dener
+    // Site, uygulamanın normal (OkHttp) isteklerine HTTP 503 / 403 verip gerçek tarayıcıya (WebView) içerik veriyor.
+    // CloudflareKiller bu durumda 60 sn boşuna bekliyordu. Artık 503 / 403 gelirse sayfa doğrudan
+    // WebView'da açılıp HTML'i okunuyor (aynı anda en fazla 2 WebView, sonuçlar 2 dk önbellekte).
+    @Volatile
+    private var blocked = false
+
+    @Volatile
+    private var siteCookie = ""
+
+    private val wvSem = Semaphore(2)
+    private val htmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
+
+    private fun cookieMap(c: String): Map<String, String> {
+        val m = LinkedHashMap<String, String>()
+        for (kv in c.split(";")) {
+            val k = kv.substringBefore("=").trim()
+            val v = kv.substringAfter("=", "").trim()
+            if (k.isNotBlank() && v.isNotBlank()) m[k] = v
+        }
+        return m
+    }
+
+    // Sayfayı WebView'da açar, hazır olunca (Cloudflare kontrol sayfası geçince) belge HTML'ini döndürür
+    private fun webHtmlBlocking(url: String, timeoutMs: Long): String? {
+        val ctx = appCtx() ?: run {
+            dbg = "context yok ($dbg)"
+            return null
+        }
+        val holder = arrayOfNulls<WebView>(1)
+        val created = CountDownLatch(1)
+        val main = Handler(Looper.getMainLooper())
+        val res = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val lastLen = java.util.concurrent.atomic.AtomicInteger(-1)
+        main.post {
+            try {
+                val wv = WebView(ctx)
+                holder[0] = wv
+                val st = wv.settings
+                st.javaScriptEnabled = true
+                st.domStorageEnabled = true
+                st.userAgentString = ua
+                st.loadsImagesAutomatically = false
+                st.blockNetworkImage = true
+                try {
+                    CookieManager.getInstance().setAcceptCookie(true)
+                } catch (e: Throwable) {
+                }
+                wv.webViewClient = WebViewClient()
+                wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
+            } catch (e: Throwable) {
+                d("webview olusturulamadi ${e.javaClass.simpleName} ${e.message}")
+            } finally {
+                created.countDown()
+            }
+        }
+        try {
+            created.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {
+        }
+        if (holder[0] == null) return null
+
+        val js = "(function(){try{return JSON.stringify({t:document.title,r:document.readyState," +
+            "h:document.documentElement.outerHTML});}catch(e){return '';}})()"
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end && res.get() == null) {
+            try {
+                Thread.sleep(700)
+            } catch (e: InterruptedException) {
+                break
+            }
+            main.post {
+                try {
+                    holder[0]?.evaluateJavascript(js) { r ->
+                        try {
+                            if (r.isNullOrBlank() || r == "null") return@evaluateJavascript
+                            val txt = (org.json.JSONTokener(r).nextValue() as? String) ?: return@evaluateJavascript
+                            if (txt.isBlank()) return@evaluateJavascript
+                            val o = JSONObject(txt)
+                            val title = o.optString("t")
+                            val rs = o.optString("r")
+                            val h = o.optString("h")
+                            val chall = title.contains("Just a moment", true) || title.contains("Attention Required", true) ||
+                                title.contains("Bir dakika", true) || h.contains("cf-browser-verification", true)
+                            if (chall || h.length < 3000) return@evaluateJavascript
+                            val prev = lastLen.getAndSet(h.length)
+                            if (rs == "complete" || (rs == "interactive" && prev == h.length)) res.set(h)
+                        } catch (e: Throwable) {
+                        }
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+        }
+        try {
+            val c = CookieManager.getInstance().getCookie(mainUrl)
+            if (!c.isNullOrBlank()) siteCookie = c
+        } catch (e: Throwable) {
+        }
+        main.post {
+            try {
+                holder[0]?.stopLoading()
+                holder[0]?.destroy()
+            } catch (e: Throwable) {
+            }
+        }
+        return res.get()
+    }
+
+    private suspend fun webFetch(url: String): Page? {
+        val c = htmlCache[url]
+        if (c != null && System.currentTimeMillis() - c.first < 120_000L) return Page(200, c.second, emptyMap())
+        val html = wvSem.withPermit {
+            withContext(Dispatchers.IO) { webHtmlBlocking(url, 25_000L) }
+        }
+        if (html == null) {
+            dbg = "webview html alinamadi ($dbg)"
+            return null
+        }
+        htmlCache[url] = System.currentTimeMillis() to html
+        return Page(200, html, emptyMap())
+    }
+
+    // cf = true: site adresi için 403/503 gelirse sayfa WebView ile okunur
     private suspend fun fetch(
         url: String,
         ref: String?,
@@ -107,15 +230,23 @@ class Zdizi : MainAPI() {
         extra: Map<String, String> = emptyMap(),
         cookies: Map<String, String> = emptyMap()
     ): Page? {
+        val isSite = url.startsWith(mainUrl, true)
         return try {
-            var r = app.get(url, headers = hdr(ref, extra), cookies = cookies)
-            if (cf && (r.code == 403 || r.code == 503)) {
-                val k = cfKiller ?: CloudflareKiller().also { cfKiller = it }
-                r = app.get(url, headers = hdr(ref, extra), cookies = cookies, interceptor = k)
+            val ck = if (isSite && siteCookie.isNotBlank()) cookieMap(siteCookie) + cookies else cookies
+            val r = app.get(url, headers = hdr(ref, extra), cookies = ck)
+            if (isSite && cf && (r.code == 403 || r.code == 503)) {
+                blocked = true
+                val w = webFetch(url)
+                if (w != null) return w
             }
             Page(r.code, r.text, r.cookies)
         } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
             dbg = "hata: ${e.message}"
+            if (isSite && cf) {
+                blocked = true
+                return webFetch(url)
+            }
             null
         }
     }
@@ -321,7 +452,8 @@ class Zdizi : MainAPI() {
     // ------------------------------------------------------------------
     // Sitede resmi çıkmayan kartlara TMDB'den poster bulur
     private suspend fun fillPosters(list: List<SearchResponse>) {
-        list.filter { it.posterUrl.isNullOrBlank() }.take(30).amap { r ->
+        // Sitenin poster adresleri uygulamada 503 veriyor: tüm kartlara TMDB posteri öncelikli verilir
+        list.take(40).amap { r ->
             try {
                 val nm = r.name.replace(Regex("(?i)\\bizle\\b"), "").replace(Regex("\\(\\d{4}\\)"), "")
                     .replace(Regex("\\s+"), " ").trim()
@@ -695,7 +827,7 @@ class Zdizi : MainAPI() {
         }
 
         // Sitenin tam listesi alınamadıysa (yedek yöntem): TMDB + sitede yoklama ile eksikleri tamamla
-        if (!siteComplete) {
+        if (!siteComplete && !blocked) {
             if (tm != null) {
                 val baseSlug = epSlug ?: slugNorm
                 val haveKeys = eps.map { "${it.season}_${it.episode}" }.toHashSet()
