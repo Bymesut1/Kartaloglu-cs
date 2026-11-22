@@ -29,8 +29,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 
 class Zdizi : MainAPI() {
     override var mainUrl = "https://zdizi.com"
@@ -107,7 +105,7 @@ class Zdizi : MainAPI() {
     @Volatile
     private var siteCookie = ""
 
-    private val wvSem = Semaphore(2)
+    private val wvSem = java.util.concurrent.Semaphore(2)
     private val htmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     private fun cookieMap(c: String): Map<String, String> {
@@ -209,7 +207,16 @@ class Zdizi : MainAPI() {
     private suspend fun webFetch(url: String): Page? {
         val c = htmlCache[url]
         if (c != null && System.currentTimeMillis() - c.first < 120_000L) return Page(200, c.second, emptyMap())
-        val html: String? = wvSem.withPermit { webHtmlBlocking(url, 25_000L) }
+        val html: String? = try {
+            wvSem.acquire()
+            try {
+                webHtmlBlocking(url, 25_000L)
+            } finally {
+                wvSem.release()
+            }
+        } catch (e: InterruptedException) {
+            null
+        }
         if (html == null) {
             dbg = "webview html alinamadi ($dbg)"
             return null
