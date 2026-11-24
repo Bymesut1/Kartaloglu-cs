@@ -630,7 +630,7 @@ class HDFilmCehennemi : MainAPI() {
     // Şimdi: script yalnızca 2xx gelince "bitti" işareti gönderir; 403 ise WebView açık kalır, doğrulama
     // çözülünce (sonraki isteklerde) script yeniden dener. Ayrıca /cdn-cgi/trace sayfası doğrulama çalıştırmaz,
     // bu yüzden çözülmezse gerçek sayfa ("/") üzerinden denenir.
-    private suspend fun wvFetch(host: String, path: String, extra: Map<String, String>): SiteResp? {
+    private suspend fun wvFetch(host: String, path: String, extra: Map<String, String>, pageAnchor: String? = null): SiteResp? {
         val hdr = extra.entries.filter {
             it.key.equals("Accept", true) || it.key.equals("X-Requested-With", true)
         }
@@ -683,7 +683,10 @@ class HDFilmCehennemi : MainAPI() {
             val attempts = ArrayList<Array<Any?>>()
             // Çalışan yöntem: ana sayfa ("/") yüklenirken XHR. Ağır olduğu için, bir kez çalıştıktan sonra
             // küçük bir 404 sayfası denenir; 2 kez işe yaramazsa bir daha denenmez (eski yönteme dönülür).
-            val lightAttempt = wvCleared && !wvLightBad
+            // Oynatıcı isteği (/video/<id>/) için önce film sayfasının KENDİSİ açılır: XHR'nin Referer'ı ve çerezleri
+            // tarayıcıdakiyle aynı olsun (ana sayfadan istenince site başka filmin oynatıcısını veriyor)
+            val lightAttempt = pageAnchor == null && wvCleared && !wvLightBad
+            if (pageAnchor != null) attempts.add(arrayOf(pageAnchor, null, "", 18_000L))
             if (lightAttempt) attempts.add(arrayOf("/hdfc-hafif-sayfa/", null, "", 3_500L))
             attempts.add(arrayOf("/", null, "", 18_000L))
             attempts.add(arrayOf("/", null, "XMLHttpRequest", 18_000L))
@@ -751,7 +754,7 @@ class HDFilmCehennemi : MainAPI() {
                                 log("WV hafif sayfa çalışmadı, ana sayfa yöntemi kullanılacak")
                             }
                         }
-                    } else {
+                    } else if (anchor == "/hdfc-hafif-sayfa/") {
                         wvLightFails = 0
                     }
                     return resp
@@ -773,7 +776,7 @@ class HDFilmCehennemi : MainAPI() {
         }
     }
 
-    private suspend fun siteGet(path: String, extra: Map<String, String> = emptyMap()): SiteResp? {
+    private suspend fun siteGet(path: String, extra: Map<String, String> = emptyMap(), pageAnchor: String? = null): SiteResp? {
         // 1) Düz istekler (Cloudflare engeli görülürse 10 dk boyunca denenmez, doğrudan WebView)
         if (System.currentTimeMillis() >= plainBlockedUntil) {
             val tries = ArrayList<Pair<String, Boolean>>()
@@ -818,7 +821,7 @@ class HDFilmCehennemi : MainAPI() {
         val cands = listOf(good?.first ?: hosts[0], hosts[1], hosts[0]).distinct()
         for (host in cands) {
             val r = try {
-                wvFetch(host, path, extra)
+                wvFetch(host, path, extra, pageAnchor)
             } catch (e: java.util.concurrent.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1493,6 +1496,17 @@ class HDFilmCehennemi : MainAPI() {
         val ifr = pageIframe(html)
 
         val all = parseAlts(html).map { a -> Player(a.name, a.lang.ifBlank { "dual" }, a.id, null) }
+        try {
+            val dd = Jsoup.parse(html)
+            log("ALT baslik=${dd.title().take(80)} ifr=${ifr.take(140)}")
+            all.forEach { log("ALT id=${it.id} ad=${it.name} dil=${it.lang}") }
+            dumpLog("alts", dd.select("div.alternative-links, .video-container").outerHtml().take(6000))
+            dd.select("script:not([src])").filter { sc ->
+                val d = sc.data()
+                d.contains("data-video") || d.contains("alternative") || d.contains("/video/")
+            }.take(2).forEachIndexed { i, sc -> dumpLog("scr$i", sc.data().take(3000)) }
+        } catch (e: Throwable) {
+        }
         val dual = all.filter { it.lang == "dual" }
         val subbed = all.filter { it.lang != "dual" }
         log("sayfa len=${html.length} dual=${dual.size} altyazili=${subbed.size} iframe=${ifr.isNotBlank()} ${pageUrl.take(80)}")
@@ -1541,8 +1555,10 @@ class HDFilmCehennemi : MainAPI() {
                                 "Accept" to "application/json, text/plain, */*",
                                 "X-Requested-With" to "fetch",
                                 "Referer" to pageUrl
-                            )
+                            ),
+                            pathOf(pageUrl)
                         )
+                        log("VID id=${job.id} kod=${rr?.code} -> " + rr?.text.orEmpty().take(300).replace(Regex("\\s+"), " "))
                         iframeFromAjax(rr?.text.orEmpty()).ifBlank { if (job === list[0]) ifr else "" }
                     }
                     if (embedUrl.isBlank() || !seenEmb.add(embedUrl)) return@amap
