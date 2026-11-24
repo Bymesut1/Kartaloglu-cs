@@ -899,9 +899,33 @@ class Filmmakinesi : MainAPI() {
             log("sayfa alinamadi $data")
             return false
         }
-        val parts = extractParts(Jsoup.parse(res.text), res.text)
-        log("sayfa ${res.code} len=${res.text.length} kaynak=${parts.size}")
+        val xhrParts = extractParts(Jsoup.parse(res.text), res.text)
+        // Log analizi: Close adresleri açılan filmden farklı bir filme ait çıkıyordu (ör. Rob Lowe sayfasından
+        // "The Imitation Game" dosyası). Sayfa, WebView içinden senkron XHR ile (X-Requested-With: XMLHttpRequest)
+        // alınıyordu; site bu istekte farklı kaynak verebilir. Bu yüzden kaynaklar ayrıca sayfanın GERÇEK
+        // gezinti (navigation) görünümünden de okunur ve o tercih edilir.
+        var navParts: List<Pair<String, String>> = emptyList()
+        if (!isRateLimited()) {
+            val nav = try {
+                wvHtml(data, "$mainUrl/")
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            if (!nav.isNullOrBlank()) navParts = extractParts(Jsoup.parse(nav), nav)
+        }
+        log("sayfa ${res.code} len=${res.text.length} xhrKaynak=${xhrParts.size} navKaynak=${navParts.size}")
+        xhrParts.forEach { log("XHR kaynak ${it.first} ${it.second.take(80)}") }
+        navParts.forEach { log("NAV kaynak ${it.first} ${it.second.take(80)}") }
+        if (navParts.isNotEmpty() && navParts.map { it.second }.toSet() != xhrParts.map { it.second }.toSet()) {
+            log("KAYNAK FARKI: gezinti görünümü kullanılıyor")
+        }
+        val parts = if (navParts.isNotEmpty()) navParts else xhrParts
         if (parts.isEmpty()) return false
+        // Film adresindeki yıl (ör. ...-2026/): yayın dosya adındaki yıl bundan çok farklıysa başka film demektir
+        val pageYear: Int? = if (data.contains("/film/"))
+            Regex("-((?:19|20)\\d{2})(?:/|$)").find(data)?.groupValues?.get(1)?.toIntOrNull() else null
 
         val seenUrl = Collections.synchronizedSet(HashSet<String>())
         val gotExt = AtomicBoolean(false)
@@ -912,7 +936,9 @@ class Filmmakinesi : MainAPI() {
             try {
                 log("E $label ${embed.take(80)}")
                 val found = findStream(embed, data, label)
-                if (found != null) {
+                if (found != null && wrongFilm(found.url, pageYear)) {
+                    log("$label ATLANDI: yayın başka bir filme ait ${found.url.take(110)}")
+                } else if (found != null) {
                     if (seenUrl.add(found.url)) {
                         callback(
                             newExtractorLink(
@@ -942,6 +968,14 @@ class Filmmakinesi : MainAPI() {
             Unit
         }
         return seenUrl.isNotEmpty() || gotExt.get()
+    }
+
+    // Yayın dosya adı ".../hls/<ad>-<yıl>-<kalite>...-<id>.mp4/..." biçiminde; yıl, film adresindeki yıldan >1 farklıysa yanlış film
+    private fun wrongFilm(streamUrl: String, pageYear: Int?): Boolean {
+        if (pageYear == null) return false
+        val y = Regex("/hls\\d*/[^/]*?-((?:19|20)\\d{2})-", IC).find(streamUrl)?.groupValues?.get(1)?.toIntOrNull()
+            ?: return false
+        return kotlin.math.abs(y - pageYear) > 1
     }
 
     // ---------------- Akış bulma / doğrulama ----------------
@@ -1500,6 +1534,12 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
         h["Sec-Fetch-Dest"] = "empty"
         h["Sec-Fetch-Mode"] = "cors"
         h["Sec-Fetch-Site"] = "same-origin"
+        hdr["sec-ch-ua"]?.let { h["sec-ch-ua"] = it }
+        hdr["sec-ch-ua-mobile"]?.let { h["sec-ch-ua-mobile"] = it }
+        hdr["sec-ch-ua-platform"]?.let { h["sec-ch-ua-platform"] = it }
+        // Gerçek tarayıcıda sayfa yüklenip betikler çalıştıktan sonra istek gider; anında gelen istek bot sayılabilir
+        Thread.sleep(900)
+        log("CLOSE çerez=${cookies.keys.joinToString(",")} n=${n.take(8)}")
         val resp = try {
             app.post(
                 origin + kn,
@@ -1528,7 +1568,7 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
         }
         // Betik (knKur) adresin sonuna ortam bit maskesini ekler: tarayıcıda 255
         val full = if (Regex("[?&]o=\\d+").containsMatchIn(a)) a else a + (if (a.contains("?")) "&o=255" else "?o=255")
-        log("CLOSE adres bulundu ${full.take(100)}")
+        log("CLOSE adres bulundu ${full.take(140)}")
         return full
     }
 
