@@ -1231,7 +1231,7 @@ class HDFilmCehennemi : MainAPI() {
         val org = originOf(v)
         val url = if (kn.path.startsWith("http", true)) kn.path else org + (if (kn.path.startsWith("/")) "" else "/") + kn.path
         // Tarayıcı sayfa yüklenir yüklenmez değil, kısa bir süre sonra istiyor
-        kotlinx.coroutines.delay(1100L)
+        Thread.sleep(1100L)
         for (attempt in 1..2) {
             val form = LinkedHashMap<String, String>()
             for ((key, vv) in kn.fields) {
