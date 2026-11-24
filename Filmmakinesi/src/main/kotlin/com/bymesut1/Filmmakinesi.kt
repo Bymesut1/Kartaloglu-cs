@@ -1178,6 +1178,10 @@ class Filmmakinesi : MainAPI() {
             log("EM hata $label ${e.message?.take(60)}")
             null
         }
+        if (er == null && hardBlocked(embed)) {
+            log("$label sert Cloudflare engeli (IP), WebView denenmiyor")
+            return null
+        }
         if (er != null) {
             base = er.base
             val cands = er.urls
@@ -1191,9 +1195,11 @@ class Filmmakinesi : MainAPI() {
 
             val st = verified.firstOrNull { er.strict.contains(it.first) }
             if (st != null) unverified = Found(st.first, !isMp4(st.first), st.second.headers)
+            // Close adresi doğrudan siteden alındı: doğrulama geçmese bile adresi ver, WebView'lerle oyalanma
+            if (er.direct && unverified != null) return unverified
 
             // Doğrulanamayan aday akış değil de başka bir embed sayfası olabilir: bir adım daha içine gir
-            val pages = verified.filter { !it.second.ok && !isMp4(it.first) && !wvRegex.containsMatchIn(it.first) }
+            val pages = (if (er.direct) emptyList() else verified.filter { !it.second.ok && !isMp4(it.first) && !wvRegex.containsMatchIn(it.first) })
                 .map { it.first }.take(2)
             for (pg in pages) {
                 val hop = try {
@@ -1246,16 +1252,21 @@ class Filmmakinesi : MainAPI() {
             if (!map.containsKey(u)) map[u] = label.ifBlank { "Kaynak" }
         }
 
+        // Yalnızca açılan sayfanın kendi kaynak düğmeleri alınır (başka film/dizi karışmasın);
+        // düğme yoksa sırayla yedeklere bakılır.
         doc.select("a[data-video_url]").forEach { a ->
             addPart(
                 a.attr("data-video_url"),
                 a.text().replace(Regex("\\s+"), " ").trim()
             )
         }
-        Regex("data-video_url=\"([^\"]+)\"").findAll(html).forEach { addPart(it.groupValues[1], "Kaynak") }
-
-        doc.select("iframe[data-src], iframe[src]").forEach { f ->
-            addPart(f.attr("data-src").ifBlank { f.attr("src") }, "Kaynak")
+        if (map.isEmpty()) {
+            Regex("data-video_url=\"([^\"]+)\"").findAll(html).forEach { addPart(it.groupValues[1], "Kaynak") }
+        }
+        if (map.isEmpty()) {
+            doc.select("iframe[data-src], iframe[src]").forEach { f ->
+                addPart(f.attr("data-src").ifBlank { f.attr("src") }, "Kaynak")
+            }
         }
 
         return map.map { it.value to it.key }
@@ -1265,7 +1276,7 @@ class Filmmakinesi : MainAPI() {
 
     private data class Found(val url: String, val hls: Boolean, val headers: Map<String, String>)
 
-    private data class Embed(val urls: List<String>, val strict: Set<String>, val base: String)
+    private data class Embed(val urls: List<String>, val strict: Set<String>, val base: String, val direct: Boolean = false)
 
     private fun embedHeaders(ref: String): Map<String, String> = mapOf(
         "User-Agent" to androidUA,
@@ -1414,7 +1425,118 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
         return null
     }
 
+    // ---- Sert Cloudflare engeli (IP engeli, "Access denied" sayfası): çözücü/WebView ile aşılamaz, boşuna beklenmez ----
+    private val hardBlockUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun hardBlocked(url: String): Boolean =
+        System.currentTimeMillis() < (hardBlockUntil[originOf(url)] ?: 0L)
+
+    private fun isHardBlock(r: NiceResponse?): Boolean {
+        if (r == null || r.code != 403) return false
+        val t = r.text
+        if (Regex("challenge-platform|Just a moment|cf-chl", IC).containsMatchIn(t)) return false
+        return Regex("cf\\.errors|cf-error-details|Access denied|error code: 10\\d\\d|Attention Required", IC).containsMatchIn(t)
+    }
+
+    // ---- Close (closeload) çözücü ----
+    // Log analizi: Close artık yayın adresini sayfada saklamıyor; sayfadaki betik /video/embed/<id>/kn/ adresine
+    // POST atıyor (hash, s=g, n, j, p, d) ve gelen onaltılık yanıtı knC ile çözüyor. Eski WebView yöntemi
+    // ağı kapattığı için bu istek hiç gitmiyordu (file:"" kalıyordu). Burada aynı işlem doğrudan yapılır.
+    private fun fnv3(str: String): String {
+        var h = 2166136261L
+        for (r in 0 until 3) {
+            for (ch in str) {
+                h = (h xor ch.code.toLong()) and 0xFFFFFFFFL
+                h = (h * 16777619L) and 0xFFFFFFFFL
+            }
+        }
+        return ("0000000" + h.toString(16)).takeLast(8)
+    }
+
+    private fun closeKnC(x: String, n: String, p: String): String {
+        val sb = StringBuilder()
+        var ks = ""
+        var i = 0
+        while (i + 1 < x.length) {
+            if (i % 8 == 0) ks = fnv3(n + "|" + (i / 8) + "|" + p)
+            val a = x.substring(i, i + 2).toInt(16)
+            val b = ks.substring(i % 8, i % 8 + 2).toInt(16)
+            sb.append((a xor b).toChar())
+            i += 2
+        }
+        return sb.toString()
+    }
+
+    private suspend fun closeSolve(
+        html: String,
+        finalUrl: String,
+        blobs: List<String>,
+        hdr: Map<String, String>,
+        cookies: Map<String, String>
+    ): String? {
+        val kn = Regex("""["'](/video/embed/[^"']+/kn/)["']""").find(html)?.groupValues?.get(1) ?: return null
+        val nj = Regex("""var\s+n\s*=\s*"([0-9a-fA-F]+)"\s*,\s*j\s*=\s*"([0-9a-fA-F]+)"""").find(html) ?: return null
+        val n = nj.groupValues[1]
+        val j = nj.groupValues[2]
+        val hash = Regex("""hash\s*:\s*"([0-9a-fA-F]+)"""").find(html)?.groupValues?.get(1) ?: return null
+        var k = "112775bdddff5b3d"
+        for (b in blobs) {
+            val m = Regex("""var\s+k\s*=\s*"([0-9a-zA-Z]+)"\s*;\s*function\s+f\s*\(""").find(b)
+            if (m != null) {
+                k = m.groupValues[1]
+                break
+            }
+        }
+        // knF(n): ortam parmak izi gerçek tarayıcıda hep aynı: [object Window]|[object HTMLDocument]|function
+        val p = fnv3(n + "|" + k + "|[object Window]|[object HTMLDocument]|function")
+        val origin = originOf(finalUrl)
+        val h = LinkedHashMap<String, String>()
+        h["User-Agent"] = hdr["User-Agent"] ?: uaSiteMobile
+        h["Accept"] = "*/*"
+        h["Accept-Language"] = "tr-TR,tr;q=0.9,en;q=0.7"
+        h["Origin"] = origin
+        h["Referer"] = finalUrl
+        h["X-Requested-With"] = "XMLHttpRequest"
+        h["Sec-Fetch-Dest"] = "empty"
+        h["Sec-Fetch-Mode"] = "cors"
+        h["Sec-Fetch-Site"] = "same-origin"
+        val resp = try {
+            app.post(
+                origin + kn,
+                headers = h,
+                cookies = cookies,
+                data = mapOf("hash" to hash, "s" to "g", "n" to n, "j" to j, "p" to p, "d" to "1"),
+                timeout = 15L
+            )
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("CLOSE POST hata ${e.message?.take(60)}")
+            return null
+        }
+        val hex = resp.text.replace(Regex("[^0-9a-f]"), "")
+        log("CLOSE POST kod=${resp.code} hex=${hex.length}")
+        if (resp.code != 200 || hex.length < 16) {
+            log("CLOSE gövde: " + resp.text.take(120).replace(Regex("\\s+"), " "))
+            return null
+        }
+        val dec = closeKnC(hex, n, p)
+        val a = dec.substringBefore('\n').trim()
+        if (!a.startsWith("http", true)) {
+            log("CLOSE çözüm geçersiz: " + a.take(60))
+            return null
+        }
+        // Betik (knKur) adresin sonuna ortam bit maskesini ekler: tarayıcıda 255
+        val full = if (Regex("[?&]o=\\d+").containsMatchIn(a)) a else a + (if (a.contains("?")) "&o=255" else "?o=255")
+        log("CLOSE adres bulundu ${full.take(100)}")
+        return full
+    }
+
     private suspend fun resolveEmbed(embedUrl: String, pageUrl: String, depth: Int = 0): Embed? {
+        if (hardBlocked(embedUrl)) {
+            log("EM sert engel aktif, atlandı ${embedUrl.take(60)}")
+            return null
+        }
         val refs = listOf(pageUrl, "$mainUrl/").distinct()
         var wvTried = false // WebView yedeği çağrı başına yalnızca bir kez (her referer için 25 sn beklenmesin)
         for (rf in refs) {
@@ -1423,14 +1545,27 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
             val rapidHost = originOf(embedUrl).contains("rapid", true)
             val hA = if (rapidHost) embedHeaders(rf) else browserEmbedHeaders(rf)
             val hB = if (rapidHost) browserEmbedHeaders(rf) else embedHeaders(rf)
+            var hUsed = hA
             var r = fetchEmbed(embedUrl, hA, "A", false)
             if (r == null || r.code != 200) {
                 val r2 = fetchEmbed(embedUrl, hB, "B", false)
-                if (r2 != null && (r2.code == 200 || r == null)) r = r2
+                if (r2 != null && (r2.code == 200 || r == null)) {
+                    r = r2
+                    hUsed = hB
+                }
+            }
+            if (isHardBlock(r)) {
+                // IP engeli: çözücü (30 sn) ve WebView (60 sn) denemek boşuna; bir süre bu adrese hiç gidilmez
+                hardBlockUntil[originOf(embedUrl)] = System.currentTimeMillis() + 5L * 60 * 1000
+                log("EM sert Cloudflare engeli (403) ${embedUrl.take(60)}")
+                return null
             }
             if (r == null || r.code != 200) {
                 val r3 = fetchEmbed(embedUrl, hB, "CF", true)
-                if (r3 != null) r = r3
+                if (r3 != null) {
+                    r = r3
+                    hUsed = hB
+                }
             }
 
             var html: String
@@ -1461,6 +1596,19 @@ try{Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){wind
             // Log analizi: Rapid sayfasındaki asıl adres her yüklemede değişen (rastgele isimli, tuzlu, karıştırmalı) bir JS ile
             // çözülüyor; Close sayfasındaki sabit görünen master.txt ise sahte (404). Bu betikleri gerçek bir WebView'de çalıştırıp
             // jwplayer.setup'a verilen ayarı yakalıyoruz.
+            // Close: yayın adresi /kn/ isteğiyle alınır (WebView gerekmez, ~1 sn)
+            if (html.contains("/kn/") && html.contains("knKur")) {
+                val cu = try {
+                    closeSolve(html, finalUrl, FmDecoder.collectBlobs(html), hUsed, r?.cookies ?: emptyMap())
+                } catch (e: java.util.concurrent.CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    log("CLOSE hata ${e.javaClass.simpleName} ${e.message?.take(60)}")
+                    null
+                }
+                if (cu != null) return Embed(listOf(cu), setOf(cu), finalUrl, true)
+            }
+
             val js = try {
                 jsStream(html, finalUrl)
             } catch (e: java.util.concurrent.CancellationException) {
